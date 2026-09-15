@@ -252,10 +252,9 @@ python -m tests.mock_uvsock_server --port 4823
 
 ```text
 MIT License
-Copyright (c) 2026 <Your Name or Organization>
+Copyright (c) 2026 <春雫>
 ```
 
-> 发布前请将 LICENSE 文件中的 `<Your Name or Organization>` 替换为你的真实姓名 / 组织。
 
 ## 参考与致谢
 
