@@ -32,6 +32,8 @@
 - **符号检索**：`find_symbol` 从 .axf ELF 符号表模糊检索函数/全局变量（地址+类型），AI 读任意符号不再靠猜名字；
 - **写寄存器 / 改 PC**：`set_register` 写 CPU 寄存器并读回验证，可修正现场、改返回值、改 PC 跳转执行；
 - **性能分析**：`dwt` 读 DWT 周期计数器（自动使能），配合两次采样测代码段执行时间；
+- **HardFault / 异常定位**：`fault_report` 读 SCB 寄存器判异常类型与原因，并从异常栈帧恢复现场（PC/LR/R0-R3），排查死机/跑飞/复位循环；
+- **条件断点**：`set_conditional_breakpoint` 设 C 表达式条件/命中次数断点，只在特定条件或第 N 次命中才停；
 - **自动进出调试模式**：`enter_debug` / `exit_debug`，支持 AI 驱动"进入 → 设断点 → 运行到断点 → 读变量 → 退出"完整闭环；
 - **编译 / 烧录闭环**：基于 Keil 官方 `UV4.exe` 命令行，提供 `build_project`（编译）、`rebuild_project`（重编译）、`flash_download`（烧录）、`build_and_flash`（编译成功后自动烧录），支持 AI 自主"改代码 → 编译 → 烧录 → 上板"全流程闭环；
 - **后台静默编译**：编译 / 烧录以隐藏窗口方式启动 UV4，**不会闪现新的 Keil 界面**，用户已打开的实例不受打扰；
@@ -125,7 +127,7 @@ mdk_agent/
 │   ├── client.py             # UVClient：调试能力封装 + 连接缓存
 │   ├── builder.py            # UV4 命令行：编译 / 重编译 / 烧录 / 编译烧录闭环
 │   ├── locator.py             # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
-│   └── server.py             # MCP Server 与 38 个工具定义（29 调试 + 4 编译烧录 + 2 Keil 管理 + 1 一体闭环）
+│   └── server.py             # MCP Server 与 40 个工具定义（31 调试 + 4 编译烧录 + 2 Keil 管理 + 1 一体闭环）
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_e2e.py           # UVClient 协议闭环测试
@@ -164,7 +166,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **38** 个（29 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具 + 1 个 `flash_debug` 一体闭环）：
+共 **40** 个（31 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具 + 1 个 `flash_debug` 一体闭环）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -194,6 +196,8 @@ python run_server.py --transport http --http-port 8300
 | `find_symbol` | 符号检索：从 .axf ELF 符号表模糊检索函数/全局变量（返回名字/类型/地址/大小），AI 读符号不再靠猜名字 | `query`、`kind`（all/func/object/global/local）、`limit` |
 | `set_register` | 写寄存器/改 PC：向 R0-R12/SP/LR/PC/xPSR 写值并读回验证，可修正现场、改返回值、改 PC 跳转执行 | `register`、`value` |
 | `dwt` | DWT 周期计数器：读 CYCCNT（自动使能），配合两次采样算代码段执行周期数与耗时 | — |
+| `fault_report` | HardFault/异常定位：读 SCB（ICSR/HFSR/CFSR/MMFAR/BFAR）判异常类型+原因，从异常栈帧恢复 PC/LR/R0-R3/xPSR，排查死机/跑飞 | — |
+| `set_conditional_breakpoint` | 条件断点：仅在 condition（C 表达式如 R0==5）成立/第 count 次命中时才停，减少无关中断 | `expr`、`condition`、`count` |
 | `enter_debug` | 自动进入 Keil 调试模式 | — |
 | `exit_debug` | 自动退出 Keil 调试模式 | — |
 | `set_breakpoint` | 在符号 / 地址处设软件断点 | `expr`（如 `main`、`0x08001034`） |

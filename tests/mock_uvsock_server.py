@@ -54,12 +54,21 @@ class MockUVSOCKServer:
         self.reg_map = {"__currentPC()": 0x8000DB4, "PC": 0x8000DB4, "R15": 0x8000DB4,
                         "__currentLR()": 0x8000DC4, "LR": 0x8000DC4, "R14": 0x8000DC4,
                         "__currentSP()": 0x2002FF00, "SP": 0x2002FF00, "R13": 0x2002FF00,
+                        "MSP": 0x20000040, "PSP": 0x2002FF00,
                         "R0": 0x20000000, "R1": 0x0000002A, "R2": 0x00000001, "R3": 0x00000000,
                         "R4": 0xDEADBEEF, "R5": 0x00000007, "R6": 0x00000000, "R7": 0x00000000,
                         "R8": 0x00000000, "R9": 0x00000000, "R10": 0x00000000, "R11": 0x00000000,
                         "R12": 0x00000000, "xPSR": 0x21000000}
         # DWT/SCS 调试寄存器（供 dwt 周期计数器）
         self.dwt = {"demcr": 0, "ctrl": 0, "cyccnt": 0x1234}
+        # SCB 异常寄存器（供 fault_report）：模拟 HardFault + FORCED + 除零
+        self.scb = {"icsr": 0x3, "cfsr": 0x2000000, "hfsr": 0x40000000,
+                    "mmfar": 0, "bfar": 0}
+        # 在 0x20000040 预置一段异常栈帧（R0,R1,R2,R3,R12,LR,PC,xPSR 自低地址到高）
+        fbase = 0x20000040 - 0x20000000
+        for i, v in enumerate([0x11, 0x22, 0x33, 0x44, 0x55,
+                               0x08000abc, 0x08000def, 0x21000000]):
+            struct.pack_into('<I', self.mem, fbase + i * 4, v)
         self.running = False
         self.debugging = False
         self.breakpoints = []  # 断点符号/地址列表
@@ -293,6 +302,10 @@ class MockUVSOCKServer:
         elif nAddr in (0xE000EDFC, 0xE0001000, 0xE0001004):  # DWT/SCS 调试寄存器
             key = {0xE000EDFC: "demcr", 0xE0001000: "ctrl", 0xE0001004: "cyccnt"}[nAddr]
             payload = struct.pack('<I', self.dwt[key] & 0xFFFFFFFF)
+        elif nAddr in (0xE000ED04, 0xE000ED28, 0xE000ED2C, 0xE000ED34, 0xE000ED38):  # SCB 异常寄存器
+            key = {0xE000ED04: "icsr", 0xE000ED28: "cfsr", 0xE000ED2C: "hfsr",
+                   0xE000ED34: "mmfar", 0xE000ED38: "bfar"}[nAddr]
+            payload = struct.pack('<I', self.scb[key] & 0xFFFFFFFF)
         if not payload:
             return uvsock.UV_STATUS_NO_MEM_ACCESS, b""
         resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0) + payload

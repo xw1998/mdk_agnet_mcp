@@ -428,6 +428,55 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "expr": expr, "error": str(e)})
 
     @server.tool(
+        name="set_conditional_breakpoint",
+        title="设置条件断点",
+        description=(
+            "在符号/地址处设带条件的软件断点：仅当 condition（C 表达式，如 'R0==5'、"
+            "'test_array[0]==0x11111111'）成立时才暂停；count 为命中计数（默认1，第 count 次满足才停）。"
+            "用于只在特定条件/次数下停住，减少无关中断。需已进入调试且配置 .axf。"
+        ),
+    )
+    async def set_conditional_breakpoint(expr: str, condition: str, count: int = 1) -> str:
+        try:
+            client = _get_client()
+            e = (expr or "").strip()
+            cond = (condition or "").strip()
+            if not cond:
+                return _js({"ok": False, "expr": expr, "error": "condition 不能为空"})
+            # 先解析地址（避开 BS 命令后连接被污染的坑）
+            addr = None
+            if e.lower().startswith("0x"):
+                try:
+                    addr = int(e, 16)
+                except ValueError:
+                    addr = None
+            else:
+                ar = client.calc_expression(f"&{e}")
+                if ar.get("ok") and isinstance(ar.get("value"), int):
+                    addr = ar["value"]
+            loc = _get_locator()
+            target = hex(addr) if addr is not None else expr
+            cmd = f"BS {target}, {cond}"
+            if count and count > 1:
+                cmd = f"{cmd}, {count}"
+            r = client.exec_command(cmd)
+            out = {"ok": r.get("ok"), "expr": expr, "condition": cond, "count": count,
+                   "command": cmd, "status_text": r.get("status_text")}
+            if addr is not None:
+                out["address"] = hex(addr)
+                l = loc.addr_to_location(addr) if loc else None
+                if l:
+                    out["file"] = l["file"]
+                    out["line"] = l["line"]
+                _breakpoints.append({"expr": expr, "address": hex(addr), "condition": cond,
+                                     "count": count, "file": out.get("file"), "line": out.get("line")})
+            if not r.get("ok"):
+                out["error"] = f"设置条件断点失败: {r}"
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "expr": expr, "condition": condition, "error": str(e)})
+
+    @server.tool(
         name="set_watchpoint",
         title="设置数据断点（访问断点）",
         description=(
@@ -882,6 +931,44 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ctrl = _dwt_read_u32(client, _DWT_CTRL) or 0
         return _dwt_write_u32(client, _DWT_CTRL, ctrl | 1)
 
+    # ---------------- HardFault / 异常现场定位 ----------------
+    _FAULT_NAME = {0: "Thread(正常线程)", 1: "Reset", 2: "NMI", 3: "HardFault", 4: "MemManage",
+                   5: "BusFault", 6: "UsageFault", 11: "SVCall", 12: "DebugMonitor",
+                   14: "PendSV", 15: "SysTick"}
+
+    @staticmethod
+    def _reg_val(client, *cands):
+        """按候选表达式顺序读寄存器/表达式的整数值，返回第一个成功的。"""
+        for c in cands:
+            try:
+                r = client.calc_expression(c)
+                if r.get("ok") and isinstance(r.get("value"), int):
+                    return r["value"]
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    @staticmethod
+    def _decode_cfsr(cfsr: int) -> list:
+        """把 CFSR(0xE000ED28) 拆解为可读的故障原因列表。"""
+        flags = []
+        if cfsr & 0x01: flags.append("MMFSR:IACCVIOL 指令访问冲突")
+        if cfsr & 0x02: flags.append("MMFSR:DACCVIOL 数据访问冲突")
+        if cfsr & 0x08: flags.append("MMFSR:MSTKERR 异常入栈错误")
+        if cfsr & 0x10: flags.append("MMFSR:MUNSTKERR 异常出栈错误")
+        if cfsr & 0x100: flags.append("BFSR:IBUSERR 指令总线错误")
+        if cfsr & 0x200: flags.append("BFSR:PRECISERR 精确数据总线错误")
+        if cfsr & 0x400: flags.append("BFSR:IMPRECISERR 不精确数据总线错误")
+        if cfsr & 0x800: flags.append("BFSR:UNSTKERR 异常出栈错误")
+        if cfsr & 0x1000: flags.append("BFSR:STKERR 异常入栈错误")
+        if cfsr & 0x10000: flags.append("UFSR:UNDEFINSTR 未定义指令")
+        if cfsr & 0x20000: flags.append("UFSR:INVSTATE 无效执行状态")
+        if cfsr & 0x40000: flags.append("UFSR:INVPC 无效PC")
+        if cfsr & 0x80000: flags.append("UFSR:NOCP 无协处理器")
+        if cfsr & 0x1000000: flags.append("UFSR:UNALIGNED 非对齐访问")
+        if cfsr & 0x2000000: flags.append("UFSR:DIVBYZERO 除零")
+        return flags
+
     @server.tool(
         name="dwt",
         title="DWT 周期计数器（性能分析）",
@@ -909,6 +996,66 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                    "usage": "执行周期数 = (cycles2 - cycles1) & 0xFFFFFFFF；耗时 = 周期数 / frequency_hz"}
             if freq and cycles:
                 out["seconds_since_enable"] = round(cycles / freq, 6)
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="fault_report",
+        title="HardFault / 异常现场定位",
+        description=(
+            "读取 SCB 异常寄存器（ICSR/HFSR/CFSR/MMFAR/BFAR）判断当前异常类型与原因，"
+            "并从异常栈帧恢复现场（异常发生时 R0-R3/R12/LR/PC/xPSR）。排查死机/跑飞/复位循环时使用："
+            "先看 exception 是什么异常、cfsr.reasons 给出原因，再看 fault_frame.pc 定位出错指令。"
+            "需已进入调试且停在异常处理程序（best-effort，handler 已运行时栈帧可能偏移）。"
+        ),
+    )
+    async def fault_report() -> str:
+        try:
+            client = _get_client()
+            icsr = _dwt_read_u32(client, 0xE000ED04) or 0
+            cfsr = _dwt_read_u32(client, 0xE000ED28) or 0
+            hfsr = _dwt_read_u32(client, 0xE000ED2C) or 0
+            mmfar = _dwt_read_u32(client, 0xE000ED34)
+            bfar = _dwt_read_u32(client, 0xE000ED38)
+            vect = icsr & 0x1FF
+            exc = _FAULT_NAME.get(vect, f"外部中断 IRQ{vect - 16}") if vect >= 16 \
+                else _FAULT_NAME.get(vect, f"异常{vect}")
+            out = {"ok": True, "exception": {"vector": vect, "name": exc}}
+            reasons = _decode_cfsr(cfsr)
+            out["cfsr"] = {"value": "0x%08x" % (cfsr or 0), "reasons": reasons}
+            if hfsr:
+                hf = []
+                if hfsr & 0x40000000: hf.append("HFSR:FORCED 强制异常(由子级 fault 升级)")
+                if hfsr & 0x02: hf.append("HFSR:VECTTBL 向量表错误")
+                if hf: out["hardfault"] = hf
+            if mmfar: out["mmfar"] = "0x%08x" % mmfar
+            if bfar: out["bfar"] = "0x%08x" % bfar
+            # 当前现场
+            info = _build_location(client)
+            if info:
+                out["current"] = info
+            # 异常栈帧恢复：EXC_RETURN bit2=0 用 MSP，bit2=1 用 PSP
+            lr = _reg_val(client, "LR", "R14")
+            out["exception_return"] = "0x%08x" % lr if lr is not None else None
+            if lr is not None:
+                sp_reg = "PSP" if (lr & 0x4) else "MSP"
+                sp_ptr = _reg_val(client, sp_reg, "__currentSP()")
+                if sp_ptr is not None:
+                    # Cortex-M 异常帧：R0,R1,R2,R3,R12,LR,PC,xPSR（自低地址到高）
+                    r0 = _dwt_read_u32(client, sp_ptr + 0x00) or 0
+                    r1 = _dwt_read_u32(client, sp_ptr + 0x04) or 0
+                    r2 = _dwt_read_u32(client, sp_ptr + 0x08) or 0
+                    r3 = _dwt_read_u32(client, sp_ptr + 0x0C) or 0
+                    r12 = _dwt_read_u32(client, sp_ptr + 0x10) or 0
+                    flr = _dwt_read_u32(client, sp_ptr + 0x14) or 0
+                    fpc = _dwt_read_u32(client, sp_ptr + 0x18) or 0
+                    fxpsr = _dwt_read_u32(client, sp_ptr + 0x1C) or 0
+                    out["fault_frame"] = {"stack": "0x%08x" % sp_ptr,
+                                          "r0": "0x%08x" % r0, "r1": "0x%08x" % r1,
+                                          "r2": "0x%08x" % r2, "r3": "0x%08x" % r3,
+                                          "r12": "0x%08x" % r12, "lr": "0x%08x" % flr,
+                                          "pc": "0x%08x" % fpc, "xpsr": "0x%08x" % fxpsr}
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
