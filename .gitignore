@@ -23,3 +23,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# 本地测试残留
+_build_test*.log

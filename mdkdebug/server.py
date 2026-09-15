@@ -302,6 +302,20 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="close_uvision",
+        description=(
+            "关闭所有 Keil uVision 实例，配合 launch_uvision 实现 Keil 开关闭环。"
+            "force 默认 False：先优雅关闭（发送关闭消息），残留则自动强制终止；"
+            "force=True 直接强制结束所有 UV4.exe。注意：会关闭所有 Keil 实例。"
+        ),
+    )
+    async def close_uvision(force: bool = False) -> str:
+        try:
+            return _js(builder.close_uvision(force=force))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="build_project",
         description=(
             "编译 Keil 工程（UV4 -b，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，可省略以用默认工程；"

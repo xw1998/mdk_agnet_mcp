@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -176,6 +177,51 @@ def launch_uvision(uv4: str, project: str) -> dict:
         }
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"启动 Keil uVision 失败：{e}"}
+
+
+def _uv4_pids() -> list[str]:
+    """返回当前所有 UV4.exe 的 PID 列表。"""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq UV4.exe"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        return re.findall(r"UV4\.exe\s+(\d+)", out)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def close_uvision(force: bool = False, timeout: int = 10) -> dict:
+    """关闭所有 Keil uVision 实例（AI 管理 Keil 开关的闭环）。
+
+    force=False：先优雅关闭（taskkill 发送关闭消息，允许正常收尾）；
+    若仍有实例残留则自动升级为强制终止。
+    force=True：直接强制终止所有 UV4.exe。
+    """
+    before = _uv4_pids()
+    if not before:
+        return {"ok": True, "action": "关闭Keil", "closed": 0, "msg": "当前无 Keil uVision 实例"}
+    try:
+        if not force:
+            subprocess.run(["taskkill", "/IM", "UV4.exe"],
+                           capture_output=True, text=True, timeout=timeout)
+            remain = _uv4_pids()
+            if remain:
+                # 优雅未完全退出，强制兜底
+                subprocess.run(["taskkill", "/F", "/IM", "UV4.exe"],
+                               capture_output=True, text=True, timeout=timeout)
+                remain = _uv4_pids()
+                return {"ok": len(remain) == 0, "action": "关闭Keil",
+                        "closed": len(before), "force_fallback": True,
+                        "remaining": remain}
+            return {"ok": True, "action": "关闭Keil", "closed": len(before), "force": False}
+        subprocess.run(["taskkill", "/F", "/IM", "UV4.exe"],
+                       capture_output=True, text=True, timeout=timeout)
+        remain = _uv4_pids()
+        return {"ok": len(remain) == 0, "action": "关闭Keil",
+                "closed": len(before), "force": True, "remaining": remain}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"关闭 Keil 失败：{e}"}
 
 
 def build_and_flash(uv4: str, project: str, target: str | None = None,

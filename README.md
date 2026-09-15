@@ -19,7 +19,8 @@
 - **自动进出调试模式**：`enter_debug` / `exit_debug`，支持 AI 驱动"进入 → 设断点 → 运行到断点 → 读变量 → 退出"完整闭环；
 - **编译 / 烧录闭环**：基于 Keil 官方 `UV4.exe` 命令行，提供 `build_project`（编译）、`rebuild_project`（重编译）、`flash_download`（烧录）、`build_and_flash`（编译成功后自动烧录），支持 AI 自主"改代码 → 编译 → 烧录 → 上板"全流程闭环；
 - **后台静默编译**：编译 / 烧录以隐藏窗口方式启动 UV4，**不会闪现新的 Keil 界面**，用户已打开的实例不受打扰；
-- **AI 管理 Keil 开启**：`launch_uvision` 可拉起 Keil 并打开工程（供调试查看界面），若已运行同工程则复用已有实例，无需用户手动打开；
+- **AI 管理 Keil 开关（闭环）**：`launch_uvision` 拉起 Keil 打开工程（复用已有实例），`close_uvision` 关闭 Keil（默认优雅关闭、残留自动强制），Keil 的开启/关闭全部由 AI 闭环管理，无需手动操作；
+- **编译烧录输出集中返回**：每次编译/烧录的完整日志（含警告/错误）经 `-o` 捕获并由 AI 完整返回，在对话中即可查看，无需盯 Keil 窗口；
 - **UV4 自动探测**：优先显式 `--uv4-path`，其次探测常见安装目录，再查 Windows 注册表；
 - **连接缓存**：常驻服务内共享一条 TCP 连接，空闲自动断开、下次调用自动重连；
 - **线程安全**：连接状态以锁保护，可被 MCP 并发调用；
@@ -143,7 +144,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **19** 个（14 个调试工具 + 4 个编译烧录工具 + 1 个 Keil 启动工具）：
+共 **20** 个（14 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -162,6 +163,7 @@ python run_server.py --transport http --http-port 8300
 | `clear_breakpoint` | 清除断点（符号名或断点编号） | `expr` |
 | `list_breakpoints` | 列出当前断点 | — |
 | `launch_uvision` | 可见方式拉起 Keil 打开工程，复用已有实例 | `project` |
+| `close_uvision` | 关闭所有 Keil 实例（默认优雅，残留强制） | `force` |
 | `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口） | `project`、`target` |
 | `rebuild_project` | 全量重编译（`UV4 -r`） | `project`、`target` |
 | `flash_download` | 烧录到目标 Flash（`UV4 -f`） | `project`、`target` |
