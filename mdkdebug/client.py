@@ -1,0 +1,281 @@
+# -*- coding: utf-8 -*-
+"""
+UVClient：高层封装 Keil UVSOCK 调试能力，并内置“连接缓存 + 空闲自动断开”。
+
+连接策略（服务 + 缓存）：
+- 首次调用时建立 TCP 连接；
+- 后续调用若距上次使用未超过 idle_timeout，则复用连接；
+- 超过 idle_timeout 未使用，或遇到连接已失效，则断开后重连；
+- 显式 close() 立即断开。
+线程安全：通过 threading.Lock 保护连接状态，可被 MCP 并发调用。
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+
+from . import uvsock
+from .interface import UVInterface
+from .uvsock import (
+    UVSOCK_CMD, UV_STATUS_SUCCESS, UV_STATUS_TEXT, status_text, UVStatusError,
+)
+
+logger = logging.getLogger("mdkdebug.client")
+
+# 允许单次读内存的最大分块（Keil 协议限制）
+MAX_CHUNK = 16384
+
+
+class UVClient:
+    """线程安全的 UVSOCK 调试客户端（含连接缓存）。"""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 4823,
+                 idle_timeout: float = 30.0):
+        self.host = host
+        self.port = port
+        self.idle_timeout = idle_timeout  # 秒，空闲超过则断开
+        self._lock = threading.Lock()
+        self._last_used = 0.0
+        self.phy = UVInterface(host=host, port=port)
+
+    # ------------------------------------------------------------------
+    # 连接生命周期
+    # ------------------------------------------------------------------
+    def _ensure_connected(self) -> None:
+        now = time.monotonic()
+        if self.phy.is_connected:
+            if now - self._last_used <= self.idle_timeout:
+                return
+            # 空闲超时，断开以便重连
+            logger.info("连接空闲超过 %.1fs，断开重连", self.idle_timeout)
+            self.phy.close()
+        self.phy.open()
+        self._last_used = now
+
+    def _request(self, cmd_code: int, data: bytes = b'',
+                 expect_status: bool = True):
+        """加锁执行一次命令，返回 (r_status, 响应数据解析结果)。"""
+        with self._lock:
+            self._ensure_connected()
+            uv = UVSOCK_CMD(cmd_code, data=data)
+            raw = self.phy.send(uv.pack())
+            self._last_used = time.monotonic()
+            if raw is None:
+                # 连接可能已失效，尝试重连一次
+                self.phy.close()
+                raise UVStatusError(uvsock.UV_STATUS_TIMEOUT,
+                                    f"cmd=0x{cmd_code:04X}")
+            resp = uv.unpack(raw)
+            # resp = (totalLen, eCmd, bufLen, cycles, tStamp, id, r_cmd, r_status, data)
+            return resp[7], resp[8]
+
+    def close(self) -> None:
+        with self._lock:
+            self.phy.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # 状态 / 版本
+    # ------------------------------------------------------------------
+    def get_version(self) -> dict:
+        status, m_data = self._request(uvsock.UV_GEN_GET_VERSION)
+        version = m_data.hex()
+        return {"status": status, "ok": status == UV_STATUS_SUCCESS,
+                "version_hex": version,
+                "status_text": status_text(status)}
+
+    def get_status(self) -> dict:
+        """查询调试状态。
+
+        真实 Keil 的 UV_DBG_STATUS 响应：r_status 恒为 0，真正的运行状态在响应
+        data 的低字节（1=执行中，0=已停止）；mock 则直接用 r_status 表示状态。
+        因此优先从 data 解析，data 为空时回退到 r_status。
+        """
+        status, m_data = self._request(uvsock.UV_DBG_STATUS)
+        # 仅当 r_status 为成功时，data 低字节才表示运行状态（真实 Keil）
+        if status == uvsock.UV_STATUS_SUCCESS:
+            state = m_data[0] if len(m_data) >= 1 else None
+            if state is not None:
+                running = (state == 1)
+                return {
+                    "ok": True, "status": status,
+                    "status_text": "执行中" if running else "已停止",
+                    "running": running, "debugging": True,
+                    "data": m_data.hex() if m_data else "",
+                }
+        # 非成功 / 兼容 mock：按 r_status 直接判断运行状态
+        running = status in (uvsock.DBG_EXECUTING,
+                             uvsock.UV_STATUS_TARGET_EXECUTING,
+                             uvsock.UV_STATUS_DEBUGGING)
+        if status == uvsock.DBG_EXECUTING:
+            text, debugging = "执行中", True
+        elif status in (uvsock.DBG_STOPPED, uvsock.UV_STATUS_TARGET_STOPPED):
+            text, debugging = "已停止", True
+        elif status == uvsock.UV_STATUS_NOT_DEBUGGING:
+            text, debugging = "未处于调试状态", False
+        else:
+            text, debugging = status_text(status), False
+        return {
+            "ok": True, "status": status,
+            "status_text": text,
+            "running": running, "debugging": debugging,
+            "data": m_data.hex() if m_data else "",
+        }
+
+    # ------------------------------------------------------------------
+    # 表达式 / 变量
+    # ------------------------------------------------------------------
+    def calc_expression(self, expr: str) -> dict:
+        """读取/计算调试表达式（变量、寄存器、指针解引用等）。"""
+        from .uvsock import VSET
+        ve = VSET()
+        data = ve.pack(expr)
+        status, m_data = self._request(uvsock.UV_DBG_CALC_EXPRESSION, data=data)
+        if status != UV_STATUS_SUCCESS:
+            return {"status": status, "ok": False,
+                    "status_text": status_text(status)}
+        val_type, val, name = ve.unpack(m_data)
+        type_name = uvsock.VTT_TYPE_NAME.get(val_type, f"type_{val_type}")
+        return {
+            "status": status, "ok": True,
+            "expression": expr,
+            "value_type": type_name,
+            "value": val,
+            "value_raw": name,
+        }
+
+    # ------------------------------------------------------------------
+    # 内存读写
+    # ------------------------------------------------------------------
+    def read_mem(self, addr: int, n_bytes: int) -> dict:
+        """读取指定地址的 n_bytes 内存（自动分块）。返回十六进制字节串。"""
+        if n_bytes <= 0:
+            return {"status": uvsock.UV_STATUS_OUT_OF_RANGE, "ok": False,
+                    "status_text": "n_bytes 必须为正整数", "addr": addr,
+                    "n_bytes": n_bytes, "data_hex": "", "ascii": ""}
+        result = b""
+        offset = 0
+        while offset < n_bytes:
+            chunk = min(MAX_CHUNK, n_bytes - offset)
+            am = uvsock.AMEM()
+            status, m_data = self._request(uvsock.UV_DBG_MEM_READ,
+                                           data=am.pack_read(addr + offset, chunk))
+            if status != UV_STATUS_SUCCESS:
+                return {"status": status, "ok": False,
+                        "status_text": status_text(status), "addr": addr,
+                        "n_bytes": n_bytes, "data_hex": result.hex(),
+                        "ascii": self._to_ascii(result)}
+            nAddr, ErrAddr, nErr, payload = am.unpack(m_data)
+            result += payload
+            offset += chunk
+        return {"status": UV_STATUS_SUCCESS, "ok": True, "addr": addr,
+                "n_bytes": n_bytes, "data_hex": result.hex(),
+                "ascii": self._to_ascii(result)}
+
+    def write_mem(self, addr: int, data: bytes) -> dict:
+        """向指定地址写入字节。返回实际写入长度。"""
+        if not data:
+            return {"status": uvsock.UV_STATUS_OUT_OF_RANGE, "ok": False,
+                    "status_text": "data 不能为空", "addr": addr,
+                    "written": 0}
+        am = uvsock.AMEM()
+        status, m_data = self._request(uvsock.UV_DBG_MEM_WRITE,
+                                       data=am.pack_write(addr, data))
+        if status != UV_STATUS_SUCCESS:
+            return {"status": status, "ok": False,
+                    "status_text": status_text(status), "addr": addr,
+                    "written": 0}
+        return {"status": status, "ok": True, "addr": addr,
+                "written": len(data)}
+
+    # ------------------------------------------------------------------
+    # 调试会话控制（进入/退出）
+    # ------------------------------------------------------------------
+    def enter_debug(self) -> dict:
+        """进入调试模式（UV_DBG_ENTER）。受工程的 Load/Flash/Run-to-main 设置影响。"""
+        return self._control(uvsock.UV_DBG_ENTER, "进入调试")
+
+    def exit_debug(self) -> dict:
+        """退出调试模式（UV_DBG_EXIT）。"""
+        return self._control(uvsock.UV_DBG_EXIT, "退出调试")
+
+    # ------------------------------------------------------------------
+    # 断点管理（基于 Keil 命令窗口命令）
+    # ------------------------------------------------------------------
+    def exec_command(self, command: str) -> dict:
+        """执行一条 Keil 命令窗口命令（BS/BK/BL/EVAL 等）。"""
+        if any(c in command for c in "\r\n\0"):
+            return {"status": uvsock.UV_STATUS_INVALID_NAME, "ok": False,
+                    "status_text": "每次只能发送一条调试命令", "command": command}
+        from .uvsock import EXECCMD
+        status, m_data = self._request(uvsock.UV_DBG_EXEC_CMD,
+                                       data=EXECCMD.pack(command))
+        out = {"status": status, "ok": status == uvsock.UV_STATUS_SUCCESS,
+               "status_text": status_text(status), "command": command}
+        # 若响应带输出文本则附上
+        if m_data:
+            try:
+                out["output"] = m_data.rstrip(b"\x00").decode("UTF-8", "replace")
+            except Exception:
+                out["output_hex"] = m_data.hex()
+        return out
+
+    def set_breakpoint(self, expr: str) -> dict:
+        """在符号/地址处设置软件断点（命令窗口 BS）。"""
+        return self.exec_command(f"BS {expr}")
+
+    def clear_breakpoint(self, expr: str) -> dict:
+        """清除断点（命令窗口 BK，可传符号名或断点编号）。"""
+        return self.exec_command(f"BK {expr}")
+
+    def list_breakpoints(self) -> dict:
+        """列出当前所有断点（命令窗口 BL）。"""
+        return self.exec_command("BL")
+
+    # ------------------------------------------------------------------
+    # 运行控制
+    # ------------------------------------------------------------------
+    def run(self) -> dict:
+        return self._control(uvsock.UV_DBG_START_EXECUTION, "运行")
+
+    def stop(self) -> dict:
+        return self._control(uvsock.UV_DBG_STOP_EXECUTION, "暂停")
+
+    def reset(self) -> dict:
+        return self._control(uvsock.UV_DBG_RESET, "复位")
+
+    def step(self, mode: str = "into") -> dict:
+        mode = (mode or "into").lower()
+        cmd_map = {
+            "into": uvsock.UV_DBG_STEP_INTO,
+            "instruction": uvsock.UV_DBG_STEP_INSTRUCTION,
+            "over": uvsock.UV_DBG_STEP_HLL,
+            "out": uvsock.UV_DBG_STEP_OUT,
+        }
+        if mode not in cmd_map:
+            return {"status": uvsock.UV_STATUS_INVALID_NAME, "ok": False,
+                    "status_text": f"不支持的 step 模式: {mode}",
+                    "mode": mode}
+        return self._control(cmd_map[mode], f"单步({mode})", extra={"mode": mode})
+
+    def _control(self, cmd_code: int, label: str, extra: dict | None = None) -> dict:
+        status, m_data = self._request(cmd_code)
+        out = {"status": status, "ok": status == UV_STATUS_SUCCESS,
+               "status_text": status_text(status), "action": label}
+        if extra:
+            out.update(extra)
+        return out
+
+    # ------------------------------------------------------------------
+    # 工具
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_ascii(data: bytes) -> str:
+        return "".join(chr(b) if 32 <= b < 127 else "." for b in data)

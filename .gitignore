@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Keil / 构建产物
+*.uvguix.*
+*.bak
+*.dep
+*.crf
+*.d
+*.o
+*.axf
+*.build_log.htm
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
