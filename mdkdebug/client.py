@@ -347,21 +347,23 @@ class UVClient:
         return out
 
     def read_cpu_registers_stable(self, retries: int = 12, delay: float = 0.3) -> dict:
-        """读取 CPU 寄存器并排除 run 刚停止时的脏 PC 值。
+        """读取 CPU 寄存器并排除停止瞬间的脏 PC 值。
 
-        Keil 在 run(START_EXECUTION) 到断点停止的瞬间，"PC" 表达式可能短暂返回
-        脏值（实测为 1），需重试直到读到合理地址（FLASH/SRAM 区段）才返回。
+        Keil 在 run/step 到断点停止的瞬间，"PC" 表达式可能短暂返回脏值
+        （实测为 1 或 SRAM 地址），需重试直到读到 FLASH 代码段地址才返回。
         最多重试 retries 次，期间每次间隔 delay 秒；若始终未读到合理值则返回最后一次结果。
         """
         last: dict = {}
         for _ in range(max(1, retries)):
             r = self.read_cpu_registers()
             last = r
-            pc = r.get("pc") if r.get("ok") else None
+            if not r.get("ok"):
+                return r  # 读取本身失败（如未在调试态）立即返回，不重试
+            pc = r.get("pc")
             if isinstance(pc, int):
+                # 真实 PC 总指向 FLASH 代码段；SRAM 地址是脏值（可能读到 SP/栈内容）
                 in_flash = 0x08000000 <= pc <= 0x081FFFFF
-                in_sram = 0x20000000 <= pc <= 0x2001FFFF
-                if pc not in (0, 1) and (in_flash or in_sram):
+                if pc not in (0, 1) and in_flash:
                     return r
             time.sleep(delay)
         return last

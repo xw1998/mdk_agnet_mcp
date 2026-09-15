@@ -103,6 +103,42 @@ def _parse_addr(s: str | int) -> int:
     return int(s, 10)
 
 
+def _build_location(client):
+    """读取当前 PC 并构建停靠位置信息：文件行、源码上下文、两级调用栈。
+
+    供 get_current_location 与 step 系列复用，让 AI 单步/查询后立即看到停靠代码。
+    返回 dict：{ok, pc, registers, file, line, address, source, display_path, callstack}；
+    .axf 未就绪返回 None；无法读寄存器返回 {ok:False, error, detail}。
+    """
+    loc = _get_locator()
+    if not loc or not loc.is_ready():
+        return None
+    regs = client.read_cpu_registers_stable()
+    if not regs.get("ok"):
+        return {"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "detail": regs}
+    pc = regs.get("pc")
+    lr = regs.get("lr")
+    result = {"ok": True, "pc": hex(pc) if isinstance(pc, int) else pc, "registers": regs}
+    cur = loc.addr_to_location(pc) if isinstance(pc, int) else None
+    if cur:
+        result["file"] = cur["file"]
+        result["line"] = cur["line"]
+        result["address"] = hex(cur["address"])
+        src = loc.read_source(cur["file"], cur["line"], context=4)
+        if src:
+            result["source"] = src["source"]
+            result["display_path"] = src["display_path"]
+    callstack = []
+    if cur:
+        callstack.append({"level": 0, "pc": hex(pc), "file": cur["file"], "line": cur["line"]})
+    if isinstance(lr, int):
+        lrc = loc.addr_to_location(lr)
+        if lrc:
+            callstack.append({"level": 1, "pc": hex(lr), "file": lrc["file"], "line": lrc["line"]})
+    result["callstack"] = callstack
+    return result
+
+
 def _js(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
@@ -347,34 +383,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def get_current_location() -> str:
         try:
-            loc = _get_locator()
-            if not loc or not loc.is_ready():
-                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号，或未从工程推断到）"})
             client = _get_client()
-            # 用稳定读取跳过 run 刚停止时的脏 PC 值
-            regs = client.read_cpu_registers_stable()
-            if not regs.get("ok"):
-                return _js({"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "detail": regs})
-            pc = regs.get("pc"); lr = regs.get("lr")
-            result = {"ok": True, "pc": hex(pc) if isinstance(pc, int) else pc, "registers": regs}
-            cur = loc.addr_to_location(pc) if isinstance(pc, int) else None
-            if cur:
-                result["file"] = cur["file"]
-                result["line"] = cur["line"]
-                result["address"] = hex(cur["address"])
-                src = loc.read_source(cur["file"], cur["line"], context=4)
-                if src:
-                    result["source"] = src["source"]
-                    result["display_path"] = src["display_path"]
-            callstack = []
-            if cur:
-                callstack.append({"level": 0, "pc": hex(pc), "file": cur["file"], "line": cur["line"]})
-            if isinstance(lr, int):
-                lrc = loc.addr_to_location(lr)
-                if lrc:
-                    callstack.append({"level": 1, "pc": hex(lr), "file": lrc["file"], "line": lrc["line"]})
-            result["callstack"] = callstack
-            return _js(result)
+            info = _build_location(client)
+            if info is None:
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号，或未从工程推断到）"})
+            return _js(info)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -469,7 +482,27 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def step(mode: str = "into") -> str:
         try:
-            return _js(_get_client().step(mode))
+            client = _get_client()
+            r = client.step(mode)
+            out = dict(r)
+            # 单步成功后附带当前停靠位置+源码上下文+调用栈，让 AI 立即看到进/出函数的效果
+            try:
+                loc = _get_locator()
+                if loc and loc.is_ready():
+                    info = _build_location(client)
+                    if info and info.get("ok"):
+                        out["pc"] = info.get("pc")
+                        out["stopped_file"] = info.get("file")
+                        out["stopped_line"] = info.get("line")
+                        out["stopped_address"] = info.get("address")
+                        if info.get("source"):
+                            out["stopped_source"] = info["source"]
+                            out["display_path"] = info.get("display_path")
+                        if info.get("callstack"):
+                            out["callstack"] = info["callstack"]
+            except Exception as e:  # noqa: BLE001
+                out["location_error"] = str(e)
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
