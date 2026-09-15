@@ -19,11 +19,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
+import xml.etree.ElementTree as ET
 
 from mcp.server.mcpserver import MCPServer
 
 from .client import UVClient, UVSOCKConnectError
+from .locator import Locator
 from . import builder, __version__
 
 logger = logging.getLogger("mdkdebug.server")
@@ -32,7 +35,52 @@ logger = logging.getLogger("mdkdebug.server")
 _client: UVClient | None = None
 # 编译/烧录配置（UV4.exe 路径与默认工程）
 _builder_cfg = {"uv4": None, "default_project": None}
+# 符号定位配置（.axf 路径与 Locator 实例）
+_symbol_cfg = {"locator": None, "axf": None}
+_breakpoints: list = []  # 内部断点记录（expr/address/file/line），因 BL 输出不经 socket 回传
 
+def _resolve_axf(uvprojx_path: str | None) -> str | None:
+    """从 .uvprojx 推断 .axf 路径（解析 OutputDirectory/OutputName）。"""
+    if not uvprojx_path or not os.path.isfile(uvprojx_path):
+        return None
+    try:
+        root = ET.parse(uvprojx_path).getroot()
+        out_dir = out_name = None
+        for tgt in root.iter("Target"):
+            for o in tgt.iter("OutputName"):
+                if o.text:
+                    out_name = o.text.strip()
+            for o in tgt.iter("OutputDirectory"):
+                if o.text:
+                    out_dir = o.text.strip()
+        if out_name:
+            base = os.path.dirname(os.path.abspath(uvprojx_path))
+            axf = os.path.normpath(os.path.join(base, out_dir or "", out_name + ".axf"))
+            if os.path.isfile(axf):
+                return axf
+    except Exception as e:  # noqa: BLE001
+        logger.warning("解析 uvprojx 输出配置失败: %s", e)
+    return None
+
+def _get_locator() -> Locator | None:
+    return _symbol_cfg.get("locator")
+
+def _parse_target(locator, target: str):
+    """把目标字符串解析为地址。支持 0x地址 或 文件:行号（如 main.c:77）。"""
+    t = (target or "").strip()
+    if t.lower().startswith("0x"):
+        try:
+            return int(t, 16)
+        except ValueError:
+            return None
+    if ":" in t:
+        file, line = t.rsplit(":", 1)
+        try:
+            ln = int(line.strip())
+        except ValueError:
+            return None
+        return locator.line_to_addr(file.strip(), ln)
+    return None
 
 def _get_client() -> UVClient:
     global _client
@@ -62,13 +110,24 @@ def _js(obj) -> str:
 def create_server(host: str = "127.0.0.1", port: int = 4823,
                   idle_timeout: float = 30.0,
                   uv4_path: str | None = None,
-                  default_project: str | None = None) -> MCPServer:
-    global _client, _builder_cfg
+                  default_project: str | None = None,
+                  axf_path: str | None = None) -> MCPServer:
+    global _client, _builder_cfg, _symbol_cfg
     _client = UVClient(host=host, port=port, idle_timeout=idle_timeout)
     uv4 = builder.find_uv4(uv4_path)
     if uv4 is None:
         logger.warning("未定位到 UV4.exe，编译/烧录工具不可用。可用 --uv4-path 指定。")
     _builder_cfg = {"uv4": uv4, "default_project": default_project}
+    # 符号定位：优先显式 axf_path，其次从默认工程推断
+    axf = axf_path or _resolve_axf(default_project)
+    locator = None
+    if axf and os.path.isfile(axf):
+        proj_dir = os.path.dirname(default_project) if default_project else None
+        locator = Locator(axf, project_dir=proj_dir)
+        logger.info("符号定位：axf=%s 条目=%d", axf, locator.total_entries())
+    elif not axf:
+        logger.warning("未定位到 .axf，位置定位工具(get_current_location/run_to_line)不可用")
+    _symbol_cfg = {"locator": locator, "axf": axf}
     logger.info("Mdkdebug 已就绪：UVSOCK@%s:%d  idle_timeout=%ss", host, port, idle_timeout)
     logger.info("构建配置：UV4=%s  默认工程=%s", uv4, default_project)
 
@@ -219,7 +278,34 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def set_breakpoint(expr: str) -> str:
         try:
-            return _js(_get_client().set_breakpoint(expr))
+            client = _get_client()
+            e = (expr or "").strip()
+            # 先解析地址再设断点：BS 命令后连接会被断点响应污染（异步消息堆积），
+            # 此时再 calc_expression(&expr) 会收到 BS 的 status 22 而非表达式结果。
+            addr = None
+            if e.lower().startswith("0x"):
+                try:
+                    addr = int(e, 16)
+                except ValueError:
+                    addr = None
+            else:
+                ar = client.calc_expression(f"&{e}")
+                if ar.get("ok") and isinstance(ar.get("value"), int):
+                    addr = ar["value"]
+            # 用解析出的地址设断点，更精确且能拿到位置信息
+            r = client.set_breakpoint(hex(addr) if addr is not None else expr)
+            out = {"expr": expr}
+            out.update(r)
+            loc = _get_locator()
+            if addr is not None:
+                out["address"] = hex(addr)
+                l = loc.addr_to_location(addr) if loc else None
+                if l:
+                    out["file"] = l["file"]
+                    out["line"] = l["line"]
+                _breakpoints.append({"expr": expr, "address": hex(addr),
+                                     "file": out.get("file"), "line": out.get("line")})
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "expr": expr, "error": str(e)})
 
@@ -230,7 +316,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def clear_breakpoint(expr: str) -> str:
         try:
-            return _js(_get_client().clear_breakpoint(expr))
+            r = _get_client().clear_breakpoint(expr)
+            _breakpoints[:] = [b for b in _breakpoints if b.get("expr") != expr]
+            return _js(r)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "expr": expr, "error": str(e)})
 
@@ -241,9 +329,101 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def list_breakpoints() -> str:
         try:
+            if _breakpoints:
+                return _js({"ok": True, "breakpoints": list(_breakpoints)})
             return _js(_get_client().list_breakpoints())
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
+
+    # ---------------- 位置定位 / run to cursor ----------------
+    @server.tool(
+        name="get_current_location",
+        title="读取当前执行位置",
+        description=(
+            "读取当前 PC，定位到 源文件:行号 并返回该行附近的源码上下文，"
+            "同时给出调用栈（PC + LR 反查）。让 AI 像人一样知道程序停在哪、看的是什么代码。"
+            "需已进入调试状态且配置了 .axf 调试符号。"
+        ),
+    )
+    async def get_current_location() -> str:
+        try:
+            loc = _get_locator()
+            if not loc or not loc.is_ready():
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号，或未从工程推断到）"})
+            client = _get_client()
+            # 用稳定读取跳过 run 刚停止时的脏 PC 值
+            regs = client.read_cpu_registers_stable()
+            if not regs.get("ok"):
+                return _js({"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "detail": regs})
+            pc = regs.get("pc"); lr = regs.get("lr")
+            result = {"ok": True, "pc": hex(pc) if isinstance(pc, int) else pc, "registers": regs}
+            cur = loc.addr_to_location(pc) if isinstance(pc, int) else None
+            if cur:
+                result["file"] = cur["file"]
+                result["line"] = cur["line"]
+                result["address"] = hex(cur["address"])
+                src = loc.read_source(cur["file"], cur["line"], context=4)
+                if src:
+                    result["source"] = src["source"]
+                    result["display_path"] = src["display_path"]
+            callstack = []
+            if cur:
+                callstack.append({"level": 0, "pc": hex(pc), "file": cur["file"], "line": cur["line"]})
+            if isinstance(lr, int):
+                lrc = loc.addr_to_location(lr)
+                if lrc:
+                    callstack.append({"level": 1, "pc": hex(lr), "file": lrc["file"], "line": lrc["line"]})
+            result["callstack"] = callstack
+            return _js(result)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="run_to_line",
+        title="运行到指定行",
+        description=(
+            "让目标运行到指定位置后停止（run to cursor）。target 可为 十六进制地址(0x...) 或"
+            "文件:行号（如 main.c:77）。实现为：临时断点->运行->清除断点。"
+            "需已进入调试状态且配置了 .axf 调试符号。"
+        ),
+    )
+    async def run_to_line(target: str) -> str:
+        try:
+            loc = _get_locator()
+            if not loc or not loc.is_ready():
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号）"})
+            addr = _parse_target(loc, target)
+            if addr is None:
+                return _js({"ok": False, "target": target,
+                            "error": "无法解析目标：需为 0x地址 或 文件:行号（如 main.c:77）"})
+            client = _get_client()
+            bp = client.set_breakpoint(hex(addr))
+            if not bp.get("ok"):
+                return _js({"ok": False, "target": target, "addr": hex(addr),
+                            "error": f"设置临时断点失败: {bp}"})
+            r = client.run()
+            # UVSOCK 的 run(START_EXECUTION) 在运行到断点停止时会返回 BP_CREATED(22) 而非 0，
+            # 视为"已运行并停在断点"，据此判定运行成功
+            run_ok = r.get("ok") or r.get("status") == 22
+            client.clear_breakpoint(hex(addr))
+            _breakpoints[:] = [b for b in _breakpoints if b.get("expr") != hex(addr)]
+            if not run_ok:
+                return _js({"ok": False, "target": target, "addr": hex(addr),
+                            "error": f"运行失败: {r}"})
+            # run 刚停止时 PC 可能是脏值(实测=1)，用稳定读取跳过脏值得到真实停靠位置
+            regs = client.read_cpu_registers_stable()
+            out = {"ok": True, "target": target, "addr": hex(addr)}
+            if regs.get("ok") and isinstance(regs.get("pc"), int):
+                stop = loc.addr_to_location(regs["pc"])
+                if stop:
+                    out["stopped_file"] = stop["file"]
+                    out["stopped_line"] = stop["line"]
+                    src = loc.read_source(stop["file"], stop["line"], context=3)
+                    if src:
+                        out["stopped_source"] = src["source"]
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "target": target, "error": str(e)})
 
     # ---------------- 运行控制 ----------------
     @server.tool(
@@ -452,10 +632,12 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
 async def run_stdio(host: str = "127.0.0.1", port: int = 4823,
                     idle_timeout: float = 30.0,
                     uv4_path: str | None = None,
-                    default_project: str | None = None) -> None:
+                    default_project: str | None = None,
+                    axf_path: str | None = None) -> None:
     """以标准输入/输出方式运行（MCP 客户端常用方式）。"""
     server = create_server(host=host, port=port, idle_timeout=idle_timeout,
-                           uv4_path=uv4_path, default_project=default_project)
+                           uv4_path=uv4_path, default_project=default_project,
+                           axf_path=axf_path)
     await server.run_stdio_async()
 
 
@@ -463,11 +645,13 @@ async def run_http(host: str = "127.0.0.1", port: int = 4823,
                    idle_timeout: float = 30.0,
                    http_host: str = "127.0.0.1", http_port: int = 8300,
                    uv4_path: str | None = None,
-                   default_project: str | None = None) -> None:
+                   default_project: str | None = None,
+                   axf_path: str | None = None) -> None:
     """以 Streamable HTTP 方式运行（可被远程/浏览器 MCP 客户端连接）。"""
     import uvicorn
     server = create_server(host=host, port=port, idle_timeout=idle_timeout,
-                           uv4_path=uv4_path, default_project=default_project)
+                           uv4_path=uv4_path, default_project=default_project,
+                           axf_path=axf_path)
     app = server.streamable_http_app()
     config = uvicorn.Config(app, host=http_host, port=http_port, log_level="info")
     uvicorn.Server(config).run()

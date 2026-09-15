@@ -42,6 +42,8 @@ def main() -> int:
                         help="Keil UV4.exe 绝对路径，缺省时自动探测 (如 D:/Keil_v5/UV4/UV4.exe)")
     parser.add_argument("--default-project", default=None,
                         help="默认待编译/烧录的 Keil 工程 (.uvprojx) 路径")
+    parser.add_argument("--axf-path", default=None,
+                        help="调试符号文件 .axf 路径，缺省时从默认工程自动推断")
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     args = parser.parse_args()
 
@@ -56,13 +58,15 @@ def main() -> int:
     if args.transport == "http":
         run_http(host=args.host, port=args.port, idle_timeout=args.idle_timeout,
                  http_host=args.http_host, http_port=args.http_port,
-                 uv4_path=args.uv4_path, default_project=args.default_project)
+                 uv4_path=args.uv4_path, default_project=args.default_project,
+                 axf_path=args.axf_path)
         return 0
 
     asyncio.run(run_stdio(host=args.host, port=args.port,
                           idle_timeout=args.idle_timeout,
                           uv4_path=args.uv4_path,
-                          default_project=args.default_project))
+                          default_project=args.default_project,
+                          axf_path=args.axf_path))
     return 0
 
 

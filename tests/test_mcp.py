@@ -41,7 +41,7 @@ async def main():
                     "read_variable", "enter_debug", "exit_debug",
                     "launch_uvision", "close_uvision", "flash_debug",
                     "build_project", "rebuild_project", "flash_download",
-                    "build_and_flash"}
+                    "build_and_flash", "get_current_location", "run_to_line"}
         check("工具全部注册", expected.issubset(set(names)), names)
         print("       已注册:", names)
 
@@ -141,6 +141,22 @@ async def main():
             _srv.builder.close_uvision = _orig_close
             _srv.builder.build_and_flash = _orig_bf
             _srv.builder.launch_uvision = _orig_launch
+
+        # Locator 符号定位：地址↔文件:行 往返 + 源码读取
+        from mdkdebug.locator import Locator
+        _axf = "example_mdk_project/mdk_test/MDK-ARM/mdk_test/mdk_test.axf"
+        _pdir = "example_mdk_project/mdk_test/MDK-ARM"
+        if os.path.isfile(_axf):
+            _loc = Locator(_axf, project_dir=_pdir)
+            _lm = _loc.addr_to_location(0x8000db5)
+            _round = _loc.line_to_addr(_lm["file"], _lm["line"]) if _lm else None
+            check("Locator addr↔line 往返", bool(_lm) and _round == 0x8000db4,
+                  f"lm={_lm} round={_round}")
+            _src = _loc.read_source(_lm["file"], _lm["line"], 1) if _lm else None
+            check("Locator 读源码上下文", bool(_src) and any(
+                s["lineno"] == _lm["line"] for s in _src["source"]), str(_src)[:160])
+        else:
+            print("  [skip] .axf 不存在，跳过 Locator 测试")
 
     finally:
         srv.stop()

@@ -321,6 +321,51 @@ class UVClient:
         """列出当前所有断点（命令窗口 BL）。"""
         return self.exec_command("BL")
 
+    def read_cpu_registers(self) -> dict:
+        """读取 CPU 核心寄存器 PC/LR/SP（R15/R14/R13）。多候选表达式以兼容不同 Keil 版本。"""
+        candidates = {
+            "pc": ("__currentPC()", "PC", "R15"),
+            "lr": ("__currentLR()", "LR", "R14"),
+            "sp": ("__currentSP()", "SP", "R13"),
+        }
+        regs = {}
+        for name, exprs in candidates.items():
+            for expr in exprs:
+                try:
+                    r = self.calc_expression(expr)
+                except Exception:  # noqa: BLE001 单候选解析失败继续下一个
+                    continue
+                if r.get("ok") and isinstance(r.get("value"), int):
+                    regs[name] = r["value"]
+                    break
+        if not regs:
+            return {"status": uvsock.UV_STATUS_INVALID_NAME, "ok": False,
+                    "status_text": "无法读取寄存器（未处于调试状态或表达式不可用）",
+                    "registers": {}}
+        out = {"status": uvsock.UV_STATUS_SUCCESS, "ok": True, "registers": regs}
+        out.update(regs)
+        return out
+
+    def read_cpu_registers_stable(self, retries: int = 12, delay: float = 0.3) -> dict:
+        """读取 CPU 寄存器并排除 run 刚停止时的脏 PC 值。
+
+        Keil 在 run(START_EXECUTION) 到断点停止的瞬间，"PC" 表达式可能短暂返回
+        脏值（实测为 1），需重试直到读到合理地址（FLASH/SRAM 区段）才返回。
+        最多重试 retries 次，期间每次间隔 delay 秒；若始终未读到合理值则返回最后一次结果。
+        """
+        last: dict = {}
+        for _ in range(max(1, retries)):
+            r = self.read_cpu_registers()
+            last = r
+            pc = r.get("pc") if r.get("ok") else None
+            if isinstance(pc, int):
+                in_flash = 0x08000000 <= pc <= 0x081FFFFF
+                in_sram = 0x20000000 <= pc <= 0x2001FFFF
+                if pc not in (0, 1) and (in_flash or in_sram):
+                    return r
+            time.sleep(delay)
+        return last
+
     # ------------------------------------------------------------------
     # 运行控制
     # ------------------------------------------------------------------

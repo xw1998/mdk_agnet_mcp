@@ -16,7 +16,9 @@
 - **MCP Server**：以标准 `stdio` 或 `streamable HTTP` 传输方式暴露调试能力，AI 工具可直接调用；
 - **表达式 / 变量读取**：`calc_expression` 读全局变量、寄存器、指针解引用（如 `SData_UA`、`*(uint32_t*)0x20000000`）；
 - **内存读写**：任意地址读 / 写，超过单次上限（16 KB）自动分块，规避 Keil 协议长度限制；
-- **运行控制**：全速运行、暂停、复位、单步（`into` / `over` / `out` / `instruction`）；
+- **运行控制**：全速运行、暂停、复位、单步（`into` / `over` / `out` / `instruction`）、`run_to_line` 运行到指定行；
+- **像人一样看代码位置**：`get_current_location` 读取当前 PC，基于 `.axf` 调试符号定位到 `源文件:行号`，返回该行附近源码上下文与调用栈（PC/LR 反查），让 AI 像人一样知道程序停在哪、在看什么代码；
+- **断点带位置**：`set_breakpoint` 自动反查断点对应的 `文件:行号`，`list_breakpoints` 返回断点列表含位置信息；
 - **断点管理**：设 / 删 / 列断点，基于 Keil 命令窗口命令（`BS` / `BK` / `BL`）；
 - **自动进出调试模式**：`enter_debug` / `exit_debug`，支持 AI 驱动"进入 → 设断点 → 运行到断点 → 读变量 → 退出"完整闭环；
 - **编译 / 烧录闭环**：基于 Keil 官方 `UV4.exe` 命令行，提供 `build_project`（编译）、`rebuild_project`（重编译）、`flash_download`（烧录）、`build_and_flash`（编译成功后自动烧录），支持 AI 自主"改代码 → 编译 → 烧录 → 上板"全流程闭环；
@@ -85,6 +87,7 @@ AI 客户端通过 MCP 协议把用户/模型意图转成工具调用；`mdkdebu
 |----|------|------|
 | `mcp` | ≥ 2.0（验证于 2.2.0） | MCP Server 框架（`MCPServer`） |
 | `pydantic` | ≥ 2.8（验证于 2.13.5） | MCP 依赖的类型模型 |
+| `pyelftools` | ≥ 0.30（验证于 0.33） | 解析 `.axf` 调试符号，供 `get_current_location` / `run_to_line` / 断点位置定位使用 |
 
 安装：
 
@@ -108,7 +111,8 @@ mdk_agent/
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
 │   ├── client.py             # UVClient：调试能力封装 + 连接缓存
 │   ├── builder.py            # UV4 命令行：编译 / 重编译 / 烧录 / 编译烧录闭环
-│   └── server.py             # MCP Server 与 22 个工具定义（15 调试 + 4 编译烧录 + 2 Keil 管理 + 1 一体闭环）
+│   ├── locator.py             # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
+│   └── server.py             # MCP Server 与 24 个工具定义（17 调试 + 4 编译烧录 + 2 Keil 管理 + 1 一体闭环）
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_e2e.py           # UVClient 协议闭环测试
@@ -147,7 +151,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **22** 个（15 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具 + 1 个 `flash_debug` 一体闭环）：
+共 **24** 个（17 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具 + 1 个 `flash_debug` 一体闭环）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -161,11 +165,13 @@ python run_server.py --transport http --http-port 8300
 | `stop` | 暂停执行 | — |
 | `reset` | 复位目标 | — |
 | `step` | 单步执行 | `mode`：`into`/`over`/`out`/`instruction` |
+| `run_to_line` | 运行到指定行（run to cursor），接受 `文件:行号` 或 `0x地址` | `target`（如 `main.c:77`） |
+| `get_current_location` | 读取当前 PC，定位到 文件:行号 + 源码上下文 + 调用栈 | — |
 | `enter_debug` | 自动进入 Keil 调试模式 | — |
 | `exit_debug` | 自动退出 Keil 调试模式 | — |
 | `set_breakpoint` | 在符号 / 地址处设软件断点 | `expr`（如 `main`、`0x08001034`） |
 | `clear_breakpoint` | 清除断点（符号名或断点编号） | `expr` |
-| `list_breakpoints` | 列出当前断点 | — |
+| `list_breakpoints` | 列出断点（含对应的 文件:行号 位置） | — |
 | `launch_uvision` | 可见方式拉起 Keil 打开工程，复用已有实例 | `project` |
 | `close_uvision` | 关闭所有 Keil 实例（默认优雅，残留强制） | `force` |
 | `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口） | `project`、`target` |
