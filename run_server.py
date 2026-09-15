@@ -38,6 +38,10 @@ def main() -> int:
                         help="传输方式：stdio（MCP 标准）或 http（Streamable HTTP）")
     parser.add_argument("--http-host", default="127.0.0.1", help="HTTP 监听主机 (默认 127.0.0.1)")
     parser.add_argument("--http-port", type=int, default=8300, help="HTTP 监听端口 (默认 8300)")
+    parser.add_argument("--uv4-path", default=None,
+                        help="Keil UV4.exe 绝对路径，缺省时自动探测 (如 D:/Keil_v5/UV4/UV4.exe)")
+    parser.add_argument("--default-project", default=None,
+                        help="默认待编译/烧录的 Keil 工程 (.uvprojx) 路径")
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     args = parser.parse_args()
 
@@ -51,11 +55,14 @@ def main() -> int:
 
     if args.transport == "http":
         run_http(host=args.host, port=args.port, idle_timeout=args.idle_timeout,
-                 http_host=args.http_host, http_port=args.http_port)
+                 http_host=args.http_host, http_port=args.http_port,
+                 uv4_path=args.uv4_path, default_project=args.default_project)
         return 0
 
     asyncio.run(run_stdio(host=args.host, port=args.port,
-                          idle_timeout=args.idle_timeout))
+                          idle_timeout=args.idle_timeout,
+                          uv4_path=args.uv4_path,
+                          default_project=args.default_project))
     return 0
 
 

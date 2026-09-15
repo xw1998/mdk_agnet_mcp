@@ -17,6 +17,8 @@
 - **运行控制**：全速运行、暂停、复位、单步（`into` / `over` / `out` / `instruction`）；
 - **断点管理**：设 / 删 / 列断点，基于 Keil 命令窗口命令（`BS` / `BK` / `BL`）；
 - **自动进出调试模式**：`enter_debug` / `exit_debug`，支持 AI 驱动"进入 → 设断点 → 运行到断点 → 读变量 → 退出"完整闭环；
+- **编译 / 烧录闭环**：基于 Keil 官方 `UV4.exe` 命令行，提供 `build_project`（编译）、`rebuild_project`（重编译）、`flash_download`（烧录）、`build_and_flash`（编译成功后自动烧录），支持 AI 自主"改代码 → 编译 → 烧录 → 上板"全流程闭环；
+- **UV4 自动探测**：优先显式 `--uv4-path`，其次探测常见安装目录，再查 Windows 注册表；
 - **连接缓存**：常驻服务内共享一条 TCP 连接，空闲自动断开、下次调用自动重连；
 - **线程安全**：连接状态以锁保护，可被 MCP 并发调用；
 - **随附模拟调试器**：无需硬件即可离线联调与跑测试。
@@ -67,6 +69,7 @@ AI 客户端通过 MCP 协议把用户/模型意图转成工具调用；`mdkdebu
 | 操作系统 | Windows（Keil uVision 运行环境） |
 | Python | ≥ 3.11（开发 / 验证于 3.12） |
 | Keil | uVision 5，且已配置 UVSOCK 调试插件（见"对接真实 Keil"） |
+| Keil UV4 | `UV4.exe` 用于编译 / 烧录，可自动探测或 `--uv4-path` 指定（通常随 Keil 安装于 `UV4/UV4.exe`） |
 
 ### Python 组件依赖
 
@@ -98,7 +101,8 @@ mdk_agent/
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
 │   ├── client.py             # UVClient：调试能力封装 + 连接缓存
-│   └── server.py             # MCP Server 与 14 个工具定义
+│   ├── builder.py            # UV4 命令行：编译 / 重编译 / 烧录 / 编译烧录闭环
+│   └── server.py             # MCP Server 与 18 个工具定义（14 调试 + 4 编译烧录）
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_e2e.py           # UVClient 协议闭环测试
@@ -132,10 +136,12 @@ python run_server.py --transport http --http-port 8300
 | `--idle-timeout` | `30.0` | 连接缓存空闲断开秒数（`0` 表示不主动断开） |
 | `--transport` | `stdio` | `stdio` 或 `http` |
 | `--http-host` / `--http-port` | `127.0.0.1` / `8300` | HTTP 传输时的监听地址 |
+| `--uv4-path` | 自动探测 | Keil `UV4.exe` 绝对路径，缺省时自动探测（如 `D:/Keil_v5/UV4/UV4.exe`） |
+| `--default-project` | 无 | 默认待编译 / 烧录的 `.uvprojx` 工程路径，工具调用可省略 `project` 参数 |
 
 ## 暴露的 MCP 工具
 
-共 **14** 个：
+共 **18** 个（14 个调试工具 + 4 个编译烧录工具）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -153,6 +159,12 @@ python run_server.py --transport http --http-port 8300
 | `set_breakpoint` | 在符号 / 地址处设软件断点 | `expr`（如 `main`、`0x08001034`） |
 | `clear_breakpoint` | 清除断点（符号名或断点编号） | `expr` |
 | `list_breakpoints` | 列出当前断点 | — |
+| `build_project` | 编译工程（`UV4 -b`） | `project`、`target` |
+| `rebuild_project` | 全量重编译（`UV4 -r`） | `project`、`target` |
+| `flash_download` | 烧录到目标 Flash（`UV4 -f`） | `project`、`target` |
+| `build_and_flash` | 编译成功后才烧录，AI 全流程闭环 | `project`、`target` |
+
+> 编译烧录工具的 `project` 均可省略：省略时使用启动参数 `--default-project` 指定的默认工程。
 
 ## 接入 AI 工具客户端
 
@@ -217,6 +229,22 @@ python run_server.py --transport http --http-port 8300
 > `example_mdk_project/mdk_test` 为随附的 STM32F4 HAL 例程（main 中 while(1) 翻转 GPIOC PIN13），
 > 供真机验证与入门参考，随项目一并开源。
 
+### 编译 → 烧录 → 调试 完整闭环
+
+AI 修改代码后，可按如下顺序实现"自己编译、自己烧录、自己验证"的全流程闭环：
+
+```
+1. build_and_flash(project="")   # 先编译，成功后自动烧录到目标 Flash
+   # 或拆开：build_project → flash_download
+2. enter_debug                    # 自动进入调试模式
+3. set_breakpoint(main)           # 在入口设断点
+4. run                            # 全速运行到断点
+5. calc_expression(...)           # 读取变量验证改动是否生效
+6. exit_debug                     # 退出调试模式
+```
+
+> 注：`build_and_flash` 返回结构含 `build` 与 `flash` 两个子结果；仅当编译退出码为 0/1（无致命错误）才执行烧录，否则跳过烧录并报错。
+
 ## 测试
 
 无需真实 Keil，使用 `tests/mock_uvsock_server.py` 模拟调试器：
@@ -238,7 +266,9 @@ python -m tests.mock_uvsock_server --port 4823
 - **连接缓存**：常驻服务内共享一条 TCP 连接，`idle_timeout` 空闲自动断开、下次调用自动重连，兼顾实时性与资源释放；
 - **线程安全**：连接状态以锁保护，可被 MCP 并发调用；
 - **内存读写分块**：超过单次上限（16 KB）自动分块读，规避 Keil 协议长度限制；
-- **地址解析**：工具层统一支持 `0x` / `0b` / `0o` 前缀或纯十进制。
+- **地址解析**：工具层统一支持 `0x` / `0b` / `0o` 前缀或纯十进制；
+- **编译烧录选型**：采用 Keil 官方 `UV4.exe` 命令行（`-b`/`-r`/`-f`/`-o`），退出码 0=成功、1=成功有警告、2=有错误、≥3=不完整；编译输出经 `-o` 重定向到临时日志文件捕获；`build_and_flash` 在编译成功后自动接烧录，形成闭环；
+- **UV4 与 UVSOCK 共存**：编译烧录与在线调试共用同一 Keil 实例；建议先 `build_and_flash`（此时 Keil 处于非调试态）再 `enter_debug` 进入调试，避免调试态下编译冲突。
 
 ## 已知限制
 

@@ -13,6 +13,7 @@ venv/
 *.d
 *.o
 *.axf
+*.htm
 *.build_log.htm
 
 # 系统

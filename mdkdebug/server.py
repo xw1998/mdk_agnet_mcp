@@ -24,12 +24,14 @@ import sys
 from mcp.server.mcpserver import MCPServer
 
 from .client import UVClient
-from . import __version__
+from . import builder, __version__
 
 logger = logging.getLogger("mdkdebug.server")
 
 # 全局共享一个带连接缓存的客户端（线程安全）
 _client: UVClient | None = None
+# 编译/烧录配置（UV4.exe 路径与默认工程）
+_builder_cfg = {"uv4": None, "default_project": None}
 
 
 def _get_client() -> UVClient:
@@ -58,10 +60,17 @@ def _js(obj) -> str:
 
 
 def create_server(host: str = "127.0.0.1", port: int = 4823,
-                  idle_timeout: float = 30.0) -> MCPServer:
-    global _client
+                  idle_timeout: float = 30.0,
+                  uv4_path: str | None = None,
+                  default_project: str | None = None) -> MCPServer:
+    global _client, _builder_cfg
     _client = UVClient(host=host, port=port, idle_timeout=idle_timeout)
+    uv4 = builder.find_uv4(uv4_path)
+    if uv4 is None:
+        logger.warning("未定位到 UV4.exe，编译/烧录工具不可用。可用 --uv4-path 指定。")
+    _builder_cfg = {"uv4": uv4, "default_project": default_project}
     logger.info("Mdkdebug 已就绪：UVSOCK@%s:%d  idle_timeout=%ss", host, port, idle_timeout)
+    logger.info("构建配置：UV4=%s  默认工程=%s", uv4, default_project)
 
     server = MCPServer(
         name="mdkdebug",
@@ -264,22 +273,95 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
+    # ---------------- 编译 / 烧录（UV4 命令行） ----------------
+    def _resolve_project(project: str) -> str:
+        """解析待操作工程：参数优先，其次服务配置的默认工程。"""
+        if _builder_cfg["uv4"] is None:
+            raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定编译工具路径")
+        if project.strip():
+            return project.strip()
+        if _builder_cfg["default_project"]:
+            return _builder_cfg["default_project"]
+        raise RuntimeError("未指定工程路径，请传入 project 参数或配置默认工程")
+
+    @server.tool(
+        name="build_project",
+        description=(
+            "编译 Keil 工程（UV4 -b）。project 为 .uvprojx 工程路径，可省略以用默认工程；"
+            "target 为可选目标名。返回退出码与编译日志。"
+        ),
+    )
+    async def build_project(project: str = "", target: str = "") -> str:
+        try:
+            p = _resolve_project(project)
+            return _js(builder.build_project(_builder_cfg["uv4"], p, target.strip() or None))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="rebuild_project",
+        description=(
+            "重新编译 Keil 工程（UV4 -r，全量重编）。project 为 .uvprojx 工程路径，"
+            "可省略以用默认工程；target 为可选目标名。"
+        ),
+    )
+    async def rebuild_project(project: str = "", target: str = "") -> str:
+        try:
+            p = _resolve_project(project)
+            return _js(builder.rebuild_project(_builder_cfg["uv4"], p, target.strip() or None))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="flash_download",
+        description=(
+            "烧录 Keil 工程到目标 Flash（UV4 -f，Flash Download）。project 为 .uvprojx 路径，"
+            "可省略以用默认工程；target 为可选目标名。"
+        ),
+    )
+    async def flash_download(project: str = "", target: str = "") -> str:
+        try:
+            p = _resolve_project(project)
+            return _js(builder.flash_download(_builder_cfg["uv4"], p, target.strip() or None))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="build_and_flash",
+        description=(
+            "编译并烧录闭环：先编译，成功后才烧录（UV4 -b 成功后 -f）。"
+            "project 为 .uvprojx 路径，可省略以用默认工程；target 为可选目标名。"
+        ),
+    )
+    async def build_and_flash(project: str = "", target: str = "") -> str:
+        try:
+            p = _resolve_project(project)
+            return _js(builder.build_and_flash(_builder_cfg["uv4"], p, target.strip() or None))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
     return server
 
 
 async def run_stdio(host: str = "127.0.0.1", port: int = 4823,
-                    idle_timeout: float = 30.0) -> None:
+                    idle_timeout: float = 30.0,
+                    uv4_path: str | None = None,
+                    default_project: str | None = None) -> None:
     """以标准输入/输出方式运行（MCP 客户端常用方式）。"""
-    server = create_server(host=host, port=port, idle_timeout=idle_timeout)
+    server = create_server(host=host, port=port, idle_timeout=idle_timeout,
+                           uv4_path=uv4_path, default_project=default_project)
     await server.run_stdio_async()
 
 
 async def run_http(host: str = "127.0.0.1", port: int = 4823,
                    idle_timeout: float = 30.0,
-                   http_host: str = "127.0.0.1", http_port: int = 8300) -> None:
+                   http_host: str = "127.0.0.1", http_port: int = 8300,
+                   uv4_path: str | None = None,
+                   default_project: str | None = None) -> None:
     """以 Streamable HTTP 方式运行（可被远程/浏览器 MCP 客户端连接）。"""
     import uvicorn
-    server = create_server(host=host, port=port, idle_timeout=idle_timeout)
+    server = create_server(host=host, port=port, idle_timeout=idle_timeout,
+                           uv4_path=uv4_path, default_project=default_project)
     app = server.streamable_http_app()
     config = uvicorn.Config(app, host=http_host, port=http_port, log_level="info")
     uvicorn.Server(config).run()
