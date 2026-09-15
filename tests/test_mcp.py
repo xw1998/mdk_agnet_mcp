@@ -37,9 +37,26 @@ async def main():
         tools = {t.name: t for t in await server.list_tools()}
         names = sorted(tools.keys())
         expected = {"get_version", "get_status", "calc_expression",
-                    "read_mem", "write_mem", "run", "stop", "reset", "step"}
+                    "read_mem", "write_mem", "run", "stop", "reset", "step",
+                    "read_variable", "enter_debug", "exit_debug",
+                    "launch_uvision", "close_uvision", "flash_debug",
+                    "build_project", "rebuild_project", "flash_download",
+                    "build_and_flash"}
         check("工具全部注册", expected.issubset(set(names)), names)
         print("       已注册:", names)
+
+        # UVSOCK 未开启时：连接失败应返回开启指引（而非裸 ConnectionRefused）
+        from mdkdebug.client import UVClient, UVSOCKConnectError
+        cold = UVClient(host="127.0.0.1", port=48231)  # 无监听端口，模拟未开启
+        got_hint = False
+        msg_hint = ""
+        try:
+            cold.get_version()
+        except UVSOCKConnectError as e:
+            msg_hint = str(e)
+            got_hint = ("UVSOCK" in msg_hint and "Edit" in msg_hint
+                        and "Configuration" in msg_hint and "4823" in msg_hint)
+        check("UVSOCK 未开启返回开启指引", got_hint, msg_hint)
 
         # 工具 schema 生成（参数）
         t = tools["read_mem"]

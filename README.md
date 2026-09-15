@@ -22,6 +22,7 @@
 - **编译 / 烧录闭环**：基于 Keil 官方 `UV4.exe` 命令行，提供 `build_project`（编译）、`rebuild_project`（重编译）、`flash_download`（烧录）、`build_and_flash`（编译成功后自动烧录），支持 AI 自主"改代码 → 编译 → 烧录 → 上板"全流程闭环；
 - **后台静默编译**：编译 / 烧录以隐藏窗口方式启动 UV4，**不会闪现新的 Keil 界面**，用户已打开的实例不受打扰；
 - **AI 管理 Keil 开关（闭环）**：`launch_uvision` 拉起 Keil 打开工程（复用已有实例），`close_uvision` 关闭 Keil（默认优雅关闭、残留自动强制），Keil 的开启/关闭全部由 AI 闭环管理，无需手动操作；
+- **规避旧窗口调试旧代码**：`flash_debug` 自动按「关闭所有 Keil → 编译并烧录新固件 → 重新打开本工程 → 进入调试」顺序执行，避免因残留旧工程窗口导致调试到旧代码（即使 AI 不记得先关旧窗口也能保证加载的是新固件符号）；
 - **编译烧录输出集中返回**：每次编译/烧录的完整日志（含警告/错误）经 `-o` 捕获并由 AI 完整返回，在对话中即可查看，无需盯 Keil 窗口；
 - **UV4 自动探测**：优先显式 `--uv4-path`，其次探测常见安装目录，再查 Windows 注册表；
 - **连接缓存**：常驻服务内共享一条 TCP 连接，空闲自动断开、下次调用自动重连；
@@ -107,7 +108,7 @@ mdk_agent/
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
 │   ├── client.py             # UVClient：调试能力封装 + 连接缓存
 │   ├── builder.py            # UV4 命令行：编译 / 重编译 / 烧录 / 编译烧录闭环
-│   └── server.py             # MCP Server 与 21 个工具定义（15 调试 + 4 编译烧录 + 2 Keil 管理）
+│   └── server.py             # MCP Server 与 22 个工具定义（15 调试 + 4 编译烧录 + 2 Keil 管理 + 1 一体闭环）
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_e2e.py           # UVClient 协议闭环测试
@@ -146,7 +147,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **21** 个（15 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具）：
+共 **22** 个（15 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具 + 1 个 `flash_debug` 一体闭环）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -171,6 +172,7 @@ python run_server.py --transport http --http-port 8300
 | `rebuild_project` | 全量重编译（`UV4 -r`） | `project`、`target` |
 | `flash_download` | 烧录到目标 Flash（`UV4 -f`） | `project`、`target` |
 | `build_and_flash` | 编译成功后才烧录，AI 全流程闭环 | `project`、`target` |
+| `flash_debug` | 「关旧 Keil→编烧→开新→进调试」一体闭环，规避旧窗口调试旧代码 | `project`、`target` |
 
 > 编译烧录工具均以**隐藏窗口**后台执行，不闪现 Keil 界面；`launch_uvision` 则以**可见**方式打开 Keil 供调试查看。
 
@@ -195,8 +197,9 @@ python run_server.py --transport http --http-port 8300
 
 ## 对接真实 Keil
 
-1. 在 Keil uVision 中加载并启动 **UVSOCK** 调试插件（`Tools` 菜单 / 插件管理器），使其在
-   `127.0.0.1:4823` 监听（参考 KeilAssistant 的 `setup.ini`）；
+1. 在 Keil uVision 中开启 **UVSOCK**：菜单 `Edit → Configuration...`，切到 **Other** 选项卡，
+   勾选 **UVSOCK Enabled**，确认端口为 **4823**，点 OK 后**重启 Keil** 使设置生效；
+   之后它会在 `127.0.0.1:4823` 监听（供本服务连接调试）。若未开启，连接类工具会返回开启指引；
 2. 进入调试会话后，启动本 MCP Server，即可由 AI 调用上述工具进行在线调试；
 3. `calc_expression` 可直接使用工程内变量名；读写内存地址按目标映射（如 `0x20000000` 为 SRAM）；
 4. 断点 / 进出 debug 的命令与语义如下：
@@ -213,6 +216,8 @@ python run_server.py --transport http --http-port 8300
 - `EXEC_CMD` 响应**不回传命令输出**：真实 Keil 对 `BL` 的响应 `data` 为空，拿不到断点列表文本
   （模拟调试器 mock 才会返回 `output`）。因此 `list_breakpoints` 在真实环境拿不到列表，`ok=true` 仅表示命令被接受；
 - `run` 后目标会命中 `main` 断点而停止；断点在退出并重新 `enter_debug` 后依然保留生效；
+- **用 `flash_debug` 保证调试的是新固件**：`build_and_flash` 只负责编烧，若此前 Keil 还开着旧工程窗口，直接 `enter_debug` 会调试到旧代码；
+  `flash_debug` 会先关闭所有 Keil 实例再编烧、重开工程、进调试，从机制上规避该问题。
 - 目标运行期间 UVSOCK 会推送异步消息，堆积在 socket 缓冲会导致后续命令读响应错位
   （典型报错"AMEM 响应数据过短"）。本实现已在发送请求前自动清空残留。
 - **`UV_DBG_STATUS` 的 r_status（响应码）恒为 0，真实运行状态在响应 `data` 低字节**

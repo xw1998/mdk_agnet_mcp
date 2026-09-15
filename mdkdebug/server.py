@@ -23,7 +23,7 @@ import sys
 
 from mcp.server.mcpserver import MCPServer
 
-from .client import UVClient
+from .client import UVClient, UVSOCKConnectError
 from . import builder, __version__
 
 logger = logging.getLogger("mdkdebug.server")
@@ -388,6 +388,61 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         try:
             p = _resolve_project(project)
             return _js(builder.build_and_flash(_builder_cfg["uv4"], p, target.strip() or None))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="flash_debug",
+        description=(
+            "「关旧 Keil→编烧→开新→进调试」一体闭环：先关闭所有 Keil 实例（避免残留旧工程窗口导致调试到旧代码），"
+            "再编译并烧录新固件，成功后重新以可见方式打开本工程并自动进入调试模式。"
+            "适用于 AI 修改代码后需上板验证新代码的完整流程，规避「旧窗口调试旧代码」问题。"
+            "project 为 .uvprojx 路径，可省略用默认工程；target 为可选目标名。"
+        ),
+    )
+    async def flash_debug(project: str = "", target: str = "") -> str:
+        try:
+            p = _resolve_project(project)
+            uv4 = _builder_cfg["uv4"]
+            if uv4 is None:
+                raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定")
+            # 1) 关闭所有 Keil 实例，确保后续用干净实例加载新固件
+            close = builder.close_uvision(force=False)
+            # 2) 编译 + 烧录新固件
+            bf = builder.build_and_flash(uv4, p, target.strip() or None)
+            if not bf.get("ok"):
+                return _js({
+                    "ok": False, "action": "flash_debug", "stage": "编译烧录",
+                    "close_uvision": close, "build_flash": bf,
+                    "status_text": "编译/烧录未通过，未重开工程进入调试",
+                })
+            # 3) 重新打开本工程（干净实例，加载新固件符号）
+            launch = builder.launch_uvision(uv4, p)
+            # 4) 进入调试：Keil 启动需时间，对连接类错误做短暂重试
+            client = _get_client()
+            enter = None
+            last_error = None
+            for _ in range(8):
+                try:
+                    enter = client.enter_debug()
+                    break
+                except UVSOCKConnectError as e:  # Keil 尚未就绪 / UVSOCK 未开启
+                    last_error = str(e)
+                    await asyncio.sleep(1)
+                except Exception as e:  # noqa: BLE001 其他错误立即返回
+                    last_error = str(e)
+                    break
+            if enter is None:
+                enter = {"ok": False, "error": last_error or "进入调试失败"}
+            return _js({
+                "ok": enter.get("ok", False),
+                "action": "flash_debug", "stage": "调试",
+                "close_uvision": close,
+                "build": bf.get("build"), "flash": bf.get("flash"),
+                "launch_uvision": launch, "enter_debug": enter,
+                "status_text": ("已重新打开工程并进入调试" if enter.get("ok")
+                                else "已重新打开工程，但进入调试失败，请检查 UVSOCK 是否开启"),
+            })
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 

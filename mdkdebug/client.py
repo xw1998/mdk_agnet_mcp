@@ -19,7 +19,7 @@ import time
 from . import uvsock
 from .interface import UVInterface
 from .uvsock import (
-    UVSOCK_CMD, UV_STATUS_SUCCESS, UV_STATUS_TEXT, status_text, UVStatusError,
+    UVSOCK_CMD, UV_STATUS_SUCCESS, UV_STATUS_TEXT, status_text, UVError, UVStatusError,
 )
 
 logger = logging.getLogger("mdkdebug.client")
@@ -27,6 +27,19 @@ logger = logging.getLogger("mdkdebug.client")
 # 允许单次读内存的最大分块（Keil 协议限制）
 MAX_CHUNK = 16384
 
+
+# UVSOCK 开启指引：连接失败时提示用户如何在 Keil 中开启 UVSOCK 插件
+UVSOCK_HINT = (
+    "请在 Keil uVision 中开启 UVSOCK：菜单 Edit → Configuration... → 切到 Other 选项卡 → "
+    "勾选 UVSOCK Enabled → 确认端口为 4823 → 点 OK，然后重启 Keil 使设置生效，再重新调用本工具。"
+)
+
+class UVSOCKConnectError(UVError):
+    """无法连接 Keil UVSOCK 服务（通常因 UVSOCK 插件未开启）。"""
+    def __init__(self, host: str, port: int, cause: Exception):
+        super().__init__(
+            f"无法连接 Keil UVSOCK 服务（{host}:{port}）：{cause}。{UVSOCK_HINT}"
+        )
 
 class UVClient:
     """线程安全的 UVSOCK 调试客户端（含连接缓存）。"""
@@ -51,7 +64,10 @@ class UVClient:
             # 空闲超时，断开以便重连
             logger.info("连接空闲超过 %.1fs，断开重连", self.idle_timeout)
             self.phy.close()
-        self.phy.open()
+        try:
+            self.phy.open()
+        except OSError as e:  # 连接被拒/超时：UVSOCK 未开启
+            raise UVSOCKConnectError(self.host, self.port, e) from e
         self._last_used = now
 
     def _request(self, cmd_code: int, data: bytes = b'',
