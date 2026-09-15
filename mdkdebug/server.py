@@ -126,6 +126,22 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "expression": expr, "error": str(e)})
 
+    @server.tool(
+        name="read_variable",
+        title="按变量名查询变量地址与内容",
+        description=(
+            "按变量名查询变量的内存地址与当前内容（值）。内部用 '&变量名' 取地址、"
+            "'变量名' 取值，AI 无需手写取地址表达式即可定位变量。"
+            "name 为变量名（如 'SData_UA'、'timer.sec'）；返回 {address, value, value_type}。"
+            "适合先查地址再配合 read_mem/write_mem 对变量内存做进一步读写。"
+        ),
+    )
+    async def read_variable(name: str) -> str:
+        try:
+            return _js(_get_client().read_variable(name))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "name": str(name), "error": str(e)})
+
     # ---------------- 内存读写 ----------------
     @server.tool(
         name="read_mem",

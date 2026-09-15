@@ -53,6 +53,13 @@ async def main():
         r = await call(server, "calc_expression", {"expr": "v1"})
         check("MCP calc_expression", '"value": 3735928559' in r, r)
 
+        # 按变量名查询地址与内容
+        r = await call(server, "read_variable", {"name": "v1"})
+        check("MCP read_variable 地址", '"address": "0x20000004"' in r, r)
+        check("MCP read_variable 值", '"value": 3735928559' in r, r)
+        r = await call(server, "read_variable", {"name": "not_exist"})
+        check("MCP read_variable 未知变量", '"ok": false' in r, r)
+
         r = await call(server, "read_mem", {"addr": "0x20000000", "n_bytes": 4})
         check("MCP read_mem(hex地址)", '"ok": true' in r and '"data_hex"' in r, r)
 

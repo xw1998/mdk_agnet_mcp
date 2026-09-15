@@ -151,6 +151,41 @@ class UVClient:
             "value_raw": name,
         }
 
+    def read_variable(self, name: str) -> dict:
+        """按变量名查询其地址与内容（值）。
+
+        用 `&name` 取变量地址、`name` 取变量值，便于 AI 依变量名定位内存。
+        返回 {name, address(十六进制串), value, value_type}。
+        """
+        name = name.strip()
+        if not name:
+            return {"ok": False, "name": "", "error": "变量名不能为空"}
+        # 地址：&name
+        addr_r = self.calc_expression(f"&{name}")
+        if not addr_r.get("ok"):
+            return {
+                "ok": False, "name": name, "address": None, "value": None,
+                "message": "无法解析变量地址（变量不存在或未处于调试状态）",
+                "detail": addr_r,
+            }
+        address = addr_r.get("value")
+        # 值：name
+        val_r = self.calc_expression(name)
+        if val_r.get("ok"):
+            return {
+                "ok": True, "name": name,
+                "address": hex(address) if isinstance(address, int) else address,
+                "value": val_r.get("value"),
+                "value_type": val_r.get("value_type"),
+                "value_raw": val_r.get("value_raw"),
+            }
+        return {
+            "ok": True, "name": name,
+            "address": hex(address) if isinstance(address, int) else address,
+            "value": None, "value_type": None,
+            "note": "变量存在（已取到地址），但未能读取其值",
+        }
+
     # ------------------------------------------------------------------
     # 内存读写
     # ------------------------------------------------------------------

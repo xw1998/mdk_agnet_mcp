@@ -179,44 +179,124 @@ def launch_uvision(uv4: str, project: str) -> dict:
         return {"ok": False, "error": f"启动 Keil uVision 失败：{e}"}
 
 
-def _uv4_pids() -> list[str]:
-    """返回当前所有 UV4.exe 的 PID 列表。"""
+def _uv4_pids() -> list[int]:
+    """用 Toolhelp 快照枚举当前所有 UV4.exe 的 PID（纯 ctypes，不依赖 tasklist）。"""
     try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq UV4.exe"],
-            capture_output=True, text=True, timeout=10,
-        ).stdout
-        return re.findall(r"UV4\.exe\s+(\d+)", out)
-    except Exception:  # noqa: BLE001
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
         return []
+    TH32CS_SNAPPROCESS = 0x00000002
+    kernel32 = ctypes.windll.kernel32
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    pids = []
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == ctypes.c_void_p(-1).value or snap == -1:
+        return pids
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if kernel32.Process32FirstW(snap, ctypes.byref(pe)):
+            while True:
+                try:
+                    name = pe.szExeFile
+                except Exception:
+                    break
+                if name.lower() == "uv4.exe":
+                    pids.append(int(pe.th32ProcessID))
+                if not kernel32.Process32NextW(snap, ctypes.byref(pe)):
+                    break
+    finally:
+        kernel32.CloseHandle(snap)
+    return pids
+
+
+def _close_uvision_graceful(pid: int) -> bool:
+    """向指定 PID 的可见主窗口发送 WM_CLOSE（优雅关闭）。返回是否找到窗口。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        WM_CLOSE = 0x0010
+        user32 = ctypes.windll.user32
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            pid_win = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_win))
+            if pid_win.value == pid and user32.IsWindowVisible(hwnd):
+                found.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        if found:
+            user32.PostMessage(found[0], WM_CLOSE, 0, 0)
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _terminate_uvision(pid: int) -> None:
+    """强制终止指定 PID 的进程（TerminateProcess，纯 ctypes）。"""
+    try:
+        import ctypes
+        PROCESS_TERMINATE = 0x0001
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if handle:
+            kernel32.TerminateProcess(handle, 1)
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
 
 
 def close_uvision(force: bool = False, timeout: int = 10) -> dict:
-    """关闭所有 Keil uVision 实例（AI 管理 Keil 开关的闭环）。
+    """关闭所有 Keil uVision 实例（AI 管理 Keil 开关的闭环，纯 ctypes 不依赖 taskkill）。
 
-    force=False：先优雅关闭（taskkill 发送关闭消息，允许正常收尾）；
-    若仍有实例残留则自动升级为强制终止。
-    force=True：直接强制终止所有 UV4.exe。
+    force=False：先对每个实例的可见主窗口发 WM_CLOSE 优雅关闭，等待退出；
+    超时后残留实例强制终止。force=True：直接强制终止所有 UV4.exe。
+    注意：会关闭所有 Keil 实例；未保存的调试会话/源码改动可能丢失，调用前请确保已保存。
     """
+    import time as _time
     before = _uv4_pids()
     if not before:
         return {"ok": True, "action": "关闭Keil", "closed": 0, "msg": "当前无 Keil uVision 实例"}
     try:
         if not force:
-            subprocess.run(["taskkill", "/IM", "UV4.exe"],
-                           capture_output=True, text=True, timeout=timeout)
+            for pid in before:
+                _close_uvision_graceful(pid)
+            # 等待优雅退出
+            deadline = _time.time() + timeout
+            while _time.time() < deadline:
+                if not _uv4_pids():
+                    break
+                _time.sleep(0.3)
             remain = _uv4_pids()
             if remain:
-                # 优雅未完全退出，强制兜底
-                subprocess.run(["taskkill", "/F", "/IM", "UV4.exe"],
-                               capture_output=True, text=True, timeout=timeout)
+                for pid in remain:
+                    _terminate_uvision(pid)
                 remain = _uv4_pids()
                 return {"ok": len(remain) == 0, "action": "关闭Keil",
-                        "closed": len(before), "force_fallback": True,
-                        "remaining": remain}
+                        "closed": len(before), "force_fallback": True, "remaining": remain}
             return {"ok": True, "action": "关闭Keil", "closed": len(before), "force": False}
-        subprocess.run(["taskkill", "/F", "/IM", "UV4.exe"],
-                       capture_output=True, text=True, timeout=timeout)
+        for pid in before:
+            _terminate_uvision(pid)
         remain = _uv4_pids()
         return {"ok": len(remain) == 0, "action": "关闭Keil",
                 "closed": len(before), "force": True, "remaining": remain}

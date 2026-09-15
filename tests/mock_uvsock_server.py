@@ -188,6 +188,16 @@ class MockUVSOCKServer:
         # 解析 VSET：vType(4) + union(8) + nLen(4) + str
         nlen = struct.unpack('<i', data[12:16])[0]
         name = data[16:16 + nlen].decode("UTF-8", "replace").rstrip('\x00')
+        # 支持 &name 取地址（供 read_variable 用）
+        if name.startswith("&"):
+            varname = name[1:]
+            if varname not in self.var_table:
+                return uvsock.UV_STATUS_PARSE_ERROR, b""
+            _, addr, _size = self.var_table[varname]
+            resp = struct.pack('<i', uvsock.VTT_uint) \
+                + struct.pack('<Q', addr) \
+                + struct.pack('<i', len(name)) + name.encode()
+            return uvsock.UV_STATUS_SUCCESS, resp
         if name not in self.var_table:
             return uvsock.UV_STATUS_PARSE_ERROR, b""
         vtype, addr, size = self.var_table[name]

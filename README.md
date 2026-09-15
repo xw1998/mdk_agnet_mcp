@@ -105,7 +105,7 @@ mdk_agent/
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
 │   ├── client.py             # UVClient：调试能力封装 + 连接缓存
 │   ├── builder.py            # UV4 命令行：编译 / 重编译 / 烧录 / 编译烧录闭环
-│   └── server.py             # MCP Server 与 18 个工具定义（14 调试 + 4 编译烧录）
+│   └── server.py             # MCP Server 与 21 个工具定义（15 调试 + 4 编译烧录 + 2 Keil 管理）
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_e2e.py           # UVClient 协议闭环测试
@@ -144,13 +144,14 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **20** 个（14 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具）：
+共 **21** 个（15 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
 | `get_version` | 查询 UVSOCK 插件版本 | — |
 | `get_status` | 查询是否处于调试、目标是否运行、状态码 | — |
 | `calc_expression` | 计算并读取表达式 / 变量值 | `expr` |
+| `read_variable` | 按变量名查询变量地址与内容（值） | `name` |
 | `read_mem` | 读取目标内存 | `addr`（`0x…` 或十进制）、`n_bytes` |
 | `write_mem` | 写入目标内存 | `addr`、`data_hex`（十六进制串，可带空格） |
 | `run` | 全速运行 | — |
