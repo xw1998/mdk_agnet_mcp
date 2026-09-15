@@ -1,3 +1,4 @@
 mcp>=2.0
 pydantic>=2.8
 pyelftools>=0.30
+capstone>=5.0

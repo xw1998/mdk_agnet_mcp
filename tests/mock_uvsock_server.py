@@ -50,6 +50,16 @@ class MockUVSOCKServer:
             "v3": (uvsock.VTT_ushort, base + 12, 2, 1, 2),
             "arr": (uvsock.VTT_uint, base + 16, 32, 8, 4),
         }
+        # CPU 寄存器（供 read_registers / set_register），R0=返回值/首参，R1-R3=后续参数
+        self.reg_map = {"__currentPC()": 0x8000DB4, "PC": 0x8000DB4, "R15": 0x8000DB4,
+                        "__currentLR()": 0x8000DC4, "LR": 0x8000DC4, "R14": 0x8000DC4,
+                        "__currentSP()": 0x2002FF00, "SP": 0x2002FF00, "R13": 0x2002FF00,
+                        "R0": 0x20000000, "R1": 0x0000002A, "R2": 0x00000001, "R3": 0x00000000,
+                        "R4": 0xDEADBEEF, "R5": 0x00000007, "R6": 0x00000000, "R7": 0x00000000,
+                        "R8": 0x00000000, "R9": 0x00000000, "R10": 0x00000000, "R11": 0x00000000,
+                        "R12": 0x00000000, "xPSR": 0x21000000}
+        # DWT/SCS 调试寄存器（供 dwt 周期计数器）
+        self.dwt = {"demcr": 0, "ctrl": 0, "cyccnt": 0x1234}
         self.running = False
         self.debugging = False
         self.breakpoints = []  # 断点符号/地址列表
@@ -204,16 +214,19 @@ class MockUVSOCKServer:
         name = data[16:16 + nlen].decode("UTF-8", "replace").rstrip('\x00')
 
         # 寄存器表达式（供 read_cpu_registers/get_current_location/snapshot 定位）
-        reg_map = {"__currentPC()": 0x8000DB4, "PC": 0x8000DB4, "R15": 0x8000DB4,
-                   "__currentLR()": 0x8000DC4, "LR": 0x8000DC4, "R14": 0x8000DC4,
-                   "__currentSP()": 0x2002FF00, "SP": 0x2002FF00, "R13": 0x2002FF00,
-                   # R0-R12 通用寄存器（R0=返回值/首参，R1-R3=后续参数）
-                   "R0": 0x20000000, "R1": 0x0000002A, "R2": 0x00000001, "R3": 0x00000000,
-                   "R4": 0xDEADBEEF, "R5": 0x00000007, "R6": 0x00000000, "R7": 0x00000000,
-                   "R8": 0x00000000, "R9": 0x00000000, "R10": 0x00000000, "R11": 0x00000000,
-                   "R12": 0x00000000, "xPSR": 0x21000000}
-        if name in reg_map:
-            val = reg_map[name]
+        # 先处理赋值表达式：R0 = <value>（供 set_register）
+        am = re.match(r"^([A-Za-z_]\w*)\s*=\s*(-?\d+)$", name)
+        if am:
+            reg = am.group(1).upper()
+            if reg in self.reg_map:
+                self.reg_map[reg] = int(am.group(2))
+                val = self.reg_map[reg]
+                resp = struct.pack('<i', uvsock.VTT_uint) \
+                    + struct.pack('<Q', val) \
+                    + struct.pack('<i', len(name)) + name.encode()
+                return uvsock.UV_STATUS_SUCCESS, resp
+        if name in self.reg_map:
+            val = self.reg_map[name]
             resp = struct.pack('<i', uvsock.VTT_uint) \
                 + struct.pack('<Q', val) \
                 + struct.pack('<i', len(name)) + name.encode()
@@ -277,6 +290,9 @@ class MockUVSOCKServer:
         elif 0x08000000 <= nAddr < 0x08000000 + len(self.flash):
             off = nAddr - 0x08000000
             payload = bytes(self.flash[off:off + nBytes])
+        elif nAddr in (0xE000EDFC, 0xE0001000, 0xE0001004):  # DWT/SCS 调试寄存器
+            key = {0xE000EDFC: "demcr", 0xE0001000: "ctrl", 0xE0001004: "cyccnt"}[nAddr]
+            payload = struct.pack('<I', self.dwt[key] & 0xFFFFFFFF)
         if not payload:
             return uvsock.UV_STATUS_NO_MEM_ACCESS, b""
         resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0) + payload
@@ -285,6 +301,11 @@ class MockUVSOCKServer:
     def _mem_write(self, data):
         nAddr, nBytes, ErrAddr, nErr = struct.unpack('<QIQI', data[:24])
         payload = data[24:24 + nBytes]
+        if nAddr in (0xE000EDFC, 0xE0001000, 0xE0001004):  # DWT/SCS 调试寄存器
+            key = {0xE000EDFC: "demcr", 0xE0001000: "ctrl", 0xE0001004: "cyccnt"}[nAddr]
+            self.dwt[key] = struct.unpack('<I', payload[:4])[0]
+            resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
+            return uvsock.UV_STATUS_SUCCESS, resp
         off = nAddr - 0x20000000
         if off < 0 or off + len(payload) > len(self.mem):
             return uvsock.UV_STATUS_NO_MEM_ACCESS, b""

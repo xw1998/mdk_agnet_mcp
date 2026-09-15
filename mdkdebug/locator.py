@@ -89,6 +89,59 @@ class Locator:
         self._ensure_loaded()
         return len(self._rows)
 
+    def search_symbols(self, query: str = "", limit: int = 50, kind: str = "all"):
+        """从 .axf ELF 符号表模糊检索符号（函数 / 对象），供 find_symbol 使用。
+
+        query 为空则列出全部；kind 取 all/func/object/global/local。
+        仅返回地址非零、类型为 func/object 的符号，过滤 .debug 伪符号；按地址排序。
+        """
+        self._ensure_loaded()
+        try:
+            with open(self.axf_path, "rb") as f:
+                elf = ELFFile(f)
+                sec = elf.get_section_by_name(".symtab")
+                if sec is None:
+                    sec = elf.get_section_by_name(".dynsym")
+                if sec is None:
+                    return []
+                q = (query or "").lower()
+                out = []
+                for sym in sec.iter_symbols():
+                    name = sym.name
+                    if not name:
+                        continue
+                    if q and q not in name.lower():
+                        continue
+                    addr = sym.entry["st_value"]
+                    if addr == 0:
+                        continue
+                    st = sym.entry["st_info"]
+                    # pyelftools 的 bind/type 是名字字符串（如 STT_FUNC / STB_GLOBAL），st_info 为 Container
+                    stype = str(st["type"])
+                    bind = str(st["bind"])
+                    tname = stype.replace("STT_", "").lower()  # func / object / notype ...
+                    bname = bind.replace("STB_", "").lower()   # global / local / weak
+                    if tname not in ("func", "object"):
+                        continue
+                    if kind == "func" and tname != "func":
+                        continue
+                    if kind == "object" and tname != "object":
+                        continue
+                    if kind in ("global", "local") and bname != kind:
+                        continue
+                    out.append({
+                        "name": name,
+                        "type": tname,
+                        "bind": bname,
+                        "addr": "0x%08x" % addr,
+                        "size": sym.entry.get("st_size", 0),
+                    })
+                out.sort(key=lambda s: int(s["addr"], 16))
+                return out[:limit]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("读取 .axf 符号表失败: %s", e)
+            return []
+
     def addr_to_location(self, addr: int):
         """地址 -> {file, line}（取 <=addr 的最近行条目）。"""
         self._ensure_loaded()

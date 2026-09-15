@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import struct
 import sys
 import xml.etree.ElementTree as ET
 
@@ -534,6 +535,27 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
+    # ---------------- 符号检索 ----------------
+    @server.tool(
+        name="find_symbol",
+        title="检索符号",
+        description=(
+            "从 .axf ELF 符号表模糊检索 函数/全局变量 符号（query 为子串，大小写不敏感，空则列出全部）。"
+            "AI 想读取某个全局变量或跳到某函数而不知道确切名字时，先用它搜到符号名与地址，"
+            "再配合 calc_expression / read_variable / set_breakpoint / disassemble 使用。"
+            "kind 可取 all/func/object/global/local 过滤。需配置 .axf 调试符号。"
+        ),
+    )
+    async def find_symbol(query: str = "", limit: int = 50, kind: str = "all") -> str:
+        try:
+            loc = _get_locator()
+            if loc is None:
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号，或未从工程推断到）"})
+            symbols = loc.search_symbols(query=query, limit=max(1, min(limit, 200)), kind=kind)
+            return _js({"ok": True, "query": query, "kind": kind, "count": len(symbols), "symbols": symbols})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "query": query, "error": str(e)})
+
     # ---------------- 位置定位 / run to cursor ----------------
     @server.tool(
         name="get_current_location",
@@ -791,6 +813,102 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if "pc" in core:
                 aapcs["program_counter"] = core["pc"]
             out["aapcs"] = aapcs
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="set_register",
+        title="写寄存器 / 改 PC",
+        description=(
+            "向指定 CPU 寄存器写入值（支持 R0-R12/SP/LR/PC/xPSR，R13/R14/R15 自动映射为 SP/LR/PC）。"
+            "value 可为 0x 十六进制或十进制。写后自动读回验证。用于修正现场、强制改返回值、"
+            "或改 PC 跳到某函数/地址执行（改 PC 后需配合 run 继续执行）。需已进入调试状态。"
+        ),
+    )
+    async def set_register(register: str, value: str) -> str:
+        try:
+            client = _get_client()
+            reg = (register or "").strip().upper()
+            aliases = {"R13": "SP", "R14": "LR", "R15": "PC", "XPSR": "xPSR"}
+            if reg in aliases:
+                reg = aliases[reg]
+            if reg not in ("R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7",
+                           "R8", "R9", "R10", "R11", "R12", "SP", "LR", "PC", "xPSR"):
+                return _js({"ok": False, "register": register, "error": f"不支持的寄存器名: {register}"})
+            vs = (value or "").strip()
+            try:
+                num = int(vs, 0) if vs.lower().startswith(("0x", "-0x")) else int(vs, 10)
+            except ValueError:
+                return _js({"ok": False, "register": reg, "error": f"无法解析数值: {value}"})
+            # Keil Watch 表达式赋值（R0 = 0x...），走 CALC_EXPRESSION 求值器
+            r = client.calc_expression(f"{reg} = {num}")
+            if not r.get("ok"):
+                r2 = client.exec_command(f"{reg} = {num}")
+                if not r2.get("ok"):
+                    return _js({"ok": False, "register": reg, "value": value,
+                                "error": "寄存器写入失败", "detail": r2})
+            check = client.calc_expression(reg)
+            return _js({"ok": True, "register": reg, "set_value": "0x%x" % num,
+                        "readback": check.get("value") if check.get("ok") else None,
+                        "readback_ok": check.get("ok", False)})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "register": register, "error": str(e)})
+
+    # ---------------- DWT 周期计数器（性能分析） ----------------
+    # DEMCR @0xE000EDFC bit24 TRCENA、DWT_CTRL @0xE0001000 bit0 CYCCNTENA、CYCCNT @0xE0001004
+    _DWT_DEMCR = 0xE000EDFC
+    _DWT_CTRL = 0xE0001000
+    _DWT_CYCCNT = 0xE0001004
+
+    @staticmethod
+    def _dwt_read_u32(client, addr: int):
+        r = client.read_mem(addr, 4)
+        if not r.get("ok"):
+            return None
+        # read_mem 返回小端字节序 hex，需按小端解析成 u32
+        return int.from_bytes(bytes.fromhex(r["data_hex"]), "little")
+
+    @staticmethod
+    def _dwt_write_u32(client, addr: int, val: int) -> bool:
+        r = client.write_mem(addr, struct.pack("<I", val & 0xFFFFFFFF))
+        return bool(r.get("ok"))
+
+    @staticmethod
+    def _dwt_enable(client) -> bool:
+        demcr = _dwt_read_u32(client, _DWT_DEMCR) or 0
+        if not _dwt_write_u32(client, _DWT_DEMCR, demcr | 0x01000000):
+            return False
+        ctrl = _dwt_read_u32(client, _DWT_CTRL) or 0
+        return _dwt_write_u32(client, _DWT_CTRL, ctrl | 1)
+
+    @server.tool(
+        name="dwt",
+        title="DWT 周期计数器（性能分析）",
+        description=(
+            "读取 Cortex-M DWT->CYCCNT 周期计数器（自动使能 DWT+TRCENA）。返回当前周期计数 cycles、"
+            "CPU 频率 frequency_hz 与估算的运行秒数。用法：在同一代码段 前后各调一次 dwt，"
+            "执行周期数 = (cycles2 - cycles1) & 0xFFFFFFFF，耗时 = 周期数 / frequency_hz。"
+            "用于测某段代码/某个函数的执行时间（如 SysTick 中断耗时、循环耗时）。需已进入调试且目标暂停。"
+        ),
+    )
+    async def dwt() -> str:
+        try:
+            client = _get_client()
+            _dwt_enable(client)
+            cycles = _dwt_read_u32(client, _DWT_CYCCNT)
+            freq = None
+            try:
+                f = client.calc_expression("SystemCoreClock")
+                if f.get("ok") and isinstance(f.get("value"), int):
+                    freq = f["value"]
+            except Exception:  # noqa: BLE001
+                pass
+            out = {"ok": True, "cycles": cycles,
+                   "frequency_hz": freq,
+                   "usage": "执行周期数 = (cycles2 - cycles1) & 0xFFFFFFFF；耗时 = 周期数 / frequency_hz"}
+            if freq and cycles:
+                out["seconds_since_enable"] = round(cycles / freq, 6)
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
