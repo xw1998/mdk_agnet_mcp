@@ -737,6 +737,229 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="read_registers",
+        title="读取 CPU 寄存器组",
+        description=(
+            "批量读取 CPU 核心寄存器 R0-R12/SP/LR/PC/xPSR 及当前值，并按 AAPCS 调用约定解读："
+            "R0-R3 为函数前 4 个入参（若当前停在函数入口/调用点），R0 为返回值，SP 栈指针、LR 返回地址。"
+            "排查函数参数传错、返回值不对、寄存器被踩等问题时使用。需已进入调试状态。"
+        ),
+    )
+    async def read_registers() -> str:
+        try:
+            client = _get_client()
+            # 寄存器名候选（大小写兼容不同 Keil 版本）
+            order = ["R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7",
+                     "R8", "R9", "R10", "R11", "R12", "SP", "LR", "PC", "xPSR"]
+            aliases = {"SP": ("__currentSP()", "SP", "R13"),
+                       "LR": ("__currentLR()", "LR", "R14"),
+                       "PC": ("__currentPC()", "PC", "R15")}
+            core: dict = {}
+            failed: list = []
+            for name in order:
+                cands = aliases.get(name, (name,))
+                val = None
+                for c in cands:
+                    try:
+                        r = client.calc_expression(c)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if r.get("ok") and isinstance(r.get("value"), int):
+                        val = r["value"]
+                        break
+                if val is None:
+                    failed.append(name)
+                else:
+                    core[name.lower()] = val
+            if not core:
+                return _js({"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "failed": failed})
+            out = {"ok": True, "registers": core, "count": len(core)}
+            if failed:
+                out["unavailable"] = failed
+            # AAPCS 解读：R0-R3 前4入参（当帧为函数入口时才有意义），R0 返回值，LR 返回地址
+            aapcs = {}
+            for i in range(4):
+                key = f"r{i}"
+                if key in core:
+                    aapcs[f"arg{i+1}"] = core[key]
+            if "r0" in core:
+                aapcs["return_value"] = core["r0"]
+            if "lr" in core:
+                aapcs["return_address"] = core["lr"]
+            if "sp" in core:
+                aapcs["stack_pointer"] = core["sp"]
+            if "pc" in core:
+                aapcs["program_counter"] = core["pc"]
+            out["aapcs"] = aapcs
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="disassemble",
+        title="反汇编指定地址",
+        description=(
+            "反汇编目标代码。addr 可为 十六进制地址(0x...) 或 符号名(如 'main'、'SystemClock_Config')；"
+            "省略时用当前 PC。count 为反汇编的指令条数（默认 8）。返回每条指令的地址、机器码、汇编文本。"
+            "排查死循环 / 跑飞 / 启动流程 / 优化后行为时，查看 PC 处指令在做什么。需已进入调试且配置 .axf。"
+        ),
+    )
+    async def disassemble(addr: str = "", count: int = 8) -> str:
+        try:
+            client = _get_client()
+            loc = _get_locator()
+            if not loc or not loc.is_ready():
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号）"})
+            # 解析目标地址：显式地址 / 符号名（calc_expression &name 取址）/ 文件:行 / 当前 PC
+            if (addr or "").strip():
+                a = (addr or "").strip()
+                base = None
+                if a.lower().startswith("0x"):
+                    base = int(a, 16)
+                else:
+                    ar = client.calc_expression(f"&{a}")
+                    if ar.get("ok") and isinstance(ar.get("value"), int):
+                        base = ar["value"]
+                    else:
+                        base = _parse_target(loc, a)  # 尝试 文件:行号
+                if base is None:
+                    return _js({"ok": False, "addr": a, "error": "无法解析地址（需 0x地址 或符号名）"})
+            else:
+                regs = client.read_cpu_registers_stable()
+                if not regs.get("ok") or not isinstance(regs.get("pc"), int):
+                    return _js({"ok": False, "error": "未指定地址且无法读取当前 PC"})
+                base = regs["pc"]
+            # 读取指令字节（每条 Thumb 指令最多 4 字节，预取足够缓冲）
+            n = max(1, int(count))
+            n_bytes = min(n * 4 + 16, 4096)
+            r = client.read_mem(base, n_bytes)
+            data_hex = r.get("data_hex") or ""
+            raw = bytes.fromhex(data_hex) if data_hex else b""
+            if not raw:
+                return _js({"ok": False, "addr": hex(base), "error": "读取指令内存失败"})
+            # capstone 反汇编（Thumb，支持 Thumb-2 混合）
+            try:
+                import capstone
+            except ImportError as ie:  # noqa: BLE001
+                return _js({"ok": False, "error": f"缺少 capstone 依赖: {ie}，请 pip install capstone"})
+            md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
+            md.detail = False
+            insns = []
+            for ins in md.disasm(raw, base):
+                insns.append({"address": f"0x{ins.address:x}",
+                              "bytes": ins.bytes.hex(),
+                              "mnemonic": ins.mnemonic,
+                              "op_str": ins.op_str,
+                              "text": f"{ins.mnemonic} {ins.op_str}".strip()})
+                if len(insns) >= n:
+                    break
+            out = {"ok": True, "addr": hex(base), "count": len(insns)}
+            # 定位起始地址对应的 文件:行
+            sl = loc.addr_to_location(base) if loc else None
+            if sl:
+                out["file"] = sl["file"]
+                out["line"] = sl["line"]
+            out["instructions"] = insns
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="diagnose",
+        title="一键诊断当前现场",
+        description=(
+            "聚合一次排查所需的所有现场信息：CPU 寄存器组(含 AAPCS 解读) + PC 处指令反汇编 + "
+            "源码上下文 + 完整调用栈 + 当前函数局部变量 + 指定关键全局变量，生成结构化现场报告。"
+            "AI 接到 bug 报告后一次调用即可看清程序卡在哪、寄存器状态、正在执行什么指令、谁调进来的，"
+            "避免多次 get_current_location/read_registers/disassemble/read_locals 往返。"
+            "globals 可选，传关键全局变量名列表。需已进入调试且配置 .axf。"
+        ),
+    )
+    async def diagnose(globals: list = None, source_context: int = 4, disasm_count: int = 6) -> str:
+        try:
+            client = _get_client()
+            loc = _get_locator()
+            if not loc or not loc.is_ready():
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号）"})
+            out: dict = {"ok": True}
+            # 1) 寄存器组 + AAPCS
+            regs = client.read_cpu_registers()
+            if regs.get("ok"):
+                core = regs.get("registers") or {}
+                out["registers"] = core
+                aapcs = {}
+                for i in range(4):
+                    if f"r{i}" in core:
+                        aapcs[f"arg{i+1}"] = core[f"r{i}"]
+                for k, v in (("return_value", "r0"), ("return_address", "lr"),
+                             ("stack_pointer", "sp"), ("program_counter", "pc")):
+                    if v in core:
+                        aapcs[k] = core[v]
+                out["aapcs"] = aapcs
+            # 2) 位置 + 源码上下文 + 完整调用栈
+            info = _build_location(client)
+            if info:
+                out["pc"] = info.get("pc")
+                out["file"] = info.get("file")
+                out["line"] = info.get("line")
+                out["address"] = info.get("address")
+                out["source"] = info.get("source")
+                out["display_path"] = info.get("display_path")
+                out["callstack"] = info.get("callstack")
+                if info.get("warning"):
+                    out["warning"] = info["warning"]
+                if info.get("hit_breakpoint"):
+                    out["hit_breakpoint"] = info["hit_breakpoint"]
+                pc = regs.get("pc") if regs.get("ok") else None
+                # 3) PC 处反汇编（正在执行的指令）
+                if isinstance(pc, int):
+                    try:
+                        import capstone
+                        n = max(1, int(disasm_count))
+                        r = client.read_mem(pc, n * 4 + 16)
+                        raw = bytes.fromhex(r.get("data_hex") or "") if r.get("data_hex") else b""
+                        if raw:
+                            md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
+                            md.detail = False
+                            insns = []
+                            for ins in md.disasm(raw, pc):
+                                insns.append({"address": f"0x{ins.address:x}",
+                                              "text": f"{ins.mnemonic} {ins.op_str}".strip()})
+                                if len(insns) >= n:
+                                    break
+                            out["disassembly"] = {"pc": hex(pc), "instructions": insns}
+                    except ImportError:
+                        out["disassembly"] = {"error": "缺少 capstone 依赖，跳过反汇编"}
+                # 4) 当前函数局部变量
+                if isinstance(pc, int):
+                    names = loc.local_variables(pc)
+                    if names:
+                        out["locals"] = []
+                        for name in names:
+                            try:
+                                r = client.calc_expression(name)
+                                out["locals"].append({"name": name, "ok": r.get("ok"),
+                                                      "value_type": r.get("value_type"),
+                                                      "value": r.get("value")})
+                            except Exception as ex:  # noqa: BLE001
+                                out["locals"].append({"name": name, "ok": False, "error": str(ex)})
+            # 5) 指定关键全局变量
+            if globals:
+                out["globals"] = []
+                for g in globals:
+                    try:
+                        r = client.read_variable(str(g), read_memory=False)
+                        out["globals"].append({"name": str(g), "ok": r.get("ok"),
+                                               "value_type": r.get("value_type"),
+                                               "value": r.get("value"),
+                                               "address": r.get("address")})
+                    except Exception as ex:  # noqa: BLE001
+                        out["globals"].append({"name": str(g), "ok": False, "error": str(ex)})
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="run_to_line",
         title="运行到指定行",
         description=(

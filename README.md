@@ -26,6 +26,9 @@
 - **状态快照**：`snapshot` 一次性返回当前位置（文件行 + PC）+ 源码上下文 + 完整调用栈 + 局部变量 + 指定全局变量，让 AI 一眼看清程序卡在哪、处于什么状态；
 - **变量组**：`watch` 批量读取一组表达式的当前值，便于固定观察多路信号；
 - **结构体字段概览**：`read_struct` 基于 DWARF 解析结构体的字段布局（类型 / 偏移 / 大小），并用基址 + 偏移读取各字段运行时值，让 AI 看清一个结构体的完整内容；
+- **寄存器组 + AAPCS**：`read_registers` 批量读取 R0-R12/SP/LR/PC/xPSR 并解读 AAPCS 调用约定（R0-R3 入参、R0 返回值、LR 返回地址），排查函数参数传错 / 返回值不对 / 寄存器被踩；
+- **反汇编**：`disassemble` 用 capstone 反汇编目标代码（支持 `0x地址` / 符号名 / 文件:行 / 缺省 PC），排查死循环、跑飞、启动流程与优化后行为；
+- **一键诊断**：`diagnose` 聚合寄存器组 + PC 反汇编 + 源码上下文 + 调用栈 + 局部变量 + 指定全局变量，AI 接到 bug 报告后一次调用即可看清现场；
 - **自动进出调试模式**：`enter_debug` / `exit_debug`，支持 AI 驱动"进入 → 设断点 → 运行到断点 → 读变量 → 退出"完整闭环；
 - **编译 / 烧录闭环**：基于 Keil 官方 `UV4.exe` 命令行，提供 `build_project`（编译）、`rebuild_project`（重编译）、`flash_download`（烧录）、`build_and_flash`（编译成功后自动烧录），支持 AI 自主"改代码 → 编译 → 烧录 → 上板"全流程闭环；
 - **后台静默编译**：编译 / 烧录以隐藏窗口方式启动 UV4，**不会闪现新的 Keil 界面**，用户已打开的实例不受打扰；
@@ -118,7 +121,7 @@ mdk_agent/
 │   ├── client.py             # UVClient：调试能力封装 + 连接缓存
 │   ├── builder.py            # UV4 命令行：编译 / 重编译 / 烧录 / 编译烧录闭环
 │   ├── locator.py             # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
-│   └── server.py             # MCP Server 与 32 个工具定义（23 调试 + 4 编译烧录 + 2 Keil 管理 + 1 一体闭环）
+│   └── server.py             # MCP Server 与 35 个工具定义（26 调试 + 4 编译烧录 + 2 Keil 管理 + 1 一体闭环）
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_e2e.py           # UVClient 协议闭环测试
@@ -157,7 +160,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **32** 个（23 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具 + 1 个 `flash_debug` 一体闭环）：
+共 **35** 个（26 个调试工具 + 4 个编译烧录工具 + 2 个 Keil 管理工具 + 1 个 `flash_debug` 一体闭环）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -181,6 +184,9 @@ python run_server.py --transport http --http-port 8300
 | `set_watchpoint` | 数据断点：在变量/地址处设 读/写/读写 访问断点，命中即暂停（`BS READ/WRITE/READWRITE`） | `expr`、`access`、`count` |
 | `clear_watchpoint` | 清除数据断点 | `expr` |
 | `list_watchpoints` | 列出当前数据断点（含地址、访问类型、位置） | — |
+| `read_registers` | 批量读取 CPU 核心寄存器 R0-R12/SP/LR/PC/xPSR 及当前值，并按 AAPCS 解读 R0-R3 入参、R0 返回值、LR 返回地址，排查参数/返回值/寄存器被踩 | — |
+| `disassemble` | capstone 反汇编目标代码：地址 `0x…` / 符号名 / 文件:行 / 缺省当前 PC，排查死循环、跑飞、启动流程、优化行为 | `addr`、`count`（默认 8） |
+| `diagnose` | 一键诊断：聚合寄存器组(含 AAPCS) + PC 处反汇编 + 源码上下文 + 完整调用栈 + 局部变量 + 指定全局变量，一次调用看清现场 | `globals`、`disasm_count`、`source_context` |
 | `enter_debug` | 自动进入 Keil 调试模式 | — |
 | `exit_debug` | 自动退出 Keil 调试模式 | — |
 | `set_breakpoint` | 在符号 / 地址处设软件断点 | `expr`（如 `main`、`0x08001034`） |
@@ -258,7 +264,8 @@ python run_server.py --transport http --http-port 8300
 - **已用 STM32F4 例程完成 20+ 个工具端到端全功能真机测试**：版本/状态、表达式、内存读写、
   运行控制（run/stop/reset/step/run_timeout/run_to_line）、断点管理（set/clear/list）、进出调试、
   状态快照（`snapshot`）、变量组（`watch`）、结构体字段概览（`read_struct`）、数据断点
-  （`set_watchpoint` 读触发暂停）、局部变量读取（`read_locals`）等全部通过。
+  （`set_watchpoint` 读触发暂停）、局部变量读取（`read_locals`）、寄存器组（`read_registers`）、
+  反汇编（`disassemble`，地址与符号名两种路径）、一键诊断（`diagnose`）等全部通过。
   > 说明：`read_struct` 对**局部**结构体的字段值读取依赖正确停靠帧（reset 后首次进入函数内部）；
   > 全局符号 / 正确停靠下的结构体则稳定返回布局与运行时值。
 

@@ -23,8 +23,17 @@ class MockUVSOCKServer:
     def __init__(self, host="127.0.0.1", port=4823):
         self.host = host
         self.port = port
-        # 模拟 64KB 内存
+        # 模拟 64KB SRAM（0x20000000 起）
         self.mem = bytearray(64 * 1024)
+        # 模拟 FLASH 代码段（0x08000000 起，用于反汇编等）
+        self.flash = bytearray(64 * 1024)
+        # 预置一段真实 Thumb 指令（对应 PC 0x08000000 附近）：
+        #   00 00   MOVS r0, r0
+        #   01 1c   ADDS r1, r0, #0
+        #   08 1c   ADDS r0, r1, #0
+        #   ff e7   B .-2  (死循环)
+        for i, b in enumerate(bytes.fromhex("00001c081cffe7")):
+            self.flash[0x08000000 - 0x08000000 + i] = b
         # 预置一些 "变量" 所在内存：v0..v3 放在 0x20000000 起
         base = 0x20000000
         struct.pack_into('<i', self.mem, base - 0x20000000, 0x11223344)        # int
@@ -197,7 +206,12 @@ class MockUVSOCKServer:
         # 寄存器表达式（供 read_cpu_registers/get_current_location/snapshot 定位）
         reg_map = {"__currentPC()": 0x8000DB4, "PC": 0x8000DB4, "R15": 0x8000DB4,
                    "__currentLR()": 0x8000DC4, "LR": 0x8000DC4, "R14": 0x8000DC4,
-                   "__currentSP()": 0x2002FF00, "SP": 0x2002FF00, "R13": 0x2002FF00}
+                   "__currentSP()": 0x2002FF00, "SP": 0x2002FF00, "R13": 0x2002FF00,
+                   # R0-R12 通用寄存器（R0=返回值/首参，R1-R3=后续参数）
+                   "R0": 0x20000000, "R1": 0x0000002A, "R2": 0x00000001, "R3": 0x00000000,
+                   "R4": 0xDEADBEEF, "R5": 0x00000007, "R6": 0x00000000, "R7": 0x00000000,
+                   "R8": 0x00000000, "R9": 0x00000000, "R10": 0x00000000, "R11": 0x00000000,
+                   "R12": 0x00000000, "xPSR": 0x21000000}
         if name in reg_map:
             val = reg_map[name]
             resp = struct.pack('<i', uvsock.VTT_uint) \
@@ -256,10 +270,15 @@ class MockUVSOCKServer:
 
     def _mem_read(self, data):
         nAddr, nBytes = struct.unpack('<QI', data[:12])
-        off = nAddr - 0x20000000
-        if off < 0 or off + nBytes > len(self.mem):
+        payload = b""
+        if 0x20000000 <= nAddr < 0x20000000 + len(self.mem):
+            off = nAddr - 0x20000000
+            payload = bytes(self.mem[off:off + nBytes])
+        elif 0x08000000 <= nAddr < 0x08000000 + len(self.flash):
+            off = nAddr - 0x08000000
+            payload = bytes(self.flash[off:off + nBytes])
+        if not payload:
             return uvsock.UV_STATUS_NO_MEM_ACCESS, b""
-        payload = bytes(self.mem[off:off + nBytes])
         resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0) + payload
         return uvsock.UV_STATUS_SUCCESS, resp
 
