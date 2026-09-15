@@ -285,9 +285,26 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         raise RuntimeError("未指定工程路径，请传入 project 参数或配置默认工程")
 
     @server.tool(
+        name="launch_uvision",
+        description=(
+            "可见方式启动 Keil uVision 并打开工程，供人工查看界面 / 调试准备。"
+            "project 为 .uvprojx 路径，可省略以用默认工程；若已运行同工程则复用已有实例。"
+            "用户无需手动打开 Keil，AI 可通过本工具拉起。"
+        ),
+    )
+    async def launch_uvision(project: str = "") -> str:
+        try:
+            if _builder_cfg["uv4"] is None:
+                raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定")
+            p = _resolve_project(project)
+            return _js(builder.launch_uvision(_builder_cfg["uv4"], p))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="build_project",
         description=(
-            "编译 Keil 工程（UV4 -b）。project 为 .uvprojx 工程路径，可省略以用默认工程；"
+            "编译 Keil 工程（UV4 -b，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，可省略以用默认工程；"
             "target 为可选目标名。返回退出码与编译日志。"
         ),
     )
@@ -301,7 +318,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="rebuild_project",
         description=(
-            "重新编译 Keil 工程（UV4 -r，全量重编）。project 为 .uvprojx 工程路径，"
+            "重新编译 Keil 工程（UV4 -r，全量重编，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
             "可省略以用默认工程；target 为可选目标名。"
         ),
     )
@@ -315,7 +332,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="flash_download",
         description=(
-            "烧录 Keil 工程到目标 Flash（UV4 -f，Flash Download）。project 为 .uvprojx 路径，"
+            "烧录 Keil 工程到目标 Flash（UV4 -f，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
             "可省略以用默认工程；target 为可选目标名。"
         ),
     )
@@ -329,7 +346,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="build_and_flash",
         description=(
-            "编译并烧录闭环：先编译，成功后才烧录（UV4 -b 成功后 -f）。"
+            "编译并烧录闭环（后台隐藏窗口，不闪现界面）：先编译，成功后才烧录（UV4 -b 成功后 -f）。"
             "project 为 .uvprojx 路径，可省略以用默认工程；target 为可选目标名。"
         ),
     )

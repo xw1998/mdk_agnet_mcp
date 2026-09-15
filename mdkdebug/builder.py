@@ -74,17 +74,29 @@ def _status_text(exit_code: int) -> str:
     return f"失败（退出码 {exit_code}）"
 
 
-def _run_uv4(uv4: str, args: list[str], timeout: int) -> tuple[int, str]:
-    """运行 UV4，捕获输出，返回 (退出码, 输出文本)。"""
+def _run_uv4(uv4: str, args: list[str], timeout: int,
+             visible: bool = False) -> tuple[int, str]:
+    """运行 UV4，捕获输出，返回 (退出码, 输出文本)。
+
+    visible=False 时以隐藏窗口方式启动 UV4，避免编译/烧录时闪现新的
+    Keil 界面（用户常已打开一个 uVision 实例，不应再弹窗打扰）。
+    隐藏的是本次新建的 UV4 进程窗口，不影响用户已打开实例的显示。
+    """
     # 用 -o 把构建输出重定向到临时文件（UV4 的 GUI 构建日志不走 stdout）
     log_fd, log_path = tempfile.mkstemp(suffix=".log")
     os.close(log_fd)
     cmd = [uv4] + args + ["-o", log_path]
     out_text = ""
+    # 隐藏新进程主窗口（GUI 程序；SW_HIDE 不产生控制台，也不影响既有实例）
+    startupinfo = None
+    if os.name == "nt" and not visible:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=timeout, check=False,
+            timeout=timeout, check=False, startupinfo=startupinfo,
         )
         parts = [s for s in (proc.stdout, proc.stderr) if s]
         out_text = "".join(parts)
@@ -143,6 +155,27 @@ def flash_download(uv4: str, project: str, target: str | None = None,
     args = ["-f", project] + (["-t", target] if target else [])
     code, out = _run_uv4(uv4, args, timeout)
     return _result("烧录", code, out)
+
+
+def launch_uvision(uv4: str, project: str) -> dict:
+    """可见方式启动 Keil uVision 并打开指定工程（供调试查看界面）。
+
+    UV4.exe 是 uVision 单实例程序：若已有一个 uVision 运行且打开相同工程，
+    本次启动会复用已有实例（新进程随即退出），不会另开窗口。
+    用 Popen 异步启动、立即返回，不阻塞调用方。
+    """
+    if not uv4:
+        return {"ok": False, "error": "未定位到 UV4.exe"}
+    cmd = [uv4, project]
+    try:
+        proc = subprocess.Popen(cmd)
+        return {
+            "ok": True,
+            "pid": proc.pid,
+            "msg": "已启动 Keil uVision 并打开工程（若已运行同工程则复用已有实例）",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"启动 Keil uVision 失败：{e}"}
 
 
 def build_and_flash(uv4: str, project: str, target: str | None = None,

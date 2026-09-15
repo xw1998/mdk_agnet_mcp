@@ -18,6 +18,8 @@
 - **断点管理**：设 / 删 / 列断点，基于 Keil 命令窗口命令（`BS` / `BK` / `BL`）；
 - **自动进出调试模式**：`enter_debug` / `exit_debug`，支持 AI 驱动"进入 → 设断点 → 运行到断点 → 读变量 → 退出"完整闭环；
 - **编译 / 烧录闭环**：基于 Keil 官方 `UV4.exe` 命令行，提供 `build_project`（编译）、`rebuild_project`（重编译）、`flash_download`（烧录）、`build_and_flash`（编译成功后自动烧录），支持 AI 自主"改代码 → 编译 → 烧录 → 上板"全流程闭环；
+- **后台静默编译**：编译 / 烧录以隐藏窗口方式启动 UV4，**不会闪现新的 Keil 界面**，用户已打开的实例不受打扰；
+- **AI 管理 Keil 开启**：`launch_uvision` 可拉起 Keil 并打开工程（供调试查看界面），若已运行同工程则复用已有实例，无需用户手动打开；
 - **UV4 自动探测**：优先显式 `--uv4-path`，其次探测常见安装目录，再查 Windows 注册表；
 - **连接缓存**：常驻服务内共享一条 TCP 连接，空闲自动断开、下次调用自动重连；
 - **线程安全**：连接状态以锁保护，可被 MCP 并发调用；
@@ -141,7 +143,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **18** 个（14 个调试工具 + 4 个编译烧录工具）：
+共 **19** 个（14 个调试工具 + 4 个编译烧录工具 + 1 个 Keil 启动工具）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -159,12 +161,15 @@ python run_server.py --transport http --http-port 8300
 | `set_breakpoint` | 在符号 / 地址处设软件断点 | `expr`（如 `main`、`0x08001034`） |
 | `clear_breakpoint` | 清除断点（符号名或断点编号） | `expr` |
 | `list_breakpoints` | 列出当前断点 | — |
-| `build_project` | 编译工程（`UV4 -b`） | `project`、`target` |
+| `launch_uvision` | 可见方式拉起 Keil 打开工程，复用已有实例 | `project` |
+| `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口） | `project`、`target` |
 | `rebuild_project` | 全量重编译（`UV4 -r`） | `project`、`target` |
 | `flash_download` | 烧录到目标 Flash（`UV4 -f`） | `project`、`target` |
 | `build_and_flash` | 编译成功后才烧录，AI 全流程闭环 | `project`、`target` |
 
-> 编译烧录工具的 `project` 均可省略：省略时使用启动参数 `--default-project` 指定的默认工程。
+> 编译烧录工具均以**隐藏窗口**后台执行，不闪现 Keil 界面；`launch_uvision` 则以**可见**方式打开 Keil 供调试查看。
+
+> 编译烧录 / Keil 启动工具的 `project` 均可省略：省略时使用启动参数 `--default-project` 指定的默认工程。
 
 ## 接入 AI 工具客户端
 
@@ -268,6 +273,7 @@ python -m tests.mock_uvsock_server --port 4823
 - **内存读写分块**：超过单次上限（16 KB）自动分块读，规避 Keil 协议长度限制；
 - **地址解析**：工具层统一支持 `0x` / `0b` / `0o` 前缀或纯十进制；
 - **编译烧录选型**：采用 Keil 官方 `UV4.exe` 命令行（`-b`/`-r`/`-f`/`-o`），退出码 0=成功、1=成功有警告、2=有错误、≥3=不完整；编译输出经 `-o` 重定向到临时日志文件捕获；`build_and_flash` 在编译成功后自动接烧录，形成闭环；
+- **窗口策略**：编译 / 烧录用 `STARTUPINFO(SW_HIDE)` 隐藏新进程窗口（不闪现），`launch_uvision` 用可见方式打开 Keil 供调试；隐藏的是本次新建的 UV4 进程，不影响用户已打开实例；
 - **UV4 与 UVSOCK 共存**：编译烧录与在线调试共用同一 Keil 实例；建议先 `build_and_flash`（此时 Keil 处于非调试态）再 `enter_debug` 进入调试，避免调试态下编译冲突。
 
 ## 已知限制
