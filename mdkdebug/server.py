@@ -103,12 +103,53 @@ def _parse_addr(s: str | int) -> int:
     return int(s, 10)
 
 
-def _build_location(client):
-    """读取当前 PC 并构建停靠位置信息：文件行、源码上下文、两级调用栈。
+def _backtrace(client, loc, pc, lr, sp, max_frames: int = 16, stack_bytes: int = 1024) -> list:
+    """基于 PC/LR + 栈启发式读取做完整调用栈回溯。
 
-    供 get_current_location 与 step 系列复用，让 AI 单步/查询后立即看到停靠代码。
-    返回 dict：{ok, pc, registers, file, line, address, source, display_path, callstack}；
-    .axf 未就绪返回 None；无法读寄存器返回 {ok:False, error, detail}。
+    第一帧为 PC，第二帧为 LR，之后从 SP 向上扫描栈内存（AAPCS 下返回地址在栈中
+    成链），凡落在 FLASH 代码段的值视为返回地址并反查 文件:行。启发式方案，不保证
+    与真实帧完全一致，但对多数 ARM 调用链足够给出完整路径。返回 [{level,pc,file,line}]。
+    """
+    frames: list = []
+    seen: set = set()
+
+    def add(addr: int) -> None:
+        if addr in seen or not loc.is_code_address(addr):
+            return
+        seen.add(addr)
+        l = loc.addr_to_location(addr)
+        frames.append({"pc": hex(addr),
+                       "file": l["file"] if l else "?",
+                       "line": l["line"] if l else None})
+
+    add(pc)
+    if isinstance(lr, int):
+        add(lr)
+    if isinstance(sp, int):
+        raw = b""
+        try:
+            r = client.read_mem(sp, stack_bytes)
+            data_hex = r.get("data_hex") or ""
+            raw = bytes.fromhex(data_hex) if data_hex else b""
+        except Exception as e:  # noqa: BLE001
+            logger.debug("栈回溯读取失败: %s", e)
+        for off in range(0, len(raw) - 3, 4):
+            w = int.from_bytes(raw[off:off + 4], "little")
+            if len(frames) >= max_frames:
+                break
+            if loc.is_code_address(w):
+                add(w)
+    for i, fr in enumerate(frames):
+        fr["level"] = i
+    return frames
+
+
+def _build_location(client):
+    """读取当前 PC 并构建停靠位置信息：文件行、源码上下文、完整调用栈。
+
+    供 get_current_location 与 step/run 系列复用，让 AI 查询后立即看到停靠代码。
+    返回 dict：{ok, pc, registers, file, line, address, source, display_path, callstack,
+    warning(可选), hit_breakpoint(可选)}；.axf 未就绪返回 None；无法读寄存器返回 {ok:False}。
     """
     loc = _get_locator()
     if not loc or not loc.is_ready():
@@ -118,6 +159,7 @@ def _build_location(client):
         return {"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "detail": regs}
     pc = regs.get("pc")
     lr = regs.get("lr")
+    sp = regs.get("sp")
     result = {"ok": True, "pc": hex(pc) if isinstance(pc, int) else pc, "registers": regs}
     cur = loc.addr_to_location(pc) if isinstance(pc, int) else None
     if cur:
@@ -128,14 +170,27 @@ def _build_location(client):
         if src:
             result["source"] = src["source"]
             result["display_path"] = src["display_path"]
-    callstack = []
-    if cur:
-        callstack.append({"level": 0, "pc": hex(pc), "file": cur["file"], "line": cur["line"]})
-    if isinstance(lr, int):
-        lrc = loc.addr_to_location(lr)
-        if lrc:
-            callstack.append({"level": 1, "pc": hex(lr), "file": lrc["file"], "line": lrc["line"]})
-    result["callstack"] = callstack
+        # 漂移检测：当前文件比 .axf 新则提示重编译，避免行号/符号错位
+        stale, path = loc.source_stale(cur["file"])
+        if stale:
+            result["warning"] = (f"源码 {path} 比 .axf 新（未重编译），行号/符号可能偏移，"
+                                  "建议先 build_and_flash 再调试")
+    # 完整调用栈回溯（PC/LR/SP + 栈启发式）
+    result["callstack"] = _backtrace(client, loc, pc, lr, sp)
+    # 断点命中反馈：停靠地址是否落在已设断点
+    if cur and _breakpoints and isinstance(pc, int):
+        for bp in _breakpoints:
+            try:
+                if bp.get("address") and int(bp["address"], 16) == pc:
+                    bp["hit_count"] = bp.get("hit_count", 0) + 1
+                    result["hit_breakpoint"] = {
+                        "expr": bp.get("expr"), "address": bp.get("address"),
+                        "file": bp.get("file"), "line": bp.get("line"),
+                        "hit_count": bp.get("hit_count"),
+                    }
+                    break
+            except (TypeError, ValueError):
+                continue
     return result
 
 
@@ -392,6 +447,49 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="read_locals",
+        title="读取当前函数局部变量",
+        description=(
+            "读取当前 PC 所在函数的 参数+局部变量 及其当前值。基于 .axf(DWARF) 定位"
+            "包含当前 PC 的函数作用域，得到变量名列表后用 calc_expression 在当前上下文求值，"
+            "让 AI 看到当前函数（而非仅全局变量）的局部状态。需已进入调试且配置 .axf。"
+        ),
+    )
+    async def read_locals() -> str:
+        try:
+            client = _get_client()
+            loc = _get_locator()
+            if not loc or not loc.is_ready():
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号）"})
+            regs = client.read_cpu_registers_stable()
+            if not regs.get("ok"):
+                return _js({"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "detail": regs})
+            pc = regs.get("pc")
+            if not isinstance(pc, int):
+                return _js({"ok": False, "error": "无法获取当前 PC"})
+            names = loc.local_variables(pc)
+            if names is None:
+                return _js({"ok": False, "pc": hex(pc), "error": "未从 .axf 定位到当前函数或变量信息"})
+            cur = loc.addr_to_location(pc)
+            out = {"ok": True, "pc": hex(pc)}
+            if cur:
+                out["file"] = cur["file"]
+                out["line"] = cur["line"]
+            vars_list = []
+            for name in names:
+                try:
+                    r = client.calc_expression(name)
+                    vars_list.append({"name": name, "ok": r.get("ok"),
+                                      "value_type": r.get("value_type"),
+                                      "value": r.get("value")})
+                except Exception as ex:  # noqa: BLE001
+                    vars_list.append({"name": name, "ok": False, "error": str(ex)})
+            out["locals"] = vars_list
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="run_to_line",
         title="运行到指定行",
         description=(
@@ -447,6 +545,32 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     async def run() -> str:
         try:
             return _js(_get_client().run())
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="run_timeout",
+        title="运行一段时间后自动暂停",
+        description=(
+            "让目标 MCU 全速运行 timeout_ms 毫秒后自动暂停，并返回停靠位置（文件行+源码+完整调用栈）。"
+            "用于验证时序 / 观察运行 N 毫秒后的状态。timeout_ms 默认 1000。"
+        ),
+    )
+    async def run_timeout(timeout_ms: int = 1000) -> str:
+        try:
+            client = _get_client()
+            t = max(1, int(timeout_ms))
+            r = client.run()
+            if not (r.get("ok") or r.get("status") == 22):
+                return _js({"ok": False, "error": f"运行失败: {r}"})
+            await asyncio.sleep(t / 1000.0)
+            client.stop()
+            info = _build_location(client)
+            out = {"ok": True, "action": "run_with_timeout", "timeout_ms": t}
+            out.update(r)
+            if info:
+                out.update(info)
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 

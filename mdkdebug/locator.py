@@ -160,3 +160,87 @@ class Locator:
             "line": line,
             "source": source,
         }
+
+
+    # ------------------------------------------------------------------
+    # 完整调用栈辅助 / 局部变量 / 漂移检测 / 代码地址判断
+    # ------------------------------------------------------------------
+    @staticmethod
+    def is_code_address(addr: int) -> bool:
+        """判断地址是否落在 FLASH 代码段（真实 PC / 返回地址所在区段）。"""
+        return 0x08000000 <= addr <= 0x081FFFFF
+
+    @property
+    def axf_mtime(self):
+        """.axf 文件最后修改时间（用于检测源码漂移）。"""
+        try:
+            return os.path.getmtime(self.axf_path)
+        except OSError:
+            return None
+
+    def source_stale(self, file: str):
+        """定位文件是否比 .axf 新（源码已改但未重编译）。返回 (bool, 绝对路径)。"""
+        if not file or file == "?":
+            return False, None
+        mt = self.axf_mtime
+        if mt is None:
+            return False, None
+        path = self.resolve_source_path(file)
+        if not path:
+            return False, None
+        try:
+            return os.path.getmtime(path) > mt, path
+        except OSError:
+            return False, None
+
+    def local_variables(self, pc: int):
+        """返回包含 pc 的函数内的 参数+局部变量名 列表（含嵌套块/内联函数）。
+
+        供调试时在当前上下文用 calc_expression 逐个求值。未定位到函数或无 .axf 返回 None。
+        """
+        self._ensure_loaded()
+        try:
+            with open(self.axf_path, "rb") as f:
+                elf = ELFFile(f)
+                if not elf.has_dwarf_info():
+                    return None
+                di = elf.get_dwarf_info()
+                all_names: list = []
+                for cu in di.iter_CUs():
+                    top = cu.get_top_DIE()
+                    for die in top.iter_children():
+                        if die.tag != "DW_TAG_subprogram":
+                            continue
+                        lo = die.attributes.get("DW_AT_low_pc")
+                        if lo is None:
+                            continue
+                        low = lo.value
+                        hi = die.attributes.get("DW_AT_high_pc")
+                        if hi is None:
+                            continue
+                        high = hi.value if hi.form == "DW_FORM_addr" else low + hi.value
+                        # 寄存器 PC 为去 Thumb bit 的值(如 0x8000d00)，而 DIE low_pc 常带 bit0(1)，
+                        # 故同时用 pc 与 pc|1 匹配范围，避免误判不在函数内
+                        if not (low <= pc <= high or low <= (pc | 1) <= high):
+                            continue
+                        self._collect_die_vars(die, all_names)
+                # 多个匹配 DIE(声明/内联/范围重叠)可能各自收集部分变量，合并去重保序
+                seen: set = set()
+                uniq = [n for n in all_names if not (n in seen or seen.add(n))]
+                return uniq or None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("解析局部变量失败: %s", e)
+            return None
+
+    def _collect_die_vars(self, die, names: list) -> None:
+        """递归收集 DIE 及其子块（lexical_block/内联）的参数与局部变量名。"""
+        for c in die.iter_children():
+            if c.tag in ("DW_TAG_formal_parameter", "DW_TAG_variable"):
+                nm = c.attributes.get("DW_AT_name")
+                if nm is not None:
+                    name = _decode_name(nm.value)
+                    if name and name not in names:
+                        names.append(name)
+            if c.tag in ("DW_TAG_lexical_block", "DW_TAG_subprogram",
+                         "DW_TAG_inlined_subroutine", "DW_TAG_catch_block"):
+                self._collect_die_vars(c, names)
