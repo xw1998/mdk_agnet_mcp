@@ -111,6 +111,15 @@ class MockUVSOCKServer:
         # DWT：CYCCNT 使能并跑一个值
         w32(self.sys, 0xE0000000, 0xE0001000 + 0x00, 0x00000001)      # CTRL
         w32(self.sys, 0xE0000000, 0xE0001000 + 0x04, 0x00001234)      # CYCCNT
+        # ITM：DEMCR.TRCENA + ITM->TCR(ITMENA|TSENA|SWOENA|SYNCENA)
+        #   + ITM->TER(Stimulus Port0 使能) + 一条预置 ITM 输出缓冲
+        # 注意 DEMCR 同时被 self.dwt["demcr"] 分支接管（_mem_read 0xE000EDFC），需同步
+        self.dwt["demcr"] = 0x01000000                              # DEMCR TRCENA
+        w32(self.sys, 0xE0000000, 0xE0000E80 + 0x00, 0x00400783)      # ITM->TCR: ITMENA|TSENA|SWOENA|bits5-10
+        w32(self.sys, 0xE0000000, 0xE0000E00 + 0x00, 0x00000001)      # ITM->TER port0
+        # 串口窗口缓冲（模拟 Debug(printf) Viewer 收到的 ITM 输出）
+        self.serial_buf = [bytearray(b'') for _ in range(4)]
+        self.serial_buf[0] = bytearray(b'Hello from ITM port0!\r\nSysTick tick 100\r\n')
 
     def start(self):
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -219,6 +228,12 @@ class MockUVSOCKServer:
         if cmd == uvsock.UV_DBG_EXEC_CMD:
             return self._exec_cmd(data)
 
+        if cmd == uvsock.UV_DBG_SERIAL_GET:
+            return self._serial_get(data)
+
+        if cmd == uvsock.UV_DBG_SERIAL_PUT:
+            return self._serial_put(data)
+
         # 未知命令
         return uvsock.UV_STATUS_NOT_SUPPORTED, b""
 
@@ -249,6 +264,29 @@ class MockUVSOCKServer:
             # 简单返回变量值（若命中预置变量）
             return uvsock.UV_STATUS_SUCCESS, b""
         return uvsock.UV_STATUS_PARSE_ERROR, b""
+
+    # ---- 串口 / ITM 缓冲 ----
+    def _serial_get(self, data):
+        """读取指定串口窗口缓冲。请求 data = port(4B 小端) + size(4B 小端)。"""
+        if len(data) < 8:
+            return uvsock.UV_STATUS_PARSE_ERROR, b""
+        port, size = struct.unpack('<II', data[:8])
+        if port >= len(self.serial_buf):
+            return uvsock.UV_STATUS_NOT_FOUND, b""
+        buf = self.serial_buf[port]
+        return uvsock.UV_STATUS_SUCCESS, bytes(buf[:size])
+
+    def _serial_put(self, data):
+        """写入串口窗口缓冲（模拟向目标串口/ITM 输入通道下发）。
+        请求 data = port(4B 小端) + 载荷字节。"""
+        if len(data) < 5:
+            return uvsock.UV_STATUS_PARSE_ERROR, b""
+        port = struct.unpack('<I', data[:4])[0]
+        if port >= len(self.serial_buf):
+            return uvsock.UV_STATUS_NOT_FOUND, b""
+        payload = data[4:]
+        self.serial_buf[port].extend(payload)
+        return uvsock.UV_STATUS_SUCCESS, b""
 
     # ---- 具体处理 ----
     def _calc_expression(self, data):

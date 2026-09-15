@@ -13,6 +13,7 @@ UVClient：高层封装 Keil UVSOCK 调试能力，并内置“连接缓存 + �
 from __future__ import annotations
 
 import logging
+import struct
 import threading
 import time
 
@@ -401,6 +402,51 @@ class UVClient:
         if extra:
             out.update(extra)
         return out
+
+    # ------------------------------------------------------------------
+    # 串口 / ITM（Instrumentation Trace Macrocell）数据读写
+    # ------------------------------------------------------------------
+    def serial_get(self, port: int = 0, size: int = 4096) -> dict:
+        """从 Keil 串口窗口读取数据（含 Debug(printf) Viewer / ITM 输出）。
+
+        经 UV_DBG_SERIAL_GET(0x2011) 拉取指定串口窗口当前缓冲内容。
+        port: 串口窗口编号（Keil 的 Serial Windows 序号，通常 0=UART#1，
+              Debug(printf) Viewer 对应其中一个编号）；size: 最多读取字节数。
+        返回 {ok, port, size, data_hex, ascii}。
+
+        注意：真实 ITM 输出需 Keil 已配置 Trace（Core Clock + Stimulus Port0）
+        且调试器 SWO 引脚已使能，否则读到的缓冲可能为空。
+        """
+        if size <= 0 or size > 65536:
+            return {"ok": False, "error": "size 需在 1~65536 之间", "size": size}
+        # 请求 data = 目标串口窗口号(4B 小端) + 期望字节数(4B 小端)
+        data = struct.pack('<II', port & 0xFFFFFFFF, size)
+        status, m_data = self._request(uvsock.UV_DBG_SERIAL_GET, data=data)
+        out = {"ok": status == uvsock.UV_STATUS_SUCCESS,
+               "status": status, "status_text": status_text(status),
+               "port": port, "size": size,
+               "data_hex": m_data.hex(), "ascii": self._to_ascii(m_data)}
+        if status != uvsock.UV_STATUS_SUCCESS:
+            out["data_hex"] = ""
+            out["ascii"] = ""
+        return out
+
+    def serial_put(self, port: int = 0, data: bytes = b'') -> dict:
+        """向 Keil 串口窗口写入数据（向目标仿真串口 / ITM 输入通道下发）。
+
+        经 UV_DBG_SERIAL_PUT(0x2012) 将字节写入指定串口窗口。
+        port: 串口窗口编号；data: 要写入的原始字节。
+        返回 {ok, port, written}。
+        """
+        if not data:
+            return {"ok": False, "error": "data 不能为空", "port": port}
+        if len(data) > 65536:
+            return {"ok": False, "error": "data 过长(>65536)", "port": port}
+        req = struct.pack('<I', port & 0xFFFFFFFF) + data
+        status, m_data = self._request(uvsock.UV_DBG_SERIAL_PUT, data=req)
+        return {"ok": status == uvsock.UV_STATUS_SUCCESS,
+                "status": status, "status_text": status_text(status),
+                "port": port, "written": len(data)}
 
     # ------------------------------------------------------------------
     # 工具

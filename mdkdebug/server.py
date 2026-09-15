@@ -1001,6 +1001,63 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
+    # ---------------- ITM / Debug(printf) Viewer trace ----------------
+    # ITM 寄存器（Cortex-M4）
+    _ITM_DEMCR = 0xE000EDFC   # bit24 TRCENA
+    _ITM_TCR = 0xE0000E80     # bit0 ITMENA, bit22 SWOENA, bit23 SYNCENA, bit1 TSENA, bits16-20 TraceBusID
+    _ITM_TER = 0xE0000E00     # 每 bit 一个 stimulus port（bit0 = Port0）
+    _ITM_TPR = 0xE0000E40     # 特权访问控制
+    _DWT_CTRL = 0xE0001000    # bit1 CYCCNTENA 等
+
+    @staticmethod
+    def _read_u32(client, addr: int):
+        r = client.read_mem(addr, 4)
+        if not r.get("ok"):
+            return None
+        return int.from_bytes(bytes.fromhex(r["data_hex"]), "little")
+
+    @server.tool(
+        name="itm_trace",
+        title="ITM / Debug(printf) Viewer trace",
+        description=(
+            "读取 Cortex-M ITM（Instrumentation Trace Macrocell）经 SWO 输出的调试打印数据，"
+            "即 Keil 的 Debug(printf) Viewer 缓冲内容，并检查 Trace 配置是否就绪。"
+            "参数 port=串口窗口编号（Debug(printf) Viewer 对应其中一个，默认 0）、"
+            "size=最多读取字节数(默认4096)。返回 {config, trace}：config 给出 DEMCR.TRCENA / "
+            "ITM->TCR / ITM->TER 的 Trace 使能诊断（判断为何收不到 ITM 打印）；trace 为拉取到的"
+            "缓冲文本。需已进入调试；真实 ITM 输出还要求 Keil 已配置 Trace(Core Clock + "
+            "Stimulus Port0) 且调试器(ST-Link/J-Link) SWO 引脚已连接。"
+        ),
+    )
+    async def itm_trace(port: int = 0, size: int = 4096) -> str:
+        try:
+            client = _get_client()
+            demcr = _read_u32(client, _ITM_DEMCR)
+            tcr = _read_u32(client, _ITM_TCR)
+            ter = _read_u32(client, _ITM_TER)
+            cfg = {"demcr": demcr, "tcr": tcr, "ter": ter}
+            cfg["trcena"] = bool(demcr is not None and (demcr & 0x01000000))
+            cfg["itmena"] = bool(tcr is not None and (tcr & 0x01))
+            cfg["swoena"] = bool(tcr is not None and (tcr & 0x00400000))
+            port0_en = bool(ter is not None and (ter & 0x01))
+            cfg["port0_en"] = port0_en
+            # Trace 就绪诊断
+            ready = cfg["trcena"] and cfg["itmena"] and cfg["swoena"] and port0_en
+            cfg["ready"] = ready
+            cfg["note"] = (
+                "Trace 已就绪，可接收 ITM 打印。" if ready else
+                "Trace 未完全就绪：请确认 Keil 已勾选 Trace 使能(Core Clock 正确、Stimulus Port0 已勾选)，"
+                "并确认调试器 SWO 引脚已连接，且程序已初始化 ITM(TCR.ITMENA=1)。"
+            )
+            # 拉取串口窗口缓冲
+            trace = client.serial_get(port=int(port), size=int(size))
+            out = {"ok": trace.get("ok"), "config": cfg, "trace": trace}
+            if trace.get("ok"):
+                out["text"] = trace.get("ascii", "")
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
     @server.tool(
         name="fault_report",
         title="HardFault / 异常现场定位",

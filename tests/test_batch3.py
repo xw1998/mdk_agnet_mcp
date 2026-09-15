@@ -127,6 +127,26 @@ async def main():
         d = load(r)
         check("未知外设报错并给可用列表", d.get("ok") is False and "可用" in d.get("error", ""), r[:300])
 
+        # ---- itm_trace：读 ITM/Debug(printf) Viewer 缓冲 + Trace 配置诊断 ----
+        need = {"itm_trace"}
+        check("itm_trace 工具已注册", need.issubset(names), sorted(need - names))
+        r = await call(server, "itm_trace", {"port": 0, "size": 200})
+        d = load(r)
+        check("itm_trace 返回 ok", d.get("ok") is True, r[:300])
+        cfg = d.get("config", {})
+        # mock 预置 DEMCR.TRCENA=1、ITM->TCR=0x782(ITMENA+SWOENA+SYNCENA)、TER=0x1(port0)
+        check("itm_trace config 含 trcena/itmena", cfg.get("trcena") is True and cfg.get("itmena") is True, str(cfg))
+        check("itm_trace config.ready=True", cfg.get("ready") is True, str(cfg))
+        # 拉取到预置的 ITM 输出
+        text = d.get("text", "")
+        check("itm_trace 读到 ITM 打印", "Hello from ITM" in text, repr(text))
+        check("itm_trace trace.ok=True", d.get("trace", {}).get("ok") is True, str(d.get("trace")))
+
+        # 非法 port 报错（mock 只有 0-3）
+        r = await call(server, "itm_trace", {"port": 9})
+        d = load(r)
+        check("itm_trace 非法 port 报错", d.get("ok") is False and "未找到" in str(d.get("trace", {}).get("status_text")), r[:300])
+
         print(f"\n批次3结果: {len(PASS)} 通过, {len(FAIL)} 失败")
         if FAIL:
             print("失败项:", FAIL)
