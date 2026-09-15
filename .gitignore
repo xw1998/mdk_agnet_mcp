@@ -26,3 +26,6 @@ Thumbs.db
 
 # 本地测试残留
 _build_test*.log
+
+# 本地开发经验文档（不上云端仓库）
+docs/
