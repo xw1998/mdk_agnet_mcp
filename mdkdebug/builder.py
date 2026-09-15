@@ -266,6 +266,17 @@ def _terminate_uvision(pid: int) -> None:
         pass
 
 
+def _wait_pids_settle(wait: float = 2.0) -> list[int]:
+    """强制终止后短暂轮询，等待 UV4 进程真正退出，避免返回时误报残留 PID。"""
+    import time as _time
+    deadline = _time.time() + wait
+    while _time.time() < deadline:
+        remain = _uv4_pids()
+        if not remain:
+            return []
+        _time.sleep(0.1)
+    return _uv4_pids()
+
 def close_uvision(force: bool = False, timeout: int = 10) -> dict:
     """关闭所有 Keil uVision 实例（AI 管理 Keil 开关的闭环，纯 ctypes 不依赖 taskkill）。
 
@@ -291,13 +302,13 @@ def close_uvision(force: bool = False, timeout: int = 10) -> dict:
             if remain:
                 for pid in remain:
                     _terminate_uvision(pid)
-                remain = _uv4_pids()
+                remain = _wait_pids_settle()
                 return {"ok": len(remain) == 0, "action": "关闭Keil",
                         "closed": len(before), "force_fallback": True, "remaining": remain}
             return {"ok": True, "action": "关闭Keil", "closed": len(before), "force": False}
         for pid in before:
             _terminate_uvision(pid)
-        remain = _uv4_pids()
+        remain = _wait_pids_settle()
         return {"ok": len(remain) == 0, "action": "关闭Keil",
                 "closed": len(before), "force": True, "remaining": remain}
     except Exception as e:  # noqa: BLE001
