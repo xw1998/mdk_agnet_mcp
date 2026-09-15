@@ -60,6 +60,15 @@ async def main():
         r = await call(server, "read_variable", {"name": "not_exist"})
         check("MCP read_variable 未知变量", '"ok": false' in r, r)
 
+        # 数组读取：sizeof + 逐元素 + 内存
+        r = await call(server, "read_variable", {"name": "arr", "count": 4})
+        check("MCP read_variable 数组 size", '"size_bytes": 32' in r, r)
+        check("MCP read_variable 数组元素", '"index": 1, "value": 20' in r, r)
+        check("MCP read_variable 数组元素[3]", '"index": 3, "value": 40' in r, r)
+        check("MCP read_variable 数组内存", '"memory_hex"' in r, r)
+        r = await call(server, "read_variable", {"name": "arr", "count": 8})
+        check("MCP read_variable 数组8元素", r.count('"index"') == 8, r)
+
         r = await call(server, "read_mem", {"addr": "0x20000000", "n_bytes": 4})
         check("MCP read_mem(hex地址)", '"ok": true' in r and '"data_hex"' in r, r)
 

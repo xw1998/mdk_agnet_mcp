@@ -151,7 +151,7 @@ python run_server.py --transport http --http-port 8300
 | `get_version` | 查询 UVSOCK 插件版本 | — |
 | `get_status` | 查询是否处于调试、目标是否运行、状态码 | — |
 | `calc_expression` | 计算并读取表达式 / 变量值 | `expr` |
-| `read_variable` | 按变量名查询变量地址与内容（值） | `name` |
+| `read_variable` | 按变量名查地址/值/大小，支持数组逐元素与整块内存 | `name`、`count` |
 | `read_mem` | 读取目标内存 | `addr`（`0x…` 或十进制）、`n_bytes` |
 | `write_mem` | 写入目标内存 | `addr`、`data_hex`（十六进制串，可带空格） |
 | `run` | 全速运行 | — |

@@ -9,6 +9,7 @@ Keil 环境做端到端联调测试。维护一块模拟内存和几个模拟变
 from __future__ import annotations
 
 import argparse
+import re
 import socket
 import struct
 import threading
@@ -30,11 +31,15 @@ class MockUVSOCKServer:
         struct.pack_into('<I', self.mem, base - 0x20000000 + 4, 0xDEADBEEF)   # uint
         struct.pack_into('<f', self.mem, base - 0x20000000 + 8, 3.14)          # float
         struct.pack_into('<H', self.mem, base - 0x20000000 + 12, 0xABCD)       # ushort
-        self.var_table = {
-            "v0": (uvsock.VTT_int, base, 4),
-            "v1": (uvsock.VTT_uint, base + 4, 4),
-            "v2": (uvsock.VTT_float, base + 8, 4),
-            "v3": (uvsock.VTT_ushort, base + 12, 2),
+        # 数组示例：arr 为 8 个 uint32，位于 base+16，共 32 字节
+        for i in range(8):
+            struct.pack_into('<I', self.mem, base - 0x20000000 + 16 + i * 4, 10 + i * 10)
+        self.var_table = {  # (vtype, addr, total_size, count, elem_size)
+            "v0": (uvsock.VTT_int, base, 4, 1, 4),
+            "v1": (uvsock.VTT_uint, base + 4, 4, 1, 4),
+            "v2": (uvsock.VTT_float, base + 8, 4, 1, 4),
+            "v3": (uvsock.VTT_ushort, base + 12, 2, 1, 2),
+            "arr": (uvsock.VTT_uint, base + 16, 32, 8, 4),
         }
         self.running = False
         self.debugging = False
@@ -188,24 +193,50 @@ class MockUVSOCKServer:
         # 解析 VSET：vType(4) + union(8) + nLen(4) + str
         nlen = struct.unpack('<i', data[12:16])[0]
         name = data[16:16 + nlen].decode("UTF-8", "replace").rstrip('\x00')
-        # 支持 &name 取地址（供 read_variable 用）
+
+        # &name 取地址（供 read_variable）
         if name.startswith("&"):
             varname = name[1:]
             if varname not in self.var_table:
                 return uvsock.UV_STATUS_PARSE_ERROR, b""
-            _, addr, _size = self.var_table[varname]
-            resp = struct.pack('<i', uvsock.VTT_uint) \
-                + struct.pack('<Q', addr) \
+            _, addr, _size, _c, _es = self.var_table[varname]
+            resp = struct.pack('<i', uvsock.VTT_uint)                 + struct.pack('<Q', addr)                 + struct.pack('<i', len(name)) + name.encode()
+            return uvsock.UV_STATUS_SUCCESS, resp
+
+        # sizeof(name) 返回字节大小
+        m = re.match(r"sizeof\((\w+)\)", name)
+        if m:
+            varname = m.group(1)
+            if varname not in self.var_table:
+                return uvsock.UV_STATUS_PARSE_ERROR, b""
+            _vt, _a, size, _c, _es = self.var_table[varname]
+            resp = struct.pack('<i', uvsock.VTT_uint)                 + struct.pack('<Q', size)                 + struct.pack('<i', len(name)) + name.encode()
+            return uvsock.UV_STATUS_SUCCESS, resp
+
+        # name[i] 数组元素
+        m = re.match(r"(\w+)\[(\d+)\]", name)
+        if m:
+            varname, idx = m.group(1), int(m.group(2))
+            if varname not in self.var_table:
+                return uvsock.UV_STATUS_PARSE_ERROR, b""
+            vtype, addr, _size, count, es = self.var_table[varname]
+            if idx < 0 or idx >= count:
+                return uvsock.UV_STATUS_PARSE_ERROR, b""
+            off = addr - 0x20000000 + idx * es
+            code = uvsock.VTT_TYPE_MAP[vtype]
+            val = struct.unpack_from(f'<{code}', self.mem, off)[0]
+            val_size = struct.calcsize(f'<{code}')
+            union = struct.pack(f'<{code}', val) + b'\x00' * (8 - val_size)
+            resp = struct.pack('<i', vtype) + union \
                 + struct.pack('<i', len(name)) + name.encode()
             return uvsock.UV_STATUS_SUCCESS, resp
+
         if name not in self.var_table:
             return uvsock.UV_STATUS_PARSE_ERROR, b""
-        vtype, addr, size = self.var_table[name]
+        vtype, addr, _size, _c, _es = self.var_table[name]
         off = addr - 0x20000000
         code = uvsock.VTT_TYPE_MAP[vtype]
         val = struct.unpack_from(f'<{code}', self.mem, off)[0]
-        # 返回 VSET：vType(4) + union(8) + nLen(4) + name
-        # union 8 字节按类型打包到前 val_size，其余补零
         val_size = struct.calcsize(f'<{code}')
         union = struct.pack(f'<{code}', val) + b'\x00' * (8 - val_size)
         resp = struct.pack('<i', vtype) + union \

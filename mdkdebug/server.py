@@ -130,15 +130,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="read_variable",
         title="按变量名查询变量地址与内容",
         description=(
-            "按变量名查询变量的内存地址与当前内容（值）。内部用 '&变量名' 取地址、"
-            "'变量名' 取值，AI 无需手写取地址表达式即可定位变量。"
-            "name 为变量名（如 'SData_UA'、'timer.sec'）；返回 {address, value, value_type}。"
-            "适合先查地址再配合 read_mem/write_mem 对变量内存做进一步读写。"
+            "按变量名查询变量的内存地址与当前内容（值），支持数组等类型。"
+            "内部用 '&变量名' 取地址、'变量名' 取值、'sizeof(变量名)' 取大小，"
+            "AI 无需手写取地址表达式即可定位变量。"
+            "name 为变量名（如 'SData_UA'、'timer.sec'、'arr'）；"
+            "count 可选：>0 时按数组逐元素读 name[0..count-1] 返回 elements；"
+            "返回 {address, value, value_type, size_bytes, elements, memory_hex}。"
+            "适合先查地址/数组内容，再配合 read_mem/write_mem 进一步读写。"
         ),
     )
-    async def read_variable(name: str) -> str:
+    async def read_variable(name: str, count: int = 0, read_memory: bool = True) -> str:
         try:
-            return _js(_get_client().read_variable(name))
+            return _js(_get_client().read_variable(name, count=int(count or 0),
+                                                  read_memory=bool(read_memory)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "name": str(name), "error": str(e)})
 

@@ -151,40 +151,71 @@ class UVClient:
             "value_raw": name,
         }
 
-    def read_variable(self, name: str) -> dict:
-        """按变量名查询其地址与内容（值）。
+    def read_variable(self, name: str, count: int = 0,
+                     read_memory: bool = True) -> dict:
+        """按变量名查询其地址与内容（值），支持数组等类型。
 
-        用 `&name` 取变量地址、`name` 取变量值，便于 AI 依变量名定位内存。
-        返回 {name, address(十六进制串), value, value_type}。
+        用 `&name` 取地址、`name` 取值，并尝试 `sizeof(name)` 获取字节大小。
+        - count>0：按数组读取 `name[0..count-1]`，返回各元素值（便于查看数组内容）；
+        - read_memory：结合基地址与 sizeof，用 read_mem 读出变量所在连续内存
+          （十六进制 + ASCII），覆盖结构体/大块数据查看。
+        返回 {name, address, value, value_type, size_bytes, elements, memory_hex, ascii}。
         """
         name = name.strip()
         if not name:
             return {"ok": False, "name": "", "error": "变量名不能为空"}
+
+        result: dict = {"ok": False, "name": name}
+
         # 地址：&name
         addr_r = self.calc_expression(f"&{name}")
-        if not addr_r.get("ok"):
-            return {
-                "ok": False, "name": name, "address": None, "value": None,
-                "message": "无法解析变量地址（变量不存在或未处于调试状态）",
-                "detail": addr_r,
-            }
-        address = addr_r.get("value")
+        address = addr_r.get("value") if addr_r.get("ok") else None
+        if addr_r.get("ok"):
+            result["address"] = hex(address) if isinstance(address, int) else address
+
         # 值：name
         val_r = self.calc_expression(name)
         if val_r.get("ok"):
+            result["value"] = val_r.get("value")
+            result["value_type"] = val_r.get("value_type")
+            result["value_raw"] = val_r.get("value_raw")
+
+        # 大小：sizeof(name)（尝试，失败忽略）
+        sz_r = self.calc_expression(f"sizeof({name})")
+        size_bytes = sz_r.get("value") if sz_r.get("ok") else None
+        if size_bytes is not None and isinstance(size_bytes, int):
+            result["size_bytes"] = size_bytes
+
+        # 数组元素：count>0 时逐个读 name[i]
+        if count and count > 0:
+            elements = []
+            for i in range(count):
+                e = self.calc_expression(f"{name}[{i}]")
+                if e.get("ok"):
+                    elements.append({"index": i, "value": e.get("value"),
+                                     "value_type": e.get("value_type")})
+                else:
+                    elements.append({"index": i, "error": "读取失败"})
+                    break
+            result["elements"] = elements
+
+        # 读取变量内存（基地址 + 大小均可得时）
+        if read_memory and isinstance(address, int) and size_bytes:
+            cap = min(size_bytes, 16 * 1024)  # 防超长
+            mem = self.read_mem(address, cap)
+            if mem.get("ok"):
+                result["memory_hex"] = mem.get("data_hex")
+                result["ascii"] = mem.get("ascii")
+
+        if not result.get("ok") and address is None and not val_r.get("ok"):
             return {
-                "ok": True, "name": name,
-                "address": hex(address) if isinstance(address, int) else address,
-                "value": val_r.get("value"),
-                "value_type": val_r.get("value_type"),
-                "value_raw": val_r.get("value_raw"),
+                "ok": False, "name": name,
+                "message": "无法解析变量（变量不存在或未处于调试状态）",
+                "detail": {"addr": addr_r, "value": val_r},
             }
-        return {
-            "ok": True, "name": name,
-            "address": hex(address) if isinstance(address, int) else address,
-            "value": None, "value_type": None,
-            "note": "变量存在（已取到地址），但未能读取其值",
-        }
+        result["ok"] = True
+        return result
+
 
     # ------------------------------------------------------------------
     # 内存读写
