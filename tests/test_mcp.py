@@ -124,6 +124,24 @@ async def main():
         r = await call(server, "exit_debug", {})
         check("MCP exit_debug", '"ok": true' in r, r)
 
+        # flash_debug 编译失败分支：不重开工程、不进调试（monkeypatch 编译失败）
+        import mdkdebug.server as _srv
+        _orig_close = _srv.builder.close_uvision
+        _orig_bf = _srv.builder.build_and_flash
+        _orig_launch = _srv.builder.launch_uvision
+        _srv.builder.close_uvision = lambda force=False, timeout=10: {"ok": True, "closed": 0}
+        _srv.builder.build_and_flash = lambda *a, **k: {"ok": False, "stage": "编译", "status_text": "编译未通过"}
+        _srv.builder.launch_uvision = lambda *a, **k: {"ok": True}
+        try:
+            r = await call(server, "flash_debug", {"project": "P.uvprojx"})
+            ok_fail = ('"stage": "编译烧录"' in r and '"ok": false' in r
+                       and "未重开工程进入调试" in r and "launch_uvision" not in r)
+            check("flash_debug 编译失败不重开不进调试", ok_fail, r)
+        finally:
+            _srv.builder.close_uvision = _orig_close
+            _srv.builder.build_and_flash = _orig_bf
+            _srv.builder.launch_uvision = _orig_launch
+
     finally:
         srv.stop()
 
