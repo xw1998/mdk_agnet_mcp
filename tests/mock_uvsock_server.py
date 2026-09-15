@@ -194,6 +194,17 @@ class MockUVSOCKServer:
         nlen = struct.unpack('<i', data[12:16])[0]
         name = data[16:16 + nlen].decode("UTF-8", "replace").rstrip('\x00')
 
+        # 寄存器表达式（供 read_cpu_registers/get_current_location/snapshot 定位）
+        reg_map = {"__currentPC()": 0x8000DB4, "PC": 0x8000DB4, "R15": 0x8000DB4,
+                   "__currentLR()": 0x8000DC4, "LR": 0x8000DC4, "R14": 0x8000DC4,
+                   "__currentSP()": 0x2002FF00, "SP": 0x2002FF00, "R13": 0x2002FF00}
+        if name in reg_map:
+            val = reg_map[name]
+            resp = struct.pack('<i', uvsock.VTT_uint) \
+                + struct.pack('<Q', val) \
+                + struct.pack('<i', len(name)) + name.encode()
+            return uvsock.UV_STATUS_SUCCESS, resp
+
         # &name 取地址（供 read_variable）
         if name.startswith("&"):
             varname = name[1:]

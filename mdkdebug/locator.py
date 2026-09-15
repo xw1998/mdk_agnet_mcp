@@ -244,3 +244,145 @@ class Locator:
             if c.tag in ("DW_TAG_lexical_block", "DW_TAG_subprogram",
                          "DW_TAG_inlined_subroutine", "DW_TAG_catch_block"):
                 self._collect_die_vars(c, names)
+
+    # --------------------------------------------------------------
+    # 结构体字段概览：按变量名解析 DWARF 结构体/联合体成员布局
+    # --------------------------------------------------------------
+    def _ref_die(self, die, attr_name: str):
+        """返回 die 的引用类属性 attr_name（如 'DW_AT_type'）指向的 DIE。
+
+        用 pyelftools 的 get_DIE_from_attribute(name)，其按 form 正确区分
+        DW_FORM_ref4（CU 内偏移，需加 cu_offset）与 DW_FORM_ref_addr（绝对偏移），
+        避免直接 get_DIE_from_refaddr 漏加偏移导致 typedef 被错解成 unsigned int。
+        """
+        if die is None or not attr_name:
+            return None
+        try:
+            return die.get_DIE_from_attribute(attr_name)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("解析类型引用失败 %s: %s", attr_name, e)
+            return None
+
+    def _type_info(self, dwarfinfo, die, depth: int = 0):
+        """从类型 DIE 提取 {type_name, kind, size}，处理 typedef/const/volatile 解引用。"""
+        if die is None or depth > 8:
+            return {"type_name": "?", "kind": None, "size": None}
+        tag = die.tag
+        nm = die.attributes.get("DW_AT_name")
+        name = _decode_name(nm.value) if nm is not None else None
+        size = die.attributes.get("DW_AT_byte_size")
+        sz = size.value if size is not None else None
+        # 解引用类型修饰（typedef/const/volatile/restrict/pointer 指向的引用）
+        if tag in ("DW_TAG_typedef", "DW_TAG_const_type",
+                   "DW_TAG_volatile_type", "DW_TAG_restrict_type",
+                   "DW_TAG_reference_type"):
+            t = die.attributes.get("DW_AT_type")
+            inner = self._type_info(dwarfinfo, self._ref_die(die, "DW_AT_type") if t else None,
+                                    depth + 1)
+            return {"type_name": name or inner.get("type_name"),
+                    "kind": inner.get("kind"), "size": sz or inner.get("size")}
+        # 指针固定 4 字节（Cortex-M 32 位）
+        if tag == "DW_TAG_pointer_type":
+            return {"type_name": (name or "*") + "*", "kind": "pointer", "size": 4}
+        # 数组/结构体/联合体若无显式 byte_size，尝试从数组维度/成员推断
+        if sz is None:
+            if tag == "DW_TAG_array_type":
+                et = die.attributes.get("DW_AT_type")
+                elem = self._type_info(dwarfinfo, self._ref_die(die, "DW_AT_type") if et else None,
+                                       depth + 1)
+                count = 1
+                for sub in die.iter_children():
+                    if sub.tag == "DW_TAG_subrange_type":
+                        ub = sub.attributes.get("DW_AT_upper_bound")
+                        lo = sub.attributes.get("DW_AT_lower_bound")
+                        lo_v = lo.value if lo is not None else 0
+                        if ub is not None:
+                            try:
+                                count *= (int(ub.value) - int(lo_v) + 1)
+                            except (TypeError, ValueError):
+                                pass
+                if elem.get("size"):
+                    sz = elem["size"] * max(1, count)
+        return {"type_name": name or tag.replace("DW_TAG_", ""),
+                "kind": tag.replace("DW_TAG_", ""), "size": sz}
+
+    def struct_members(self, var_name: str):
+        """按变量名解析其 DWARF 结构体/联合体类型与成员布局。
+
+        返回 {type, size_bytes, fields:[{name, offset, type, size}]}；
+        变量不存在 / 非结构体 / 无 DWARF 返回 None。供 server.read_struct 按偏移读各成员。
+        变量可为全局变量、局部变量或形式参数。DWARF 中同名符号可能有多个（如局部结构体变量与同名指针参数），
+        故对每个同名变量逐个尝试，取第一个能解到结构体的。
+        """
+        self._ensure_loaded()
+        try:
+            with open(self.axf_path, "rb") as f:
+                elf = ELFFile(f)
+                if not elf.has_dwarf_info():
+                    return None
+                dwarfinfo = elf.get_dwarf_info()
+                for cu in dwarfinfo.iter_CUs():
+                    for type_die in self._iter_var_type_dies(dwarfinfo, cu.get_top_DIE(), var_name):
+                        desc = self._describe_struct(dwarfinfo, type_die)
+                        if desc is not None:
+                            return desc
+        except Exception as e:  # noqa: BLE001
+            logger.warning("解析结构体成员失败 %s: %s", var_name, e)
+        return None
+
+    def _iter_var_type_dies(self, dwarfinfo, die, var_name: str, depth: int = 0):
+        """生成器：递归产出名为 var_name 的变量/参数的类型 DIE（同名可能有多个）。"""
+        if depth > 300:
+            return
+        nm = die.attributes.get("DW_AT_name")
+        if die.tag in ("DW_TAG_variable", "DW_TAG_formal_parameter") and nm is not None \
+                and _decode_name(nm.value) == var_name:
+            t = die.attributes.get("DW_AT_type")
+            if t is not None:
+                yield self._ref_die(die, "DW_AT_type")
+        for c in die.iter_children():
+            yield from self._iter_var_type_dies(dwarfinfo, c, var_name, depth + 1)
+
+    def _describe_struct(self, dwarfinfo, type_die):
+        """解析结构体/联合体 DIE 的成员布局。"""
+        if type_die is None:
+            return None
+        # typedef 指向的实际结构体
+        while type_die.tag in ("DW_TAG_typedef", "DW_TAG_const_type", "DW_TAG_volatile_type"):
+            t = type_die.attributes.get("DW_AT_type")
+            if t is None:
+                break
+            nxt = self._ref_die(type_die, "DW_AT_type")
+            if nxt is None:
+                break
+            type_die = nxt
+        if type_die is None or type_die.tag not in ("DW_TAG_structure_type", "DW_TAG_union_type",
+                                                    "DW_TAG_class_type"):
+            return None
+        nm = type_die.attributes.get("DW_AT_name")
+        sz = type_die.attributes.get("DW_AT_byte_size")
+        fields = []
+        for m in type_die.iter_children():
+            if m.tag != "DW_TAG_member":
+                continue
+            mname = m.attributes.get("DW_AT_name")
+            mt = m.attributes.get("DW_AT_type")
+            loc = m.attributes.get("DW_AT_data_member_location")
+            # data_member_location 可能是常量(字节偏移)或表达式(简化为取常量)
+            off = 0
+            if loc is not None:
+                lv = loc.value
+                off = int(lv) if isinstance(lv, (int, float)) else 0
+            mtype_die = self._ref_die(m, "DW_AT_type") if mt else None
+            tinfo = self._type_info(dwarfinfo, mtype_die) if mtype_die else {}
+            fields.append({
+                "name": _decode_name(mname.value) if mname is not None else "?",
+                "offset": off,
+                "type": tinfo.get("type_name", "?"),
+                "size": tinfo.get("size"),
+            })
+        return {
+            "type": _decode_name(nm.value) if nm is not None else "struct",
+            "size_bytes": sz.value if sz is not None else None,
+            "fields": fields,
+        }

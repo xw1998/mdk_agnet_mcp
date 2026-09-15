@@ -38,6 +38,7 @@ _builder_cfg = {"uv4": None, "default_project": None}
 # 符号定位配置（.axf 路径与 Locator 实例）
 _symbol_cfg = {"locator": None, "axf": None}
 _breakpoints: list = []  # 内部断点记录（expr/address/file/line），因 BL 输出不经 socket 回传
+_watchpoints: list = []  # 内部数据断点（watchpoint）记录
 
 def _resolve_axf(uvprojx_path: str | None) -> str | None:
     """从 .uvprojx 推断 .axf 路径（解析 OutputDirectory/OutputName）。"""
@@ -101,6 +102,31 @@ def _parse_addr(s: str | int) -> int:
     if s.lower().startswith("0o"):
         return int(s, 8)
     return int(s, 10)
+
+
+def _fmt_field(raw: bytes, tname: str):
+    """把结构体成员原始字节格式化为友好值。返回 {hex, int(可选), float(可选), ascii(可选)}。"""
+    import struct as _struct
+    n = len(raw)
+    t = (tname or "").lower()
+    out = {"hex": raw.hex()}
+    if n in (4, 8) and ("float" in t or "double" in t):
+        try:
+            out["float"] = _struct.unpack("<f" if n == 4 else "<d", raw[:n])[0]
+            return out
+        except Exception:  # noqa: BLE001
+            pass
+    if n in (1, 2, 4, 8):
+        v = int.from_bytes(raw[:n], "little", signed=False)
+        out["int"] = v
+        out["hex_int"] = f"0x{v:x}"
+    elif n >= 4:
+        v = int.from_bytes(raw[:4], "little", signed=False)
+        out["int"] = v
+        out["hex_int"] = f"0x{v:x}"
+    if n and all(0x20 <= b < 0x7f for b in raw):
+        out["ascii"] = raw.decode("ascii", errors="replace")
+    return out
 
 
 def _backtrace(client, loc, pc, lr, sp, max_frames: int = 16, stack_bytes: int = 1024) -> list:
@@ -401,6 +427,88 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "expr": expr, "error": str(e)})
 
     @server.tool(
+        name="set_watchpoint",
+        title="设置数据断点（访问断点）",
+        description=(
+            "设置数据/访问断点：当指定地址被 读取/写入/读写 时目标运行自动暂停。"
+            "用于定位'谁在何时改坏了某变量/内存'。expr 为变量名（如 'test_array'）或地址（如 '0x20000000'）；"
+            "access 取 read/write/readwrite，默认 write；count 为触发次数（默认1）。"
+            "返回设断地址与 文件:行。命中后可用 get_current_location/snapshot 看是谁改的。需已进入调试。"
+        ),
+    )
+    async def set_watchpoint(expr: str, access: str = "write", count: int = 1) -> str:
+        try:
+            client = _get_client()
+            e = (expr or "").strip()
+            acc = (access or "write").lower()
+            acc_map = {"read": "READ", "write": "WRITE", "rw": "READWRITE",
+                       "wr": "READWRITE", "readwrite": "READWRITE"}
+            if acc not in acc_map:
+                return _js({"ok": False, "expr": expr, "access": access,
+                            "error": "access 须为 read / write / readwrite"})
+            acc_up = acc_map[acc]
+            # 解析目标地址：0x 直接取，变量名先 & 取址（避开 BS 命令后连接被污染的坑）
+            addr = None
+            if e.lower().startswith("0x"):
+                try:
+                    addr = int(e, 16)
+                except ValueError:
+                    addr = None
+            else:
+                ar = client.calc_expression(f"&{e}")
+                if ar.get("ok") and isinstance(ar.get("value"), int):
+                    addr = ar["value"]
+            if addr is None:
+                return _js({"ok": False, "expr": expr,
+                            "error": "无法解析目标地址（变量不存在或未处于调试状态）"})
+            cmd = f"BS {acc_up} 0x{addr:x}"
+            r = client.exec_command(cmd)
+            out = {"ok": r.get("ok"), "expr": expr, "address": hex(addr),
+                   "access": acc, "count": count, "command": cmd}
+            if not r.get("ok"):
+                out["error"] = f"设置数据断点失败: {r}"
+                return _js(out)
+            loc = _get_locator()
+            l = loc.addr_to_location(addr) if loc else None
+            if l:
+                out["file"] = l["file"]
+                out["line"] = l["line"]
+            _watchpoints.append({"expr": expr, "address": hex(addr), "access": acc,
+                                 "count": count, "file": out.get("file"),
+                                 "line": out.get("line")})
+            out["message"] = f"已设置{acc}数据断点，命中即暂停"
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "expr": expr, "error": str(e)})
+
+    @server.tool(
+        name="clear_watchpoint",
+        title="清除数据断点",
+        description="清除指定地址/变量的数据断点（命令窗口 BK）。expr 为变量名或 0x 地址。",
+    )
+    async def clear_watchpoint(expr: str) -> str:
+        try:
+            client = _get_client()
+            e = (expr or "").strip()
+            r = client.exec_command(f"BK {e}")
+            _watchpoints[:] = [w for w in _watchpoints
+                               if w.get("expr") != e and w.get("address") != e]
+            return _js(r)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "expr": expr, "error": str(e)})
+
+    @server.tool(
+        name="list_watchpoints",
+        title="列出数据断点",
+        description="列出本服务设置的内部数据断点记录（命令窗口 BL 对数据断点输出不经 socket 回传）。",
+    )
+    async def list_watchpoints() -> str:
+        try:
+            return _js({"ok": True, "watchpoints": list(_watchpoints)})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="clear_breakpoint",
         title="清除断点",
         description="清除指定符号或断点编号处的断点（命令窗口 BK）。",
@@ -485,6 +593,145 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 except Exception as ex:  # noqa: BLE001
                     vars_list.append({"name": name, "ok": False, "error": str(ex)})
             out["locals"] = vars_list
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="snapshot",
+        title="获取调试状态快照",
+        description=(
+            "一次返回当前调试位置的全貌：PC、文件:行、源码上下文、完整调用栈、当前函数局部变量，"
+            "以及指定的全局变量（globals 参数传入变量名列表）。AI 排查问题时一次调用即可获得完整画面，"
+            "避免多次 get_current_location/read_locals/read_variable 往返。globals 可选，"
+            "如 ['SystemCoreClock','test_array']。需已进入调试且配置 .axf。"
+        ),
+    )
+    async def snapshot(globals: list = None, source_context: int = 4) -> str:
+        try:
+            client = _get_client()
+            loc = _get_locator()
+            if not loc or not loc.is_ready():
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号）"})
+            info = _build_location(client)
+            if info is None:
+                return _js({"ok": False, "error": "无法构建位置信息"})
+            out = {"ok": True, "pc": info.get("pc"),
+                   "file": info.get("file"), "line": info.get("line"),
+                   "address": info.get("address"),
+                   "source": info.get("source"), "display_path": info.get("display_path"),
+                   "callstack": info.get("callstack")}
+            if info.get("warning"):
+                out["warning"] = info["warning"]
+            if info.get("hit_breakpoint"):
+                out["hit_breakpoint"] = info["hit_breakpoint"]
+            regs = info.get("registers") or {}
+            pc = regs.get("pc")
+            # 当前函数局部变量
+            if isinstance(pc, int):
+                names = loc.local_variables(pc)
+                if names:
+                    out["locals"] = []
+                    for name in names:
+                        try:
+                            r = client.calc_expression(name)
+                            out["locals"].append({"name": name, "ok": r.get("ok"),
+                                                  "value_type": r.get("value_type"),
+                                                  "value": r.get("value")})
+                        except Exception as ex:  # noqa: BLE001
+                            out["locals"].append({"name": name, "ok": False, "error": str(ex)})
+            # 指定全局变量
+            if globals:
+                out["globals"] = []
+                for g in globals:
+                    try:
+                        r = client.read_variable(str(g), read_memory=False)
+                        out["globals"].append({"name": str(g), "ok": r.get("ok"),
+                                               "value_type": r.get("value_type"),
+                                               "value": r.get("value"),
+                                               "address": r.get("address")})
+                    except Exception as ex:  # noqa: BLE001
+                        out["globals"].append({"name": str(g), "ok": False, "error": str(ex)})
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="watch",
+        title="批量读取表达式",
+        description=(
+            "一次求值多个表达式（变量/寄存器/指针解引用等）并返回结果，减少往返调用。"
+            "expressions 为表达式列表，如 ['SystemCoreClock','timer.sec','*(uint32_t*)0x20000000']。"
+            "需已进入调试状态。"
+        ),
+    )
+    async def watch(expressions: list) -> str:
+        try:
+            client = _get_client()
+            if not expressions:
+                return _js({"ok": False, "error": "expressions 不能为空"})
+            results = []
+            for expr in expressions:
+                try:
+                    r = client.calc_expression(str(expr))
+                    results.append({"expression": str(expr), "ok": r.get("ok"),
+                                    "value_type": r.get("value_type"),
+                                    "value": r.get("value")})
+                except Exception as ex:  # noqa: BLE001
+                    results.append({"expression": str(expr), "ok": False, "error": str(ex)})
+            return _js({"ok": True, "results": results})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="read_struct",
+        title="读取结构体/联合体字段概览",
+        description=(
+            "按变量名读取一个结构体（或联合体）变量，解析其 DWARF 成员布局（成员名/偏移/类型/大小），"
+            "并逐个读出每个成员当前值，供 AI 查看外设配置、数据包等复杂结构体的字段级内容。"
+            "name 为全局结构体变量名（如 'hUart1'、'timHandle'）。需已进入调试且配置 .axf。"
+        ),
+    )
+    async def read_struct(name: str, max_fields: int = 64) -> str:
+        try:
+            client = _get_client()
+            loc = _get_locator()
+            if not loc or not loc.is_ready():
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号）"})
+            ar = client.calc_expression(f"&{name}")
+            vr = client.calc_expression(name)
+            base = ar.get("value") if (ar.get("ok") and isinstance(ar.get("value"), int)) else None
+            info = loc.struct_members(name)
+            out = {"ok": True, "name": name}
+            if base is not None:
+                out["address"] = hex(base)
+            if vr.get("ok"):
+                out["value_type"] = vr.get("value_type")
+            if not info:
+                out["error"] = ("未从 .axf(DWARF) 解析到结构体字段（变量可能非结构体、已优化或无调试信息）。"
+                                "可用 read_variable 读原始内存。")
+                if vr.get("ok"):
+                    out["value"] = vr.get("value")
+                return _js(out)
+            out["struct_type"] = info["type"]
+            out["size_bytes"] = info["size_bytes"]
+            fields = []
+            for fd in info.get("fields", [])[:max_fields]:
+                off = fd.get("offset", 0)
+                sz = fd.get("size") or 4
+                field_val = None
+                if base is not None:
+                    try:
+                        r = client.read_mem(base + off, sz)
+                        dh = r.get("data_hex") or ""
+                        raw = bytes.fromhex("".join(dh.split())) if dh else b""
+                        if raw:
+                            field_val = _fmt_field(raw, fd.get("type", ""))
+                    except Exception as ex:  # noqa: BLE001
+                        field_val = {"error": str(ex)}
+                fields.append({"name": fd.get("name"), "offset": off,
+                               "type": fd.get("type"), "size": sz, "value": field_val})
+            out["fields"] = fields
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
