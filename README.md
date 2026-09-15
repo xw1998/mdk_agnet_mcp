@@ -106,10 +106,16 @@ AI 客户端通过 MCP 协议把用户/模型意图转成工具调用；`mdkdebu
 | `pyelftools` | ≥ 0.30（验证于 0.33） | 解析 `.axf` 调试符号，供 `get_current_location` / `run_to_line` / 断点位置定位使用 |
 | `capstone` | ≥ 5.0（验证于 5.0.9） | Thumb 反汇编，供 `disassemble` / `diagnose` 使用 |
 
-安装：
+安装（两种方式任选其一）：
 
 ```bash
+# 方式一：仅装依赖，从源码运行
 pip install -r requirements.txt
+python run_server.py
+
+# 方式二：打包安装（推荐，可执行 mdkdebug 命令）
+pip install -e .
+mdkdebug --version
 ```
 
 > 注：`mcp 2.x` 中 `FastMCP` 已改名为 `MCPServer`（`from mcp.server.mcpserver import MCPServer`），
@@ -119,11 +125,13 @@ pip install -r requirements.txt
 
 ```
 mdk_agent/
-├── run_server.py             # MCP Server 启动入口（stdio / http）
+├── run_server.py             # 启动入口薄壳（转发到 mdkdebug.cli）
+├── pyproject.toml            # 打包配置（pip install -e .）
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.1.0）
+│   ├── __init__.py           # 包初始化（版本号 0.2.0）
+│   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
 │   ├── client.py             # UVClient：调试能力封装 + 连接缓存
