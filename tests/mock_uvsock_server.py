@@ -64,6 +64,10 @@ class MockUVSOCKServer:
         # SCB 异常寄存器（供 fault_report）：模拟 HardFault + FORCED + 除零
         self.scb = {"icsr": 0x3, "cfsr": 0x2000000, "hfsr": 0x40000000,
                     "mmfar": 0, "bfar": 0}
+        # 外设寄存器内存（供 read_peripheral）：0x40000000 段与 0xE0000000 段
+        self.periph = bytearray(0x100000)      # 0x40000000 - 0x400FFFFF
+        self.sys = bytearray(0x20000)          # 0xE0000000 - 0xE001FFFF (SysTick/NVIC/SCB/...)
+        self._init_periph_regs()
         # 在 0x20000040 预置一段异常栈帧（R0,R1,R2,R3,R12,LR,PC,xPSR 自低地址到高）
         fbase = 0x20000040 - 0x20000000
         for i, v in enumerate([0x11, 0x22, 0x33, 0x44, 0x55,
@@ -77,6 +81,36 @@ class MockUVSOCKServer:
         self.sock.bind((host, port))
         self.sock.listen(1)
         self._thread = None
+
+    def _init_periph_regs(self):
+        """预置少量外设寄存器值，供 read_peripheral 联调。
+        段内偏移 = 目标地址 - 段基址（0x40000000 / 0xE0000000）。"""
+        def w32(buf, segbase, addr, val):
+            struct.pack_into('<I', buf, addr - segbase, val & 0xFFFFFFFF)
+        # RCC：AHB1ENR 使能 GPIOA/B，APB2ENR 使能 TIM1，APB1ENR 使能 TIM2
+        w32(self.periph, 0x40000000, 0x40023800 + 0x30, 0x00000003)   # AHB1ENR
+        w32(self.periph, 0x40000000, 0x40023800 + 0x44, 0x00000001)   # APB2ENR
+        w32(self.periph, 0x40000000, 0x40023800 + 0x40, 0x00000001)   # APB1ENR
+        # GPIOA：MODER 全为输出(0x55..)、ODR 高、IDR 低
+        w32(self.periph, 0x40000000, 0x40020000 + 0x00, 0x55555555)   # MODER
+        w32(self.periph, 0x40000000, 0x40020000 + 0x14, 0x0000FFFF)   # ODR
+        w32(self.periph, 0x40000000, 0x40020000 + 0x10, 0x00000000)   # IDR
+        # USART1：BRR、CR1=UE|TE|RE
+        w32(self.periph, 0x40000000, 0x40011000 + 0x08, 0x00000111)   # BRR
+        w32(self.periph, 0x40000000, 0x40011000 + 0x0C, 0x0000200D)   # CR1
+        # TIM2：PSC=0x0F、ARR=0xFFFF、CNT=0x1000
+        w32(self.periph, 0x40000000, 0x40000000 + 0x28, 0x0000000F)   # PSC
+        w32(self.periph, 0x40000000, 0x40000000 + 0x2C, 0x0000FFFF)   # ARR
+        w32(self.periph, 0x40000000, 0x40000000 + 0x24, 0x00001000)   # CNT
+        # SCB：AIRCR 带 VECTKEY + PRIGROUP
+        w32(self.sys, 0xE0000000, 0xE000ED00 + 0x0C, 0xFA050000)
+        # SysTick：CTRL=ENABLE|CLKSOURCE、LOAD=0xFF、VAL=0x80
+        w32(self.sys, 0xE0000000, 0xE000E010 + 0x00, 0x00000007)      # CTRL
+        w32(self.sys, 0xE0000000, 0xE000E010 + 0x04, 0x000000FF)      # LOAD
+        w32(self.sys, 0xE0000000, 0xE000E010 + 0x08, 0x00000080)      # VAL
+        # DWT：CYCCNT 使能并跑一个值
+        w32(self.sys, 0xE0000000, 0xE0001000 + 0x00, 0x00000001)      # CTRL
+        w32(self.sys, 0xE0000000, 0xE0001000 + 0x04, 0x00001234)      # CYCCNT
 
     def start(self):
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -306,6 +340,12 @@ class MockUVSOCKServer:
             key = {0xE000ED04: "icsr", 0xE000ED28: "cfsr", 0xE000ED2C: "hfsr",
                    0xE000ED34: "mmfar", 0xE000ED38: "bfar"}[nAddr]
             payload = struct.pack('<I', self.scb[key] & 0xFFFFFFFF)
+        elif 0x40000000 <= nAddr < 0x40000000 + len(self.periph):  # 外设段
+            off = nAddr - 0x40000000
+            payload = bytes(self.periph[off:off + nBytes])
+        elif 0xE0000000 <= nAddr < 0xE0000000 + len(self.sys):  # 系统外设段
+            off = nAddr - 0xE0000000
+            payload = bytes(self.sys[off:off + nBytes])
         if not payload:
             return uvsock.UV_STATUS_NO_MEM_ACCESS, b""
         resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0) + payload
@@ -317,6 +357,14 @@ class MockUVSOCKServer:
         if nAddr in (0xE000EDFC, 0xE0001000, 0xE0001004):  # DWT/SCS 调试寄存器
             key = {0xE000EDFC: "demcr", 0xE0001000: "ctrl", 0xE0001004: "cyccnt"}[nAddr]
             self.dwt[key] = struct.unpack('<I', payload[:4])[0]
+            resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
+            return uvsock.UV_STATUS_SUCCESS, resp
+        if 0x40000000 <= nAddr < 0x40000000 + len(self.periph):
+            self.periph[nAddr - 0x40000000: nAddr - 0x40000000 + len(payload)] = payload
+            resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
+            return uvsock.UV_STATUS_SUCCESS, resp
+        if 0xE0000000 <= nAddr < 0xE0000000 + len(self.sys):
+            self.sys[nAddr - 0xE0000000: nAddr - 0xE0000000 + len(payload)] = payload
             resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
             return uvsock.UV_STATUS_SUCCESS, resp
         off = nAddr - 0x20000000

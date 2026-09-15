@@ -29,6 +29,7 @@ from mcp.server.mcpserver import MCPServer
 from .client import UVClient, UVSOCKConnectError
 from .locator import Locator
 from . import builder, __version__
+from .periph import list_peripherals as _periph_list, get_peripheral as _periph_get
 
 logger = logging.getLogger("mdkdebug.server")
 
@@ -1517,6 +1518,68 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             })
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
+
+    @staticmethod
+    def _periph_read_u32(client, addr: int):
+        """按小端解析读取外设寄存器 32 位值，失败返回 None。"""
+        r = client.read_mem(addr, 4)
+        if not r.get("ok"):
+            return None
+        return int.from_bytes(bytes.fromhex(r["data_hex"]), "little")
+
+    @server.tool(
+        name="list_peripherals",
+        title="列出可用外设寄存器表",
+        description=(
+            "列出 mdkdebug 内置的 STM32F4 常用外设（RCC/GPIOA-H/USART/SPI/I2C/TIM/ADC/"
+            "PWR/FLASH/SysTick/SCB/NVIC/DWT/EXTI/SYSCFG 等）及基址，供 read_peripheral 使用。"
+        ),
+    )
+    async def list_peripherals() -> str:
+        return _js({"ok": True, "count": len(_periph_list()), "peripherals": _periph_list()})
+
+    @server.tool(
+        name="read_peripheral",
+        title="读取外设寄存器组（SFR）",
+        description=(
+            "一键读取指定外设（如 RCC/GPIOA/USART1/SPI1/I2C1/TIM2/ADC1/SCB/SysTick）的全部寄存器当前值，"
+            "并解析关键位域（时钟使能/波特率/GPIO 模式/定时器计数等）。"
+            "排查时钟没使能、GPIO 模式配置错误、串口波特率不对、定时器计数是否跑起来等场景。"
+            "需已进入调试状态。periph 为外设名（大小写不敏感）。"
+        ),
+    )
+    async def read_peripheral(periph: str) -> str:
+        try:
+            client = _get_client()
+            p = _periph_get(periph)
+            if not p:
+                avail = ", ".join(x["name"] for x in _periph_list())
+                return _js({"ok": False, "error": f"未知外设 {periph}，可用: {avail}"})
+            regs: list = []
+            for name, rdef in p["regs"].items():
+                addr = p["base"] + rdef["off"]
+                val = _periph_read_u32(client, addr)
+                if val is None:
+                    regs.append({"reg": name, "addr": f"0x{addr:X}", "value": None})
+                    continue
+                entry = {"reg": name, "addr": f"0x{addr:X}", "value": f"0x{val:08X}", "raw": val}
+                # 关键位域解读
+                bits = []
+                for fname, lsb, width, enum in rdef.get("fields", []):
+                    fval = (val >> lsb) & ((1 << width) - 1)
+                    item = {"name": fname, "bits": f"{lsb}+{width}", "value": fval}
+                    if enum is not None:
+                        desc = enum.get(fval)
+                        if desc is not None:
+                            item["desc"] = desc
+                    bits.append(item)
+                if bits:
+                    entry["fields"] = bits
+                regs.append(entry)
+            return _js({"ok": True, "peripheral": p["name"], "base": f"0x{p['base']:08X}",
+                        "desc": p["desc"], "reg_count": len(regs), "regs": regs})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "periph": periph, "error": str(e)})
 
     return server
 
