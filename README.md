@@ -1,5 +1,7 @@
 # Mdkdebug —— 可被 AI 工具调用的 Keil uVision 调试服务
 
+> **你只要把线接好，剩下的交给 AI。**
+
 通过 **UVSOCK/TCP** 协议连接 Keil uVision 调试器，以 **MCP（Model Context Protocol）Server**
 形式，向 Claude、灵犀等 AI 工具暴露嵌入式在线调试能力：读变量 / 表达式、读写目标内存、
 运行控制（运行 / 暂停 / 复位 / 单步）、断点管理，以及自动进入 / 退出调试模式。

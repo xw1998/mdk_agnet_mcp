@@ -43,6 +43,9 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+/* 测试数组：用于真机验证 read_variable 按变量名读取数组元素与整块内存 */
+volatile uint32_t test_array[8] = {0x11111111, 0x22222222, 0x33333333, 0x44444444,
+                                   0x55555555, 0x66666666, 0x77777777, 0x88888888};
 
 /* USER CODE END PV */
 
@@ -95,6 +98,7 @@ int main(void)
   while (1)
   {
 	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+	  (void)test_array[0];
 	  HAL_Delay(500);
 	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
 	  HAL_Delay(500);
