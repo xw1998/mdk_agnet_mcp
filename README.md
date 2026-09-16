@@ -276,6 +276,24 @@ python run_server.py --transport http --http-port 8300
 ```
 
 > 请将示例中的绝对路径替换为你的工程实际路径。
+#### 注入自定义符号工程
+
+可切换的符号工程（供 `list_symbol_projects` 列表、配合 `set_symbol_file` 切换）默认仅含仓库内置的
+`mdk_test`（路径相对仓库根自动推导，`clone` 后编译出 `.axf` 即自动可用，不写死本机绝对路径）。
+本机或仓库外工程的符号文件**无需改代码**，用以下任一方式追加注入：
+
+- **启动参数**（可多次指定）：
+  `--symbol-project 名字:.axf路径:.map路径:flash起始16进制:flash大小16进制`
+- **环境变量** `MDKDEBUG_SYMBOL_PROJECTS`（JSON 数组，`flash_start`/`flash_size` 为十进制整数）：
+  ```json
+  [{"name":"myproj","axf":"D:/board/out.axf","map":"D:/board/out.map","flash_start":134217728,"flash_size":1048576}]
+  ```
+
+示例（同时保留内置 mdk_test，并追加一个本机工程）：
+
+```bash
+python run_server.py --symbol-project myboard:D:/board/out.axf:D:/board/out.map:0x08000000:0x100000
+```
 
 ## 对接真实 Keil
 
