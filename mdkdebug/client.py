@@ -457,10 +457,13 @@ class UVClient:
     # 运行控制
     # ------------------------------------------------------------------
     def run(self) -> dict:
-        return self._control(uvsock.UV_DBG_START_EXECUTION, "运行")
+        return self._control(uvsock.UV_DBG_START_EXECUTION, "运行",
+                             accept=(uvsock.UV_STATUS_TARGET_EXECUTING,))
 
     def stop(self) -> dict:
-        return self._control(uvsock.UV_DBG_STOP_EXECUTION, "暂停")
+        return self._control(uvsock.UV_DBG_STOP_EXECUTION, "暂停",
+                             accept=(uvsock.UV_STATUS_TARGET_EXECUTING,
+                                     uvsock.UV_STATUS_TARGET_STOPPED))
 
     def reset(self) -> dict:
         """复位目标。
@@ -482,22 +485,27 @@ class UVClient:
         if not running:
             return out
         last = out
-        for _ in range(2):
+        for _ in range(3):
             stopped = self.stop()
-            if not stopped.get("ok"):
-                last["note"] = ("目标处于运行状态且自动暂停失败，复位未执行；"
-                                "可显式调用 stop 后再 reset。")
-                last["auto_stop"] = stopped
-                return last
-            # stop 异步生效：等目标真正停下（或以超时兜底）再复位，
-            # 否则紧接着的复位仍会被 Keil 以 status=11 拒绝（真机实测）。
+            # stop 的响应状态可能滞后（真机实测会返回 status=11），不能据此判失败，
+            # 改为轮询 get_status 确认目标是否真正停下；且 stop 异步生效，
+            # 未停下就复位仍会被 Keil 以 status=11 拒绝。
+            halted = False
             for _ in range(20):
                 try:
-                    if not self.get_status().get("running"):
-                        break
+                    st = self.get_status()
                 except Exception:  # noqa: BLE001
+                    halted = True
+                    break
+                if not st.get("running"):
+                    halted = True
                     break
                 time.sleep(0.05)
+            if not halted:
+                last["note"] = ("目标处于运行状态，已尝试暂停但仍未停下，复位未执行；"
+                                "可稍后重试或显式调用 stop 后再 reset。")
+                last["auto_stop"] = stopped
+                return last
             retry = self._control(uvsock.UV_DBG_RESET, "复位")
             if retry.get("ok"):
                 retry["auto_stopped"] = True
@@ -522,11 +530,21 @@ class UVClient:
             return {"status": uvsock.UV_STATUS_INVALID_NAME, "ok": False,
                     "status_text": f"不支持的 step 模式: {mode}",
                     "mode": mode}
-        return self._control(cmd_map[mode], f"单步({mode})", extra={"mode": mode})
+        return self._control(cmd_map[mode], f"单步({mode})", extra={"mode": mode},
+                             accept=(uvsock.UV_STATUS_TARGET_EXECUTING,
+                                     uvsock.UV_STATUS_TARGET_STOPPED))
 
-    def _control(self, cmd_code: int, label: str, extra: dict | None = None) -> dict:
+    def _control(self, cmd_code: int, label: str, extra: dict | None = None,
+                 accept: tuple = ()) -> dict:
+        """执行运行控制命令。
+
+        accept 为"除 status=0 外同样表示命令已生效"的状态码集合：真实 Keil 对
+        run/stop/step 常回带目标当前状态码（11=正在运行 / 12=已停止），此时命令
+        其实已经生效，不应判成失败（真机实测：step over 返回 12 且带完整停靠位置）。
+        """
         status, m_data = self._request(cmd_code)
-        out = {"status": status, "ok": status == UV_STATUS_SUCCESS,
+        ok = status == UV_STATUS_SUCCESS or status in accept
+        out = {"status": status, "ok": ok,
                "status_text": status_text(status), "action": label}
         if extra:
             out.update(extra)
