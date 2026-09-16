@@ -640,6 +640,56 @@ def _build_location(client):
     return result
 
 
+def _near_function_entry(pc, meta: dict | None, window: int = 16) -> bool:
+    """当前 PC 是否位于函数入口 window 字节内（prologue 阶段，DWARF 位置常未就绪）。"""
+    if not meta or meta.get("low_pc") is None or not isinstance(pc, int):
+        return False
+    low = meta["low_pc"] & ~1
+    return 0 <= (pc & ~1) - low <= window
+
+
+def _aapcs_param_fallback(client, idx, regs: dict | None = None):
+    """函数入口处按 AAPCS 回退读取参数：前 4 个在 R0-R3，第 5 个起在栈上。
+
+    仅由 read_locals 在"表达式求值取不到有效值(失败或 0) + PC 位于函数入口"时调用。
+    返回 {value, value_type, source, fallback}；无法回退时返回 None。
+    注意：栈传参按"SP 尚未因 prologue push 调整"假定取值，SP 已下移时可能偏移。
+    """
+    if not isinstance(idx, int) or idx < 0:
+        return None
+    regs = regs or {}
+    if idx < 4:
+        rname = "R%d" % idx
+        val = regs.get(rname.lower())
+        if not isinstance(val, int):
+            try:
+                r = client.calc_expression(rname)
+                if r.get("ok") and isinstance(r.get("value"), int):
+                    val = r["value"]
+            except Exception:  # noqa: BLE001
+                val = None
+        if isinstance(val, int) and val != 0:
+            return {"value": val, "value_type": "int",
+                    "source": "register:%s" % rname, "fallback": True}
+        return None
+    sp = regs.get("sp")
+    if not isinstance(sp, int):
+        return None
+    addr = sp + (idx - 4) * 4
+    try:
+        mr = client.read_mem(addr, 4)
+        if mr.get("ok"):
+            raw = bytes.fromhex(mr.get("data_hex") or "")
+            if len(raw) >= 4:
+                val = int.from_bytes(raw[:4], "little")
+                if val != 0:
+                    return {"value": val, "value_type": "int",
+                            "source": "stack:0x%08x" % addr, "fallback": True}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _js(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
@@ -1371,7 +1421,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             pc = regs.get("pc")
             if not isinstance(pc, int):
                 return _js({"ok": False, "error": "无法获取当前 PC"})
-            names = loc.local_variables(pc)
+            meta = loc.local_var_meta(pc) if hasattr(loc, "local_var_meta") else None
+            names = [v["name"] for v in meta["vars"]] if meta and meta.get("vars") else None
+            if not names:
+                names = loc.local_variables(pc)
+                meta = None
             if names is None:
                 return _js({"ok": False, "pc": hex(pc), "error": "未从 .axf 定位到当前函数或变量信息"})
             cur = loc.addr_to_location(pc)
@@ -1379,16 +1433,35 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if cur:
                 out["file"] = cur["file"]
                 out["line"] = cur["line"]
+            pinfo = {v["name"]: v for v in (meta or {}).get("vars", [])}
+            at_entry = _near_function_entry(pc, meta)
+            fallbacks = []
             vars_list = []
             for name in names:
                 try:
                     r = client.calc_expression(name)
-                    vars_list.append({"name": name, "ok": r.get("ok"),
-                                      "value_type": r.get("value_type"),
-                                      "value": r.get("value")})
+                    item = {"name": name, "ok": r.get("ok"),
+                            "value_type": r.get("value_type"),
+                            "value": r.get("value")}
                 except Exception as ex:  # noqa: BLE001
-                    vars_list.append({"name": name, "ok": False, "error": str(ex)})
+                    item = {"name": name, "ok": False, "error": str(ex)}
+                p = pinfo.get(name)
+                if (at_entry and p and p.get("is_param")
+                        and (not item.get("ok") or item.get("value") in (0, None))):
+                    fb = _aapcs_param_fallback(client, p.get("param_index"), regs)
+                    if fb:
+                        item.update(fb)
+                        item["note"] = ("当前 PC 位于函数入口(prologue 阶段)，表达式求值未取到有效值，"
+                                        "已按 AAPCS 回退读取；该值为按调用约定推断，单步过 prologue 后更准确。")
+                        fallbacks.append(name)
+                vars_list.append(item)
             out["locals"] = vars_list
+            if fallbacks:
+                out["param_fallback"] = {
+                    "names": fallbacks,
+                    "note": ("函数入口处 DWARF 位置描述可能未就绪：前 4 个参数取 R0-R3，"
+                             "第 5 个起取栈；已回退读取的参数仅供参考。"),
+                }
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})

@@ -48,6 +48,9 @@ class MockUVSOCKServer:
         for i in range(8):
             struct.pack_into('<I', self.mem, base - 0x20000000 + 16 + i * 4, 10 + i * 10)
         self.pending_async = []  # 模拟 Keil 异步推送队列（0x5020 输出 / 0x4000 报错）
+        # True 时模拟真实 Keil：目标处于运行状态时拒绝复位（status=11 UV_STATUS_TARGET_EXECUTING）
+        self.reset_requires_stop = False
+        self.reset_calls = 0
         self.var_table = {  # (vtype, addr, total_size, count, elem_size)
             "v0": (uvsock.VTT_int, base, 4, 1, 4),
             "v1": (uvsock.VTT_uint, base + 4, 4, 1, 4),
@@ -241,6 +244,10 @@ class MockUVSOCKServer:
             elif cmd == uvsock.UV_DBG_STOP_EXECUTION:
                 self.running = False
             elif cmd == uvsock.UV_DBG_RESET:
+                self.reset_calls += 1
+                # 真实 Keil：目标运行中直接复位会被拒（status=11），需先 stop
+                if self.running and self.reset_requires_stop:
+                    return uvsock.UV_STATUS_TARGET_EXECUTING, b""
                 self.running = False
             return uvsock.UV_STATUS_SUCCESS, b""
 

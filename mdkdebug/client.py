@@ -463,7 +463,52 @@ class UVClient:
         return self._control(uvsock.UV_DBG_STOP_EXECUTION, "暂停")
 
     def reset(self) -> dict:
-        return self._control(uvsock.UV_DBG_RESET, "复位")
+        """复位目标。
+
+        真实 Keil 在目标处于运行状态时会拒绝复位（status=11 UV_STATUS_TARGET_EXECUTING）；
+        且 stop 是异步生效的，暂停后立即复位仍可能被拒。这里自动"暂停 → 等目标真正
+        停下 → 复位"，最多重试 2 轮，成功时在返回里标 auto_stopped。
+        """
+        out = self._control(uvsock.UV_DBG_RESET, "复位")
+        if out.get("ok"):
+            return out
+        running = out.get("status") in (uvsock.UV_STATUS_TARGET_EXECUTING,
+                                        uvsock.DBG_EXECUTING)
+        if not running:
+            try:
+                running = bool(self.get_status().get("running"))
+            except Exception:  # noqa: BLE001
+                running = False
+        if not running:
+            return out
+        last = out
+        for _ in range(2):
+            stopped = self.stop()
+            if not stopped.get("ok"):
+                last["note"] = ("目标处于运行状态且自动暂停失败，复位未执行；"
+                                "可显式调用 stop 后再 reset。")
+                last["auto_stop"] = stopped
+                return last
+            # stop 异步生效：等目标真正停下（或以超时兜底）再复位，
+            # 否则紧接着的复位仍会被 Keil 以 status=11 拒绝（真机实测）。
+            for _ in range(20):
+                try:
+                    if not self.get_status().get("running"):
+                        break
+                except Exception:  # noqa: BLE001
+                    break
+                time.sleep(0.05)
+            retry = self._control(uvsock.UV_DBG_RESET, "复位")
+            if retry.get("ok"):
+                retry["auto_stopped"] = True
+                retry["note"] = "目标原处于运行状态，已自动先暂停(stop)、等其停止后再复位。"
+                return retry
+            last = retry
+        last["auto_stopped"] = True
+        last["first_attempt"] = out
+        last["note"] = ("目标原处于运行状态，已自动暂停并等待其停止，但仍未能复位"
+                        "（目标可能反复自动运行）；可显式 stop 后稍等再 reset。")
+        return last
 
     def step(self, mode: str = "into") -> dict:
         mode = (mode or "into").lower()

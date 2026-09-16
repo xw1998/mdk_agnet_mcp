@@ -362,6 +362,76 @@ class Locator:
                          "DW_TAG_inlined_subroutine", "DW_TAG_catch_block"):
                 self._collect_die_vars(c, names)
 
+    def local_var_meta(self, pc: int):
+        """返回包含 pc 的函数的变量元信息：
+        {low_pc, high_pc, vars:[{name, is_param, param_index}]}。
+
+        param_index 为形参在 DWARF 声明顺序中的序号（0 基），供 AAPCS 回退时
+        判断该参数在 R0-R3 还是栈上。未定位到函数或无 .axf 返回 None。
+        """
+        self._ensure_loaded()
+        try:
+            with open(self.axf_path, "rb") as f:
+                elf = ELFFile(f)
+                if not elf.has_dwarf_info():
+                    return None
+                di = elf.get_dwarf_info()
+                seq: list = []
+                low_found = None
+                high_found = None
+                for cu in di.iter_CUs():
+                    top = cu.get_top_DIE()
+                    for die in top.iter_children():
+                        if die.tag != "DW_TAG_subprogram":
+                            continue
+                        lo = die.attributes.get("DW_AT_low_pc")
+                        if lo is None:
+                            continue
+                        low = lo.value
+                        hi = die.attributes.get("DW_AT_high_pc")
+                        if hi is None:
+                            continue
+                        high = hi.value if hi.form == "DW_FORM_addr" else low + hi.value
+                        if not (low <= pc <= high or low <= (pc | 1) <= high):
+                            continue
+                        if low_found is None:
+                            low_found, high_found = low, high
+                        self._collect_die_var_meta(die, seq)
+                if low_found is None:
+                    return None
+                seen: set = set()
+                uniq: list = []
+                for v in seq:
+                    if v["name"] in seen:
+                        continue
+                    seen.add(v["name"])
+                    uniq.append(v)
+                return {"low_pc": low_found, "high_pc": high_found, "vars": uniq}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("解析局部变量元信息失败: %s", e)
+            return None
+
+    def _collect_die_var_meta(self, die, out: list, counter: dict | None = None) -> None:
+        """递归收集参数/局部变量元信息，并按声明顺序给形参编号。"""
+        if counter is None:
+            counter = {"n": 0}
+        for c in die.iter_children():
+            if c.tag in ("DW_TAG_formal_parameter", "DW_TAG_variable"):
+                nm = c.attributes.get("DW_AT_name")
+                if nm is not None:
+                    name = _decode_name(nm.value)
+                    if name:
+                        is_param = c.tag == "DW_TAG_formal_parameter"
+                        idx = None
+                        if is_param:
+                            idx = counter["n"]
+                            counter["n"] += 1
+                        out.append({"name": name, "is_param": is_param,
+                                    "param_index": idx})
+            if c.tag in ("DW_TAG_lexical_block", "DW_TAG_subprogram",
+                         "DW_TAG_inlined_subroutine", "DW_TAG_catch_block"):
+                self._collect_die_var_meta(c, out, counter)
+
     # --------------------------------------------------------------
     # 结构体字段概览：按变量名解析 DWARF 结构体/联合体成员布局
     # --------------------------------------------------------------
