@@ -28,8 +28,9 @@ from mcp.server.mcpserver import MCPServer
 
 from .client import UVClient, UVSOCKConnectError
 from .locator import Locator
-from . import builder, __version__
-from .periph import list_peripherals as _periph_list, get_peripheral as _periph_get
+from . import builder, mapfile, __version__
+from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
+                     query_memory_map as _query_memory_map)
 
 logger = logging.getLogger("mdkdebug.server")
 
@@ -41,6 +42,7 @@ _builder_cfg = {"uv4": None, "default_project": None}
 _symbol_cfg = {"locator": None, "axf": None}
 _breakpoints: list = []  # 内部断点记录（expr/address/file/line），因 BL 输出不经 socket 回传
 _watchpoints: list = []  # 内部数据断点（watchpoint）记录
+_snapshot_baseline: dict | None = None  # snapshot_diff 对比基线
 
 def _resolve_axf(uvprojx_path: str | None) -> str | None:
     """从 .uvprojx 推断 .axf 路径（解析 OutputDirectory/OutputName）。"""
@@ -67,6 +69,16 @@ def _resolve_axf(uvprojx_path: str | None) -> str | None:
 
 def _get_locator() -> Locator | None:
     return _symbol_cfg.get("locator")
+
+
+def _resolve_map() -> str:
+    """从已配置的 .axf 推断同目录同名 .map 路径；不存在返回空串。"""
+    axf = _symbol_cfg.get("axf")
+    if axf:
+        base = os.path.splitext(axf)[0] + ".map"
+        if os.path.isfile(base):
+            return base
+    return ""
 
 def _parse_target(locator, target: str):
     """把目标字符串解析为地址。支持 0x地址 或 文件:行号（如 main.c:77）。"""
@@ -1637,6 +1649,347 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                         "desc": p["desc"], "reg_count": len(regs), "regs": regs})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "periph": periph, "error": str(e)})
+
+    async def _wait_stopped(client, timeout: float = 8.0) -> bool:
+        """轮询等待目标停止（running 变为 False），超时返回 False。
+
+        先确认目标进入过运行态（见过 running=True），再等其停止；避免 run/step 命令
+        刚发出时首次 get_status 读到旧的停止态而误判，导致随后读内存撞上目标正在运行
+        的竞态（AMEM 响应异常）。若一直未见过运行态（run 未生效或目标立即停在很近的
+        断点），连续若干次未运行也视为已停止。
+        """
+        import time as _t
+        deadline = _t.monotonic() + timeout
+        seen_running = False
+        stable_stopped = 0
+        while _t.monotonic() < deadline:
+            st = client.get_status()
+            if st.get("running") is True:
+                seen_running = True
+                stable_stopped = 0
+            else:  # running False
+                if seen_running:
+                    return True
+                stable_stopped += 1
+                if stable_stopped >= 3:
+                    # run 未生效或目标立即停在很近断点：目标确为停止态，读内存安全
+                    return True
+            await asyncio.sleep(0.1)
+        return False
+
+    # ---------------- 批次4-1：内存地图 / 搜索 / 填充 ----------------
+    @server.tool(
+        name="query_memory_map",
+        title="查询内存区域地图",
+        description=(
+            "返回目标 STM32 的内存布局（FLASH/SRAM1/2/APB1/APB2/AHB1/AHB2/ITM/DWT/SCS 地址范围），"
+            "可用 addr 参数标注某地址落在哪个区域。在 read_mem/write_mem/fill_mem 前调用，"
+            "避免把外设区当 RAM 读或把越界地址当合法地址。addr 为空返回全部区域。"
+        ),
+    )
+    async def query_memory_map(addr: str = "") -> str:
+        try:
+            a = _parse_addr(addr) if addr else None
+            return _js(_query_memory_map(a))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="search_mem",
+        title="在内存范围内搜索字节序列",
+        description=(
+            "在 [start,end) 地址范围内扫描十六进制字节序列（pattern_hex，如 'DEADBEEF'），"
+            "返回所有命中地址（分块读、块间重叠防跨块漏匹配）。用于找魔数、定位被越界写坏的缓冲、"
+            "搜索特定数据结构。需已进入调试。start/end 用 0x 十六进制。"
+        ),
+    )
+    async def search_mem(start: str, end: str, pattern_hex: str, max_results: int = 20) -> str:
+        try:
+            client = _get_client()
+            try:
+                pattern = bytes.fromhex((pattern_hex or "").replace(" ", "").replace("0x", ""))
+            except ValueError:
+                return _js({"ok": False, "error": "pattern_hex 非法，须为偶数个十六进制字符"})
+            if not pattern:
+                return _js({"ok": False, "error": "pattern_hex 不能为空"})
+            return _js(client.search_mem(_parse_addr(start), _parse_addr(end), pattern, max_results))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="fill_mem",
+        title="批量填充/清零内存",
+        description=(
+            "从 addr 起连续写入 count 个相同字节（byte 为 0~255 单字节值）。用于清零大块缓冲、"
+            "SRAM 初始化、批量回填等。需已进入调试。addr 用 0x 十六进制。"
+        ),
+    )
+    async def fill_mem(addr: str, byte: int, count: int) -> str:
+        try:
+            client = _get_client()
+            return _js(client.fill_mem(_parse_addr(addr), int(byte), int(count)))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    # ---------------- 批次4-2：状态对比 / 函数耗时 ----------------
+    @server.tool(
+        name="snapshot_diff",
+        title="对比调试状态快照（diff）",
+        description=(
+            "记录/对比调试状态的基线：首次调用创建基线（保存指定 globals 与 PC/LR/SP 寄存器），"
+            "之后调用对比当前状态，输出 changed/unchanged/unreadable。用于观察程序运行后哪些变量/"
+            "寄存器发生变化，定位被意外改写的状态。globals 传变量名列表（如 ['SystemCoreClock']）。"
+            "需已进入调试且配置 .axf。"
+        ),
+    )
+    async def snapshot_diff(globals: list = None) -> str:
+        global _snapshot_baseline
+        try:
+            client = _get_client()
+            loc = _get_locator()
+            if not loc or not loc.is_ready():
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号）"})
+            regs = client.read_cpu_registers_stable()
+            if not regs.get("ok"):
+                return _js({"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "detail": regs})
+            g = {}
+            for name in (globals or []):
+                try:
+                    r = client.read_variable(str(name), read_memory=False)
+                    g[str(name)] = {"ok": r.get("ok"), "value": r.get("value"),
+                                    "value_type": r.get("value_type")}
+                except Exception as ex:  # noqa: BLE001
+                    g[str(name)] = {"ok": False, "error": str(ex)}
+            current = {"globals": g, "registers": dict(regs.get("registers") or {})}
+            if _snapshot_baseline is None:
+                _snapshot_baseline = current
+                return _js({"ok": True, "created": True,
+                            "message": "已创建基线快照（再次调用对比变化）",
+                            "globals_count": len(g)})
+            base = _snapshot_baseline
+            changed, unchanged, unreadable = [], [], []
+            allg = set(base["globals"]) | set(g)
+            for name in sorted(allg):
+                b = base["globals"].get(name, {})
+                c = g.get(name, {})
+                if not b.get("ok") or not c.get("ok"):
+                    unreadable.append(name)
+                elif b.get("value") != c.get("value"):
+                    changed.append({"name": name, "before": b.get("value"),
+                                    "after": c.get("value")})
+                else:
+                    unchanged.append(name)
+            reg_changed = []
+            for k in sorted(set(base["registers"]) | set(current["registers"])):
+                bv = base["registers"].get(k)
+                cv = current["registers"].get(k)
+                if bv != cv:
+                    reg_changed.append({"reg": k, "before": bv, "after": cv})
+            return _js({"ok": True, "created": False,
+                        "changed_globals": changed, "unchanged_globals": unchanged,
+                        "unreadable": unreadable,
+                        "changed_registers": reg_changed})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="profile_function",
+        title="函数执行耗时（周期数）分析",
+        description=(
+            "测量指定函数（func 传函数名或 0x 入口地址）一次调用的执行周期数：自动设入口断点、"
+            "运行到入口记录 DWT CYCCNT、step out 返回调用者后再记录，求差值。用于函数级性能分析、"
+            "对比优化前后耗时。依赖 DWT 周期计数器（Cortex-M3/M4 内置）。"
+            "需已进入调试且函数当前未被占用。"
+        ),
+    )
+    async def profile_function(func: str, max_ms: int = 10000) -> str:
+        try:
+            client = _get_client()
+            addr = None
+            f = (func or "").strip()
+            if not f:
+                return _js({"ok": False, "error": "func 不能为空"})
+            if f.lower().startswith("0x"):
+                try:
+                    addr = int(f, 16)
+                except ValueError:
+                    addr = None
+            else:
+                ar = client.calc_expression(f)
+                if ar.get("ok") and isinstance(ar.get("value"), int):
+                    addr = ar["value"]
+            if addr is None:
+                return _js({"ok": False, "error": f"无法解析函数入口地址: {f}"})
+            if not _dwt_enable(client):
+                return _js({"ok": False, "error": "无法使能 DWT CYCCNT"})
+            bp_expr = hex(addr)
+            client.set_breakpoint(bp_expr)
+            # Keil 会异步推送“断点已设”消息，若立即 run，该消息与 run 响应错位导致 status 乱码
+            await asyncio.sleep(0.2)
+            r = client.run()
+            if not (r.get("ok") or r.get("status") == 22):
+                client.clear_breakpoint(bp_expr)
+                return _js({"ok": False, "error": f"运行失败: {r}"})
+            if not await _wait_stopped(client, max_ms / 1000.0):
+                client.stop()
+                client.clear_breakpoint(bp_expr)
+                return _js({"ok": False, "error": f"运行 {max_ms}ms 未到达函数入口（函数可能未被调用）"})
+            t0 = _dwt_read_u32(client, _DWT_CYCCNT) or 0
+            client.clear_breakpoint(bp_expr)
+            # 清断点同样触发“断点删除”异步消息，立即 step 会与响应错位
+            await asyncio.sleep(0.2)
+            so = client.step("out")
+            if not so.get("ok"):
+                return _js({"ok": False, "error": f"step out 失败: {so}"})
+            if not await _wait_stopped(client, max_ms / 1000.0):
+                client.stop()
+                return _js({"ok": False, "error": "step out 超时"})
+            t1 = _dwt_read_u32(client, _DWT_CYCCNT) or 0
+            cycles = (t1 - t0) & 0xFFFFFFFF
+            info = _build_location(client)
+            out = {"ok": True, "function": f, "entry": hex(addr),
+                   "cycles": cycles, "cycles_hex": hex(cycles)}
+            if info:
+                out.update(info)
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    # ---------------- 批次4-3：编译错误 / map 解析 ----------------
+    @server.tool(
+        name="parse_build_errors",
+        title="解析编译错误输出",
+        description=(
+            "把 build/rebuild 输出的错误/警告文本解析为结构化列表（文件:行:列 + 消息），"
+            "兼容 ARMCC5(AC5) 'path(line): error:' 与 ARMCLANG(AC6) 'path:line:col: error:' 两种格式，"
+            "并用 .axf 符号表尝试把文件定位到源码路径。errors_text 传入 build 工具返回的错误信息。"
+        ),
+    )
+    async def parse_build_errors(errors_text: str) -> str:
+        import re
+        try:
+            loc = _get_locator()
+            text = errors_text or ""
+            # ARMCLANG (AC6): path\file.c:12:5: error: message
+            ac6 = re.findall(r'^(.+?\.(?:c|h|cpp|s|S)):(\d+):(\d+):\s*(error|warning):\s*(.+)$',
+                             text, re.M)
+            # ARMCC5 (AC5): path\file.c(12): error:  message
+            ac5 = re.findall(r'^(.+?\.(?:c|h|cpp|s|S))\((\d+)\):\s*(error|warning):\s*(.+)$',
+                             text, re.M)
+            items = []
+            for m in ac6:
+                file, line, col, lvl, msg = m
+                resolved = loc.resolve_source_path(file) if loc else file
+                items.append({"file": resolved, "line": int(line), "column": int(col),
+                              "level": lvl, "message": msg.strip()})
+            for m in ac5:
+                file, line, lvl, msg = m
+                resolved = loc.resolve_source_path(file) if loc else file
+                items.append({"file": resolved, "line": int(line), "column": None,
+                              "level": lvl, "message": msg.strip()})
+            errors = [x for x in items if x["level"] == "error"]
+            warnings = [x for x in items if x["level"] == "warning"]
+            return _js({"ok": True, "count": len(items),
+                        "error_count": len(errors), "warning_count": len(warnings),
+                        "items": items})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="parse_map",
+        title="解析 .map 链接映射文件",
+        description=(
+            "解析当前工程的 .map 文件（由 .axf 同目录推断），返回 program_size、各 section 占用、"
+            "符号地址表、栈使用、未使用 section。用于检查 FLASH/RAM 占用、确认符号地址、分析栈溢出风险。"
+            "需已 build 生成 .map 文件且已配置 .axf。"
+        ),
+    )
+    async def parse_map() -> str:
+        try:
+            path = _resolve_map()
+            if not path:
+                return _js({"ok": False, "error": "未找到 .map 文件（请先 build_project 生成，"
+                            "并确保已配置 .axf）"})
+            data = mapfile.parse_map_file(path)
+            return _js({**data, "path": path})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    # ---------------- 批次4-4：写外设 / 异常等待 ----------------
+    @server.tool(
+        name="write_peripheral",
+        title="写入外设寄存器",
+        description=(
+            "向指定外设（如 GPIOA/USART1/RCC/TIM2）的单个寄存器写值（value 可为 0x 十六进制或十进制），"
+            "写后立即读回确认。用于置位时钟使能、改 GPIO 模式、配置波特率、修改定时器寄存器等。"
+            "需已进入调试。periph 为外设名，reg 为寄存器名（大小写不敏感）。"
+        ),
+    )
+    async def write_peripheral(periph: str, reg: str, value: str) -> str:
+        try:
+            client = _get_client()
+            p = _periph_get(periph)
+            if not p:
+                avail = ", ".join(x["name"] for x in _periph_list())
+                return _js({"ok": False, "error": f"未知外设 {periph}，可用: {avail}"})
+            rkey = None
+            for k in p["regs"]:
+                if k.lower() == (reg or "").lower():
+                    rkey = k
+                    break
+            if not rkey:
+                avail = ", ".join(p["regs"].keys())
+                return _js({"ok": False, "error": f"外设 {p['name']} 无寄存器 {reg}，可用: {avail}"})
+            rdef = p["regs"][rkey]
+            addr = p["base"] + rdef["off"]
+            val = _parse_addr(value)
+            wr = client.write_mem(addr, struct.pack("<I", val & 0xFFFFFFFF))
+            if not wr.get("ok"):
+                return _js({"ok": False, "peripheral": p["name"], "reg": rkey,
+                            "addr": f"0x{addr:X}", "error": wr.get("status_text")})
+            rv = _periph_read_u32(client, addr)
+            return _js({"ok": True, "peripheral": p["name"], "reg": rkey,
+                        "addr": f"0x{addr:X}", "written": f"0x{val:08X}",
+                        "readback": f"0x{rv:08X}" if rv is not None else None,
+                        "match": rv == val})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="wait_fault",
+        title="运行至异常/断点并自动诊断",
+        description=(
+            "运行目标并轮询等待其停止（timeout_ms 内），若停在异常（HardFault/BusFault/UsageFault/"
+            "MemManage 等）则自动读取 ICSR/CFSR 判断异常类型并收集现场（寄存器+调用栈）；"
+            "若停在断点则返回停靠位置。用于复现崩溃：启动后等待崩溃发生并自动抓取现场。"
+            "需已进入调试且配置 .axf。"
+        ),
+    )
+    async def wait_fault(timeout_ms: int = 10000) -> str:
+        try:
+            client = _get_client()
+            r = client.run()
+            if not (r.get("ok") or r.get("status") == 22):
+                return _js({"ok": False, "error": f"运行失败: {r}"})
+            t = max(1, int(timeout_ms))
+            if not await _wait_stopped(client, t / 1000.0):
+                client.stop()
+                return _js({"ok": False, "error": f"运行 {timeout_ms}ms 未停止（未复现异常/未命中断点）"})
+            icsr = _dwt_read_u32(client, 0xE000ED04) or 0
+            vect = icsr & 0x1FF
+            exc = _FAULT_NAME.get(vect, f"异常{vect}")
+            cfsr = _dwt_read_u32(client, 0xE000ED28) or 0
+            out = {"ok": True, "action": "wait_fault",
+                   "exception": {"vector": vect, "name": exc},
+                   "is_fault": vect in (3, 4, 5, 6)}
+            if cfsr:
+                out["cfsr"] = {"value": "0x%08x" % cfsr, "reasons": _decode_cfsr(cfsr)}
+            info = _build_location(client)
+            if info:
+                out.update(info)
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
 
     return server
 

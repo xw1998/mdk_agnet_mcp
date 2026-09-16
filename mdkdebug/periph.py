@@ -410,3 +410,48 @@ def get_peripheral(name: str) -> dict | None:
         return None
     return {"name": key, "base": p["base"], "desc": p["desc"],
             "regs": _resolve_regmap(p)}
+
+
+# ----------------------------------------------------------------------------
+# 内存区域地图（Cortex-M4 / STM32F4 通用地址映射）
+# ----------------------------------------------------------------------------
+MEMORY_MAP: list = [
+    {"name": "FLASH", "start": 0x08000000, "end": 0x081FFFFF,
+     "desc": "片上 Flash（代码/常量），典型 256KB~2MB", "perms": "R-X"},
+    {"name": "SRAM1", "start": 0x20000000, "end": 0x2001FFFF,
+     "desc": "片上 SRAM（主 RAM，全局/栈/堆），典型 64KB~192KB", "perms": "RW"},
+    {"name": "SRAM2", "start": 0x10000000, "end": 0x1000FFFF,
+     "desc": "片上 SRAM2（部分型号），典型 4KB~64KB", "perms": "RW"},
+    {"name": "APB1_PERIPH", "start": 0x40000000, "end": 0x4000FFFF,
+     "desc": "APB1 外设（USART2/3、TIM2-7、SPI2/3、I2C1-3、PWR 等）", "perms": "RW"},
+    {"name": "APB2_PERIPH", "start": 0x40010000, "end": 0x4001FFFF,
+     "desc": "APB2 外设（USART1/6、TIM1/9-11、SPI1、ADC1-3、EXTI、SYSCFG）", "perms": "RW"},
+    {"name": "AHB1_PERIPH", "start": 0x40020000, "end": 0x4002FFFF,
+     "desc": "AHB1 外设（GPIOA-H、RCC、DMA1/2、CRC、FLASH 接口）", "perms": "RW"},
+    {"name": "AHB2_PERIPH", "start": 0x50000000, "end": 0x5FFFFFFF,
+     "desc": "AHB2 外设（OTG FS/HS 等）", "perms": "RW"},
+    {"name": "ITM", "start": 0xE0000000, "end": 0xE0000FFF,
+     "desc": "Instrumentation Trace Macrocell（ITM）", "perms": "RW"},
+    {"name": "DWT", "start": 0xE0001000, "end": 0xE0001FFF,
+     "desc": "Data Watchpoint and Trace（CYCCNT 周期计数器）", "perms": "RW"},
+    {"name": "SCS", "start": 0xE000E000, "end": 0xE000EFFF,
+     "desc": "System Control Space（SCB/ICSR/AIRCR/CFSR/DEMCR 等）", "perms": "RW"},
+]
+
+def query_memory_map(addr: int | None = None) -> dict:
+    """返回内存区域地图；addr 非空时标注该地址落在哪个区域。
+
+    供 AI 在 read_mem/write_mem 前判断目标地址属于 FLASH / SRAM / 外设，
+    避免把外设区当 RAM 读或把越界地址当合法地址。
+    """
+    if addr is None:
+        return {"ok": True, "count": len(MEMORY_MAP),
+                "regions": [{**r, "start_hex": f"0x{r['start']:08X}",
+                             "end_hex": f"0x{r['end']:08X}"} for r in MEMORY_MAP]}
+    hit = None
+    for r in MEMORY_MAP:
+        if r["start"] <= addr <= r["end"]:
+            hit = r
+            break
+    return {"ok": True, "addr": addr, "addr_hex": f"0x{addr:08X}",
+            "region": hit, "matched": bool(hit)}

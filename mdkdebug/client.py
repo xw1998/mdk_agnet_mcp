@@ -263,20 +263,87 @@ class UVClient:
                 "ascii": self._to_ascii(result)}
 
     def write_mem(self, addr: int, data: bytes) -> dict:
-        """向指定地址写入字节。返回实际写入长度。"""
+        """向指定地址写入字节（自动分块，支持大块/批量填充）。返回实际写入长度。"""
         if not data:
             return {"status": uvsock.UV_STATUS_OUT_OF_RANGE, "ok": False,
                     "status_text": "data 不能为空", "addr": addr,
                     "written": 0}
-        am = uvsock.AMEM()
-        status, m_data = self._request(uvsock.UV_DBG_MEM_WRITE,
-                                       data=am.pack_write(addr, data))
-        if status != UV_STATUS_SUCCESS:
-            return {"status": status, "ok": False,
-                    "status_text": status_text(status), "addr": addr,
-                    "written": 0}
-        return {"status": status, "ok": True, "addr": addr,
-                "written": len(data)}
+        total = 0
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset:offset + MAX_CHUNK]
+            am = uvsock.AMEM()
+            status, m_data = self._request(uvsock.UV_DBG_MEM_WRITE,
+                                           data=am.pack_write(addr + offset, chunk))
+            if status != UV_STATUS_SUCCESS:
+                return {"status": status, "ok": False,
+                        "status_text": status_text(status), "addr": addr,
+                        "requested": len(data), "written": total}
+            total += len(chunk)
+            offset += len(chunk)
+        return {"status": UV_STATUS_SUCCESS, "ok": True, "addr": addr,
+                "written": total}
+
+    def search_mem(self, start: int, end: int, pattern: bytes,
+                   max_results: int = 20) -> dict:
+        """在 [start, end) 地址范围内扫描字节序列，返回所有命中偏移。
+
+        分块读取并逐块查找；块间留 pattern-1 字节重叠，避免命中落在块边界被漏掉。
+        用于找魔数、定位被越界写坏的缓冲、搜索特定数据结构等。
+        """
+        if end <= start:
+            return {"ok": False, "error": "end 必须大于 start", "start": start,
+                    "end": end}
+        if not pattern:
+            return {"ok": False, "error": "pattern 不能为空"}
+        max_results = max(1, min(max_results, 1000))
+        hits: list[int] = []
+        pos = start
+        overlap = max(0, len(pattern) - 1)
+        step = max(1, MAX_CHUNK - overlap)
+        while pos < end and len(hits) < max_results:
+            n = min(MAX_CHUNK, end - pos)
+            r = self.read_mem(pos, n)
+            if not r.get("ok"):
+                break
+            try:
+                data = bytes.fromhex("".join((r.get("data_hex") or "").split()))
+            except ValueError:
+                break
+            idx = 0
+            while True:
+                i = data.find(pattern, idx)
+                if i < 0:
+                    break
+                hits.append(pos + i)
+                idx = i + 1
+                if len(hits) >= max_results:
+                    break
+            pos += step
+        return {
+            "ok": True, "start": start, "end": end,
+            "pattern_hex": pattern.hex(), "count": len(hits),
+            "addresses": [hex(h) for h in hits],
+            "truncated": len(hits) >= max_results,
+        }
+
+    def fill_mem(self, addr: int, byte: int, count: int) -> dict:
+        """从 addr 起连续写入 count 个相同字节（批量填充/清零大块内存）。"""
+        if not 0 <= byte <= 255:
+            return {"ok": False, "error": "byte 须为 0~255 的单字节值", "byte": byte}
+        if count <= 0:
+            return {"ok": False, "error": "count 必须为正整数", "count": count}
+        chunk = bytes([byte]) * min(count, MAX_CHUNK)
+        written = 0
+        while written < count:
+            n = min(MAX_CHUNK, count - written)
+            r = self.write_mem(addr + written, chunk[:n])
+            if not r.get("ok"):
+                return {"ok": False, "addr": addr, "byte": byte, "count": count,
+                        "written": written, "error": r.get("status_text")}
+            written += n
+        return {"ok": True, "addr": addr, "byte": byte, "count": count,
+                "written": written}
 
     # ------------------------------------------------------------------
     # 调试会话控制（进入/退出）
