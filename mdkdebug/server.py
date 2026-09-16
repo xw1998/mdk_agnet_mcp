@@ -461,7 +461,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="get_version",
         title="查询调试插件版本",
-        description="查询 Keil UVSOCK 插件的版本信息，返回十六进制版本串。",
+        description="查询 Keil UVSOCK 插件的版本信息，返回十六进制版本串。注意：需 Keil 已启动且已开启 UVSOCK（Edit→Configuration→Other→UVSOCK Enabled→端口4823→重启Keil），否则连接失败并返回开启指引。",
     )
     async def get_version() -> str:
         try:
@@ -474,7 +474,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="查询调试/目标状态",
         description=(
             "查询当前调试状态：是否处于调试会话、目标是否在运行、"
-            "以及 UVSOCK 状态码。可用于判断可否安全读写内存。"
+            "以及 UVSOCK 状态码。可用于判断可否安全读写内存。注意：UVSOCK 响应的 r_status 恒为 0，真实运行状态在 data 低字节（0=停止,1=执行中），本工具已正确解析。目标运行中可查状态，但此时不可安全读内存。"
         ),
     )
     async def get_status() -> str:
@@ -490,7 +490,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "计算并读取调试器中的一个表达式（变量名、寄存器、指针解引用等）。"
             "例如传入全局变量名 'SData_UA'、'timer.sec'，或 '*(uint32_t*)0x20000000'。"
-            "返回表达式在当前断点处的值及其类型。"
+            "返回表达式在当前断点处的值及其类型。注意：需已进入调试且目标暂停，目标运行中无法求值。刚 run 到断点停止的瞬间读取表达式可能返回脏值（如 PC=1），必要时重试。"
         ),
     )
     async def calc_expression(expr: str) -> str:
@@ -509,7 +509,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "name 为变量名（如 'SData_UA'、'timer.sec'、'arr'）；"
             "count 可选：>0 时按数组逐元素读 name[0..count-1] 返回 elements；"
             "返回 {address, value, value_type, size_bytes, elements, memory_hex}。"
-            "适合先查地址/数组内容，再配合 read_mem/write_mem 进一步读写。"
+            "适合先查地址/数组内容，再配合 read_mem/write_mem 进一步读写。注意：需目标暂停（运行中读取会失败/错位）；依赖 .axf 调试符号。刚停止瞬间取值可能读到脏值。"
         ),
     )
     async def read_variable(name: str, count: int = 0, read_memory: bool = True) -> str:
@@ -525,7 +525,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="读取目标内存",
         description=(
             "从指定内存地址读取 n_bytes 个字节。"
-            "addr 支持十六进制（如 '0x20000000'）或十进制；返回十六进制字节串及 ASCII 视图。"
+            "addr 支持十六进制（如 '0x20000000'）或十进制；返回十六进制字节串及 ASCII 视图。注意：需目标暂停——目标运行期间 UVSOCK 推送异步消息会堆积，导致读取响应错位（典型报错 AMEM 响应数据过短），务必先 stop 再读。勿越界读外设保留区，可先 query_memory_map 确认范围。"
         ),
     )
     async def read_mem(addr: str, n_bytes: int) -> str:
@@ -540,7 +540,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="写入目标内存",
         description=(
             "向指定内存地址写入字节。data_hex 为十六进制字节串（偶数长度），"
-            "如 'de ad be ef' 或 'deadbeef'（自动去空格）。返回实际写入长度。"
+            "如 'de ad be ef' 或 'deadbeef'（自动去空格）。返回实际写入长度。注意：需目标暂停，运行中写入会失败/错位。写外设寄存器/关键内存有副作用，写入前确认地址与值正确（可先 read_mem 备份）。"
         ),
     )
     async def write_mem(addr: str, data_hex: str) -> str:
@@ -561,7 +561,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "自动进入 Keil 调试模式（UV_DBG_ENTER）。"
             "受工程 Load/Flash Download/Run-to-main 设置影响，属于有副作用的操作；"
-            "进入后即可设断点、读变量、运行控制。"
+            "进入后即可设断点、读变量、运行控制。注意：若当前 Keil 是旧窗口、加载旧固件，进入后调试的是旧代码符号；建议改用 flash_debug 闭环（关旧Keil→编烧→重开→进调试）。受工程 Load/Flash Download/Run-to-main 设置影响，属有副作用操作。需 UVSOCK 已开启。"
         ),
     )
     async def enter_debug() -> str:
@@ -573,7 +573,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="exit_debug",
         title="退出调试模式",
-        description="自动退出 Keil 调试模式（UV_DBG_EXIT）。",
+        description="自动退出 Keil 调试模式（UV_DBG_EXIT）。注意：目标处于运行状态时退出会被拒（status=11），需先 stop 再 exit_debug。",
     )
     async def exit_debug() -> str:
         try:
@@ -587,7 +587,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="设置断点",
         description=(
             "在指定符号或地址处设置软件断点。expr 可为函数名/变量名"
-            "（如 'main'）或地址（如 '0x08001034'）。返回是否成功。"
+            "（如 'main'）或地址（如 '0x08001034'）。返回是否成功。注意：设断点走命令窗口 BS，会触发 Keil 异步推送断点消息，紧随其后的命令响应可能被污染（本工具已改为先 calc_expression 取地址再 BS 0xaddr）；设断点后立即 run/step 前需稍等异步消息落地。需已进入调试且配置 .axf。"
         ),
     )
     async def set_breakpoint(expr: str) -> str:
@@ -629,7 +629,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "在符号/地址处设带条件的软件断点：仅当 condition（C 表达式，如 'R0==5'、"
             "'test_array[0]==0x11111111'）成立时才暂停；count 为命中计数（默认1，第 count 次满足才停）。"
-            "用于只在特定条件/次数下停住，减少无关中断。需已进入调试且配置 .axf。"
+            "用于只在特定条件/次数下停住，减少无关中断。需已进入调试且配置 .axf。注意：同 set_breakpoint——设断点后异步消息可能污染下一条命令，设断点与运行控制之间建议留落地时间。需已进入调试且配置 .axf。"
         ),
     )
     async def set_conditional_breakpoint(expr: str, condition: str, count: int = 1) -> str:
@@ -679,7 +679,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "设置数据/访问断点：当指定地址被 读取/写入/读写 时目标运行自动暂停。"
             "用于定位'谁在何时改坏了某变量/内存'。expr 为变量名（如 'test_array'）或地址（如 '0x20000000'）；"
             "access 取 read/write/readwrite，默认 write；count 为触发次数（默认1）。"
-            "返回设断地址与 文件:行。命中后可用 get_current_location/snapshot 看是谁改的。需已进入调试。"
+            "返回设断地址与 文件:行。命中后可用 get_current_location/snapshot 看是谁改的。需已进入调试。注意：数据/访问断点依赖硬件 DWT 支持，可同时生效个数有限（通常2-4个），设多了会失败；命中后目标暂停，用 get_current_location/snapshot 看现场。需已进入调试。"
         ),
     )
     async def set_watchpoint(expr: str, access: str = "write", count: int = 1) -> str:
@@ -730,7 +730,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="clear_watchpoint",
         title="清除数据断点",
-        description="清除指定地址/变量的数据断点（命令窗口 BK）。expr 为变量名或 0x 地址。",
+        description="清除指定地址/变量的数据断点（命令窗口 BK）。expr 为变量名或 0x 地址。注意：清除不存在的地址返回 ok 但无副作用；需与 set_watchpoint 配合在调试会话内使用。",
     )
     async def clear_watchpoint(expr: str) -> str:
         try:
@@ -746,7 +746,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="list_watchpoints",
         title="列出数据断点",
-        description="列出本服务设置的内部数据断点记录（命令窗口 BL 对数据断点输出不经 socket 回传）。",
+        description="列出本服务设置的内部数据断点记录（命令窗口 BL 对数据断点输出不经 socket 回传）。注意：返回的是本服务内部记录（命令窗口 BL 对数据断点的输出不经 socket 回传），非 Keil 界面实时列表。",
     )
     async def list_watchpoints() -> str:
         try:
@@ -757,7 +757,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="clear_breakpoint",
         title="清除断点",
-        description="清除指定符号或断点编号处的断点（命令窗口 BK）。",
+        description="清除指定符号或断点编号处的断点（命令窗口 BK）。注意：清除断点同样走命令窗口并触发异步消息，清除后立即 run/step 前建议稍等。需已进入调试。",
     )
     async def clear_breakpoint(expr: str) -> str:
         try:
@@ -770,7 +770,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="list_breakpoints",
         title="列出断点",
-        description="列出当前调试会话中的所有断点（命令窗口 BL）。",
+        description="列出当前调试会话中的所有断点（命令窗口 BL）。注意：真实 Keil 的 EXEC_CMD(BL) 不回传命令输出，本工具返回 ok=true 表示命令被接受、但拿不到真实断点列表（协议固有限制）；请以本服务内部记录的断点为准。",
     )
     async def list_breakpoints() -> str:
         try:
@@ -788,7 +788,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "从 .axf ELF 符号表模糊检索 函数/全局变量 符号（query 为子串，大小写不敏感，空则列出全部）。"
             "AI 想读取某个全局变量或跳到某函数而不知道确切名字时，先用它搜到符号名与地址，"
             "再配合 calc_expression / read_variable / set_breakpoint / disassemble 使用。"
-            "kind 可取 all/func/object/global/local 过滤。需配置 .axf 调试符号。"
+            "kind 可取 all/func/object/global/local 过滤。需配置 .axf 调试符号。注意：依赖 .axf ELF 符号表（需已编译且配置 .axf），未编译或符号被 strip 时查不到；匹配为子串模糊，注意区分同名符号。"
         ),
     )
     async def find_symbol(query: str = "", limit: int = 50, kind: str = "all") -> str:
@@ -808,7 +808,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "读取当前 PC，定位到 源文件:行号 并返回该行附近的源码上下文，"
             "同时给出调用栈（PC + LR 反查）。让 AI 像人一样知道程序停在哪、看的是什么代码。"
-            "需已进入调试状态且配置了 .axf 调试符号。"
+            "需已进入调试状态且配置了 .axf 调试符号。注意：读 PC 已做脏值过滤与重试（run 到断点刚停止瞬间 PC 可能读到脏值1，单步可能读到 SRAM 脏值）。调用栈为 SP+LR 栈启发式回溯，在全速运行后手动 stop 或 SysTick 中断频繁场景层数受限/可能错位。"
         ),
     )
     async def get_current_location() -> str:
@@ -827,7 +827,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "读取当前 PC 所在函数的 参数+局部变量 及其当前值。基于 .axf(DWARF) 定位"
             "包含当前 PC 的函数作用域，得到变量名列表后用 calc_expression 在当前上下文求值，"
-            "让 AI 看到当前函数（而非仅全局变量）的局部状态。需已进入调试且配置 .axf。"
+            "让 AI 看到当前函数（而非仅全局变量）的局部状态。需已进入调试且配置 .axf。注意：依赖 .axf(DWARF) 且需 CPU 暂停在正常 C 函数内；若停在 SysTick 中断/异常 handler 或全速运行后手动 stop 处，局部变量解析可能不准或为空（硬件限制）。"
         ),
     )
     async def read_locals() -> str:
@@ -871,7 +871,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "一次返回当前调试位置的全貌：PC、文件:行、源码上下文、完整调用栈、当前函数局部变量，"
             "以及指定的全局变量（globals 参数传入变量名列表）。AI 排查问题时一次调用即可获得完整画面，"
             "避免多次 get_current_location/read_locals/read_variable 往返。globals 可选，"
-            "如 ['SystemCoreClock','test_array']。需已进入调试且配置 .axf。"
+            "如 ['SystemCoreClock','test_array']。需已进入调试且配置 .axf。注意：聚合 read_locals/get_current_location，同样受中断上下文限制——全速运行后手动 stop 或停在 SysTick 中断时，局部变量与完整调用栈可能层数受限/为空。"
         ),
     )
     async def snapshot(globals: list = None, source_context: int = 4) -> str:
@@ -929,7 +929,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "一次求值多个表达式（变量/寄存器/指针解引用等）并返回结果，减少往返调用。"
             "expressions 为表达式列表，如 ['SystemCoreClock','timer.sec','*(uint32_t*)0x20000000']。"
-            "需已进入调试状态。"
+            "需已进入调试状态。注意：需目标暂停，运行中表达式无法求值；刚停止瞬间个别表达式可能读到脏值。"
         ),
     )
     async def watch(expressions: list) -> str:
@@ -956,7 +956,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "按变量名读取一个结构体（或联合体）变量，解析其 DWARF 成员布局（成员名/偏移/类型/大小），"
             "并逐个读出每个成员当前值，供 AI 查看外设配置、数据包等复杂结构体的字段级内容。"
-            "name 为全局结构体变量名（如 'hUart1'、'timHandle'）。需已进入调试且配置 .axf。"
+            "name 为全局结构体变量名（如 'hUart1'、'timHandle'）。需已进入调试且配置 .axf。注意：依赖 DWARF 类型信息解析成员布局，局部/内联结构体或停在中断上下文时可能解析不到；需目标暂停在正常函数内。仅支持结构体/联合体，数组/指针另用 read_variable。"
         ),
     )
     async def read_struct(name: str, max_fields: int = 64) -> str:
@@ -1009,7 +1009,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "批量读取 CPU 核心寄存器 R0-R12/SP/LR/PC/xPSR 及当前值，并按 AAPCS 调用约定解读："
             "R0-R3 为函数前 4 个入参（若当前停在函数入口/调用点），R0 为返回值，SP 栈指针、LR 返回地址。"
-            "排查函数参数传错、返回值不对、寄存器被踩等问题时使用。需已进入调试状态。"
+            "排查函数参数传错、返回值不对、寄存器被踩等问题时使用。需已进入调试状态。注意：需目标暂停；刚 run 到断点停止瞬间个别寄存器（如 PC）可能读到脏值，建议先 get_status 确认稳定停止再读。SP/LR 在中断上下文为现场脏值，AAPCS 解读仅对普通函数调用点成立。"
         ),
     )
     async def read_registers() -> str:
@@ -1068,7 +1068,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "向指定 CPU 寄存器写入值（支持 R0-R12/SP/LR/PC/xPSR，R13/R14/R15 自动映射为 SP/LR/PC）。"
             "value 可为 0x 十六进制或十进制。写后自动读回验证。用于修正现场、强制改返回值、"
-            "或改 PC 跳到某函数/地址执行（改 PC 后需配合 run 继续执行）。需已进入调试状态。"
+            "或改 PC 跳到某函数/地址执行（改 PC 后需配合 run 继续执行）。需已进入调试状态。注意：写 PC/SP/xPSR 等关键寄存器有较大副作用（改 PC 需再 run 才生效；改 SP 可能破坏栈现场）；写后已自动读回验证。需目标暂停。"
         ),
     )
     async def set_register(register: str, value: str) -> str:
@@ -1172,7 +1172,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "读取 Cortex-M DWT->CYCCNT 周期计数器（自动使能 DWT+TRCENA）。返回当前周期计数 cycles、"
             "CPU 频率 frequency_hz 与估算的运行秒数。用法：在同一代码段 前后各调一次 dwt，"
             "执行周期数 = (cycles2 - cycles1) & 0xFFFFFFFF，耗时 = 周期数 / frequency_hz。"
-            "用于测某段代码/某个函数的执行时间（如 SysTick 中断耗时、循环耗时）。需已进入调试且目标暂停。"
+            "用于测某段代码/某个函数的执行时间（如 SysTick 中断耗时、循环耗时）。需已进入调试且目标暂停。注意：依赖 Cortex-M DWT 周期计数器（M3/M4 内置），需目标暂停；CYCCNT 为 32 位会回绕，测长时间需用 (cycles2-cycles1)&0xFFFFFFFF 差分。计时区间内勿手动 stop 干扰。"
         ),
     )
     async def dwt() -> str:
@@ -1221,7 +1221,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "size=最多读取字节数(默认4096)。返回 {config, trace}：config 给出 DEMCR.TRCENA / "
             "ITM->TCR / ITM->TER 的 Trace 使能诊断（判断为何收不到 ITM 打印）；trace 为拉取到的"
             "缓冲文本。需已进入调试；真实 ITM 输出还要求 Keil 已配置 Trace(Core Clock + "
-            "Stimulus Port0) 且调试器(ST-Link/J-Link) SWO 引脚已连接。"
+            "Stimulus Port0) 且调试器(ST-Link/J-Link) SWO 引脚已连接。注意：真实 ITM 输出需 Keil 已配置 Trace(Core Clock + Stimulus Port0) 且调试器 SWO 引脚已连接，缺任一都收不到数据（config 会给出诊断）；仅依赖 ITM 缓冲，非全量 trace。"
         ),
     )
     async def itm_trace(port: int = 0, size: int = 4096) -> str:
@@ -1260,7 +1260,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "读取 SCB 异常寄存器（ICSR/HFSR/CFSR/MMFAR/BFAR）判断当前异常类型与原因，"
             "并从异常栈帧恢复现场（异常发生时 R0-R3/R12/LR/PC/xPSR）。排查死机/跑飞/复位循环时使用："
             "先看 exception 是什么异常、cfsr.reasons 给出原因，再看 fault_frame.pc 定位出错指令。"
-            "需已进入调试且停在异常处理程序（best-effort，handler 已运行时栈帧可能偏移）。"
+            "需已进入调试且停在异常处理程序（best-effort，handler 已运行时栈帧可能偏移）。注意：需已进入调试且目标停在异常处理程序（HardFault_Handler 等）；若异常已导致复位/死循环重入，寄存器现场可能已被破坏或读不准（best-effort）。"
         ),
     )
     async def fault_report() -> str:
@@ -1319,7 +1319,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "反汇编目标代码。addr 可为 十六进制地址(0x...) 或 符号名(如 'main'、'SystemClock_Config')；"
             "省略时用当前 PC。count 为反汇编的指令条数（默认 8）。返回每条指令的地址、机器码、汇编文本。"
-            "排查死循环 / 跑飞 / 启动流程 / 优化后行为时，查看 PC 处指令在做什么。需已进入调试且配置 .axf。"
+            "排查死循环 / 跑飞 / 启动流程 / 优化后行为时，查看 PC 处指令在做什么。需已进入调试且配置 .axf。注意：依赖 .axf 符号表与配置；Thumb/ARM 指令模式按符号/地址推断，个别地址可能模式误判。需目标暂停。"
         ),
     )
     async def disassemble(addr: str = "", count: int = 8) -> str:
@@ -1390,7 +1390,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "源码上下文 + 完整调用栈 + 当前函数局部变量 + 指定关键全局变量，生成结构化现场报告。"
             "AI 接到 bug 报告后一次调用即可看清程序卡在哪、寄存器状态、正在执行什么指令、谁调进来的，"
             "避免多次 get_current_location/read_registers/disassemble/read_locals 往返。"
-            "globals 可选，传关键全局变量名列表。需已进入调试且配置 .axf。"
+            "globals 可选，传关键全局变量名列表。需已进入调试且配置 .axf。注意：聚合多个只读诊断，同样受中断上下文限制——停在 SysTick 中断/全速运行后手动 stop 时，局部变量与完整调用栈可能受限/为空。需已进入调试且配置 .axf。"
         ),
     )
     async def diagnose(globals: list = None, source_context: int = 4, disasm_count: int = 6) -> str:
@@ -1483,7 +1483,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "让目标运行到指定位置后停止（run to cursor）。target 可为 十六进制地址(0x...) 或"
             "文件:行号（如 main.c:77）。实现为：临时断点->运行->清除断点。"
-            "需已进入调试状态且配置了 .axf 调试符号。"
+            "需已进入调试状态且配置了 .axf 调试符号。注意：实现为临时断点→run→清除。run 到断点停止时返回的 status 是 22(断点已创建) 而非 0；刚停止瞬间读 PC 可能为脏值（本工具已用稳定读取修复）。需已进入调试且配置 .axf。"
         ),
     )
     async def run_to_line(target: str) -> str:
@@ -1528,7 +1528,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="run",
         title="全速运行",
-        description="让目标 MCU 全速运行（启动执行）。",
+        description="让目标 MCU 全速运行（启动执行）。注意：run 后目标全速运行，此时读内存/寄存器/表达式会失败或错位（异步消息堆积），需先 stop 再读。目标运行期间 UVSOCK 会推送异步消息。",
     )
     async def run() -> str:
         try:
@@ -1541,7 +1541,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="运行一段时间后自动暂停",
         description=(
             "让目标 MCU 全速运行 timeout_ms 毫秒后自动暂停，并返回停靠位置（文件行+源码+完整调用栈）。"
-            "用于验证时序 / 观察运行 N 毫秒后的状态。timeout_ms 默认 1000。"
+            "用于验证时序 / 观察运行 N 毫秒后的状态。timeout_ms 默认 1000。注意：运行期间读内存不可靠；到点自动 stop 后返回停靠位置。刚停止瞬间读 PC 可能脏值（已做稳定读取）。需已进入调试且配置 .axf。"
         ),
     )
     async def run_timeout(timeout_ms: int = 1000) -> str:
@@ -1565,7 +1565,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="stop",
         title="暂停执行",
-        description="暂停目标 MCU 的执行（进入断点/挂起状态）。",
+        description="暂停目标 MCU 的执行（进入断点/挂起状态）。注意：stop 后目标进入挂起态，此时才可安全读内存/寄存器/表达式。停止瞬间个别读取可能读到脏值，必要时重试。",
     )
     async def stop() -> str:
         try:
@@ -1576,7 +1576,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="reset",
         title="复位目标",
-        description="复位目标 MCU。",
+        description="复位目标 MCU。注意：复位后程序从复位向量重新运行，变量回到初值、断点保留；若复位后立即读内存，目标可能已重新运行，需先 stop。",
     )
     async def reset() -> str:
         try:
@@ -1589,7 +1589,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="单步执行",
         description=(
             "单步执行。mode 可选：'into'（单步进入）、'over'（单步跳过）、"
-            "'out'（跳出）、'instruction'（指令级）。默认 'into'。"
+            "'out'（跳出）、'instruction'（指令级）。默认 'into'。注意：单步瞬间读 PC 可能读到 SRAM 脏值（已用 FLASH 区段过滤修复）。在中断/异常 handler 内单步或 SP/LR 回溯可能层数受限。需已进入调试且配置 .axf（source 级单步）。"
         ),
     )
     async def step(mode: str = "into") -> str:
@@ -1634,7 +1634,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "可见方式启动 Keil uVision 并打开工程，供人工查看界面 / 调试准备。"
             "project 为 .uvprojx 路径，可省略以用默认工程；若已运行同工程则复用已有实例。"
-            "用户无需手动打开 Keil，AI 可通过本工具拉起。"
+            "用户无需手动打开 Keil，AI 可通过本工具拉起。注意：UV4 是单实例程序，同工程重复 launch 会复用已有实例、不会新开窗口。若需加载新固件，请配合 flash_debug 闭环避免旧窗口调试旧代码。"
         ),
     )
     async def launch_uvision(project: str = "") -> str:
@@ -1651,7 +1651,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "关闭所有 Keil uVision 实例，配合 launch_uvision 实现 Keil 开关闭环。"
             "force 默认 False：先优雅关闭（发送关闭消息），残留则自动强制终止；"
-            "force=True 直接强制结束所有 UV4.exe。注意：会关闭所有 Keil 实例。"
+            "force=True 直接强制结束所有 UV4.exe。注意：会关闭所有 Keil 实例（含人工查看中的窗口），调用前确认无需保留。强制终止后立即重取进程列表可能短暂误报残留（本工具已轮询等待）。沙箱环境受权限/跨会话限制可能无法关闭，需在真实运行环境使用。"
         ),
     )
     async def close_uvision(force: bool = False) -> str:
@@ -1664,7 +1664,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="build_project",
         description=(
             "编译 Keil 工程（UV4 -b，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，可省略以用默认工程；"
-            "target 为可选目标名。返回退出码与编译日志。"
+            "target 为可选目标名。返回退出码与编译日志。注意：UV4 -b 会新起独立隐藏进程，构建输出经 -o 捕获返回（不会显示在你已打开的 Keil 窗口）；退出码 0/1=成功,2=有错误,>=3=不完整。Keil 处于调试态时编译可能失败，建议先退出调试。"
         ),
     )
     async def build_project(project: str = "", target: str = "") -> str:
@@ -1678,7 +1678,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="rebuild_project",
         description=(
             "重新编译 Keil 工程（UV4 -r，全量重编，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
-            "可省略以用默认工程；target 为可选目标名。"
+            "可省略以用默认工程；target 为可选目标名。注意：UV4 -r 全量重编，同上——新起隐藏进程、输出经 -o 捕获；退出码语义同 build。Keil 处于调试态时编译可能失败。"
         ),
     )
     async def rebuild_project(project: str = "", target: str = "") -> str:
@@ -1692,7 +1692,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="flash_download",
         description=(
             "烧录 Keil 工程到目标 Flash（UV4 -f，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
-            "可省略以用默认工程；target 为可选目标名。"
+            "可省略以用默认工程；target 为可选目标名。注意：UV4 -f 烧录，需目标板与烧录器已连接且工程烧录算法配置正确；Keil 处于调试态时烧录可能失败，建议先退出调试。烧录会覆盖目标 Flash，属有副作用操作。"
         ),
     )
     async def flash_download(project: str = "", target: str = "") -> str:
@@ -1706,7 +1706,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="build_and_flash",
         description=(
             "编译并烧录闭环（后台隐藏窗口，不闪现界面）：先编译，成功后才烧录（UV4 -b 成功后 -f）。"
-            "project 为 .uvprojx 路径，可省略以用默认工程；target 为可选目标名。"
+            "project 为 .uvprojx 路径，可省略以用默认工程；target 为可选目标名。注意：先编译成功才烧录（编译失败不烧录）；编译/烧录均新起隐藏 UV4 进程、输出经 -o 捕获。Keil 处于调试态时建议先退出再执行。"
         ),
     )
     async def build_and_flash(project: str = "", target: str = "") -> str:
@@ -1722,7 +1722,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "「关旧 Keil→编烧→开新→进调试」一体闭环：先关闭所有 Keil 实例（避免残留旧工程窗口导致调试到旧代码），"
             "再编译并烧录新固件，成功后重新以可见方式打开本工程并自动进入调试模式。"
             "适用于 AI 修改代码后需上板验证新代码的完整流程，规避「旧窗口调试旧代码」问题。"
-            "project 为 .uvprojx 路径，可省略用默认工程；target 为可选目标名。"
+            "project 为 .uvprojx 路径，可省略用默认工程；target 为可选目标名。注意：会关闭所有 Keil 实例→编烧→重开→进调试，全程约数秒到数十秒；请先确认 project 路径正确。若板子未连接/烧录失败，不会重开工程也不进调试。输出经 -o 捕获。"
         ),
     )
     async def flash_debug(project: str = "", target: str = "") -> str:
@@ -1784,7 +1784,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="列出可用外设寄存器表",
         description=(
             "列出 mdkdebug 内置的 STM32F4 常用外设（RCC/GPIOA-H/USART/SPI/I2C/TIM/ADC/"
-            "PWR/FLASH/SysTick/SCB/NVIC/DWT/EXTI/SYSCFG 等）及基址，供 read_peripheral 使用。"
+            "PWR/FLASH/SysTick/SCB/NVIC/DWT/EXTI/SYSCFG 等）及基址，供 read_peripheral 使用。注意：仅内置 STM32F4 系列外设表（RCC/GPIO/USART/SPI/I2C/TIM/ADC/PWR/FLASH/SysTick/SCB/NVIC/DWT/EXTI/SYSCFG）；其他系列/型号无对应表。"
         ),
     )
     async def list_peripherals() -> str:
@@ -1797,7 +1797,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "一键读取指定外设（如 RCC/GPIOA/USART1/SPI1/I2C1/TIM2/ADC1/SCB/SysTick）的全部寄存器当前值，"
             "并解析关键位域（时钟使能/波特率/GPIO 模式/定时器计数等）。"
             "排查时钟没使能、GPIO 模式配置错误、串口波特率不对、定时器计数是否跑起来等场景。"
-            "需已进入调试状态。periph 为外设名（大小写不敏感）。"
+            "需已进入调试状态。periph 为外设名（大小写不敏感）。注意：仅适配 STM32F4 寄存器布局；目标型号非 F4 时寄存器偏移/位域可能不准。需已进入调试且目标暂停。"
         ),
     )
     async def read_peripheral(periph: str) -> str:
@@ -1867,7 +1867,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "返回目标 STM32 的内存布局（FLASH/SRAM1/2/APB1/APB2/AHB1/AHB2/ITM/DWT/SCS 地址范围），"
             "可用 addr 参数标注某地址落在哪个区域。在 read_mem/write_mem/fill_mem 前调用，"
-            "避免把外设区当 RAM 读或把越界地址当合法地址。addr 为空返回全部区域。"
+            "避免把外设区当 RAM 读或把越界地址当合法地址。addr 为空返回全部区域。注意：返回的是 STM32F4 的典型内存布局；其他内核/系列（如 M0/M7、G/L 系列）地址范围可能不同，请勿对非 F4 目标直接套用。"
         ),
     )
     async def query_memory_map(addr: str = "") -> str:
@@ -1883,7 +1883,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "在 [start,end) 地址范围内扫描十六进制字节序列（pattern_hex，如 'DEADBEEF'），"
             "返回所有命中地址（分块读、块间重叠防跨块漏匹配）。用于找魔数、定位被越界写坏的缓冲、"
-            "搜索特定数据结构。需已进入调试。start/end 用 0x 十六进制。"
+            "搜索特定数据结构。需已进入调试。start/end 用 0x 十六进制。注意：需目标暂停；大范围扫描较慢（分块读）；请勿搜索外设保留区或未映射地址（可能读取失败）。块间重叠处理了跨块匹配。"
         ),
     )
     async def search_mem(start: str, end: str, pattern_hex: str, max_results: int = 20) -> str:
@@ -1904,7 +1904,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="批量填充/清零内存",
         description=(
             "从 addr 起连续写入 count 个相同字节（byte 为 0~255 单字节值）。用于清零大块缓冲、"
-            "SRAM 初始化、批量回填等。需已进入调试。addr 用 0x 十六进制。"
+            "SRAM 初始化、批量回填等。需已进入调试。addr 用 0x 十六进制。注意：需目标暂停；批量写内存/清零有副作用，误写关键区（栈、外设、Flash）可能导致程序异常，写入前确认范围。"
         ),
     )
     async def fill_mem(addr: str, byte: int, count: int) -> str:
@@ -1922,7 +1922,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "记录/对比调试状态的基线：首次调用创建基线（保存指定 globals 与 PC/LR/SP 寄存器），"
             "之后调用对比当前状态，输出 changed/unchanged/unreadable。用于观察程序运行后哪些变量/"
             "寄存器发生变化，定位被意外改写的状态。globals 传变量名列表（如 ['SystemCoreClock']）。"
-            "需已进入调试且配置 .axf。"
+            "需已进入调试且配置 .axf。注意：首次调用创建基线、之后调用做对比；需目标暂停。若两次调用间目标已重启，寄存器基线（PC/SP/LR）对比意义有限。"
         ),
     )
     async def snapshot_diff(globals: list = None) -> str:
@@ -1982,7 +1982,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "测量指定函数（func 传函数名或 0x 入口地址）一次调用的执行周期数：自动设入口断点、"
             "运行到入口记录 DWT CYCCNT、step out 返回调用者后再记录，求差值。用于函数级性能分析、"
             "对比优化前后耗时。依赖 DWT 周期计数器（Cortex-M3/M4 内置）。"
-            "需已进入调试且函数当前未被占用。"
+            "需已进入调试且函数当前未被占用。注意：依赖 DWT 周期计数器（Cortex-M3/M4 内置）。函数若被中断频繁打断、或当前被占用，step out 可能错位导致测量不准；仅适合稳定可重复的函数级测量。"
         ),
     )
     async def profile_function(func: str, max_ms: int = 10000) -> str:
@@ -2045,7 +2045,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "把 build/rebuild 输出的错误/警告文本解析为结构化列表（文件:行:列 + 消息），"
             "兼容 ARMCC5(AC5) 'path(line): error:' 与 ARMCLANG(AC6) 'path:line:col: error:' 两种格式，"
-            "并用 .axf 符号表尝试把文件定位到源码路径。errors_text 传入 build 工具返回的错误信息。"
+            "并用 .axf 符号表尝试把文件定位到源码路径。errors_text 传入 build 工具返回的错误信息。注意：输入应为 build/rebuild 工具返回的错误文本格式；依赖 .axf 符号表尝试定位源码路径，未配置 .axf 时仅返回原始解析结果。"
         ),
     )
     async def parse_build_errors(errors_text: str) -> str:
@@ -2084,7 +2084,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "解析当前工程的 .map 文件（由 .axf 同目录推断），返回 program_size、各 section 占用、"
             "符号地址表、栈使用、未使用 section。用于检查 FLASH/RAM 占用、确认符号地址、分析栈溢出风险。"
-            "需已 build 生成 .map 文件且已配置 .axf。"
+            "需已 build 生成 .map 文件且已配置 .axf。注意：需已 build 生成 .map 文件且已配置 .axf（.map 与 .axf 同目录）；.map 是链接静态产物，改动源码需重新编译后才反映新布局。"
         ),
     )
     async def parse_map() -> str:
@@ -2105,7 +2105,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "向指定外设（如 GPIOA/USART1/RCC/TIM2）的单个寄存器写值（value 可为 0x 十六进制或十进制），"
             "写后立即读回确认。用于置位时钟使能、改 GPIO 模式、配置波特率、修改定时器寄存器等。"
-            "需已进入调试。periph 为外设名，reg 为寄存器名（大小写不敏感）。"
+            "需已进入调试。periph 为外设名，reg 为寄存器名（大小写不敏感）。注意：仅适配 STM32F4 寄存器布局；需目标暂停。写关键寄存器（如 RCC 时钟使能、GPIO 模式）有副作用，写错可能改变外设/系统行为，写入前确认。"
         ),
     )
     async def write_peripheral(periph: str, reg: str, value: str) -> str:
@@ -2145,7 +2145,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "运行目标并轮询等待其停止（timeout_ms 内），若停在异常（HardFault/BusFault/UsageFault/"
             "MemManage 等）则自动读取 ICSR/CFSR 判断异常类型并收集现场（寄存器+调用栈）；"
             "若停在断点则返回停靠位置。用于复现崩溃：启动后等待崩溃发生并自动抓取现场。"
-            "需已进入调试且配置 .axf。"
+            "需已进入调试且配置 .axf。注意：需目标会触发异常或断点；timeout_ms 内未停则超时返回。若目标死循环不触发异常且无断点，会一直运行到超时。需已进入调试且配置 .axf。"
         ),
     )
     async def wait_fault(timeout_ms: int = 10000) -> str:
@@ -2180,7 +2180,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="一次读取多个地址的内存",
         description=(
             "批量读内存：addresses 传地址列表，每项为 {addr, n_bytes}（n_bytes 缺省 32）。"
-            "一次 MCP 往返读多个地址，减少 AI 连续调用 read_mem 的往返。返回每处 ok/data_hex/ascii。"
+            "一次 MCP 往返读多个地址，减少 AI 连续调用 read_mem 的往返。返回每处 ok/data_hex/ascii。注意：批量读内存，需目标暂停（运行中读取会失败/错位）；仍受异步消息堆积影响，建议先 stop。"
         ),
     )
     async def read_mem_multi(addresses: list) -> str:
@@ -2207,7 +2207,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "一次提交多条只读命令，聚合返回，减少 AI 往返。commands 为列表，每项 "
             "{tool, args}。支持 read_mem(addr/n_bytes)/read_variable(name)/"
-            "calc_expression(expr)/get_status/read_registers。返回每条 ok 与结果。"
+            "calc_expression(expr)/get_status/read_registers。返回每条 ok 与结果。注意：仅支持只读命令（read_mem/read_variable/calc_expression/get_status/read_registers）；不支持写内存、运行控制、断点管理等有副作用命令。"
         ),
     )
     async def batch(commands: list) -> str:
@@ -2248,7 +2248,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="枚举工程 target 与当前/调试目标",
         description=(
             "查询当前工程全部 target（UV_PRJ_ENUM_TARGETS）、当前 target（GET_CUR_TARGET）"
-            "与当前调试 target（GET_DEBUG_TARGET）。多 target 工程排查/切换前先调它确认目标清单。"
+            "与当前调试 target（GET_DEBUG_TARGET）。多 target 工程排查/切换前先调它确认目标清单。注意：UV_PRJ_ENUM_TARGETS 真机可能返回空 data（回退从 .uvprojx 解析 target 名）；GET_DEBUG_TARGET 真机常返回空（无值可取）；调试态下枚举/切换 target 会被拒（status=10），需先 exit_debug。"
         ),
     )
     async def project_targets(project: str = "") -> str:
@@ -2281,7 +2281,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="切换调试 target",
         description=(
             "设置当前调试 target（UV_PRJ_SET_DEBUG_TARGET），target 传 target 名或索引。"
-            "多 target 工程切换调试目标后再 enter_debug。"
+            "多 target 工程切换调试目标后再 enter_debug。注意：调试态下设置调试 target 会被拒（status=10 Target is in debug mode），需先 exit_debug 再切换、再 enter_debug 恢复。target 传名称或索引。"
         ),
     )
     async def set_debug_target(target: str) -> str:
@@ -2297,7 +2297,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "解析 .uvprojx 各 target 的编译器（AC5/AC6）、优化级别（-O0..-Otime）、编译宏 Define、"
             "包含路径。project 传 .uvprojx 路径（省略用默认工程），target 指定某 target（省略用第一个）。"
-            "排查“不同 target 行为不同”时对比宏/优化差异。"
+            "排查“不同 target 行为不同”时对比宏/优化差异。注意：基于 .uvprojx 静态解析各 target 配置，需工程文件在且格式为 Keil 标准 uvprojx；不含运行时状态（优化级别/宏为工程设置值）。"
         ),
     )
     async def read_project_config(project: str = "", target: str = "") -> str:
@@ -2318,7 +2318,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "查询目标芯片信息：实时读 DBGMCU->IDCODE 寄存器得到 DEV_ID/REV_ID 并映射到型号，"
             "返回标称 Flash/RAM 容量与内存布局。排查“资源吃紧/选错型号/容量不符”时先调它。"
-            "idcode 实时读取需已进入调试（内存读依赖调试会话）；非调试态仅返回静态布局信息。"
+            "idcode 实时读取需已进入调试（内存读依赖调试会话）；非调试态仅返回静态布局信息。注意：DEV_ID = IDCODE 低12位(&0x0FFF)、REV_ID = 高16位、IDCODE 为小端字节序（本工具已正确解析）；实时读 IDCODE 需已进入调试，非调试态仅返回静态布局信息。未收录型号返回标称容量 None + 提示按丝印确认。"
         ),
     )
     async def target_info() -> str:
@@ -2373,7 +2373,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "统计各函数命中次数/占比，找出热点。用于定位“哪个函数占用最多 CPU 时间”的性能瓶颈。"
             "duration_ms 采样总时长，interval_ms 两次采样间目标运行时间，max_samples 采样数上限。"
             "注意：通过周期性 run/stop 采样，非硬件 ETM 实时采样，会轻微扰动运行时序；"
-            "某函数未命中可能因其未被执行或区间未覆盖到。"
+            "某函数未命中可能因其未被执行或区间未覆盖到。注意：采样间隔越小对运行时序扰动越大，建议按需取适中值；PC 落在函数符号间隙时会显示裸地址（属正常，不影响热点定位）。"
         ),
     )
     async def profile_sampling(duration_ms: int = 1000, interval_ms: int = 20,
@@ -2430,7 +2430,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "AI 落地的第一个工具：一键自检 Keil/UVSOCK/UV4/.axf/源码漂移/调试态/RTOS 类型，"
             "并返回推荐的调试工作流与各场景应调用的工具，避免 AI 盲目试错。"
-            "返回 {environment:{...}, recommended_workflow:[...], scene_tools:{...}}。"
+            "返回 {environment:{...}, recommended_workflow:[...], scene_tools:{...}}。注意：建议 AI 落地第一件事先调本工具获取环境自检与工作流，再按场景选择工具；自检为无副作用只读操作，可在任意时刻调用。"
         ),
     )
     async def mdk_guide() -> str:
