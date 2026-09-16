@@ -98,6 +98,9 @@ class MockUVSOCKServer:
         self.bs_status = None
         # True 时 BS 响应携带二进制 payload（模拟真机断点结构，考察 output 乱码处理）
         self.bs_binary_output = False
+        # PC 取值队列：非空时每次读 PC 表达式依次取一个值（模拟 halt 后 PC 滞后一帧，
+        # 首次读到上一轮 halt 的旧值、随后收敛）；队列空则沿用 reg_map 当前值
+        self.pc_queue = []
         self.breakpoints = []  # 断点符号/地址列表
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -396,6 +399,11 @@ class MockUVSOCKServer:
         # 解析 VSET：vType(4) + union(8) + nLen(4) + str
         nlen = struct.unpack('<i', data[12:16])[0]
         name = data[16:16 + nlen].decode("UTF-8", "replace").rstrip('\x00')
+
+        if self.pc_queue and name in ("__currentPC()", "PC", "R15"):
+            v = self.pc_queue.pop(0)
+            for k in ("__currentPC()", "PC", "R15"):
+                self.reg_map[k] = v
 
         # 寄存器表达式（供 read_cpu_registers/get_current_location/snapshot 定位）
         # 先处理赋值表达式：R0 = <value>（供 set_register）

@@ -63,6 +63,13 @@ def find_uv4(explicit: str | None = None) -> str | None:
     return None
 
 
+# 编译/烧录默认超时（秒）。
+# 旧默认 300s 对大型工程 / 首次全量编译 / 带预处理脚本（gen_scatter.py 等）的工程
+# 明显不够，会把"还在编译"误判成失败。默认放宽，并允许调用方按工程调整。
+DEFAULT_BUILD_TIMEOUT = 1800
+DEFAULT_FLASH_TIMEOUT = 600
+
+
 def _status_text(exit_code: int) -> str:
     """把 UV4 退出码映射为可读文本。"""
     if exit_code == 0:
@@ -73,6 +80,12 @@ def _status_text(exit_code: int) -> str:
         return "有错误"
     if exit_code == 3:
         return "构建不完整（可能缺少工具链）"
+    if exit_code == -1:
+        return "超时（UV4 未在限定时间内退出，本次进程已被终止）"
+    if exit_code == -2:
+        return "找不到 UV4 可执行文件"
+    if exit_code == -3:
+        return "调用 UV4 失败"
     return f"失败（退出码 {exit_code}）"
 
 
@@ -122,7 +135,10 @@ def _run_uv4(uv4: str, args: list[str], timeout: int,
                 pass
         return proc.returncode, out_text
     except subprocess.TimeoutExpired:
-        return -1, "构建超时（UV4 未在限定时间内退出）"
+        return -1, (
+            "超时：UV4 未在 %d 秒内退出，本次进程已终止。\n"
+            "大型工程、首次全量编译或带预处理脚本的工程可能超过该上限；"
+            "可调大工具的 timeout_s 参数后重试（如 timeout_s=3600）。" % timeout)
     except FileNotFoundError:
         return -2, f"找不到 UV4 可执行文件：{uv4}"
     except Exception as e:  # noqa: BLE001
@@ -146,7 +162,7 @@ def _result(action: str, exit_code: int, output: str) -> dict:
 
 
 def build_project(uv4: str, project: str, target: str | None = None,
-                  timeout: int = 300) -> dict:
+                  timeout: int = DEFAULT_BUILD_TIMEOUT) -> dict:
     """编译工程（UV4 -b）。"""
     args = ["-b", project] + (["-t", target] if target else [])
     code, out = _run_uv4(uv4, args, timeout)
@@ -154,7 +170,7 @@ def build_project(uv4: str, project: str, target: str | None = None,
 
 
 def rebuild_project(uv4: str, project: str, target: str | None = None,
-                    timeout: int = 300) -> dict:
+                    timeout: int = DEFAULT_BUILD_TIMEOUT) -> dict:
     """重新编译工程（UV4 -r，全量重编）。"""
     args = ["-r", project] + (["-t", target] if target else [])
     code, out = _run_uv4(uv4, args, timeout)
@@ -162,7 +178,7 @@ def rebuild_project(uv4: str, project: str, target: str | None = None,
 
 
 def flash_download(uv4: str, project: str, target: str | None = None,
-                   timeout: int = 300) -> dict:
+                   timeout: int = DEFAULT_FLASH_TIMEOUT) -> dict:
     """烧录工程到目标 Flash（UV4 -f，Flash Download）。"""
     args = ["-f", project] + (["-t", target] if target else [])
     code, out = _run_uv4(uv4, args, timeout)
@@ -327,7 +343,8 @@ def close_uvision(force: bool = False, timeout: int = 10) -> dict:
 
 
 def build_and_flash(uv4: str, project: str, target: str | None = None,
-                    build_timeout: int = 300, flash_timeout: int = 300) -> dict:
+                    build_timeout: int = DEFAULT_BUILD_TIMEOUT,
+                  flash_timeout: int = DEFAULT_FLASH_TIMEOUT) -> dict:
     """编译 + 烧录闭环：编译成功后才烧录。"""
     build = build_project(uv4, project, target, build_timeout)
     if not build["ok"]:

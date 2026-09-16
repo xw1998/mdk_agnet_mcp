@@ -500,17 +500,26 @@ class UVClient:
         out.update(regs)
         return out
 
-    def read_cpu_registers_stable(self, retries: int = 12, delay: float = 0.3,
-                                  require_stopped: bool = False) -> dict:
-        """读取 CPU 寄存器并排除停止瞬间的脏 PC 值。
+    def read_cpu_registers_stable(self, retries: int = 20, delay: float = 0.05,
+                                  require_stopped: bool = False,
+                                  need_stable: int = 2) -> dict:
+        """读取 CPU 寄存器，并规避 halt 瞬间的滞后（陈旧）值。
 
-        Keil 在 run/step 到断点停止的瞬间，"PC" 表达式可能短暂返回脏值
-        （实测为 1 或 SRAM 地址），需重试直到读到 FLASH 代码段地址才返回。
-        最多重试 retries 次，期间每次间隔 delay 秒；若始终未读到合理值则返回最后一次结果。
+        真机实测（F401）：run_timeout/stop 之后**首次**读到的 PC 往往还是上一次 halt 的
+        旧值——例如上一轮停在 0x08000db4，本轮首次仍读 0x08000db4、第二次才变成真实的
+        0x08000444，而同一响应里的 LR/SP 已经是新值。旧的"PC 落在 FLASH 段即认可"启发式
+        完全挡不住这类脏值：复位向量附近的陈旧地址（如 0x0800024c Reset_Handler）
+        同样落在 FLASH 段内。
 
-        require_stopped=True 时先确认目标已停止：目标运行中 Keil 读到的是陈旧寄存器
-        （实测 PC 稳定停在复位附近地址，看着像"停在 Reset_Handler"，实为脏读），
-        此时直接返回 ok=False 并说明原因，不把不可信值当结果返回。
+        因此这里改为按**读数收敛**判定：连续 need_stable 次 (PC, LR, SP) 完全一致才认为
+        稳定；不一致就继续采样。地址只做最低限度的合法性检查（None/0/1 视为无效）。
+
+        require_stopped=True 时先确认目标已停止：目标运行中 Keil 只回 PC（LR/SP 为 None）
+        且该 PC 是上次 halt 的残留值，此时直接返回 ok=False 并说明原因。
+
+        返回值在寄存器字段外附加：
+        - stable: 是否读到收敛值；False 时附 warning（PC 可能滞后，建议重试）
+        - samples: 实际采样次数
         """
         if require_stopped:
             try:
@@ -519,23 +528,40 @@ class UVClient:
                 return {"ok": False, "error": "查询目标状态失败: %s" % e}
             if st.get("ok") and st.get("running"):
                 return {"ok": False, "target_running": True,
-                        "error": "目标正在运行，读到的 PC/寄存器为陈旧值不可信"
-                                 "（实测会稳定返回复位附近地址，极易误判成停在复位）；"
+                        "error": "目标正在运行，读到的 PC 是上一次 halt 的残留值不可信"
+                                 "（实测会稳定返回上次停止地址，极易误判成停在复位）；"
                                  "请先 stop 并确认停止（可调 wait_until_stopped）后再读",
                         "status": st}
         last: dict = {}
-        for _ in range(max(1, retries)):
+        prev_sig = None
+        same = 0
+        samples = 0
+        for _ in range(max(2, retries)):
             r = self.read_cpu_registers()
             last = r
+            samples += 1
             if not r.get("ok"):
                 return r  # 读取本身失败（如未在调试态）立即返回，不重试
             pc = r.get("pc")
-            if isinstance(pc, int):
-                # 真实 PC 总指向 FLASH 代码段；SRAM 地址是脏值（可能读到 SP/栈内容）
-                in_flash = 0x08000000 <= pc <= 0x081FFFFF
-                if pc not in (0, 1) and in_flash:
+            if not isinstance(pc, int) or pc in (0, 1):
+                prev_sig, same = None, 0     # PC 明显无效，继续采样
+                time.sleep(delay)
+                continue
+            sig = (pc, r.get("lr"), r.get("sp"))
+            if sig == prev_sig:
+                same += 1
+                if same >= need_stable - 1:
+                    r["stable"] = True
+                    r["samples"] = samples
                     return r
+            else:
+                same = 0
+                prev_sig = sig
             time.sleep(delay)
+        last["stable"] = False
+        last["samples"] = samples
+        last["warning"] = ("连续 %d 次采样未收敛（PC/LR/SP 仍在变化），读到的 PC 可能是 halt "
+                           "瞬间的滞后值，不可信；请重试，或先 get_status 确认已停止" % samples)
         return last
 
     # ------------------------------------------------------------------

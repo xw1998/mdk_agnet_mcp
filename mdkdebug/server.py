@@ -630,7 +630,10 @@ def _build_location(client):
     pc = regs.get("pc")
     lr = regs.get("lr")
     sp = regs.get("sp")
-    result = {"ok": True, "pc": hex(pc) if isinstance(pc, int) else pc, "registers": regs}
+    result = {"ok": True, "pc": hex(pc) if isinstance(pc, int) else pc, "registers": regs,
+              "pc_confidence": "low" if regs.get("stable") is False else "high"}
+    if regs.get("stable") is False:
+        result["pc_warning"] = regs.get("warning")
     # 汇编级降级：符号未就绪或 PC 无法解析时，仍返回地址级信息并显式告警，不硬套源码
     if not loc or not loc.is_ready() or not isinstance(pc, int):
         result["warning"] = ("符号定位未就绪，仅返回汇编/地址级信息；"
@@ -1796,7 +1799,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "批量读取 CPU 核心寄存器 R0-R12/SP/LR/PC/xPSR 及当前值，并按 AAPCS 调用约定解读："
             "R0-R3 为函数前 4 个入参（若当前停在函数入口/调用点），R0 为返回值，SP 栈指针、LR 返回地址。"
-            "排查函数参数传错、返回值不对、寄存器被踩等问题时使用。需已进入调试状态。注意：需目标暂停；刚 run 到断点停止瞬间个别寄存器（如 PC）可能读到脏值，建议先 get_status 确认稳定停止再读。SP/LR 在中断上下文为现场脏值，AAPCS 解读仅对普通函数调用点成立。"
+            "排查函数参数传错、返回值不对、寄存器被踩等问题时使用。需已进入调试状态。注意：需目标暂停。真机实测 halt 后首次读到的 PC 可能是上一次 halt 的残留值（LR/SP 已更新），"
+            "本工具因此按'连续采样收敛'判定（连续两次 PC/LR/SP 一致才采纳），返回 stable 标记；"
+            "stable=false 表示未收敛、PC 不可信，请重试。SP/LR 在中断上下文为现场脏值，AAPCS 解读仅对普通函数调用点成立。"
         ),
     )
     async def read_registers() -> str:
@@ -2316,7 +2321,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="run",
         title="全速运行",
-        description="让目标 MCU 全速运行（启动执行）。注意：run 后目标全速运行，此时读内存/寄存器/表达式会失败或错位（异步消息堆积），需先 stop 再读。目标运行期间 UVSOCK 会推送异步消息。若期望'运行到某断点停住'，请以 get_current_location 实测 PC 停靠位置为准，run 本身返回的停靠信息不可信（PC 可能为脏值）。",
+        description="让目标 MCU 全速运行（启动执行）。注意：run 后目标全速运行，此时读内存/寄存器/表达式会失败或错位（异步消息堆积），需先 stop 再读。目标运行期间 UVSOCK 会推送异步消息。若期望'运行到某断点停住'，请以 get_current_location 实测 PC 停靠位置为准，run 本身返回的停靠信息不可信（PC 可能为脏值）。"
+            "关于'看不到现象'：调试是 halt 式的——只要 MCP/Keil 保持调试连接，目标要么被挂起、"
+            "要么在被断点拦停，外设现象（LED、串口输出、周期动作）会随之停滞，这是调试的本质而非工具缺陷。"
+            "要看真实运行现象，请在 run 之后**不要**再 stop/读内存/读寄存器，让目标自由运行；"
+            "需要恢复观察时先 exit_debug（退出调试后目标按复位/运行设置自由执行）。",
     )
     async def run() -> str:
         try:
@@ -2333,6 +2342,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "注意：到点 stop 后会轮询确认目标真正停止（stop 是异步生效的）才读 PC；"
             "若未能确认停止，返回 stopped=false + warning 且不返回停靠位置，"
             "避免把陈旧 PC（常量落复位附近 0x0800024c 之类）误当成停靠点。"
+            "另外真机实测：halt 后**首次**读到的 PC 常是上一次 halt 的残留值（LR/SP 已是新值），"
+            "故读取按'连续采样收敛'判定（连续两次 PC/LR/SP 一致才采纳），"
+            "返回 pc_confidence=high/low；low 表示采样未收敛，PC 不可信，请重试。"
             "到点常停在 SysTick 等中断上下文，此时局部变量与调用栈层数可能受限/为空，"
             "AAPCS 寄存器解读不适用。需已进入调试且配置 .axf。"
         ),
@@ -2467,13 +2479,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="build_project",
         description=(
             "编译 Keil 工程（UV4 -b，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，可省略以用默认工程；"
-            "target 为可选目标名。返回退出码与编译日志。注意：UV4 -b 会新起独立隐藏进程，构建输出经 -o 捕获返回（不会显示在你已打开的 Keil 窗口）；退出码 0/1=成功,2=有错误,>=3=不完整。Keil 处于调试态时编译可能失败，建议先退出调试。"
+            "target 为可选目标名。timeout_s 为可选超时秒数（0=默认 1800s）；大型工程/首次全量编译可显式调大，超时会返回 exit_code=-1 并说明。"
+            "返回退出码与编译日志。注意：UV4 -b 会新起独立隐藏进程，构建输出经 -o 捕获返回（不会显示在你已打开的 Keil 窗口）；退出码 0/1=成功,2=有错误,>=3=不完整。Keil 处于调试态时编译可能失败，建议先退出调试。"
         ),
     )
-    async def build_project(project: str = "", target: str = "") -> str:
+    async def build_project(project: str = "", target: str = "",
+                            timeout_s: int = 0) -> str:
         try:
             p = _resolve_project(project)
-            return _js(builder.build_project(_builder_cfg["uv4"], p, target.strip() or None))
+            t = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_BUILD_TIMEOUT
+            return _js(builder.build_project(_builder_cfg["uv4"], p, target.strip() or None, t))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -2481,13 +2496,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="rebuild_project",
         description=(
             "重新编译 Keil 工程（UV4 -r，全量重编，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
-            "可省略以用默认工程；target 为可选目标名。注意：UV4 -r 全量重编，同上——新起隐藏进程、输出经 -o 捕获；退出码语义同 build。Keil 处于调试态时编译可能失败。"
+            "可省略以用默认工程；target 为可选目标名。timeout_s 为可选超时秒数（0=默认 1800s），全量重编耗时更久，建议按需调大。"
+            "注意：UV4 -r 全量重编，同上——新起隐藏进程、输出经 -o 捕获；退出码语义同 build。Keil 处于调试态时编译可能失败。"
         ),
     )
-    async def rebuild_project(project: str = "", target: str = "") -> str:
+    async def rebuild_project(project: str = "", target: str = "",
+                              timeout_s: int = 0) -> str:
         try:
             p = _resolve_project(project)
-            return _js(builder.rebuild_project(_builder_cfg["uv4"], p, target.strip() or None))
+            t = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_BUILD_TIMEOUT
+            return _js(builder.rebuild_project(_builder_cfg["uv4"], p, target.strip() or None, t))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -2495,13 +2513,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="flash_download",
         description=(
             "烧录 Keil 工程到目标 Flash（UV4 -f，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
-            "可省略以用默认工程；target 为可选目标名。注意：UV4 -f 烧录，需目标板与烧录器已连接且工程烧录算法配置正确；Keil 处于调试态时烧录可能失败，建议先退出调试。烧录会覆盖目标 Flash，属有副作用操作。"
+            "可省略以用默认工程；target 为可选目标名。timeout_s 为可选超时秒数（0=默认 600s）。"
+            "注意：UV4 -f 烧录，需目标板与烧录器已连接且工程烧录算法配置正确；Keil 处于调试态时烧录可能失败，建议先退出调试。烧录会覆盖目标 Flash，属有副作用操作。"
         ),
     )
-    async def flash_download(project: str = "", target: str = "") -> str:
+    async def flash_download(project: str = "", target: str = "",
+                             timeout_s: int = 0) -> str:
         try:
             p = _resolve_project(project)
-            return _js(builder.flash_download(_builder_cfg["uv4"], p, target.strip() or None))
+            t = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_FLASH_TIMEOUT
+            return _js(builder.flash_download(_builder_cfg["uv4"], p, target.strip() or None, t))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -2509,13 +2530,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="build_and_flash",
         description=(
             "编译并烧录闭环（后台隐藏窗口，不闪现界面）：先编译，成功后才烧录（UV4 -b 成功后 -f）。"
-            "project 为 .uvprojx 路径，可省略以用默认工程；target 为可选目标名。注意：先编译成功才烧录（编译失败不烧录）；编译/烧录均新起隐藏 UV4 进程、输出经 -o 捕获。Keil 处于调试态时建议先退出再执行。"
+            "project 为 .uvprojx 路径，可省略以用默认工程；target 为可选目标名。"
+            "timeout_s 为可选超时秒数（0=用默认：编译 1800s、烧录 600s）；大型工程或首次全量编译建议显式调大。"
+            "注意：先编译成功才烧录（编译失败不烧录）；编译/烧录均新起隐藏 UV4 进程、输出经 -o 捕获。Keil 处于调试态时建议先退出再执行。"
         ),
     )
-    async def build_and_flash(project: str = "", target: str = "") -> str:
+    async def build_and_flash(project: str = "", target: str = "",
+                              timeout_s: int = 0) -> str:
         try:
             p = _resolve_project(project)
-            return _js(builder.build_and_flash(_builder_cfg["uv4"], p, target.strip() or None))
+            bt = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_BUILD_TIMEOUT
+            ft = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_FLASH_TIMEOUT
+            return _js(builder.build_and_flash(_builder_cfg["uv4"], p,
+                                               target.strip() or None, bt, ft))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -3020,7 +3047,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="批量执行多条命令（读类 + 断点 + 运行控制）",
         description=(
             "一次提交多条命令、聚合返回，减少 AI 往返。commands 为列表，每项 {\"tool\": \"工具名\", \"args\": {\"参数名\": 值}}；"
-            "tool 必须是本服务已注册的工具名，args 就是该工具自己的参数名（可先看该工具描述末尾的【调用示例】）。"
+            "tool 必须是本服务已注册的工具名（**本服务全部工具都支持**，含 disassemble、编译烧录、"
+            "断点管理、运行控制等；仅不支持 batch 自身，避免递归），"
+            "args 就是该工具自己的参数名（可先看该工具描述末尾的【参数】/【调用示例】）。"
             "例：一次往返下 2 个断点再运行——"
             "commands=[{\"tool\": \"set_breakpoint\", \"args\": {\"expr\": \"main\"}},"
             " {\"tool\": \"set_breakpoint\", \"args\": {\"expr\": \"svcrt_sched_activate\"}},"
