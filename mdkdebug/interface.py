@@ -8,7 +8,11 @@ import struct
 import time
 import logging
 
-from .uvsock import UVError
+from .uvsock import (UVError, UV_DBG_CMD_OUTPUT, UV_ASYNC_MSG, UV_DBG_CALLBACK,
+                     _HEADER_SIZE)
+
+# 异步推送命令码：读取响应时遇到这些帧缓存到 console_log/async_log，而非当响应返回
+_ASYNC_CMDS = frozenset((UV_DBG_CMD_OUTPUT, UV_ASYNC_MSG, UV_DBG_CALLBACK))
 
 logger = logging.getLogger("mdkdebug.interface")
 
@@ -25,6 +29,8 @@ class UVInterface:
         self.port = port
         self.sock: socket.socket | None = None
         self.recv_buf = b""
+        self.console_log: list = []  # 命令窗口输出缓存（0x5020）
+        self.async_log: list = []    # 异步消息/报错缓存（0x4000）"
 
     # ---- 连接管理 ----
     def open(self) -> None:
@@ -52,39 +58,114 @@ class UVInterface:
     # ---- 收发 ----
     def _drain_async(self) -> None:
         """
-        非阻塞清空 socket 中堆积的异步消息。
+        非阻塞读取 socket 中堆积的异步消息并解析缓存（命令输出/报错闭环）。
 
-        Keil UVSOCK 在目标运行时会持续向连接推送异步消息（回调、串口输出、
-        状态事件等）。同步请求-响应客户端不消费这些消息，它们会堆积在 OS
-        socket 缓冲中，导致下一次读响应时拿到的是残留异步帧而解析错位。
-        因此在每次发送请求前先非阻塞读空这些残留。
+        Keil UVSOCK 在目标运行或执行命令时会推送异步消息：命令输出(0x5020)、
+        异步状态/报错(0x4000)。这些消息堆积在 OS socket 缓冲中，若不消费会导致
+        下次读响应错位。本方法把堆积的异步帧解析后按类型缓存到 console_log /
+        async_log，供 read_console_output / read_async_messages 读取，实现
+        command 窗口调试输出与报错信息的闭环。非异步残留帧忽略。
         """
         if self.sock is None:
             return
         self.sock.setblocking(False)
+        pending = b""
         try:
             while True:
                 try:
                     chunk = self.sock.recv(self.MAX_RECV)
                 except BlockingIOError:
-                    break  # 已清空
+                    break
                 if not chunk:
                     break
+                pending += chunk
         finally:
             self.sock.setblocking(True)
+        self._parse_frames(pending)
+
+    def _parse_frames(self, buf: bytes) -> None:
+        """按帧长切分字节流，识别并缓存命令输出(0x5020)/异步消息(0x4000)。"""
+        off = 0
+        while off + _HEADER_SIZE <= len(buf):
+            total = struct.unpack('<I', buf[off:off + 4])[0]
+            if total < _HEADER_SIZE or off + total > len(buf):
+                break
+            ecmd = struct.unpack('<I', buf[off + 4:off + 8])[0]
+            data = buf[off + _HEADER_SIZE:off + total]
+            if ecmd == UV_DBG_CMD_OUTPUT:      # 0x5020 命令输出（SSTR）
+                txt = self._decode_sstr(data)
+                if txt is not None:
+                    self.console_log.append({"type": "output", "text": txt})
+            elif ecmd == UV_ASYNC_MSG:         # 0x4000 异步状态/报错
+                m = self._parse_async(data)
+                if m:
+                    self.async_log.append(m)
+            off += total
+
+    @staticmethod
+    def _decode_sstr(data: bytes):
+        """解析 SSTR(nLen+str)：返回字符串或 None。"""
+        if len(data) < 4:
+            return None
+        nlen = struct.unpack('<i', data[:4])[0]
+        if nlen <= 0 or nlen > len(data) - 4:
+            return None
+        return data[4:4 + nlen].rstrip(b'\x00').decode('utf-8', 'replace')
+
+    @staticmethod
+    def _extract_text(raw: bytes) -> str:
+        """提取字节流中可读文本（ASCII 可打印 + 多字节），忽略控制字节。"""
+        parts = []
+        cur = bytearray()
+        for b in raw:
+            if 32 <= b < 127 or b >= 0x80:
+                cur.append(b)
+            else:
+                if cur:
+                    parts.append(bytes(cur))
+                    cur = bytearray()
+        if cur:
+            parts.append(bytes(cur))
+        return "".join(p.decode('utf-8', 'replace') for p in parts)
+
+    def _parse_async(self, data: bytes) -> dict:
+        """解析 0x4000 异步消息：cmd_code(4)+status(4)+文本。"""
+        cmd_code = struct.unpack('<I', data[:4])[0] if len(data) >= 4 else None
+        status = struct.unpack('<i', data[4:8])[0] if len(data) >= 8 else None
+        return {"type": "async", "cmd_code": cmd_code, "status": status,
+                "text": self._extract_text(data[8:])}
+
+    def get_console_output(self, clear: bool = False) -> list:
+        """读取缓存的命令窗口输出（0x5020）。"""
+        self._drain_async()
+        out = list(self.console_log)
+        if clear:
+            self.console_log.clear()
+        return out
+
+    def get_async_messages(self, clear: bool = False) -> list:
+        """读取缓存的异步消息/报错（0x4000）。"""
+        self._drain_async()
+        out = list(self.async_log)
+        if clear:
+            self.async_log.clear()
+        return out
 
     def send(self, data: bytes) -> bytes | None:
         """发送已打包的命令，并阻塞接收完整响应帧（或 None，超时/异常）。"""
-        self.recv_buf = b""
         if self.sock is None:
             raise UVError("连接未建立，请先 open()")
-        self._drain_async()
+        self._drain_async()                 # 收集 socket 中堆积的异步帧
+        self._parse_frames(self.recv_buf)   # 处理上次 recv 残留帧，缓存其中异步帧
+        self.recv_buf = b""
         self.sock.sendall(data)
         return self.recv(ack=None)
 
     def recv(self, ack=None):
         """
-        接收响应。依据帧头前 4 字节的 m_nTotalLen 确定整包长度后返回。
+        接收响应。按帧切分字节流：异步推送帧（0x5020/0x4000/0x5002）解析缓存到
+        console_log/async_log 后继续读；首个非异步的 UV_CMD_RESPONSE 响应帧返回。
+        这样读响应时不会因混入异步帧而解析错位，命令输出/报错也能闭环读到。
         超时累计超过上限则返回 None。
         """
         timeout_counts = 0
@@ -94,10 +175,17 @@ class UVInterface:
                 if chunk:
                     self.recv_buf += chunk
                     timeout_counts = 0
-                    if len(self.recv_buf) >= 4:
+                    while len(self.recv_buf) >= 4:
                         m_nTotalLen = struct.unpack('<I', self.recv_buf[:4])[0]
-                        if len(self.recv_buf) >= m_nTotalLen:
-                            return self.recv_buf
+                        if m_nTotalLen < _HEADER_SIZE or len(self.recv_buf) < m_nTotalLen:
+                            break
+                        frame = self.recv_buf[:m_nTotalLen]
+                        self.recv_buf = self.recv_buf[m_nTotalLen:]
+                        ecmd = struct.unpack('<I', frame[4:8])[0]
+                        if ecmd in _ASYNC_CMDS:
+                            self._parse_frames(frame)   # 缓存命令输出/报错
+                            continue
+                        return frame                    # 响应帧
                     if ack is not None and ack in self.recv_buf:
                         return self.recv_buf
             except socket.timeout:

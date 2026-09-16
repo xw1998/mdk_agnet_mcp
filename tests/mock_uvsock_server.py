@@ -47,6 +47,7 @@ class MockUVSOCKServer:
         # 数组示例：arr 为 8 个 uint32，位于 base+16，共 32 字节
         for i in range(8):
             struct.pack_into('<I', self.mem, base - 0x20000000 + 16 + i * 4, 10 + i * 10)
+        self.pending_async = []  # 模拟 Keil 异步推送队列（0x5020 输出 / 0x4000 报错）
         self.var_table = {  # (vtype, addr, total_size, count, elem_size)
             "v0": (uvsock.VTT_int, base, 4, 1, 4),
             "v1": (uvsock.VTT_uint, base + 4, 4, 1, 4),
@@ -172,6 +173,23 @@ class MockUVSOCKServer:
             except Exception:
                 pass
 
+    # ---- 异步推送（模拟真实 Keil：先推命令输出/报错，再回命令响应）----
+    def _push_console(self, text):
+        """入队一条 0x5020 命令输出异步帧（SSTR 编码，含 NULL 结尾）。"""
+        payload = struct.pack('<i', len(text) + 1) + text.encode("utf-8") + b"\x00"
+        self.pending_async.append((uvsock.UV_DBG_CMD_OUTPUT, payload))
+
+    def _push_async(self, cmd_code, status, text):
+        """入队一条 0x4000 异步消息帧：cmd_code(4)+status(4)+文本。"""
+        payload = struct.pack('<II', cmd_code, status) + text.encode("utf-8")
+        self.pending_async.append((uvsock.UV_ASYNC_MSG, payload))
+
+    @staticmethod
+    def _pack_async(ecmd, payload):
+        total = 32 + len(payload)
+        header = struct.pack('<3IQdI', total, ecmd, len(payload), 0, 0.0, 0)
+        return header + payload
+
     def _process(self, conn, frame):
         m_nTotalLen, cmd, nBufLen, cycles, tStamp, m_Id = \
             struct.unpack('<3IQdI', frame[:32])
@@ -182,6 +200,10 @@ class MockUVSOCKServer:
             status = uvsock.UV_STATUS_FAILED
             resp_data = b""
             print(f"[mock] 处理命令 0x{cmd:04X} 出错: {e}")
+        # 先推送积压的异步帧（命令输出/报错），再回命令响应，贴近真实 Keil
+        for ecmd, payload in self.pending_async:
+            conn.sendall(self._pack_async(ecmd, payload))
+        self.pending_async.clear()
         conn.sendall(self._pack_response(cmd, status, resp_data))
 
     @staticmethod
@@ -271,6 +293,8 @@ class MockUVSOCKServer:
         if not parts:
             return uvsock.UV_STATUS_PARSE_ERROR, b""
         op, rest = parts[0].upper(), parts[1:]
+        # 模拟真实 Keil：任何 EXEC_CMD 先回显命令名（0x5020 第一帧）
+        self._push_console(cmd)
         if op == 'BS' and rest:
             if rest[0] not in self.breakpoints:
                 self.breakpoints.append(rest[0])
@@ -284,9 +308,18 @@ class MockUVSOCKServer:
         if op == 'BL':
             text = "\n".join(
                 f"{i}: {bp}" for i, bp in enumerate(self.breakpoints)) or ""
-            return uvsock.UV_STATUS_SUCCESS, text.encode('UTF-8') + b"\x00"
+            self._push_console(text)  # 断点列表作为命令输出（0x5020）
+            return uvsock.UV_STATUS_SUCCESS, b""
         if op == 'EVAL' and rest:
-            # 简单返回变量值（若命中预置变量）
+            name = rest[0]
+            if name in self.var_table:
+                _vt, addr, _s, _c, _es = self.var_table[name]
+                self._push_console(f"{name} = 0x{addr:08X}")  # EVAL 结果作为命令输出
+                return uvsock.UV_STATUS_SUCCESS, b""
+            # 未定义标识符：模拟 Keil 报错（0x4000 异步消息）
+            err = f"*** error 34: undefined identifier '{name}'"
+            self._push_console(err)
+            self._push_async(uvsock.UV_DBG_EXEC_CMD, uvsock.UV_STATUS_FAILED, err)
             return uvsock.UV_STATUS_SUCCESS, b""
         return uvsock.UV_STATUS_PARSE_ERROR, b""
 

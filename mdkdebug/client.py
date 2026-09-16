@@ -398,6 +398,14 @@ class UVClient:
         """列出当前所有断点（命令窗口 BL）。"""
         return self.exec_command("BL")
 
+    def read_console_output(self, clear: bool = False) -> list:
+        """读取 Keil 命令窗口输出缓存（UV_DBG_CMD_OUTPUT, 0x5020）。"""
+        return self.phy.get_console_output(clear=clear)
+
+    def read_async_messages(self, clear: bool = False) -> list:
+        """读取 Keil 异步消息/报错缓存（UV_ASYNC_MSG, 0x4000）。"""
+        return self.phy.get_async_messages(clear=clear)
+
     def read_cpu_registers(self) -> dict:
         """读取 CPU 核心寄存器 PC/LR/SP（R15/R14/R13）。多候选表达式以兼容不同 Keil 版本。"""
         candidates = {

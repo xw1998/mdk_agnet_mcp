@@ -644,6 +644,45 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
+    @server.tool(
+        name="read_console_output",
+        title="读取命令窗口输出",
+        description=(
+            "读取 Keil 命令窗口(Command)的调试输出，来自 UVSOCK 推送的 UV_DBG_CMD_OUTPUT(0x5020) "
+            "异步消息。执行 EXEC_CMD / BL / EVAL / 断点 等命令后，其输出（如断点列表、EVAL 结果、"
+            "printf 调试打印、错误行）通过本工具读取，实现调试信息闭环。clear 可选清空缓存。"
+            "注意：输出为异步推送，需先执行命令再读；每次发送请求前会自动收集堆积的异步帧。"
+        ),
+    )
+    async def read_console_output(clear: bool = False) -> str:
+        try:
+            msgs = _get_client().read_console_output(clear=clear)
+            return _js({"ok": True, "count": len(msgs),
+                        "lines": [m.get("text") for m in msgs],
+                        "clear": clear,
+                        "note": "读自 Keil UVSOCK 命令窗口输出(0x5020)"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="read_async_messages",
+        title="读取异步消息/报错",
+        description=(
+            "读取 Keil 异步消息与报错信息，来自 UVSOCK 推送的 UV_ASYNC_MSG(0x4000)。"
+            "包含命令执行状态(status)与报错文本（如 '*** error 34: undefined identifier'、"
+            "编译/烧录/调试失败的弹窗报错内容），用于闭环捕获 Keil 侧错误。clear 可选清空缓存。"
+            "注意：报错为异步推送，先执行可能出错的操作再读；status 为 Keil 返回的错误码。"
+        ),
+    )
+    async def read_async_messages(clear: bool = False) -> str:
+        try:
+            msgs = _get_client().read_async_messages(clear=clear)
+            return _js({"ok": True, "count": len(msgs), "messages": msgs,
+                        "clear": clear,
+                        "note": "读自 Keil UVSOCK 异步消息(0x4000)，含执行状态与报错"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
     # ---------------- 表达式 / 变量 ----------------
     @server.tool(
         name="calc_expression",
