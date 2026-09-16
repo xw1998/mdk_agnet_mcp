@@ -29,7 +29,7 @@ from mcp.server.mcpserver import MCPServer
 
 from .client import UVClient, UVSOCKConnectError
 from .locator import Locator
-from . import builder, mapfile, __version__
+from . import builder, mapfile, uvoptx as _uvoptx, __version__
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -1064,17 +1064,84 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "expr": expr, "bp_id": bp_id, "error": str(e)})
 
+    # ---- .uvoptx 持久化断点（Keil 在下次进调试时自动恢复，BK 清不掉）----
+    def _uvoptx_project_path(project: str) -> str:
+        p = (project or "").strip() or (_builder_cfg.get("default_project") or "")
+        return _uvoptx.uvoptx_path_for(p) if p else ""
+
+    def _read_uvoptx_persistent(project: str = "") -> dict:
+        path = _uvoptx_project_path(project)
+        if not path:
+            return {"ok": False, "error": "未指定工程（传 project 或配置 --default-project），无法定位 .uvoptx"}
+        if not os.path.isfile(path):
+            return {"ok": True, "path": path, "count": 0, "breakpoints": [],
+                    "note": "工程无 .uvoptx 文件（尚未生成或已删除）"}
+        try:
+            bps = _uvoptx.parse_uvoptx_breakpoints(path)
+            return {"ok": True, "path": path, "count": len(bps), "breakpoints": bps,
+                    "note": "Keil 持久化断点：BK 清不掉，Keil 下次进入调试会自动恢复"
+                            "（清除用 clear_uvoptx_breakpoints）"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "path": path, "error": str(e)}
+
+    @server.tool(
+        name="list_uvoptx_breakpoints",
+        title="读取持久化断点(.uvoptx)",
+        description=(
+            "读取 Keil 工程 .uvoptx 中持久化的断点列表（不依赖 UVSOCK，直接解析 XML）。"
+            "这些断点由 Keil 在调试期间写入工程文件，会在下次进入调试时自动恢复，"
+            "命令窗口 BK 无法清除（即 clear_breakpoint 返回成功、断点却依然生效的根因）。"
+            "project 传 .uvprojx/.uvoptx 路径（省略用 --default-project）。"
+            "配合 clear_uvoptx_breakpoints 使用：先确认残留，再清理。注意：Keil 运行时会用内存断点回写，清理前建议先 close_uvision。"
+        ),
+    )
+    async def list_uvoptx_breakpoints(project: str = "") -> str:
+        try:
+            return _js(_read_uvoptx_persistent(project))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="clear_uvoptx_breakpoints",
+        title="清除持久化断点(.uvoptx)",
+        description=(
+            "清除 Keil 工程 .uvoptx 中持久化的断点（直接改写 XML，不依赖 UVSOCK），"
+            "解决 BK 清不掉、下次进调试自动恢复的顽固残留。project 传 .uvprojx/.uvoptx 路径"
+            "（省略用 --default-project）；backup=True（默认）先备份为 .uvoptx.mdkdebug.bak。"
+            "注意：Keil 打开该工程时会用内存中的断点覆盖 uvoptx，务必在 Keil 关闭后（或先调 close_uvision）执行。"
+        ),
+    )
+    async def clear_uvoptx_breakpoints(project: str = "", backup: bool = True) -> str:
+        try:
+            path = _uvoptx_project_path(project)
+            if not path:
+                return _js({"ok": False, "error": "未指定工程（传 project 或配置 --default-project）"})
+            r = _uvoptx.clear_uvoptx_breakpoints(path, backup=backup)
+            r["note"] = ("已清除 .uvoptx 持久断点。若 Keil 正打开该工程，请先关闭 Keil 再清理，"
+                         "否则会被其内存断点回写覆盖。")
+            return _js(r)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
     @server.tool(
         name="list_breakpoints",
         title="列出断点",
-        description="列出当前调试会话中的所有断点（命令窗口 BL）。注意：真实 Keil 的 EXEC_CMD(BL) 不回传命令输出，本工具返回 ok=true 表示命令被接受、但拿不到真实断点列表（协议固有限制）；请以本服务内部记录的断点为准。",
+        description="列出当前调试会话中的断点：返回本服务内部记录（ok=true），并附加解析工程 .uvoptx 中 Keil 持久化的断点（uvoptx 字段）。说明：真实 Keil 的 EXEC_CMD(BL) 不回传命令输出（协议固有限制），故无法枚举真实断点；.uvoptx 字段用于暴露 BK 清不掉、下次进调试会自动恢复的残留断点。",
     )
     async def list_breakpoints() -> str:
         try:
-            return _js({"ok": True, "breakpoints": list(_breakpoints),
-                        "total": len(_breakpoints),
-                        "note": "Keil 命令窗口 BL 的输出不经 socket 回传（协议限制），无法枚举真实断点；"
-                                "本列表为本服务内部 id 记录，用于按 bp_id 可靠清除。"})
+            out = {"ok": True, "breakpoints": list(_breakpoints),
+                   "total": len(_breakpoints),
+                   "note": "Keil 命令窗口 BL 的输出不经 socket 回传（协议限制），无法枚举真实断点；"
+                           "本列表为本服务内部 id 记录，用于按 bp_id 可靠清除。"}
+            # 附加：工程 .uvoptx 中 Keil 持久化的断点（BK 清不掉，下次进调试自动恢复）
+            uv = _read_uvoptx_persistent()
+            out["uvoptx"] = uv
+            if uv.get("ok") and uv.get("count"):
+                out["note"] += (f" 另：工程 .uvoptx 有 {uv['count']} 个持久化断点"
+                                "（BK 清不掉、下次进调试自动恢复），见 uvoptx 字段，"
+                                "可用 clear_uvoptx_breakpoints 清除。")
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -1082,16 +1149,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="clear_all_breakpoints",
         title="清除全部软件断点",
         description=(
-            "清除本服务内部记录的全部软件断点（逐个按确切地址发 BK），并清空内部断点表。"
-            "用于一次清干净，避免残留断点导致运行异常。注意：Flash 软件断点会改写 Flash 指令，"
-            "清除标记后建议重新 build_and_flash 恢复原指令；内部表清空后如需按 bp_id 管理请重新设置。"
+            "清除软件断点：清空本服务内部记录并逐个按确切地址发 BK。include_uvoptx=True 时"
+            "一并清除工程 .uvoptx 中 Keil 持久化的断点（BK 清不掉、下次进调试会自动恢复的残留）。"
+            "注意：Flash 软件断点会改写 Flash 指令，清除标记后建议重新 build_and_flash 恢复原指令；"
+            "清理 .uvoptx 需 Keil 已关闭（否则被内存断点回写覆盖）。"
         ),
     )
-    async def clear_all_breakpoints() -> str:
+    async def clear_all_breakpoints(include_uvoptx: bool = False) -> str:
         try:
             client = _get_client()
-            if not _breakpoints:
-                return _js({"ok": True, "cleared": 0, "message": "内部断点表已为空"})
             cleared = []
             for b in list(_breakpoints):
                 target = b.get("address") or b.get("expr")
@@ -1103,8 +1169,23 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     cleared.append({"id": b.get("id"), "expr": b.get("expr"),
                                     "address": b.get("address"), "ok": False, "error": str(e)})
             _breakpoints[:] = []
-            return _js({"ok": True, "cleared": len(cleared), "items": cleared,
-                        "note": "Flash 软件断点清除标记后建议重新 build_and_flash 恢复被改写的指令"})
+            out = {"ok": True, "cleared": len(cleared), "items": cleared,
+                   "note": "Flash 软件断点清除标记后建议重新 build_and_flash 恢复被改写的指令"}
+            # 可选：一并清除 .uvoptx 持久化断点（BK 清不掉的残留）
+            if include_uvoptx:
+                path = _uvoptx_project_path("")
+                if not path:
+                    out["uvoptx"] = {"ok": False, "error": "未配置默认工程，无法定位 .uvoptx（请改用 clear_uvoptx_breakpoints 并传 project）"}
+                else:
+                    out["uvoptx"] = _uvoptx.clear_uvoptx_breakpoints(path)
+                    out["note"] += " 已一并清理 .uvoptx 持久断点（需 Keil 已关闭才不会被回写）。"
+            else:
+                uv = _read_uvoptx_persistent()
+                if uv.get("ok") and uv.get("count"):
+                    out["uvoptx_persistent"] = {"count": uv["count"], "path": uv.get("path")}
+                    out["note"] += (f" 注意：工程 .uvoptx 仍有 {uv['count']} 个持久化断点未清"
+                                    "（BK 清不掉、下次进调试自动恢复），可设 include_uvoptx=True 或调 clear_uvoptx_breakpoints 清除。")
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
