@@ -43,16 +43,43 @@ _builder_cfg = {"uv4": None, "default_project": None}
 _symbol_cfg = {"locator": None, "axf": None, "source_type": None}
 # 预登记候选符号工程注册表：AI 可据此切换/自动匹配当前调试固件的符号文件。
 # flash 区段用于 PC 自动匹配（辅助定位，固件 flash 可能重叠，手动 set_symbol_file 为主）。
-_SYMBOL_PROJECTS = [
-    {"name": "SVCRTOS_TEST 内核",
-     "axf": r"D:/工作/git_project/svcrtos_new/example/stm32f427/kernel/SVCRTOS_TEST/MDK-ARM/SVCRTOS_TEST/SVCRTOS_TEST.axf",
-     "map": r"D:/工作/git_project/svcrtos_new/example/stm32f427/kernel/SVCRTOS_TEST/MDK-ARM/SVCRTOS_TEST/SVCRTOS_TEST.map",
-     "flash_start": 0x08000000, "flash_size": 0x100000},
-    {"name": "mdk_test",
-     "axf": r"D:/工作/git_project/mdk_agent/example_mdk_project/mdk_test/MDK-ARM/mdk_test/mdk_test.axf",
-     "map": r"D:/工作/git_project/mdk_agent/example_mdk_project/mdk_test/MDK-ARM/mdk_test/mdk_test.map",
-     "flash_start": 0x08000000, "flash_size": 0x80000},
-]
+#
+# 为开源跨机可用，本表【不写死任何本机绝对路径】：
+#   - 仓库内置工程（mdk_test）用相对仓库根推导，clone 后编译出 .axf 即自动可用；
+#   - 本机/外部工程（如 SVCRTOS_TEST 内核）通过启动参数 --symbol-project 或环境变量
+#     MDKDEBUG_SYMBOL_PROJECTS（JSON 数组）注入追加，不硬编码进代码。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _builtin_symbol_projects() -> list:
+    """仓库内置符号工程：mdk_test（相对仓库根推导，跨机 clone 编译后即用）。"""
+    base = os.path.join(_REPO_ROOT, "example_mdk_project", "mdk_test", "MDK-ARM", "mdk_test")
+    return [{
+        "name": "mdk_test",
+        "axf": os.path.join(base, "mdk_test.axf"),
+        "map": os.path.join(base, "mdk_test.map"),
+        "flash_start": 0x08000000, "flash_size": 0x80000,
+    }]
+
+
+def _symbol_projects_from_env() -> list:
+    """从环境变量 MDKDEBUG_SYMBOL_PROJECTS 读取追加的符号工程（JSON 数组，每项含
+    name/axf/map/flash_start/flash_size）。用于注入本机/外部工程而不改代码。"""
+    raw = os.environ.get("MDKDEBUG_SYMBOL_PROJECTS")
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            logger.warning("MDKDEBUG_SYMBOL_PROJECTS 应为 JSON 数组，已忽略")
+            return []
+        return [p for p in data if isinstance(p, dict) and p.get("name")]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("MDKDEBUG_SYMBOL_PROJECTS 解析失败: %s", e)
+        return []
+
+
+_SYMBOL_PROJECTS: list = _builtin_symbol_projects()
 _breakpoints: list = []  # 内部断点记录（id/expr/address/file/line），因 BL 输出不经 socket 回传
 _bp_counter: int = 0  # 断点/数据断点 id 自增
 _watchpoints: list = []  # 内部数据断点（watchpoint）记录
@@ -586,8 +613,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                   idle_timeout: float = 30.0,
                   uv4_path: str | None = None,
                   default_project: str | None = None,
-                  axf_path: str | None = None) -> MCPServer:
-    global _client, _builder_cfg, _symbol_cfg
+                  axf_path: str | None = None,
+                  symbol_projects: list | None = None) -> MCPServer:
+    global _client, _builder_cfg, _symbol_cfg, _SYMBOL_PROJECTS
+    # 合并符号工程注册表：内置(仓库内相对) + 环境变量注入 + 启动参数注入
+    _SYMBOL_PROJECTS = (_builtin_symbol_projects()
+                        + _symbol_projects_from_env()
+                        + list(symbol_projects or []))
     _client = UVClient(host=host, port=port, idle_timeout=idle_timeout)
     uv4 = builder.find_uv4(uv4_path)
     if uv4 is None:
@@ -2869,11 +2901,12 @@ async def run_stdio(host: str = "127.0.0.1", port: int = 4823,
                     idle_timeout: float = 30.0,
                     uv4_path: str | None = None,
                     default_project: str | None = None,
-                    axf_path: str | None = None) -> None:
+                    axf_path: str | None = None,
+                    symbol_projects: list | None = None) -> None:
     """以标准输入/输出方式运行（MCP 客户端常用方式）。"""
     server = create_server(host=host, port=port, idle_timeout=idle_timeout,
                            uv4_path=uv4_path, default_project=default_project,
-                           axf_path=axf_path)
+                           axf_path=axf_path, symbol_projects=symbol_projects)
     await server.run_stdio_async()
 
 
@@ -2882,12 +2915,13 @@ async def run_http(host: str = "127.0.0.1", port: int = 4823,
                    http_host: str = "127.0.0.1", http_port: int = 8300,
                    uv4_path: str | None = None,
                    default_project: str | None = None,
-                   axf_path: str | None = None) -> None:
+                   axf_path: str | None = None,
+                   symbol_projects: list | None = None) -> None:
     """以 Streamable HTTP 方式运行（可被远程/浏览器 MCP 客户端连接）。"""
     import uvicorn
     server = create_server(host=host, port=port, idle_timeout=idle_timeout,
                            uv4_path=uv4_path, default_project=default_project,
-                           axf_path=axf_path)
+                           axf_path=axf_path, symbol_projects=symbol_projects)
     app = server.streamable_http_app()
     config = uvicorn.Config(app, host=http_host, port=http_port, log_level="info")
     uvicorn.Server(config).run()

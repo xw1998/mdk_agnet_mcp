@@ -63,7 +63,11 @@ async def main():
         d = load(r)
         check("list_symbol_projects ok", d.get("ok") is True, r[:200])
         proj = d.get("projects", [])
-        check("候选工程>=2", len(proj) >= 2, f"count={len(proj)}")
+        # 去硬编码后：默认注册表含仓库内置 mdk_test；外部工程(如 SVCRTOS)改为
+        # --symbol-project/MDKDEBUG_SYMBOL_PROJECTS 注入，不再写死进代码
+        check("候选工程含内置 mdk_test",
+              any(p.get("name") == "mdk_test" for p in proj),
+              f"names={[p.get('name') for p in proj]}")
         svcrt = [p for p in proj if "SVCRTOS" in p.get("name", "")]
         if svcrt:
             check("SVCRTOS 候选 axf 存在", svcrt[0].get("axf_exists") is True,
