@@ -153,6 +153,70 @@ class Locator:
         a, f, l = self._rows[idx]
         return {"address": a, "file": f, "line": l}
 
+    def _load_code_ranges(self):
+        """加载 函数/对象 符号的地址区间（已合并重叠），用于判断地址是否被符号表覆盖。"""
+        if getattr(self, "_code_ranges", None) is not None:
+            return self._code_ranges
+        raw = []
+        try:
+            with open(self.axf_path, "rb") as f:
+                elf = ELFFile(f)
+                sec = elf.get_section_by_name(".symtab") or elf.get_section_by_name(".dynsym")
+                if sec is not None:
+                    for sym in sec.iter_symbols():
+                        if not sym.name:
+                            continue
+                        st = sym.entry["st_info"]
+                        tname = str(st["type"]).replace("STT_", "").lower()
+                        if tname not in ("func", "object"):
+                            continue
+                        # Cortex-M Thumb 函数符号 st_value 的 bit0=1，而 Keil/行号表用偶数地址，
+                        # 故屏蔽 bit0 后入区间，避免差 1 字节造成覆盖误判。
+                        a = sym.entry["st_value"] & ~1
+                        sz = sym.entry.get("st_size", 0) or 0
+                        if a and sz > 0:
+                            raw.append((a, a + sz))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("读取符号区间失败: %s", e)
+        raw.sort()
+        merged = []
+        for a, b in raw:
+            if merged and a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        self._code_ranges = [(a, b) for a, b in merged]
+        return self._code_ranges
+
+    def is_covered(self, addr: int) -> bool:
+        """地址是否落在当前 .axf 某个符号（函数/对象）的地址区间内。
+        注意：Cortex-M Thumb 符号 st_value 的 bit0=1，Keil/行号表用偶数地址，
+        两侧都清 bit0 再比较，避免差 1 字节误判。"""
+        self._ensure_loaded()
+        addr &= ~1
+        ranges = self._load_code_ranges()
+        if not ranges:
+            return True  # 无符号区间信息时不做断言，避免误伤
+        starts = [r[0] for r in ranges]
+        i = bisect.bisect_right(starts, addr) - 1
+        return i >= 0 and ranges[i][0] <= addr < ranges[i][1]
+
+    def locate(self, addr: int):
+        """地址 -> {address, file, line, covered}。covered=False 表示地址不在符号覆盖范围，
+        此时不给 file/line（避免把符号区间外的地址误报为最近函数某行）。"""
+        loc = self.addr_to_location(addr)
+        covered = self.is_covered(addr)
+        if loc is None:
+            return {"address": addr, "file": None, "line": None, "covered": covered}
+        loc = dict(loc)
+        loc["covered"] = covered
+        if not covered:
+            loc["nearest_file"] = loc.get("file")
+            loc["nearest_line"] = loc.get("line")
+            loc["file"] = None
+            loc["line"] = None
+        return loc
+
     def line_to_addr(self, file: str, line: int):
         """源文件:行号 -> 地址（反向最近匹配）。file 可按 basename 或路径匹配。"""
         self._ensure_loaded()

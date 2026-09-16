@@ -362,6 +362,19 @@ class MapLocator:
                 "source_type": "map"}
 
 
+    def is_covered(self, addr: int) -> bool:
+        """.map 符号无 size 信息，不做覆盖断言（保守返回 True，避免误伤）。"""
+        return True
+
+    def locate(self, addr: int):
+        """与 Locator.locate 对齐：map 无行号，仅返回函数名级信息。"""
+        l = self.addr_to_location(addr)
+        if l is None:
+            return {"address": addr, "file": None, "line": None, "covered": True}
+        d = dict(l)
+        d["covered"] = True
+        return d
+
 def _load_symbol_file(path: str):
     """加载符号文件（.axf 或 .map），更新 _symbol_cfg。返回 (ok, message, count)。"""
     global _symbol_cfg
@@ -496,25 +509,46 @@ def _fmt_field(raw: bytes, tname: str):
 def _backtrace(client, loc, pc, lr, sp, max_frames: int = 16, stack_bytes: int = 1024) -> list:
     """基于 PC/LR + 栈启发式读取做完整调用栈回溯。
 
-    第一帧为 PC，第二帧为 LR，之后从 SP 向上扫描栈内存（AAPCS 下返回地址在栈中
-    成链），凡落在 FLASH 代码段的值视为返回地址并反查 文件:行。启发式方案，不保证
-    与真实帧完全一致，但对多数 ARM 调用链足够给出完整路径。返回 [{level,pc,file,line}]。
+    第一帧为 PC、第二帧为 LR（均取自寄存器，置信 high）；之后从 SP 向上扫描栈内存，
+    凡落在 FLASH 代码段的值视为返回地址并反查 文件:行。栈扫描为启发式：栈中可能残留
+    陈旧字被误判为帧（如出现在调用链中间、或落在当前 .axf 符号范围外的野地址）。
+    为此每帧带 origin(pc/lr/stack) 与 confidence(high/low)：
+    - 栈扫描帧若地址不在当前符号覆盖范围内、或解析不到 文件:行，标记 confidence=low
+      并附 note，且**停止继续扫描**（其后栈内容更不可信，避免堆叠更多错误帧）。
+    返回 [{level,pc,file,line,origin,confidence[,note]}]。
     """
     frames: list = []
     seen: set = set()
+    _is_code = getattr(loc, "is_code_address", None) or (
+        lambda a: 0x08000000 <= a <= 0x081FFFFF)
 
-    def add(addr: int) -> None:
-        if addr in seen or not loc.is_code_address(addr):
-            return
+    def _locate(addr: int):
+        f = getattr(loc, "locate", None)
+        return f(addr) if f else loc.addr_to_location(addr)
+
+    def add(addr: int, origin: str) -> bool:
+        """添加一帧，返回是否为低置信度帧。"""
+        if addr in seen or not _is_code(addr):
+            return False
         seen.add(addr)
-        l = loc.addr_to_location(addr)
-        frames.append({"pc": hex(addr),
-                       "file": l["file"] if l else "?",
-                       "line": l["line"] if l else None})
+        l = _locate(addr)
+        covered = bool(l and l.get("covered"))
+        ffile = l.get("file") if l else None
+        fline = l.get("line") if l else None
+        frame = {"pc": hex(addr), "file": ffile or "?", "line": fline,
+                 "origin": origin}
+        if origin == "stack" and (not covered or not ffile):
+            frame["confidence"] = "low"
+            frame["note"] = ("该返回地址不在当前 .axf 符号覆盖范围内或无法解析，"
+                             "疑似栈中陈旧值，可信度低")
+        else:
+            frame["confidence"] = "high"
+        frames.append(frame)
+        return frame["confidence"] == "low"
 
-    add(pc)
+    add(pc, "pc")
     if isinstance(lr, int):
-        add(lr)
+        add(lr, "lr")
     if isinstance(sp, int):
         raw = b""
         try:
@@ -527,8 +561,9 @@ def _backtrace(client, loc, pc, lr, sp, max_frames: int = 16, stack_bytes: int =
             w = int.from_bytes(raw[off:off + 4], "little")
             if len(frames) >= max_frames:
                 break
-            if loc.is_code_address(w):
-                add(w)
+            if _is_code(w) and w not in seen:
+                if add(w, "stack"):
+                    break  # 出现低置信度帧，停止继续扫描
     for i, fr in enumerate(frames):
         fr["level"] = i
     return frames
@@ -854,10 +889,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             loc = _get_locator()
             if addr is not None:
                 out["address"] = hex(addr)
-                l = loc.addr_to_location(addr) if loc else None
-                if l:
+                l = loc.locate(addr) if loc else None
+                if l and l.get("file"):
                     out["file"] = l["file"]
                     out["line"] = l["line"]
+                elif l and not l.get("covered"):
+                    out["location_note"] = (
+                        "该地址不在当前 .axf 符号覆盖范围内（未匹配到包含它的函数/对象），未给出 file/line，仅按地址下断；若目标是其他固件，请先 set_symbol_file 切到对应 .axf")
                 _bp_counter += 1
                 _breakpoints.append({"id": _bp_counter, "expr": expr, "address": hex(addr),
                                      "file": out.get("file"), "line": out.get("line")})
@@ -904,10 +942,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                    "command": cmd, "status_text": r.get("status_text")}
             if addr is not None:
                 out["address"] = hex(addr)
-                l = loc.addr_to_location(addr) if loc else None
-                if l:
+                l = loc.locate(addr) if loc else None
+                if l and l.get("file"):
                     out["file"] = l["file"]
                     out["line"] = l["line"]
+                elif l and not l.get("covered"):
+                    out["location_note"] = (
+                        "该地址不在当前 .axf 符号覆盖范围内（未匹配到包含它的函数/对象），未给出 file/line，仅按地址下断；若目标是其他固件，请先 set_symbol_file 切到对应 .axf")
                 _bp_counter += 1
                 _breakpoints.append({"id": _bp_counter, "expr": expr, "address": hex(addr), "condition": cond,
                                      "count": count, "file": out.get("file"), "line": out.get("line")})
@@ -962,10 +1003,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 out["error"] = f"设置数据断点失败: {r}"
                 return _js(out)
             loc = _get_locator()
-            l = loc.addr_to_location(addr) if loc else None
-            if l:
+            l = loc.locate(addr) if loc else None
+            if l and l.get("file"):
                 out["file"] = l["file"]
                 out["line"] = l["line"]
+            elif l and not l.get("covered"):
+                out["location_note"] = (
+                    "该地址不在当前符号覆盖范围内，未给出 file/line（数据断点按地址生效即可）")
             _bp_counter += 1
             _watchpoints.append({"id": _bp_counter, "expr": expr, "address": hex(addr), "access": acc,
                                  "count": count, "file": out.get("file"),
@@ -1293,7 +1337,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "读取当前 PC，定位到 源文件:行号 并返回该行附近的源码上下文，"
             "同时给出调用栈（PC + LR 反查）。让 AI 像人一样知道程序停在哪、看的是什么代码。"
-            "需已进入调试状态且配置了 .axf 调试符号。注意：读 PC 已做脏值过滤与重试（run 到断点刚停止瞬间 PC 可能读到脏值1，单步可能读到 SRAM 脏值）。调用栈为 SP+LR 栈启发式回溯，在全速运行后手动 stop 或 SysTick 中断频繁场景层数受限/可能错位。"
+            "需已进入调试状态且配置了 .axf 调试符号。注意：读 PC 已做脏值过滤与重试（run 到断点刚停止瞬间 PC 可能读到脏值1，单步可能读到 SRAM 脏值）。调用栈为 SP+LR 栈启发式回溯（每帧带 origin 与 confidence；confidence=low 表示该帧疑似栈中陈旧值、且其后帧已截断），在全速运行后手动 stop 或 SysTick 中断频繁场景层数受限/可能错位。"
         ),
     )
     async def get_current_location() -> str:
