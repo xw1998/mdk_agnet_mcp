@@ -22,6 +22,7 @@ import logging
 import os
 import struct
 import sys
+import time
 import xml.etree.ElementTree as ET
 
 from mcp.server.mcpserver import MCPServer
@@ -121,6 +122,131 @@ def _parse_uvprojx_config(uvprojx_path: str | None, target_name: str | None = No
         out["current"] = chosen
     else:
         out["error"] = "工程中未找到 Target 配置"
+    return out
+
+
+# ---------------- 批次6：器件信息 / 采样剖析 / 环境自检 辅助 ----------------
+
+# STM32F4 常见 DEV_ID（DBGMCU->IDCODE 低 16 位）→ 型号与标称 Flash/RAM（KB）
+_DEV_ID_MAP = {
+    0x413: {"name": "STM32F405/407/415/417", "flash_kb": 1024, "ram_kb": 192},
+    0x419: {"name": "STM32F427/437/429/439", "flash_kb": 2048, "ram_kb": 256},
+    0x423: {"name": "STM32F401xB/C",         "flash_kb": 512,  "ram_kb": 96},
+    0x431: {"name": "STM32F411xE",            "flash_kb": 512,  "ram_kb": 128},
+    0x441: {"name": "STM32F412",              "flash_kb": 1024, "ram_kb": 256},
+    0x421: {"name": "STM32F446",              "flash_kb": 512,  "ram_kb": 128},
+    0x434: {"name": "STM32F469/479",          "flash_kb": 2048, "ram_kb": 384},
+    0x458: {"name": "STM32F410",              "flash_kb": 128,  "ram_kb": 32},
+    0x433: {"name": "STM32F4(DE变体)",        "flash_kb": None, "ram_kb": None},
+    0x463: {"name": "STM32F413/423",          "flash_kb": 1536, "ram_kb": 320},
+}
+_DEV_ID_CODE_BASE = 0x08000000
+_DEV_ID_DBGMCU_BASE = 0xE0042000  # DBGMCU 外设基址（Cortex-M4）
+_RTOS_MARKERS = {
+    "FreeRTOS": ["pxCurrentTCB", "pxReadyTasksLists", "uxCurrentNumberOfTasks"],
+    "RT-Thread": ["rt_current_thread", "rt_thread_priority_table", "rt_object_attach_hook"],
+    "Keil RTX": ["osActiveThread"],
+}
+_func_cache = {"mtime": None, "funcs": []}  # 采样剖析函数符号表缓存
+
+
+def _probe_tcp(host: str, port: int, timeout: float = 0.5) -> bool:
+    """探测目标主机端口是否可达（判断 Keil UVSOCK 是否开启监听）。"""
+    import socket as _socket
+    try:
+        with _socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _load_func_table(limit: int = 10 ** 6) -> list:
+    """读取 .axf 全部函数符号 → [(start, end, name)]，按 start 排序；带 mtime 缓存。"""
+    loc = _get_locator()
+    if not loc or not loc.is_ready():
+        return []
+    try:
+        mtime = loc.axf_mtime
+    except Exception:  # noqa: BLE001
+        mtime = None
+    if _func_cache["mtime"] == mtime and _func_cache["funcs"]:
+        return _func_cache["funcs"]
+    syms = loc.search_symbols("", limit=limit, kind="func")
+    funcs = []
+    for s in syms:
+        try:
+            start = int(s["addr"], 16)
+        except (TypeError, ValueError):
+            continue
+        size = int(s.get("size") or 0)
+        end = start + size if size > 0 else start
+        funcs.append((start, end, s["name"]))
+    funcs.sort(key=lambda x: x[0])
+    # 无 size 的符号用下一个符号 start 作结束界
+    for i in range(len(funcs) - 1):
+        if funcs[i][1] <= funcs[i][0]:
+            funcs[i] = (funcs[i][0], funcs[i + 1][0], funcs[i][2])
+    _func_cache["mtime"] = mtime
+    _func_cache["funcs"] = funcs
+    return funcs
+
+
+def _func_for_pc(funcs: list, pc: int):
+    """把 PC 归到函数名（最近 start<=pc 且 pc<end 的符号）；无则返回 None。"""
+    lo, hi, hit = 0, len(funcs) - 1, -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if funcs[mid][0] <= pc:
+            hit = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if hit < 0:
+        return None
+    start, end, name = funcs[hit]
+    if pc < end:
+        return name
+    return None
+
+
+_CPU_PARTNO = {0xC20: "Cortex-M0", 0xC21: "Cortex-M3", 0xC24: "Cortex-M4", 0xC23: "Cortex-M7"}
+
+
+def _read_cpu_arch(client):
+    """读 SCB->CPUID (0xE000ED00) 解析 ARM 内核类型。返回 {arch, cpu_arch}。"""
+    try:
+        r = client.read_mem(0xE000ED00, 4)
+        h = r.get("data_hex") or ""
+        if not (r.get("ok") and len(h) >= 8):
+            return {"arch": "未知", "cpu_arch": None}
+        cpuid = int.from_bytes(bytes.fromhex(h[:8]), "little")
+        partno = (cpuid >> 4) & 0xFFF
+        arch_bits = (cpuid >> 16) & 0xF
+        # Cortex-M3/M4/M7 的 CPUID Architecture 字段为 0xF(ARMv7E-M)；M0 为 0xA(ARMv6-M)
+        arch_name = {0xF: "ARMv7E-M", 0xC: "ARMv7E-M", 0xA: "ARMv6-M"}.get(arch_bits, f"arch_{arch_bits}")
+        core = _CPU_PARTNO.get(partno, f"未知(partno 0x{partno:X})")
+        return {"arch": arch_name, "cpu_arch": core, "cpuid": f"0x{cpuid:08X}"}
+    except Exception as e:  # noqa: BLE001
+        return {"arch": "未知", "cpu_arch": None, "error": str(e)}
+
+
+def _probe_rtos():
+    """探测当前固件是否编译进常见 RTOS（基于 .axf 符号存在性）。返回 [{rtos, present}]。"""
+    loc = _get_locator()
+    if not loc or not loc.is_ready():
+        return []
+    try:
+        all_syms = loc.search_symbols("", limit=10 ** 6, kind="all")
+        names = {s["name"] for s in all_syms}
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for rtos, marks in _RTOS_MARKERS.items():
+        found = [m for m in marks if m in names]
+        if found:
+            out.append({"rtos": rtos, "present": True, "markers": found})
+    if not out:
+        out.append({"rtos": "none", "present": False, "note": "未检测到常见 RTOS 符号，疑为裸机工程"})
     return out
 
 
@@ -2182,6 +2308,184 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             cfg = _parse_uvprojx_config(p, target.strip() or None)
             cfg["project"] = p
             return _js(cfg)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    # ---------------- 批次6：目标器件信息 / 采样剖析 / 环境自检引导 ----------------
+    @server.tool(
+        name="target_info",
+        title="查询目标器件信息（芯片型号/Flash/RAM）",
+        description=(
+            "查询目标芯片信息：实时读 DBGMCU->IDCODE 寄存器得到 DEV_ID/REV_ID 并映射到型号，"
+            "返回标称 Flash/RAM 容量与内存布局。排查“资源吃紧/选错型号/容量不符”时先调它。"
+            "idcode 实时读取需已进入调试（内存读依赖调试会话）；非调试态仅返回静态布局信息。"
+        ),
+    )
+    async def target_info() -> str:
+        try:
+            client = _get_client()
+            out: dict = {"ok": False}
+            idcode = None
+            try:
+                r = client.read_mem(_DEV_ID_DBGMCU_BASE, 4)
+                h = r.get("data_hex") or ""
+                if r.get("ok") and len(h) >= 8:
+                    idcode = int.from_bytes(bytes.fromhex(h[:8]), "little")  # 小端字节序
+            except Exception as e:  # noqa: BLE001
+                out["idcode_error"] = str(e)
+            if idcode is not None:
+                dev = idcode & 0x0FFF   # DEV_ID 取低 12 位（STM32 DBGMCU_IDCODE 位[0:11]）
+                rev = (idcode >> 16) & 0xFFFF   # REV_ID 取高 16 位（位[16:31]）
+                info = _DEV_ID_MAP.get(dev)
+                out.update({
+                    "ok": True, "source": "IDCODE实时读取",
+                    "idcode": f"0x{idcode:08X}", "dev_id": f"0x{dev:04X}",
+                    "rev_id": f"0x{rev:04X}",
+                    "device_name": info["name"] if info else "未知(DEV_ID不在内置表)",
+                    "flash_kb": info["flash_kb"] if info else None,
+                    "ram_kb": info["ram_kb"] if info else None,
+                })
+                out["cpu"] = _read_cpu_arch(client)
+                if out.get("flash_kb") is None:
+                    out["capacity_note"] = (
+                        "该 DEV_ID 未内置标称容量，具体 Flash/RAM 请按芯片丝印或工程器件配置确认"
+                    )
+            else:
+                out.update({
+                    "source": "静态(未进入调试，无法读IDCODE)",
+                    "device_name": "未知", "flash_kb": None, "ram_kb": None,
+                    "note": "实时读取需已进入调试模式",
+                })
+            out["memory_layout"] = {
+                "code_base": f"0x{_DEV_ID_CODE_BASE:08X}",
+                "ram_base": "0x20000000", "periph_base": "0x40000000",
+                "dbgmcu": f"0x{_DEV_ID_DBGMCU_BASE:08X}",
+            }
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="profile_sampling",
+        title="采样剖析：定位热点函数",
+        description=(
+            "基于 PC 统计采样剖析：让目标运行，周期性暂停采样当前 PC，按 .axf 符号表归到函数，"
+            "统计各函数命中次数/占比，找出热点。用于定位“哪个函数占用最多 CPU 时间”的性能瓶颈。"
+            "duration_ms 采样总时长，interval_ms 两次采样间目标运行时间，max_samples 采样数上限。"
+            "注意：通过周期性 run/stop 采样，非硬件 ETM 实时采样，会轻微扰动运行时序；"
+            "某函数未命中可能因其未被执行或区间未覆盖到。"
+        ),
+    )
+    async def profile_sampling(duration_ms: int = 1000, interval_ms: int = 20,
+                               max_samples: int = 200) -> str:
+        try:
+            client = _get_client()
+            loc = _get_locator()
+            funcs = _load_func_table()
+            if not loc or not loc.is_ready():
+                return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf）"})
+            st = client.get_status()
+            if not st.get("debugging"):
+                return _js({"ok": False, "error": "未进入调试，无法运行/采样", "status": st})
+            dur = max(10, int(duration_ms))
+            iv = max(1, int(interval_ms))
+            ms = max(1, int(max_samples))
+            counts: dict = {}
+            samples: list = []
+            deadline = time.monotonic() + dur / 1000.0
+            client.run()
+            n = 0
+            try:
+                while n < ms and time.monotonic() < deadline:
+                    await asyncio.sleep(iv / 1000.0)
+                    client.stop()
+                    regs = client.read_cpu_registers_stable()
+                    pc = regs.get("pc")
+                    if isinstance(pc, int) and loc.is_code_address(pc):
+                        fname = _func_for_pc(funcs, pc)
+                        if fname is None:
+                            fname = f"0x{pc:08X}(未解析)"
+                        counts[fname] = counts.get(fname, 0) + 1
+                        samples.append(pc)
+                    client.run()
+                    n += 1
+            finally:
+                client.stop()
+            total = sum(counts.values())
+            top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:20]
+            hot = [{"function": k, "hits": v,
+                    "percent": round(v * 100.0 / total, 1) if total else 0} for k, v in top]
+            return _js({
+                "ok": True, "total_samples": total, "sampled_pcs": n,
+                "duration_ms": dur, "interval_ms": iv,
+                "hot_functions": hot,
+                "note": "周期性 run/stop 统计采样，会轻微扰动时序；非硬件 ETM 实时采样",
+            })
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="mdk_guide",
+        title="环境自检与调试工作流引导",
+        description=(
+            "AI 落地的第一个工具：一键自检 Keil/UVSOCK/UV4/.axf/源码漂移/调试态/RTOS 类型，"
+            "并返回推荐的调试工作流与各场景应调用的工具，避免 AI 盲目试错。"
+            "返回 {environment:{...}, recommended_workflow:[...], scene_tools:{...}}。"
+        ),
+    )
+    async def mdk_guide() -> str:
+        try:
+            host = getattr(_client, "host", "127.0.0.1")
+            port = getattr(_client, "port", 4823)
+            env = {
+                "keil_uvsocket_reachable": _probe_tcp(host, port),
+                "uv4_path": _builder_cfg.get("uv4"),
+                "default_project": _builder_cfg.get("default_project"),
+                "axf_configured": bool(_symbol_cfg.get("axf")),
+                "symbol_ready": bool(_get_locator() and _get_locator().is_ready()),
+            }
+            try:
+                status = _get_client().get_status()
+            except Exception as e:  # noqa: BLE001
+                env["status_error"] = str(e)
+                status = None
+            if status:
+                env["debugging"] = status.get("debugging")
+                env["target_running"] = status.get("running")
+            if env.get("symbol_ready"):
+                try:
+                    info = _build_location(_get_client())
+                    if info and info.get("ok"):
+                        env["current_file"] = info.get("file")
+                        env["current_line"] = info.get("line")
+                        env["source_stale"] = "warning" in info
+                        if info.get("warning"):
+                            env["source_stale_detail"] = info["warning"]
+                except Exception as e:  # noqa: BLE001
+                    env["location_error"] = str(e)
+            env["rtos"] = _probe_rtos()
+            workflow = [
+                "1. 先调 mdk_guide 自检环境（Keil/UVSOCK/axf/是否调试态/RTOS类型）",
+                "2. 若未进入调试，enter_debug 进入；进入后 set_breakpoint / run_to_line 设断点",
+                "3. 运行到断点后：get_current_location 看停靠位置，read_locals/read_variable 看变量",
+                "4. 排查现场：diagnose 一次聚合 寄存器+反汇编+调用栈+局部变量",
+                "5. 排查崩溃：fault_report 看异常类型+现场；wait_fault 复现异常",
+                "6. 性能：profile_sampling 找热点函数，profile_function 测单函数耗时",
+                "7. 行为不同：project_targets/set_debug_target/read_project_config 对比 target 宏/优化",
+                "8. 改代码上板：build_and_flash / flash_debug；收尾 exit_debug 退出调试",
+            ]
+            scene_tools = {
+                "看程序停在哪": "get_current_location / snapshot",
+                "看局部变量": "read_locals / read_struct / watch",
+                "崩溃死机复位循环": "fault_report / wait_fault / diagnose",
+                "性能热点": "profile_sampling / profile_function / dwt",
+                "内存被改坏": "set_watchpoint / search_mem / snapshot_diff",
+                "不同target行为不同": "project_targets / set_debug_target / read_project_config",
+                "串口不打印/时钟问题": "list_peripherals / read_peripheral / itm_trace",
+                "改代码重新上板": "build_and_flash / flash_debug",
+            }
+            return _js({"ok": True, "environment": env,
+                        "recommended_workflow": workflow, "scene_tools": scene_tools})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 

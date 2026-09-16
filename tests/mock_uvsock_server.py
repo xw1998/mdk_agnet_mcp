@@ -68,6 +68,8 @@ class MockUVSOCKServer:
         # SCB 异常寄存器（供 fault_report）：模拟 HardFault + FORCED + 除零
         self.scb = {"icsr": 0x3, "cfsr": 0x2000000, "hfsr": 0x40000000,
                     "mmfar": 0, "bfar": 0}
+        # DBGMCU IDCODE（供 target_info）：DEV_ID=0x423(STM32F401)、REV_ID=0x0000
+        self.idcode = 0x00000423
         # 外设寄存器内存（供 read_peripheral）：0x40000000 段与 0xE0000000 段
         self.periph = bytearray(0x100000)      # 0x40000000 - 0x400FFFFF
         self.sys = bytearray(0x20000)          # 0xE0000000 - 0xE001FFFF (SysTick/NVIC/SCB/...)
@@ -400,6 +402,8 @@ class MockUVSOCKServer:
             key = {0xE000ED04: "icsr", 0xE000ED28: "cfsr", 0xE000ED2C: "hfsr",
                    0xE000ED34: "mmfar", 0xE000ED38: "bfar"}[nAddr]
             payload = struct.pack('<I', self.scb[key] & 0xFFFFFFFF)
+        elif nAddr == 0xE0042000:  # DBGMCU->IDCODE（供 target_info）
+            payload = struct.pack('<I', self.idcode & 0xFFFFFFFF)
         elif 0x40000000 <= nAddr < 0x40000000 + len(self.periph):  # 外设段
             off = nAddr - 0x40000000
             payload = bytes(self.periph[off:off + nBytes])
