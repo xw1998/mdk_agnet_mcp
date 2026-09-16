@@ -197,9 +197,9 @@ class MockUVSOCKServer:
             return uvsock.UV_STATUS_SUCCESS, b"V5.2.0"
 
         if cmd == uvsock.UV_DBG_STATUS:
-            st = (uvsock.UV_STATUS_TARGET_EXECUTING
-                  if self.running else uvsock.UV_STATUS_TARGET_STOPPED)
-            return st, b""
+            # 模拟真实 Keil：r_status 恒为成功，运行状态在响应 data 低字节（0=停止,1=执行中）
+            data = b"\x01" if self.running else b"\x00"
+            return uvsock.UV_STATUS_SUCCESS, data
 
         if cmd == uvsock.UV_DBG_CALC_EXPRESSION:
             return self._calc_expression(data)

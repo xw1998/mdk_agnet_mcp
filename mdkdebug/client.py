@@ -121,11 +121,20 @@ class UVClient:
             state = m_data[0] if len(m_data) >= 1 else None
             if state is not None:
                 running = (state == 1)
+                if state == 0:
+                    st = "已停止"
+                elif state == 1:
+                    st = "执行中"
+                else:
+                    st = f"运行状态码({state})"
                 return {
                     "ok": True, "status": status,
                     "status_text": "执行中" if running else "已停止",
                     "running": running, "debugging": True,
+                    "state": state, "state_text": st,
                     "data": m_data.hex() if m_data else "",
+                    "note": "state 为 UV_DBG_STATUS 响应 data 低字节：0=已停止,1=执行中；"
+                            "running/debugging/state_text 已据此解码，无需再人工看裸 hex。",
                 }
         # 非成功 / 兼容 mock：按 r_status 直接判断运行状态
         running = status in (uvsock.DBG_EXECUTING,

@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -94,10 +95,20 @@ def _run_uv4(uv4: str, args: list[str], timeout: int,
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
+    # UV4 子进程用 Windows 系统 PATH 查找 python 以执行 gen_scatter.py 等预处理脚本；
+    # 若 python 不在系统 PATH（venv / Git Bash 内解释器），会报 CreateProcess failed。
+    # 注入当前解释器目录到 PATH 前部，保证 UV4 能找到 python。
+    env = None
+    if os.name == "nt":
+        env = os.environ.copy()
+        py_dir = os.path.dirname(sys.executable)
+        if py_dir:
+            cur = env.get("PATH", "")
+            env["PATH"] = py_dir + (os.pathsep + cur if cur else "")
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=timeout, check=False, startupinfo=startupinfo,
+            timeout=timeout, check=False, startupinfo=startupinfo, env=env,
         )
         parts = [s for s in (proc.stdout, proc.stderr) if s]
         out_text = "".join(parts)

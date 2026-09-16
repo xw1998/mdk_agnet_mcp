@@ -727,7 +727,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def enter_debug() -> str:
         try:
-            return _js(_get_client().enter_debug())
+            r = _get_client().enter_debug()
+            out = dict(r)
+            if not r.get("ok"):
+                out["diagnosis"] = (
+                    "进入调试失败，请依次排查：① 目标板是否已连接且调试器驱动正常；"
+                    "② 工程是否已编译出 .axf（缺失/过旧时 Keil 无法加载符号，可先 build_project 或 flash_debug）；"
+                    "③ 是否已在调试态（重复 enter 会被拒）。若 Keil 弹出需人工确认的窗口，请在界面处理。"
+                )
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -1854,7 +1862,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="run",
         title="全速运行",
-        description="让目标 MCU 全速运行（启动执行）。注意：run 后目标全速运行，此时读内存/寄存器/表达式会失败或错位（异步消息堆积），需先 stop 再读。目标运行期间 UVSOCK 会推送异步消息。",
+        description="让目标 MCU 全速运行（启动执行）。注意：run 后目标全速运行，此时读内存/寄存器/表达式会失败或错位（异步消息堆积），需先 stop 再读。目标运行期间 UVSOCK 会推送异步消息。若期望'运行到某断点停住'，请以 get_current_location 实测 PC 停靠位置为准，run 本身返回的停靠信息不可信（PC 可能为脏值）。",
     )
     async def run() -> str:
         try:
@@ -1867,7 +1875,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="运行一段时间后自动暂停",
         description=(
             "让目标 MCU 全速运行 timeout_ms 毫秒后自动暂停，并返回停靠位置（文件行+源码+完整调用栈）。"
-            "用于验证时序 / 观察运行 N 毫秒后的状态。timeout_ms 默认 1000。注意：运行期间读内存不可靠；到点自动 stop 后返回停靠位置。刚停止瞬间读 PC 可能脏值（已做稳定读取）。需已进入调试且配置 .axf。"
+            "用于验证时序 / 观察运行 N 毫秒后的状态。timeout_ms 默认 1000。注意：运行期间读内存不可靠；到点自动 stop 后返回停靠位置。刚停止瞬间读 PC 可能脏值（已做稳定读取）；到点常停在 SysTick 等中断上下文，此时局部变量与调用栈层数可能受限/为空，AAPCS 寄存器解读不适用。需已进入调试且配置 .axf。"
         ),
     )
     async def run_timeout(timeout_ms: int = 1000) -> str:
@@ -1915,7 +1923,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="单步执行",
         description=(
             "单步执行。mode 可选：'into'（单步进入）、'over'（单步跳过）、"
-            "'out'（跳出）、'instruction'（指令级）。默认 'into'。注意：单步瞬间读 PC 可能读到 SRAM 脏值（已用 FLASH 区段过滤修复）。在中断/异常 handler 内单步或 SP/LR 回溯可能层数受限。需已进入调试且配置 .axf（source 级单步）。"
+            "'out'（跳出）、'instruction'（指令级）。默认 'into'。注意：单步瞬间读 PC 可能读到 SRAM 脏值（已用 FLASH 区段过滤修复）。在中断/异常 handler 内单步或 SP/LR 回溯可能层数受限；'out' 在函数入口处不可靠（Keil 可能无法正确跳出），若卡住可改用 run_to_line 跳到函数返回行。需已进入调试且配置 .axf（source 级单步）。"
         ),
     )
     async def step(mode: str = "into") -> str:
