@@ -7,7 +7,9 @@ UVClient：高层封装 Keil UVSOCK 调试能力，并内置“连接缓存 + �
 - 后续调用若距上次使用未超过 idle_timeout，则复用连接；
 - 超过 idle_timeout 未使用，或遇到连接已失效，则断开后重连；
 - 显式 close() 立即断开。
-线程安全：通过 threading.Lock 保护连接状态，可被 MCP 并发调用。
+线程安全：通过 threading.RLock 保护连接状态，可被 MCP 并发调用。
+注意必须是可重入锁：_request 持锁期间会调用 reset_connection（它也加锁），
+用普通 Lock 会自死锁——表现为「一次命令超时后整个服务卡死」。
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import threading
 import time
 
 from . import uvsock
+from . import winutil
 from .interface import UVInterface
 from .uvsock import (
     UVSOCK_CMD, UV_STATUS_SUCCESS, UV_STATUS_TEXT, status_text, UVError, UVStatusError,
@@ -36,10 +39,19 @@ UVSOCK_HINT = (
 )
 
 class UVSOCKConnectError(UVError):
-    """无法连接 Keil UVSOCK 服务（通常因 UVSOCK 插件未开启）。"""
-    def __init__(self, host: str, port: int, cause: Exception):
+    """无法连接 Keil UVSOCK 服务（Keil 未运行 / UVSOCK 未开启 / 端口未监听）。"""
+
+    def __init__(self, host: str, port: int, cause: Exception,
+                 health: dict | None = None):
+        h = health or {}
+        if h:
+            detail = "诊断：" + h.get("diagnosis", "")
+            if h.get("suggestion"):
+                detail += " 建议：" + h["suggestion"]
+        else:
+            detail = UVSOCK_HINT
         super().__init__(
-            f"无法连接 Keil UVSOCK 服务（{host}:{port}）：{cause}。{UVSOCK_HINT}"
+            f"无法连接 Keil UVSOCK 服务（{host}:{port}）：{cause}。{detail}"
         )
 
 class UVClient:
@@ -50,7 +62,7 @@ class UVClient:
         self.host = host
         self.port = port
         self.idle_timeout = idle_timeout  # 秒，空闲超过则断开
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._last_used = 0.0
         self.phy = UVInterface(host=host, port=port)
 
@@ -67,8 +79,14 @@ class UVClient:
             self.phy.close()
         try:
             self.phy.open()
-        except OSError as e:  # 连接被拒/超时：UVSOCK 未开启
-            raise UVSOCKConnectError(self.host, self.port, e) from e
+        except OSError as e:  # 连接被拒/超时：Keil 没起或 UVSOCK 未开启
+            # 立刻做一次廉价健康检查，让调用方直接看到"断在哪一环"，
+            # 而不是只拿到一句 ConnectionRefused。
+            try:
+                health = winutil.keil_health(self.port)
+            except Exception:  # noqa: BLE001
+                health = None
+            raise UVSOCKConnectError(self.host, self.port, e, health=health) from e
         self._last_used = now
 
     def _request(self, cmd_code: int, data: bytes = b'',
@@ -77,16 +95,77 @@ class UVClient:
         with self._lock:
             self._ensure_connected()
             uv = UVSOCK_CMD(cmd_code, data=data)
-            raw = self.phy.send(uv.pack(), expect_cmd=cmd_code)
+            try:
+                raw = self.phy.send(uv.pack(), expect_cmd=cmd_code)
+            except OSError as e:
+                # Keil 进程在命令执行期间死掉：socket 被重置/断开。同样要给可操作诊断，
+                # 而不是把裸 WinError 抛给调用方（那正是"操作了没反应"的由来）。
+                reason = self._timeout_diagnostics(cmd_code)
+                self.reset_connection(reason="连接中断")
+                raise UVStatusError(uvsock.UV_STATUS_TIMEOUT,
+                                    "cmd=0x%04X；UVSOCK 连接中断（%s）；%s"
+                                    % (cmd_code, e, reason))
             self._last_used = time.monotonic()
             if raw is None:
-                # 连接可能已失效，尝试重连一次
-                self.phy.close()
+                # 超时：UVSOCK 会话很可能已被弄脏（残留调试会话/异步堆积/模态框阻塞），
+                # 只关 socket 不够——必须整体复位，否则后续命令会连续受影响。
+                reason = self._timeout_diagnostics(cmd_code)
+                self.reset_connection(reason="命令超时")
                 raise UVStatusError(uvsock.UV_STATUS_TIMEOUT,
-                                    f"cmd=0x{cmd_code:04X}")
+                                    f"cmd=0x{cmd_code:04X}；{reason}")
             resp = uv.unpack(raw)
             # resp = (totalLen, eCmd, bufLen, cycles, tStamp, id, r_cmd, r_status, data)
             return resp[7], resp[8]
+
+    def reset_connection(self, reason: str = "") -> dict:
+        """丢弃当前 UVSOCK 连接与全部接收缓冲，下次调用时重新建立连接。
+
+        为什么需要：UVSOCK 是长连接，服务端会话被上一次操作弄脏后（调试会话残留、
+        异步消息堆积、模态框阻塞），**新连接仍可能复用旧状态**——典型表现是一次超时
+        之后后续命令连续受影响，只能靠"关掉 Keil 再开"恢复。这里给出无需重启 Keil 的
+        原子复位能力（重启 Keil 见 restart_keil）。
+        """
+        with self._lock:
+            try:
+                self.phy.close()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("关闭 UVSOCK 连接时出错（忽略）：%s", e)
+            for attr in ("console_log", "async_log"):
+                buf = getattr(self.phy, attr, None)
+                if isinstance(buf, list):
+                    buf.clear()
+            self._last_used = 0.0
+        try:
+            health = winutil.keil_health(self.port)
+        except Exception:  # noqa: BLE001
+            health = None
+        return {"ok": True, "action": "重置 UVSOCK 连接",
+                "reason": reason or "手动复位",
+                "msg": "连接已丢弃，下次调用会重新建立；若仍异常可用 restart_keil 重启 Keil",
+                "keil": health}
+
+    def _timeout_diagnostics(self, cmd_code: int) -> str:
+        """命令超时时的可操作诊断：Keil 健康 + 模态对话框检测。"""
+        parts = []
+        try:
+            health = winutil.keil_health(self.port)
+            parts.append(health.get("diagnosis", ""))
+            keil_alive = health.get("keil_alive")
+        except Exception:  # noqa: BLE001
+            keil_alive = None
+        try:
+            dialogs = winutil.find_modal_dialogs()
+        except Exception:  # noqa: BLE001
+            dialogs = []
+        if dialogs:
+            titles = "、".join((d.get("title") or "(无标题)") for d in dialogs[:3])
+            parts.append("检测到 Keil 模态对话框，很可能正阻塞命令执行：%s"
+                         "（请在 Keil 界面上处理该对话框后重试）" % titles)
+        elif keil_alive:
+            parts.append("未发现模态对话框；连接已自动复位，可直接重试该命令")
+        else:
+            parts.append("Keil 进程不存在，请先 launch_uvision / restart_keil 拉起")
+        return "；".join(p for p in parts if p)
 
     def close(self) -> None:
         with self._lock:

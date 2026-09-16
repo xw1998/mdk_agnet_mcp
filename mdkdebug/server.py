@@ -29,7 +29,7 @@ from mcp.server.mcpserver import MCPServer
 
 from .client import UVClient, UVSOCKConnectError
 from .locator import Locator
-from . import builder, mapfile, uvoptx as _uvoptx, __version__
+from . import builder, mapfile, winutil, uvoptx as _uvoptx, __version__
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -2443,6 +2443,90 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         if _builder_cfg["default_project"]:
             return _builder_cfg["default_project"]
         raise RuntimeError("未指定工程路径，请传入 project 参数或配置默认工程")
+
+    @server.tool(
+        name="keil_health",
+        description=(
+            "检查 Keil 调试通道的健康状态：UV4 进程是否存在、UVSOCK 端口是否监听、"
+            "是否有模态对话框阻塞。返回 keil_alive / uv4_pids / port / port_listening / "
+            "uvsock_ready / code / diagnosis / suggestion，并在检测到 Keil 模态框时列出其标题。"
+            "用途：命令超时或「操作了没反应」时先调它，直接看清断在哪一环（keil_not_running / "
+            "port_not_listening / port_occupied），而不是干等到超时；也可作为操作前后的廉价自检"
+            "（纯 ctypes + socket 探测，Keil 未运行时也能正常返回）。"
+        ),
+    )
+    async def keil_health() -> str:
+        try:
+            port = _get_client().port
+            h = winutil.keil_health(port)
+            dialogs = winutil.find_modal_dialogs()
+            h["modal_dialogs"] = dialogs
+            h["modal_blocked_suspected"] = bool(dialogs)
+            if dialogs:
+                titles = "、".join((d.get("title") or "(无标题)") for d in dialogs[:3])
+                h["suggestion"] = (
+                    (h.get("suggestion") or "")
+                    + " 检测到 Keil 模态对话框，很可能阻塞命令执行，请先在 Keil 界面处理："
+                    + titles)
+            return _js(h)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="reset_connection",
+        description=(
+            "只重置 UVSOCK 连接（不重启 Keil）：丢弃当前 socket 与全部残留接收缓冲，"
+            "下次调用自动重新建连。用于长连接会话被弄脏（调试会话残留、异步消息堆积、"
+            "模态框阻塞后）导致后续命令连续超时的场景——以前只能「关掉 Keil 再开」，"
+            "现在可以先用本工具原地复位；复位无效再上 restart_keil。"
+        ),
+    )
+    async def reset_connection(reason: str = "") -> str:
+        try:
+            return _js(_get_client().reset_connection(reason=reason))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="restart_keil",
+        description=(
+            "一键重启 Keil 并重建调试通道：关闭所有 Keil 实例 → 以脱离父进程的方式重新拉起并打开工程 → "
+            "等待 UVSOCK 端口监听 → 重置连接。把「Keil 死了 / 会话脏了只能人工关掉再开」整条恢复流程变成一次调用。"
+            "project 为 .uvprojx 路径（省略用默认工程）；force=True 直接强制结束残留实例；"
+            "wait_ready 为等待 UVSOCK 监听的秒数（默认 20）。返回各阶段结果与最终健康快照。"
+            "注意：会关闭所有 Keil 实例（含人工查看中的窗口），未保存的调试会话/源码改动可能丢失，调用前请确认。"
+        ),
+    )
+    async def restart_keil(project: str = "", force: bool = True,
+                           wait_ready: float = 20.0) -> str:
+        try:
+            if _builder_cfg["uv4"] is None:
+                raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定")
+            p = _resolve_project(project)
+            client = _get_client()
+            out = {"action": "重启 Keil", "project": p}
+            out["pids_before"] = winutil.uv4_pids()
+            out["close"] = builder.close_uvision(force=force)
+            out["exit_wait"] = winutil.wait_uv4_exit(timeout=6.0 if force else 12.0)
+            out["launch"] = builder.launch_uvision(_builder_cfg["uv4"], p)
+            try:
+                out["port_wait"] = winutil.wait_port_listening(
+                    port=client.port, timeout=float(wait_ready or 20.0))
+            except Exception as e:  # noqa: BLE001
+                out["port_wait"] = {"ok": False, "error": str(e)}
+            out["reset"] = client.reset_connection(reason="restart_keil")
+            health = winutil.keil_health(client.port)
+            out["health"] = health
+            out["keil_alive"] = health["keil_alive"]
+            out["port_listening"] = health["port_listening"]
+            out["ok"] = bool(health["uvsock_ready"])
+            out["status_text"] = ("Keil 已重启且 UVSOCK 就绪" if out["ok"]
+                                  else "Keil 已重启但 UVSOCK 未就绪：" + health["diagnosis"])
+            if not out["ok"]:
+                out["suggestion"] = health["suggestion"]
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
 
     @server.tool(
         name="launch_uvision",

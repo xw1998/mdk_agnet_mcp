@@ -69,6 +69,7 @@ class UVInterface:
         """
         if self.sock is None:
             return
+        old_timeout = self.sock.gettimeout()
         self.sock.setblocking(False)
         pending = b""
         try:
@@ -81,7 +82,9 @@ class UVInterface:
                     break
                 pending += chunk
         finally:
-            self.sock.setblocking(True)
+            # 必须恢复成原超时，不能用 setblocking(True)——那会把超时置为 None
+            # （永久阻塞），此后任何收不到响应的命令都会无限等待，表现为"命令没反应"。
+            self.sock.settimeout(old_timeout)
         self._parse_frames(pending)
 
     def _parse_frames(self, buf: bytes) -> None:
@@ -185,6 +188,10 @@ class UVInterface:
         while timeout_counts < self.TIMEOUT_COUNTS:
             try:
                 chunk = self.sock.recv(self.MAX_RECV)
+                if not chunk:
+                    # 对端（Keil）已关闭连接：必须立刻返回，否则会无计数地空转死循环
+                    logger.warning("UVSOCK 连接已被对端关闭（EOF）")
+                    return None
                 if chunk:
                     self.recv_buf += chunk
                     timeout_counts = 0
@@ -216,6 +223,11 @@ class UVInterface:
             except socket.timeout:
                 timeout_counts += 1
                 time.sleep(self.TIMEOUT_UNIT)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+                # Keil 被关掉/崩溃时典型表现：连接被重置。立即返回让上层给诊断+复位，
+                # 不要当成普通超时反复重试（那会让调用方"干等"且看不到真正原因）。
+                logger.warning("UVSOCK 连接中断：%s", e)
+                return None
             except OSError:
                 timeout_counts += 1
                 time.sleep(self.TIMEOUT_UNIT)

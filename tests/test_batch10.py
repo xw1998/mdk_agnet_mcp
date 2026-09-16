@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""批次10 mock 测试：.uvoptx 持久化断点的读取/清理（工具 66→68）。
+"""批次10 mock 测试：.uvoptx 持久化断点的读取/清理（工具数见断言）。
 
 背景：Keil 把断点持久化写入工程 .uvoptx，下次进调试自动恢复；命令窗口 BK 清不掉，
 导致 clear_breakpoint 返回成功但断点仍生效（用户反馈的最大盲区）。
@@ -7,7 +7,7 @@
 list_breakpoints 附加 uvoptx 字段；clear_all_breakpoints 支持 include_uvoptx。
 
 覆盖：
-- 新工具注册（66→68）
+- 新工具注册（本批新增 2 个）
 - 解析 .uvoptx 持久断点（number/address/line/filename/enabled）
 - 编码容错（UTF-8 与 GBK 均可读）
 - 清理：removed 数、备份生成、其余节点保留、清理后再解析为 0
@@ -150,7 +150,7 @@ async def main():
                   "list_uvoptx_breakpoints" in tools, "")
             check("clear_uvoptx_breakpoints 已注册",
                   "clear_uvoptx_breakpoints" in tools, "")
-            check("工具总数=68", len(tools) == 68, f"实际 {len(tools)}")
+            check("工具总数=71", len(tools) == 71, f"实际 {len(tools)}")
 
             # 3a. 读取（project 显式传）
             lv = load(await call(server, "list_uvoptx_breakpoints", {"project": uvoptx2}))

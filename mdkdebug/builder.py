@@ -22,6 +22,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from . import winutil
+
 logger = logging.getLogger(__name__)
 
 # 常见 Keil 安装路径（用于自动探测 UV4.exe）
@@ -118,6 +120,11 @@ def _run_uv4(uv4: str, args: list[str], timeout: int,
         if py_dir:
             cur = env.get("PATH", "")
             env["PATH"] = py_dir + (os.pathsep + cur if cur else "")
+        # 清掉会干扰 Keil BeforeMake 钩子（py -3 xxx.py）的 Python 环境变量：
+        # MCP 服务进程若带 PYTHONHOME/PYTHONPATH，钩子里的 python 会因解释器定位错乱
+        # 抛出多帧 traceback，把真正的编译结论（0 Error(s)）淹没在噪声里。
+        for _k in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"):
+            env.pop(_k, None)
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
@@ -158,6 +165,10 @@ def _result(action: str, exit_code: int, output: str) -> dict:
         "status_text": _status_text(exit_code),
         "action": action,
         "output": output.strip() or "",
+        # 编译/烧录（UV4 命令行）与在线调试（UVSOCK）是两条独立的通道：
+        # 前者自己起实例、跑完即退，后者依赖一个活着的 Keil + 已开启的 UVSOCK。
+        # 这里顺带附上调试通道的健康快照，避免"烧录成功但调试连不上"时归错因。
+        "keil": winutil.keil_health(),
     }
 
 
@@ -188,69 +199,28 @@ def flash_download(uv4: str, project: str, target: str | None = None,
 def launch_uvision(uv4: str, project: str) -> dict:
     """可见方式启动 Keil uVision 并打开指定工程（供调试查看界面）。
 
-    UV4.exe 是 uVision 单实例程序：若已有一个 uVision 运行且打开相同工程，
-    本次启动会复用已有实例（新进程随即退出），不会另开窗口。
-    用 Popen 异步启动、立即返回，不阻塞调用方。
+    以**脱离调用方 job** 的方式启动（CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS |
+    CREATE_NEW_PROCESS_GROUP），并把标准流接到 DEVNULL。否则由 MCP 服务拉起的 UV4 会
+    随调用链所在的 job 一起被回收（现象："刚拉起就没了"），标准流也会继承被污染的环境。
+    UV4.exe 是单实例程序：若已有实例打开相同工程，本次启动会复用（新进程随即退出）。
     """
-    if not uv4:
-        return {"ok": False, "error": "未定位到 UV4.exe"}
-    cmd = [uv4, project]
-    try:
-        proc = subprocess.Popen(cmd)
-        return {
-            "ok": True,
-            "pid": proc.pid,
-            "msg": "已启动 Keil uVision 并打开工程（若已运行同工程则复用已有实例）",
-        }
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"启动 Keil uVision 失败：{e}"}
+    r = winutil.launch_detached(uv4, project)
+    if not r.get("ok"):
+        return {"ok": False, "error": r.get("error", "启动 Keil 失败")}
+    return {
+        "ok": True,
+        "pid": r.get("pid"),
+        "creationflags": r.get("creationflags"),
+        "breakaway": r.get("breakaway"),
+        "msg": "已脱离父进程启动 Keil uVision 并打开工程（若已运行同工程则复用已有实例）",
+        "hint": "UVSOCK 需数秒才监听；可用 keil_health 确认 port_listening，"
+                "或用 restart_keil 一步完成关闭→重启→等待→重连。",
+    }
 
 
 def _uv4_pids() -> list[int]:
-    """用 Toolhelp 快照枚举当前所有 UV4.exe 的 PID（纯 ctypes，不依赖 tasklist）。"""
-    try:
-        import ctypes
-        from ctypes import wintypes
-    except Exception:
-        return []
-    TH32CS_SNAPPROCESS = 0x00000002
-    kernel32 = ctypes.windll.kernel32
-
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", wintypes.WCHAR * 260),
-        ]
-
-    pids = []
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == ctypes.c_void_p(-1).value or snap == -1:
-        return pids
-    try:
-        pe = PROCESSENTRY32W()
-        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-        if kernel32.Process32FirstW(snap, ctypes.byref(pe)):
-            while True:
-                try:
-                    name = pe.szExeFile
-                except Exception:
-                    break
-                if name.lower() == "uv4.exe":
-                    pids.append(int(pe.th32ProcessID))
-                if not kernel32.Process32NextW(snap, ctypes.byref(pe)):
-                    break
-    finally:
-        kernel32.CloseHandle(snap)
-    return pids
-
+    """枚举 UV4.exe 的 PID（委托 winutil；保留函数名以兼容既有引用与测试）。"""
+    return winutil.uv4_pids()
 
 def _close_uvision_graceful(pid: int) -> bool:
     """向指定 PID 的可见主窗口发送 WM_CLOSE（优雅关闭）。返回是否找到窗口。"""

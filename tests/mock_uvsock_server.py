@@ -98,6 +98,11 @@ class MockUVSOCKServer:
         self.bs_status = None
         # True 时 BS 响应携带二进制 payload（模拟真机断点结构，考察 output 乱码处理）
         self.bs_binary_output = False
+        # True 时对所有请求都不回响应（模拟命令超时 / Keil 被模态框阻塞）
+        self.drop_responses = False
+        # 处理完 N 个请求后强行断开连接（模拟 Keil 进程中途死掉，socket 被重置）
+        self.drop_connection_after = 0
+        self._req_count = 0
         # PC 取值队列：非空时每次读 PC 表达式依次取一个值（模拟 halt 后 PC 滞后一帧，
         # 首次读到上一轮 halt 的旧值、随后收敛）；队列空则沿用 reg_map 当前值
         self.pc_queue = []
@@ -228,6 +233,22 @@ class MockUVSOCKServer:
                 conn.sendall(self._pack_response(
                     0x7F01, uvsock.UV_STATUS_NOT_DEBUGGING, b""))
             self.stale_frames = 0
+        if self.drop_responses:
+            return          # 什么都不回，让调用方等到超时
+        if self.drop_connection_after:
+            self._req_count += 1
+            if self._req_count >= self.drop_connection_after:
+                self._req_count = 0
+                self.drop_connection_after = 0
+                conn.sendall(self._pack_response(cmd, status, resp_data))
+                # SO_LINGER=0 + close => 发 RST，让对端立刻感知连接中断
+                try:
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                    struct.pack('ii', 1, 0))
+                except Exception:  # noqa: BLE001
+                    pass
+                conn.close()
+                return
         conn.sendall(self._pack_response(cmd, status, resp_data))
 
     @staticmethod
