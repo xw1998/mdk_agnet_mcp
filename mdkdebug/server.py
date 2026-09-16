@@ -67,6 +67,63 @@ def _resolve_axf(uvprojx_path: str | None) -> str | None:
         logger.warning("解析 uvprojx 输出配置失败: %s", e)
     return None
 
+# AC5(ARMCC) Cads/Optim 数值 → 优化选项文本（Keil 下拉：-O0/-O1/-O2/-O3/-Otime）
+_OPTIM_TEXT = {"0": "-O0", "1": "-O1", "2": "-O2", "3": "-O3", "4": "-Otime"}
+
+
+def _parse_uvprojx_config(uvprojx_path: str | None, target_name: str | None = None) -> dict:
+    """解析 .uvprojx 各 target 的编译器类型 / 优化级别 / 编译宏 / 包含路径。
+
+    定位 target 用 <TargetName>；uAC6=0→ARMCC(AC5)、1→ARMCLANG(AC6)；
+    优化级别：AC5 在 <Cads><Optim>（0-4 映射 _OPTIM_TEXT），AC6 尝试同一节点文本；
+    编译宏：<Cads><VariousControls><Define>（逗号分隔）；包含路径同节点 <IncludePath>（分号分隔）。
+    用于排查“不同 target 行为不同”——宏/优化差异一目了然。
+    """
+    import xml.etree.ElementTree as ET
+    if not uvprojx_path or not os.path.isfile(uvprojx_path):
+        return {"ok": False, "error": f"工程文件不存在: {uvprojx_path}"}
+    try:
+        root = ET.parse(uvprojx_path).getroot()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"解析 uvprojx 失败: {e}"}
+    targets: list[dict] = []
+    chosen = None
+    for t in root.iter("Target"):
+        name_el = t.find("TargetName")
+        name = (name_el.text or "").strip() if name_el is not None else ""
+        if not name:
+            continue
+        uac6 = (t.findtext("uAC6") or "0").strip()
+        # Cads/Optim、Cads/VariousControls/* 在 TargetOption/TargetCommonOption 之下，用任意深度路径
+        optim = (t.findtext(".//Cads/Optim") or "").strip()
+        cdef_el = t.find(".//Cads/VariousControls/Define")
+        cdefs = []
+        if cdef_el is not None and cdef_el.text and cdef_el.text.strip():
+            cdefs = [x.strip() for x in cdef_el.text.split(",") if x.strip()]
+        inc_el = t.find(".//Cads/VariousControls/IncludePath")
+        inc = [x.strip() for x in (inc_el.text or "").split(";") if x.strip()] if inc_el is not None else []
+        info = {
+            "name": name,
+            "compiler": "ARMCLANG(AC6)" if uac6 == "1" else "ARMCC(AC5)",
+            "uAC6": uac6,
+            "optimization": optim,
+            "optimization_level": _OPTIM_TEXT.get(optim, f"-O{optim}" if optim.isdigit() else ""),
+            "defines": cdefs,
+            "include_paths": inc,
+        }
+        targets.append(info)
+        if chosen is None and (target_name is None or name == target_name):
+            chosen = info
+    if chosen is None:
+        chosen = targets[0] if targets else None
+    out: dict = {"ok": bool(targets), "targets": targets, "count": len(targets)}
+    if chosen is not None:
+        out["current"] = chosen
+    else:
+        out["error"] = "工程中未找到 Target 配置"
+    return out
+
+
 def _get_locator() -> Locator | None:
     return _symbol_cfg.get("locator")
 
@@ -1988,6 +2045,143 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if info:
                 out.update(info)
             return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    # ---------------- 批次5：批量命令 / 多 target / 工程配置 ----------------
+    @server.tool(
+        name="read_mem_multi",
+        title="一次读取多个地址的内存",
+        description=(
+            "批量读内存：addresses 传地址列表，每项为 {addr, n_bytes}（n_bytes 缺省 32）。"
+            "一次 MCP 往返读多个地址，减少 AI 连续调用 read_mem 的往返。返回每处 ok/data_hex/ascii。"
+        ),
+    )
+    async def read_mem_multi(addresses: list) -> str:
+        try:
+            client = _get_client()
+            results = []
+            for item in addresses or []:
+                if isinstance(item, dict):
+                    addr = item.get("addr", item.get("address", ""))
+                    size = int(item.get("n_bytes", item.get("size", 32)) or 32)
+                else:
+                    addr, size = item, 32
+                a = _parse_addr(addr)
+                m = client.read_mem(a, size)
+                results.append({"addr": hex(a), "size": size, "ok": m.get("ok", False),
+                                "data_hex": m.get("data_hex", ""), "ascii": m.get("ascii", "")})
+            return _js({"ok": True, "count": len(results), "results": results})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="batch",
+        title="批量执行多条读类命令",
+        description=(
+            "一次提交多条只读命令，聚合返回，减少 AI 往返。commands 为列表，每项 "
+            "{tool, args}。支持 read_mem(addr/n_bytes)/read_variable(name)/"
+            "calc_expression(expr)/get_status/read_registers。返回每条 ok 与结果。"
+        ),
+    )
+    async def batch(commands: list) -> str:
+        try:
+            client = _get_client()
+            results = []
+            for c in commands or []:
+                tool = (c or {}).get("tool", "")
+                args = (c or {}).get("args", {}) or {}
+                one = {"tool": tool, "ok": False}
+                try:
+                    if tool == "read_mem":
+                        a = _parse_addr(args.get("addr", args.get("address", "")))
+                        n = int(args.get("n_bytes", args.get("size", 32)) or 32)
+                        m = client.read_mem(a, n)
+                        one.update({"addr": hex(a), "n_bytes": n,
+                                    "data_hex": m.get("data_hex", ""), "ascii": m.get("ascii", ""),
+                                    "ok": m.get("ok", False)})
+                    elif tool == "read_variable":
+                        one.update(client.read_variable(args.get("name", "")))
+                    elif tool == "calc_expression":
+                        one.update(client.calc_expression(args.get("expr", "")))
+                    elif tool == "get_status":
+                        one.update(client.get_status())
+                    elif tool == "read_registers":
+                        one.update(client.read_cpu_registers_stable())
+                    else:
+                        one["error"] = f"batch 不支持工具: {tool}"
+                except Exception as e:  # noqa: BLE001
+                    one["error"] = str(e)
+                results.append(one)
+            return _js({"ok": True, "count": len(results), "results": results})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="project_targets",
+        title="枚举工程 target 与当前/调试目标",
+        description=(
+            "查询当前工程全部 target（UV_PRJ_ENUM_TARGETS）、当前 target（GET_CUR_TARGET）"
+            "与当前调试 target（GET_DEBUG_TARGET）。多 target 工程排查/切换前先调它确认目标清单。"
+        ),
+    )
+    async def project_targets(project: str = "") -> str:
+        try:
+            client = _get_client()
+            cur = client.get_cur_target()
+            en = client.enum_targets()
+            dbg = client.get_debug_target()
+            targets = en.get("targets", [])
+            src = "uvsock"
+            if not targets:
+                # 真实 Keil UV_PRJ_ENUM_TARGETS 常返回空 data，回退从 .uvprojx 解析 target 列表
+                p = (project or "").strip() or _builder_cfg.get("default_project", "")
+                if p:
+                    cfg = _parse_uvprojx_config(p)
+                    if cfg.get("ok"):
+                        targets = [t["name"] for t in cfg.get("targets", [])]
+                        src = "uvprojx"
+            out = {"ok": cur.get("ok") or en.get("ok"),
+                   "current_target": cur.get("target", ""),
+                   "debug_target": dbg.get("target", ""),
+                   "targets": targets, "targets_source": src,
+                   "detail": {"cur": cur, "enum": en, "debug": dbg}}
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="set_debug_target",
+        title="切换调试 target",
+        description=(
+            "设置当前调试 target（UV_PRJ_SET_DEBUG_TARGET），target 传 target 名或索引。"
+            "多 target 工程切换调试目标后再 enter_debug。"
+        ),
+    )
+    async def set_debug_target(target: str) -> str:
+        try:
+            client = _get_client()
+            return _js(client.set_debug_target(target))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="read_project_config",
+        title="读取工程配置（编译宏/优化级别）",
+        description=(
+            "解析 .uvprojx 各 target 的编译器（AC5/AC6）、优化级别（-O0..-Otime）、编译宏 Define、"
+            "包含路径。project 传 .uvprojx 路径（省略用默认工程），target 指定某 target（省略用第一个）。"
+            "排查“不同 target 行为不同”时对比宏/优化差异。"
+        ),
+    )
+    async def read_project_config(project: str = "", target: str = "") -> str:
+        try:
+            p = (project or "").strip() or _builder_cfg.get("default_project", "")
+            if not p:
+                return _js({"ok": False, "error": "未提供工程路径，且未配置默认工程"})
+            cfg = _parse_uvprojx_config(p, target.strip() or None)
+            cfg["project"] = p
+            return _js(cfg)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 

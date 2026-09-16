@@ -25,6 +25,10 @@ class MockUVSOCKServer:
         self.port = port
         # 模拟 64KB SRAM（0x20000000 起）
         self.mem = bytearray(64 * 1024)
+        # 模拟工程多 target（供 UV_PRJ_* target 命令）
+        self.targets = ["mdk_test", "Debug", "Release"]
+        self.cur_target = "mdk_test"
+        self.debug_target = "mdk_test"
         # 模拟 FLASH 代码段（0x08000000 起，用于反汇编等）
         self.flash = bytearray(64 * 1024)
         # 预置一段真实 Thumb 指令（对应 PC 0x08000000 附近）：
@@ -233,6 +237,24 @@ class MockUVSOCKServer:
 
         if cmd == uvsock.UV_DBG_SERIAL_PUT:
             return self._serial_put(data)
+
+        if cmd == uvsock.UV_PRJ_ENUM_TARGETS:
+            return uvsock.UV_STATUS_SUCCESS, ("\n".join(self.targets)).encode("utf-8")
+        if cmd == uvsock.UV_PRJ_GET_CUR_TARGET:
+            return uvsock.UV_STATUS_SUCCESS, self.cur_target.encode("utf-8")
+        if cmd == uvsock.UV_PRJ_GET_DEBUG_TARGET:
+            return uvsock.UV_STATUS_SUCCESS, self.debug_target.encode("utf-8")
+        if cmd == uvsock.UV_PRJ_SET_DEBUG_TARGET:
+            # 请求 data 为 VSET 结构：vType(4)+union(8)+nLen(4)+str
+            if len(data) >= 16:
+                nlen = struct.unpack('<i', data[12:16])[0]
+                name = data[16:16 + nlen].decode("UTF-8", "replace").rstrip('\x00')
+            else:
+                name = ""
+            if name and name in self.targets:
+                self.debug_target = name
+                return uvsock.UV_STATUS_SUCCESS, name.encode("utf-8")
+            return uvsock.UV_STATUS_NOT_FOUND, b""
 
         # 未知命令
         return uvsock.UV_STATUS_NOT_SUPPORTED, b""

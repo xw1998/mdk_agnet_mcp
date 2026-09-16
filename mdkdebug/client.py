@@ -516,6 +516,71 @@ class UVClient:
                 "port": port, "written": len(data)}
 
     # ------------------------------------------------------------------
+    # target / 工程多目标
+    # ------------------------------------------------------------------
+    def _prj_text(self, cmd_code: int, data: bytes = b'', label: str = "") -> dict:
+        """发送一条 UV_PRJ_* 命令，把响应 data 解码为文本返回（UTF-8 优先，GBK 回退）。
+
+        真实 Keil 的 UV_PRJ_* 文本响应为“4字节小端长度头 + 字符串”格式，解析前先跳过头。
+        """
+        status, m_data = self._request(cmd_code, data=data)
+        out = {"ok": status == uvsock.UV_STATUS_SUCCESS, "status": status,
+               "status_text": status_text(status), "command": label,
+               "data_hex": m_data.hex()}
+        if status == uvsock.UV_STATUS_SUCCESS and m_data:
+            payload = m_data
+            if len(payload) >= 4:
+                ln = struct.unpack('<I', payload[:4])[0]
+                if 0 < ln <= len(payload) - 4:
+                    payload = payload[4:4 + ln]
+            txt = None
+            for enc in ("utf-8", "gbk", "latin-1"):
+                try:
+                    t = payload.decode(enc).rstrip("\x00").strip()
+                    if t:
+                        txt = t
+                        break
+                except (UnicodeDecodeError, ValueError):
+                    continue
+            out["text"] = txt if txt is not None else ""
+        return out
+
+    def get_cur_target(self) -> dict:
+        """查询当前工程当前 target 名（UV_PRJ_GET_CUR_TARGET 0x1017）。"""
+        r = self._prj_text(uvsock.UV_PRJ_GET_CUR_TARGET, label="get_cur_target")
+        if r.get("ok"):
+            r["target"] = r.get("text", "")
+        return r
+
+    def enum_targets(self) -> dict:
+        """枚举当前工程所有 target（UV_PRJ_ENUM_TARGETS 0x1015）。"""
+        r = self._prj_text(uvsock.UV_PRJ_ENUM_TARGETS, label="enum_targets")
+        if r.get("ok") and r.get("text"):
+            lines = [ln.strip() for ln in r["text"].splitlines() if ln.strip()]
+            r["targets"] = lines
+        return r
+
+    def get_debug_target(self) -> dict:
+        """查询当前调试 target（UV_PRJ_GET_DEBUG_TARGET 0x100B）。"""
+        r = self._prj_text(uvsock.UV_PRJ_GET_DEBUG_TARGET, label="get_debug_target")
+        if r.get("ok"):
+            r["target"] = r.get("text", "")
+        return r
+
+    def set_debug_target(self, target: str) -> dict:
+        """设置调试 target（UV_PRJ_SET_DEBUG_TARGET 0x100C）。target 为 target 名或索引。"""
+        from .uvsock import VSET
+        ve = VSET()
+        status, m_data = self._request(uvsock.UV_PRJ_SET_DEBUG_TARGET, data=ve.pack(target))
+        out = {"ok": status == uvsock.UV_STATUS_SUCCESS, "status": status,
+               "status_text": status_text(status), "target": target,
+               "data_hex": m_data.hex()}
+        if status == uvsock.UV_STATUS_SUCCESS:
+            txt = m_data.decode("utf-8", "replace").rstrip("\x00").strip()
+            out["text"] = txt
+        return out
+
+    # ------------------------------------------------------------------
     # 工具
     # ------------------------------------------------------------------
     @staticmethod
