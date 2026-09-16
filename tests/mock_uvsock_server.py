@@ -51,6 +51,8 @@ class MockUVSOCKServer:
         # True 时模拟真实 Keil：目标处于运行状态时拒绝复位（status=11 UV_STATUS_TARGET_EXECUTING）
         self.reset_requires_stop = False
         self.reset_calls = 0
+        # True 时模拟「stop 异步未生效」：命令有响应但目标仍在跑（用于验证脏 PC 防护）
+        self.stop_ignores = False
         self.var_table = {  # (vtype, addr, total_size, count, elem_size)
             "v0": (uvsock.VTT_int, base, 4, 1, 4),
             "v1": (uvsock.VTT_uint, base + 4, 4, 1, 4),
@@ -86,6 +88,16 @@ class MockUVSOCKServer:
             struct.pack_into('<I', self.mem, fbase + i * 4, v)
         self.running = False
         self.debugging = False
+        # --- 真机行为模拟钩子（供批次14 测试 A/B 修复）---
+        # >0 时：每个请求的响应前先发 N 个 r_cmd 不匹配的陈旧响应帧（模拟真机响应队列残留）
+        self.stale_frames = 0
+        # >0 时：enter_debug 后仍需 N 次 STATUS 查询才报"已进入调试态"（模拟异步就绪）
+        self.enter_ready_delay = 0
+        self._enter_pending = 0
+        # BS 命令返回码覆盖（真机成功时可能返回 22 BP_CREATED 而非 0）
+        self.bs_status = None
+        # True 时 BS 响应携带二进制 payload（模拟真机断点结构，考察 output 乱码处理）
+        self.bs_binary_output = False
         self.breakpoints = []  # 断点符号/地址列表
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -207,6 +219,12 @@ class MockUVSOCKServer:
         for ecmd, payload in self.pending_async:
             conn.sendall(self._pack_async(ecmd, payload))
         self.pending_async.clear()
+        if self.stale_frames:
+            # 模拟真机：响应队列里残留了历史请求的响应（命令码完全不同）
+            for _ in range(self.stale_frames):
+                conn.sendall(self._pack_response(
+                    0x7F01, uvsock.UV_STATUS_NOT_DEBUGGING, b""))
+            self.stale_frames = 0
         conn.sendall(self._pack_response(cmd, status, resp_data))
 
     @staticmethod
@@ -222,6 +240,14 @@ class MockUVSOCKServer:
             return uvsock.UV_STATUS_SUCCESS, b"V5.2.0"
 
         if cmd == uvsock.UV_DBG_STATUS:
+            if self._enter_pending > 0:
+                # 模拟真实 Keil：enter_debug 是异步的，未就绪时 STATUS 返回
+                # r_status=6 + "Target is not in debug mode"
+                self._enter_pending -= 1
+                if self._enter_pending == 0:
+                    self.debugging = True
+                body = b"Target is not in debug mode\x00"
+                return uvsock.UV_STATUS_NOT_DEBUGGING, struct.pack('<i', len(body)) + body
             # 模拟真实 Keil：r_status 恒为成功，运行状态在响应 data 低字节（0=停止,1=执行中）
             data = b"\x01" if self.running else b"\x00"
             return uvsock.UV_STATUS_SUCCESS, data
@@ -242,7 +268,9 @@ class MockUVSOCKServer:
             if cmd == uvsock.UV_DBG_START_EXECUTION:
                 self.running = True
             elif cmd == uvsock.UV_DBG_STOP_EXECUTION:
-                self.running = False
+                # stop_ignores=True 模拟真实 Keil 的异步滞后：响应照回，但目标仍在运行
+                if not self.stop_ignores:
+                    self.running = False
             elif cmd == uvsock.UV_DBG_RESET:
                 self.reset_calls += 1
                 # 真实 Keil：目标运行中直接复位会被拒（status=11），需先 stop
@@ -252,7 +280,11 @@ class MockUVSOCKServer:
             return uvsock.UV_STATUS_SUCCESS, b""
 
         if cmd == uvsock.UV_DBG_ENTER:
-            self.debugging = True
+            if self.enter_ready_delay > 0:
+                self.debugging = False
+                self._enter_pending = self.enter_ready_delay
+            else:
+                self.debugging = True
             self.running = False
             return uvsock.UV_STATUS_SUCCESS, b""
 
@@ -305,7 +337,13 @@ class MockUVSOCKServer:
         if op == 'BS' and rest:
             if rest[0] not in self.breakpoints:
                 self.breakpoints.append(rest[0])
-            return uvsock.UV_STATUS_SUCCESS, b""
+            st = self.bs_status if self.bs_status is not None else uvsock.UV_STATUS_SUCCESS
+            payload = b""
+            if self.bs_binary_output:
+                payload = (struct.pack('<IIII', 1, 1, 1, 1)
+                           + (0x08000DB4).to_bytes(4, 'little') + (33).to_bytes(4, 'little')
+                           + b"\\mdk_test\\../Core/Src/main.c")
+            return st, payload
         if op == 'BK' and rest:
             if rest[0].isdigit() and int(rest[0]) < len(self.breakpoints):
                 self.breakpoints.pop(int(rest[0]))

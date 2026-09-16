@@ -481,6 +481,40 @@ def _parse_addr(s: str | int) -> int:
     return int(s, 10)
 
 
+def _resolve_addr_arg(s, client=None):
+    """把地址参数解析为整数地址：支持 0x/十进制，也支持符号名（函数/全局变量）。
+
+    AI 常把符号名（如 'svcrt_task_table'）直接当 addr 传入，旧实现会抛
+    "invalid literal for int()" 逼其先 find_symbol 绕一圈。这里先按数字解析，
+    失败再当符号名处理：先查当前 .axf 符号表精确匹配，再退化到调试器表达式 '&名'。
+    返回 (addr:int, note:str|None)；无法解析时抛带操作指引的 ValueError。
+    """
+    try:
+        return _parse_addr(s), None
+    except (ValueError, TypeError):
+        pass
+    name = str(s or "").strip()
+    if not name:
+        raise ValueError("addr 为空：应为地址（如 '0x20000000'）或符号名（如 'svcrt_task_table'）")
+    loc = _get_locator()
+    if loc is not None:
+        hit = loc.symbol_addr(name)
+        if hit:
+            return hit["addr"], ("addr 由符号 '%s' 解析（%s/%s）"
+                                 % (hit["name"], hit["type"], hit["bind"]))
+    if client is not None:
+        try:
+            ar = client.calc_expression("&" + name)
+        except Exception:  # noqa: BLE001
+            ar = {}
+        v = ar.get("value") if isinstance(ar, dict) else None
+        if isinstance(v, int) and v != 0:
+            return (v & ~1), "addr 由调试器表达式 '&%s' 解析（符号表未命中）" % name
+    raise ValueError(
+        "无法把 '%s' 解析为地址：既不是合法数字地址，也不在当前 .axf 符号表中；"
+        "可用 find_symbol 检索符号名，或先 set_symbol_file 切到该符号所属的 .axf" % name)
+
+
 def _fmt_field(raw: bytes, tname: str):
     """把结构体成员原始字节格式化为友好值。返回 {hex, int(可选), float(可选), ascii(可选)}。"""
     import struct as _struct
@@ -576,10 +610,23 @@ def _build_location(client):
     返回 dict：{ok, pc, registers, file, line, address, source, display_path, callstack,
     warning(可选), hit_breakpoint(可选)}；.axf 未就绪返回 None；无法读寄存器返回 {ok:False}。
     """
+    # 目标运行中读到的是陈旧寄存器（实测 PC 稳定停在复位附近地址，看着像"停在
+    # Reset_Handler"，而 LR/SP 指向空闲循环）。据此给停靠位置/调用栈会把排查带偏，
+    # 故先确认目标已停止；未停止就不给位置，直接说明原因。
+    try:
+        st = client.get_status()
+    except Exception:  # noqa: BLE001
+        st = {}
+    if st.get("ok") and st.get("running"):
+        return {"ok": False, "target_running": True,
+                "error": "目标正在运行，PC/寄存器为陈旧值不可信（实测会稳定返回复位附近地址，"
+                         "易误判成停在复位），不给出停靠位置；请先 stop 并确认停止后再读",
+                "status": st}
     loc = _get_locator()
-    regs = client.read_cpu_registers_stable()
+    regs = client.read_cpu_registers_stable(require_stopped=True)
     if not regs.get("ok"):
-        return {"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "detail": regs}
+        return {"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试，或确认目标已停止）",
+                "detail": regs}
     pc = regs.get("pc")
     lr = regs.get("lr")
     sp = regs.get("sp")
@@ -688,6 +735,128 @@ def _aapcs_param_fallback(client, idx, regs: dict | None = None):
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+_FPB_SLOTS = 6  # Cortex-M3/M4 FPB 代码断点槽位典型值（M0/M0+ 为 4）
+
+
+def _bp_clear_note(n_cleared: int) -> str:
+    """断点清除后的提示语：按断点类型给建议，避免"每次都让人重烧"的误导。
+
+    Keil 经 SWD/JTAG 调试 Cortex-M 目标时，代码断点默认使用硬件断点（FPB），
+    只写调试单元、不改 Flash 指令，清除后无需重新烧录；只有断点数超出硬件槽位
+    而落到 Flash 软件断点、或使用模拟器时，才需要重新烧录恢复原指令。
+    """
+    note = ("已清除。Cortex-M 目标经 SWD/JTAG 调试时，未超出硬件断点槽位(FPB，典型 %d 个)"
+            "的代码断点走硬件断点，清除不涉及改写 Flash，无需重新烧录。" % _FPB_SLOTS)
+    if n_cleared > _FPB_SLOTS:
+        note += ("本次共清除 %d 个断点，已超过硬件槽位上限，可能包含写改 Flash 的软件断点；"
+                 "仅在目标行为异常时才需要 build_and_flash 重刷。" % n_cleared)
+    else:
+        note += "仅当断点超出硬件槽位落到 Flash 软件断点、或使用模拟器时才需重新烧录。"
+    return note
+
+
+# 常见参数名 -> 示例值（生成"调用示例"用；未收录的按 JSON 类型给占位值）
+_PARAM_EXAMPLES = {
+    "addr": "0x20000000", "address": "0x20000000",
+    "addresses": [{"addr": "0x20000000", "n_bytes": 16}],
+    "n_bytes": 16, "size": 64, "data_hex": "deadbeef", "byte": 0, "count": 1,
+    "expr": "main", "expressions": ["SData_UA", "timer.sec"], "name": "SData_UA",
+    "query": "main", "kind": "func", "limit": 50,
+    "target": "0x08000db4", "timeout_ms": 1000, "mode": "into", "access": "write",
+    "condition": "i == 10", "bp_id": 1, "project": "", "path": "path/to/firmware.axf",
+    "start": "0x20000000", "end": "0x20000040", "pattern_hex": "deadbeef",
+    "max_results": 20, "commands": [{"tool": "read_mem",
+                                     "args": {"addr": "0x20000000", "n_bytes": 16}}],
+    "stop_on_error": False, "duration_ms": 1000, "interval_ms": 20,
+    "periph": "GPIOA", "reg": "ODR", "value": "0x0001", "register": "r0",
+    "globals": ["g_flag"], "source_context": 4, "max_fields": 64, "func": "main",
+    "max_ms": 5000, "port": 0, "clear": False, "backup": True,
+    "include_uvoptx": False, "read_memory": True, "max_frames": 16,
+    "errors_text": "main.c(12): error: #20: identifier x is undefined",
+}
+
+
+def _example_value(name: str, spec: dict):
+    """按参数名/JSON 类型给出示例值。"""
+    if name in _PARAM_EXAMPLES:
+        return _PARAM_EXAMPLES[name]
+    t = spec.get("type")
+    if isinstance(t, list):
+        t = t[0] if t else None
+    if t == "integer":
+        return 0
+    if t == "number":
+        return 0
+    if t == "boolean":
+        return False
+    if t == "array":
+        return []
+    if t == "object":
+        return {}
+    return "<%s>" % name
+
+
+def _param_signature(tool) -> str:
+    """由工具 inputSchema 生成"必填参数 + 调用示例"文本块。"""
+    params = getattr(tool, "parameters", None) or {}
+    props = params.get("properties") or {}
+    if not props:
+        return "无（直接调用，args 传 {}）"
+    required = list(params.get("required") or [])
+    optional = [n for n in props if n not in required]
+    req_txt = ", ".join(required) if required else "无"
+    opt_txt = ", ".join(optional) if optional else "无"
+    return "必填: %s；可选: %s" % (req_txt, opt_txt)
+
+
+def _param_hint_block(tool) -> str:
+    """生成可直接照抄的【参数】/【调用示例】说明块，附到工具描述末尾。
+
+    AI 冷启动常猜错参数名（addr 写成 address、expr 写成 name），而框架只在报错里
+    给一句 "Field required"，要试错 2~3 次。这里把必填/可选参数与调用示例写进描述，
+    一次调用即可对齐。
+    """
+    params = getattr(tool, "parameters", None) or {}
+    props = params.get("properties") or {}
+    if not props:
+        return "\n【参数】无（直接调用）\n【调用示例】{}"
+    required = list(params.get("required") or [])
+    example = {}
+    for nm, spec in props.items():
+        if nm in required:
+            example[nm] = _example_value(nm, spec if isinstance(spec, dict) else {})
+    if not required:
+        example = {}
+    return ("\n【参数】%s\n【调用示例】%s"
+            % (_param_signature(tool), json.dumps(example, ensure_ascii=False)))
+
+
+def _batch_alias_args(tool: str, args: dict) -> dict:
+    """batch 历史别名兼容：addr/address、n_bytes/size 等旧写法仍可用。"""
+    a = dict(args or {})
+    if tool in ("read_mem", "read_mem_multi", "write_mem", "fill_mem", "search_mem"):
+        if "addr" not in a and "address" in a:
+            a["addr"] = a["address"]
+        if tool == "read_mem" and "n_bytes" not in a and "size" in a:
+            a["n_bytes"] = a["size"]
+    a.pop("address", None)
+    return a
+
+
+def _apply_param_hints(server) -> int:
+    """给所有已注册工具的描述追加【参数】/【调用示例】（幂等）。"""
+    tm = getattr(server, "_tool_manager", None)
+    tools = getattr(tm, "_tools", None) or {}
+    n = 0
+    for tool in tools.values():
+        desc = getattr(tool, "description", "") or ""
+        block = _param_hint_block(tool)
+        if block and "【参数】" not in desc:
+            tool.description = desc + block
+            n += 1
+    return n
 
 
 def _js(obj) -> str:
@@ -842,13 +1011,21 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="读取目标内存",
         description=(
             "从指定内存地址读取 n_bytes 个字节。"
-            "addr 支持十六进制（如 '0x20000000'）或十进制；返回十六进制字节串及 ASCII 视图。注意：需目标暂停——目标运行期间 UVSOCK 推送异步消息会堆积，导致读取响应错位（典型报错 AMEM 响应数据过短），务必先 stop 再读。勿越界读外设保留区，可先 query_memory_map 确认范围。"
+            "addr 支持十六进制（如 '0x20000000'）、十进制，或符号名（如 'SystemCoreClock'、"
+            "'svcrt_task_table'——自动查当前 .axf 符号表解析，命中时返回 addr_note 说明来源）；"
+            "返回十六进制字节串及 ASCII 视图。注意：需目标暂停——目标运行期间 UVSOCK 推送异步消息会堆积，导致读取响应错位（典型报错 AMEM 响应数据过短），务必先 stop 再读。勿越界读外设保留区，可先 query_memory_map 确认范围。"
         ),
     )
     async def read_mem(addr: str, n_bytes: int) -> str:
         try:
-            a = _parse_addr(addr)
-            return _js(_get_client().read_mem(a, int(n_bytes)))
+            client = _get_client()
+            a, note = _resolve_addr_arg(addr, client)
+            out = client.read_mem(a, int(n_bytes))
+            if note and isinstance(out, dict):
+                out = dict(out)
+                out["addr"] = hex(a)
+                out["addr_note"] = note
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "addr": str(addr), "error": str(e)})
 
@@ -862,12 +1039,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def write_mem(addr: str, data_hex: str) -> str:
         try:
-            a = _parse_addr(addr)
+            client = _get_client()
+            a, _note = _resolve_addr_arg(addr, client)
             hex_str = "".join((data_hex or "").split())
-            payload = bytes.fromhex(hex_str)
-            return _js(_get_client().write_mem(a, payload))
-        except ValueError as e:
-            return _js({"ok": False, "addr": str(addr), "error": f"data_hex 非法: {e}"})
+            try:
+                payload = bytes.fromhex(hex_str)
+            except ValueError as e:
+                return _js({"ok": False, "addr": str(addr), "error": f"data_hex 非法: {e}"})
+            return _js(client.write_mem(a, payload))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "addr": str(addr), "error": str(e)})
 
@@ -879,6 +1058,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "自动进入 Keil 调试模式（UV_DBG_ENTER）。"
             "受工程 Load/Flash Download/Run-to-main 设置影响，属于有副作用的操作；"
             "进入后即可设断点、读变量、运行控制。注意：若当前 Keil 是旧窗口、加载旧固件，进入后调试的是旧代码符号；建议改用 flash_debug 闭环（关旧Keil→编烧→重开→进调试）。受工程 Load/Flash Download/Run-to-main 设置影响，属有副作用操作。需 UVSOCK 已开启。"
+            "真机实测：进入调试是异步的——命令返回成功时目标尚未挂载完成，约 0.6~0.7s 后才真正就绪，"
+            "期间紧接的读内存/表达式/断点命令会返回 status=6（Target is not in debug mode）。"
+            "本工具已自动轮询等待就绪（默认最多 6s），返回 ready 与 ready_waited_ms；"
+            "若超时未就绪会给出 warning，此时先读内存会失败，请检查目标板连接或 Keil 是否弹窗待确认。"
         ),
     )
     async def enter_debug() -> str:
@@ -1151,9 +1334,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                    "command": r.get("command")}
             if not r.get("ok"):
                 out["error"] = f"Keil 清除命令未确认成功: {r}"
-            # Flash 软件断点提示：断点会改写 Flash 指令，移除标记后建议重新烧录恢复原指令
-            out["note"] = ("若该断点为 Flash 软件断点（地址落在 Flash 段），Keil 已改写其中指令；"
-                           "如需恢复原指令建议重新 build_and_flash 后再运行")
+            out["note"] = ("Cortex-M 目标经 SWD/JTAG 调试时代码断点默认用硬件断点(FPB)，"
+                           "清除不涉及改写 Flash，无需重新烧录；仅当断点超出硬件槽位而落到 "
+                           "Flash 软件断点、或使用模拟器(Simulator)时，才需重新烧录恢复原指令")
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "expr": expr, "bp_id": bp_id, "error": str(e)})
@@ -1245,7 +1428,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "清除软件断点：清空本服务内部记录并逐个按确切地址发 BK。include_uvoptx=True 时"
             "一并清除工程 .uvoptx 中 Keil 持久化的断点（BK 清不掉、下次进调试会自动恢复的残留）。"
-            "注意：Flash 软件断点会改写 Flash 指令，清除标记后建议重新 build_and_flash 恢复原指令；"
+            "注意：Cortex-M 目标经 SWD/JTAG 调试时，未超出硬件断点槽位(FPB)的代码断点走硬件断点，"
+            "清除不涉及改写 Flash，无需重新烧录；仅当断点数量超出硬件槽位而落到 Flash 软件断点、"
+            "或使用模拟器(Simulator)时才需重新烧录恢复原指令。"
             "清理 .uvoptx 需 Keil 已关闭（否则被内存断点回写覆盖）。"
         ),
     )
@@ -1264,7 +1449,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                     "address": b.get("address"), "ok": False, "error": str(e)})
             _breakpoints[:] = []
             out = {"ok": True, "cleared": len(cleared), "items": cleared,
-                   "note": "Flash 软件断点清除标记后建议重新 build_and_flash 恢复被改写的指令"}
+                   "note": _bp_clear_note(len(cleared))}
             # 可选：一并清除 .uvoptx 持久化断点（BK 清不掉的残留）
             if include_uvoptx:
                 path = _uvoptx_project_path("")
@@ -2144,7 +2329,12 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="运行一段时间后自动暂停",
         description=(
             "让目标 MCU 全速运行 timeout_ms 毫秒后自动暂停，并返回停靠位置（文件行+源码+完整调用栈）。"
-            "用于验证时序 / 观察运行 N 毫秒后的状态。timeout_ms 默认 1000。注意：运行期间读内存不可靠；到点自动 stop 后返回停靠位置。刚停止瞬间读 PC 可能脏值（已做稳定读取）；到点常停在 SysTick 等中断上下文，此时局部变量与调用栈层数可能受限/为空，AAPCS 寄存器解读不适用。需已进入调试且配置 .axf。"
+            "用于验证时序 / 观察运行 N 毫秒后的状态。timeout_ms 默认 1000。"
+            "注意：到点 stop 后会轮询确认目标真正停止（stop 是异步生效的）才读 PC；"
+            "若未能确认停止，返回 stopped=false + warning 且不返回停靠位置，"
+            "避免把陈旧 PC（常量落复位附近 0x0800024c 之类）误当成停靠点。"
+            "到点常停在 SysTick 等中断上下文，此时局部变量与调用栈层数可能受限/为空，"
+            "AAPCS 寄存器解读不适用。需已进入调试且配置 .axf。"
         ),
     )
     async def run_timeout(timeout_ms: int = 1000) -> str:
@@ -2152,13 +2342,23 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             client = _get_client()
             t = max(1, int(timeout_ms))
             r = client.run()
-            if not (r.get("ok") or r.get("status") == 22):
+            if not (r.get("ok") or r.get("status") in (11, 12, 22)):
                 return _js({"ok": False, "error": f"运行失败: {r}"})
             await asyncio.sleep(t / 1000.0)
-            client.stop()
-            info = _build_location(client)
-            out = {"ok": True, "action": "run_with_timeout", "timeout_ms": t}
+            sp = client.stop()
+            # stop 异步生效：必须轮询确认目标真正停下，否则读到的 PC 是陈旧值
+            # （实测稳定返回复位附近地址，误判成"停在 Reset_Handler"）。
+            ws = client.wait_until_stopped(timeout=1.0)
+            out = {"ok": True, "action": "run_with_timeout", "timeout_ms": t,
+                   "stopped": bool(ws.get("stopped")), "stop": sp, "wait_stopped": ws}
             out.update(r)
+            if not ws.get("stopped"):
+                out["ok"] = False
+                out["warning"] = ("到点已发送 stop，但目标仍在运行（未能确认停止）；"
+                                  "此时 PC/寄存器为陈旧值不可信，已不返回停靠位置。"
+                                  "可重试 stop，或先用 get_status 确认停止后再读。")
+                return _js(out)
+            info = _build_location(client)
             if info:
                 out.update(info)
             return _js(out)
@@ -2498,7 +2698,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 return _js({"ok": False, "error": "pattern_hex 非法，须为偶数个十六进制字符"})
             if not pattern:
                 return _js({"ok": False, "error": "pattern_hex 不能为空"})
-            return _js(client.search_mem(_parse_addr(start), _parse_addr(end), pattern, max_results))
+            s, sn = _resolve_addr_arg(start, client)
+            e, en = _resolve_addr_arg(end, client)
+            out = client.search_mem(s, e, pattern, max_results)
+            notes = [n for n in (sn, en) if n]
+            if notes and isinstance(out, dict):
+                out = dict(out)
+                out["addr_note"] = "；".join(notes)
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -2513,7 +2720,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     async def fill_mem(addr: str, byte: int, count: int) -> str:
         try:
             client = _get_client()
-            return _js(client.fill_mem(_parse_addr(addr), int(byte), int(count)))
+            a, _note = _resolve_addr_arg(addr, client)
+            return _js(client.fill_mem(a, int(byte), int(count)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -2796,53 +3004,73 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     size = int(item.get("n_bytes", item.get("size", 32)) or 32)
                 else:
                     addr, size = item, 32
-                a = _parse_addr(addr)
+                a, note = _resolve_addr_arg(addr, client)
                 m = client.read_mem(a, size)
-                results.append({"addr": hex(a), "size": size, "ok": m.get("ok", False),
-                                "data_hex": m.get("data_hex", ""), "ascii": m.get("ascii", "")})
+                item_out = {"addr": hex(a), "size": size, "ok": m.get("ok", False),
+                            "data_hex": m.get("data_hex", ""), "ascii": m.get("ascii", "")}
+                if note:
+                    item_out["addr_note"] = note
+                results.append(item_out)
             return _js({"ok": True, "count": len(results), "results": results})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
         name="batch",
-        title="批量执行多条读类命令",
+        title="批量执行多条命令（读类 + 断点 + 运行控制）",
         description=(
-            "一次提交多条只读命令，聚合返回，减少 AI 往返。commands 为列表，每项 "
-            "{tool, args}。支持 read_mem(addr/n_bytes)/read_variable(name)/"
-            "calc_expression(expr)/get_status/read_registers。返回每条 ok 与结果。注意：仅支持只读命令（read_mem/read_variable/calc_expression/get_status/read_registers）；不支持写内存、运行控制、断点管理等有副作用命令。"
+            "一次提交多条命令、聚合返回，减少 AI 往返。commands 为列表，每项 {\"tool\": \"工具名\", \"args\": {\"参数名\": 值}}；"
+            "tool 必须是本服务已注册的工具名，args 就是该工具自己的参数名（可先看该工具描述末尾的【调用示例】）。"
+            "例：一次往返下 2 个断点再运行——"
+            "commands=[{\"tool\": \"set_breakpoint\", \"args\": {\"expr\": \"main\"}},"
+            " {\"tool\": \"set_breakpoint\", \"args\": {\"expr\": \"svcrt_sched_activate\"}},"
+            " {\"tool\": \"run\", \"args\": {}}]。"
+            "返回 {ok, count, results:[{tool, ok, ...该工具原始返回字段}]}，逐条独立执行，"
+            "单条失败不影响其余（error 字段给出原因，参数不匹配时提示该工具的参数名）。"
+            "注意：不支持嵌套调用 batch 自身；有副作用的命令（write_mem/run/reset/flash_debug 等）"
+            "会按顺序真实执行，请自行确认顺序与后果。"
         ),
     )
-    async def batch(commands: list) -> str:
+    async def batch(commands: list, stop_on_error: bool = False) -> str:
         try:
-            client = _get_client()
+            _get_client()
+            tm = getattr(server, "_tool_manager", None)
             results = []
             for c in commands or []:
-                tool = (c or {}).get("tool", "")
-                args = (c or {}).get("args", {}) or {}
+                tool = str((c or {}).get("tool", "") or "")
+                args = dict((c or {}).get("args", {}) or {})
                 one = {"tool": tool, "ok": False}
-                try:
-                    if tool == "read_mem":
-                        a = _parse_addr(args.get("addr", args.get("address", "")))
-                        n = int(args.get("n_bytes", args.get("size", 32)) or 32)
-                        m = client.read_mem(a, n)
-                        one.update({"addr": hex(a), "n_bytes": n,
-                                    "data_hex": m.get("data_hex", ""), "ascii": m.get("ascii", ""),
-                                    "ok": m.get("ok", False)})
-                    elif tool == "read_variable":
-                        one.update(client.read_variable(args.get("name", "")))
-                    elif tool == "calc_expression":
-                        one.update(client.calc_expression(args.get("expr", "")))
-                    elif tool == "get_status":
-                        one.update(client.get_status())
-                    elif tool == "read_registers":
-                        one.update(client.read_cpu_registers_stable())
-                    else:
-                        one["error"] = f"batch 不支持工具: {tool}"
-                except Exception as e:  # noqa: BLE001
-                    one["error"] = str(e)
+                entry = tm.get_tool(tool) if tm is not None else None
+                if not tool or tool == "batch":
+                    one["error"] = f"batch 不支持工具: {tool or '(空)'}（不支持嵌套调用 batch 自身）"
+                elif entry is None:
+                    one["error"] = f"batch 不支持工具: {tool}（不是本服务已注册的工具名）"
+                else:
+                    args = _batch_alias_args(tool, args)
+                    try:
+                        raw = await entry.fn(**args)
+                    except TypeError as e:
+                        raw = None
+                        one["error"] = (f"参数不匹配: {e}；该工具参数{_param_signature(entry)}"
+                                        "（见该工具描述里的【调用示例】）")
+                    except Exception as e:  # noqa: BLE001
+                        raw = None
+                        one["error"] = str(e)
+                    if raw is not None:
+                        try:
+                            data = json.loads(raw) if isinstance(raw, str) else raw
+                        except Exception:  # noqa: BLE001
+                            data = {"result": raw}
+                        if isinstance(data, dict):
+                            one.update(data)
+                        else:
+                            one["result"] = data
+                        one["ok"] = bool(one.get("ok"))
                 results.append(one)
-            return _js({"ok": True, "count": len(results), "results": results})
+                if stop_on_error and not one.get("ok"):
+                    break
+            return _js({"ok": True, "count": len(results), "results": results,
+                        "note": "逐条独立执行；tool 可为本服务任意已注册工具（不含 batch 自身）"})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -3091,6 +3319,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                         "recommended_workflow": workflow, "scene_tools": scene_tools})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
+
+    # 为每个工具描述追加【参数】/【调用示例】：AI 冷启动可直接照抄参数名，
+    # 不必靠 "Field required" 反复试错。
+    hinted = _apply_param_hints(server)
+    logger.info("已为 %d 个工具补充参数调用示例", hinted)
 
     return server
 

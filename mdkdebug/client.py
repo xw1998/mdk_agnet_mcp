@@ -77,7 +77,7 @@ class UVClient:
         with self._lock:
             self._ensure_connected()
             uv = UVSOCK_CMD(cmd_code, data=data)
-            raw = self.phy.send(uv.pack())
+            raw = self.phy.send(uv.pack(), expect_cmd=cmd_code)
             self._last_used = time.monotonic()
             if raw is None:
                 # 连接可能已失效，尝试重连一次
@@ -357,9 +357,49 @@ class UVClient:
     # ------------------------------------------------------------------
     # 调试会话控制（进入/退出）
     # ------------------------------------------------------------------
-    def enter_debug(self) -> dict:
-        """进入调试模式（UV_DBG_ENTER）。受工程的 Load/Flash/Run-to-main 设置影响。"""
-        return self._control(uvsock.UV_DBG_ENTER, "进入调试")
+    def enter_debug(self, wait_ready: float = 6.0) -> dict:
+        """进入调试模式（UV_DBG_ENTER）。受工程的 Load/Flash/Run-to-main 设置影响。
+
+        真机实测：进入调试是**异步**的——命令返回 status=0 时目标尚未挂载完成，
+        约 0.6~0.7s 后才真正进入调试态；在这之前紧接的状态查询/读内存/表达式
+        会返回 status=6（Target is not in debug mode），断点命令也可能落空。
+        故命令成功后轮询 get_status 直到 debugging 为真（最多等 wait_ready 秒）。
+        """
+        r = self._control(uvsock.UV_DBG_ENTER, "进入调试")
+        if not r.get("ok"):
+            return r
+        try:
+            w = self.wait_debugging(timeout=wait_ready)
+        except Exception as e:  # noqa: BLE001
+            r["warning"] = "等待调试态确认时出错：%s" % e
+            return r
+        r["ready"] = bool(w.get("debugging"))
+        r["ready_waited_ms"] = w.get("waited_ms", 0)
+        if not r["ready"]:
+            r["warning"] = (
+                "enter_debug 已发出但 %.1fs 内未确认进入调试态（get_status 仍报未调试）；"
+                "后续读内存/表达式可能返回 status=6，请检查目标板连接或 Keil 是否弹窗待确认。"
+                % wait_ready)
+        return r
+
+    def wait_debugging(self, timeout: float = 6.0, interval: float = 0.15) -> dict:
+        """轮询 get_status 直到 debugging 为真；返回 {ok, debugging, waited_ms}。"""
+        t0 = time.monotonic()
+        last = {}
+        while True:
+            try:
+                last = self.get_status()
+            except Exception:  # noqa: BLE001
+                last = {}
+            if last.get("debugging"):
+                return {"ok": True, "debugging": True,
+                        "waited_ms": int((time.monotonic() - t0) * 1000),
+                        "status": last}
+            if time.monotonic() - t0 >= timeout:
+                return {"ok": False, "debugging": False,
+                        "waited_ms": int((time.monotonic() - t0) * 1000),
+                        "status": last}
+            time.sleep(interval)
 
     def exit_debug(self) -> dict:
         """退出调试模式（UV_DBG_EXIT）。"""
@@ -378,21 +418,50 @@ class UVClient:
                                        data=EXECCMD.pack(command))
         out = {"status": status, "ok": status == uvsock.UV_STATUS_SUCCESS,
                "status_text": status_text(status), "command": command}
-        # 若响应带输出文本则附上
+        # 若响应带输出文本则附上（真机 BS 的成功响应会带二进制断点结构，
+        # 直接 decode 会得到乱码，故先判断可打印性）
         if m_data:
+            body = m_data.rstrip(b"\x00")
             try:
-                out["output"] = m_data.rstrip(b"\x00").decode("UTF-8", "replace")
-            except Exception:
+                text_ = body.decode("UTF-8")
+                printable = bool(text_) and sum(
+                    1 for ch in text_ if ch.isprintable() or ch in "\t") >= len(text_) * 0.9
+            except Exception:  # noqa: BLE001
+                text_, printable = "", False
+            if printable:
+                out["output"] = text_
+            else:
                 out["output_hex"] = m_data.hex()
+                out["output_note"] = "响应携带二进制数据（非命令文本），已给 output_hex 原始字节"
         return out
 
     def set_breakpoint(self, expr: str) -> dict:
-        """在符号/地址处设置软件断点（命令窗口 BS）。"""
-        return self.exec_command(f"BS {expr}")
+        """在符号/地址处设置软件断点（命令窗口 BS）。
+
+        真机 BS 成功时可能返回 UV_STATUS_BP_CREATED(22) 而非 SUCCESS(0)
+        （断点已创建/已启用等断点类返回码），需归一化为成功，
+        否则会被误判为失败、导致断点 id 丢失。
+        """
+        return self._norm_bp_result(self.exec_command(f"BS {expr}"))
 
     def clear_breakpoint(self, expr: str) -> dict:
-        """清除断点（命令窗口 BK，可传符号名或断点编号）。"""
-        return self.exec_command(f"BK {expr}")
+        """清除断点（命令窗口 BK，可传符号名或断点编号）。
+
+        同 set_breakpoint：BK 成功可能返回 BP_DELETED(23) 等断点类返回码，
+        归一化为成功；BP_NOTFOUND(24) 表示断点本就不存在，对"清除"语义同样视为成功。
+        """
+        return self._norm_bp_result(self.exec_command(f"BK {expr}"), extra_ok=(24,))
+
+    @staticmethod
+    def _norm_bp_result(r: dict, extra_ok: tuple = ()) -> dict:
+        """把断点命令的断点类返回码（22/23/20/21，可选 24）归一化为成功。"""
+        bp_codes = (uvsock.UV_STATUS_BP_DISABLED, uvsock.UV_STATUS_BP_ENABLED,
+                    uvsock.UV_STATUS_BP_CREATED, uvsock.UV_STATUS_BP_DELETED) + tuple(extra_ok)
+        if not r.get("ok") and r.get("status") in bp_codes:
+            r["ok"] = True
+            r["note"] = ("断点命令返回码 %s(%s)，已视为成功"
+                         % (r.get("status"), r.get("status_text")))
+        return r
 
     def list_breakpoints(self) -> dict:
         """列出当前所有断点（命令窗口 BL）。"""
@@ -431,13 +500,29 @@ class UVClient:
         out.update(regs)
         return out
 
-    def read_cpu_registers_stable(self, retries: int = 12, delay: float = 0.3) -> dict:
+    def read_cpu_registers_stable(self, retries: int = 12, delay: float = 0.3,
+                                  require_stopped: bool = False) -> dict:
         """读取 CPU 寄存器并排除停止瞬间的脏 PC 值。
 
         Keil 在 run/step 到断点停止的瞬间，"PC" 表达式可能短暂返回脏值
         （实测为 1 或 SRAM 地址），需重试直到读到 FLASH 代码段地址才返回。
         最多重试 retries 次，期间每次间隔 delay 秒；若始终未读到合理值则返回最后一次结果。
+
+        require_stopped=True 时先确认目标已停止：目标运行中 Keil 读到的是陈旧寄存器
+        （实测 PC 稳定停在复位附近地址，看着像"停在 Reset_Handler"，实为脏读），
+        此时直接返回 ok=False 并说明原因，不把不可信值当结果返回。
         """
+        if require_stopped:
+            try:
+                st = self.get_status()
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": "查询目标状态失败: %s" % e}
+            if st.get("ok") and st.get("running"):
+                return {"ok": False, "target_running": True,
+                        "error": "目标正在运行，读到的 PC/寄存器为陈旧值不可信"
+                                 "（实测会稳定返回复位附近地址，极易误判成停在复位）；"
+                                 "请先 stop 并确认停止（可调 wait_until_stopped）后再读",
+                        "status": st}
         last: dict = {}
         for _ in range(max(1, retries)):
             r = self.read_cpu_registers()
@@ -464,6 +549,33 @@ class UVClient:
         return self._control(uvsock.UV_DBG_STOP_EXECUTION, "暂停",
                              accept=(uvsock.UV_STATUS_TARGET_EXECUTING,
                                      uvsock.UV_STATUS_TARGET_STOPPED))
+
+    def wait_until_stopped(self, timeout: float = 1.0, interval: float = 0.05) -> dict:
+        """轮询等待目标"真正"停止（stop 是异步生效的）。
+
+        真机实测：stop 命令返回时目标可能仍在运行（响应状态滞后），此时读到的 PC/
+        寄存器是陈旧值——会稳定返回复位附近地址（如 0x0800024c Reset_Handler），
+        而 LR/SP 却指向空闲循环，极易误判成"程序停在复位"。因此停止后需轮询
+        UV_DBG_STATUS 直到 running 为假，再做后续读取。
+
+        返回 {ok, stopped, waited_ms, status}；超时未停返回 ok=False 且 stopped=False。
+        """
+        t0 = time.time()
+        deadline = t0 + max(0.0, float(timeout))
+        while True:
+            try:
+                st = self.get_status()
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "stopped": False, "error": str(e),
+                        "waited_ms": int((time.time() - t0) * 1000)}
+            waited = int((time.time() - t0) * 1000)
+            if st.get("ok") and st.get("running") is False:
+                return {"ok": True, "stopped": True, "waited_ms": waited, "status": st}
+            if time.time() >= deadline:
+                return {"ok": False, "stopped": False, "waited_ms": waited,
+                        "error": "等待目标停止超时(%dms)：目标仍在运行，寄存器为陈旧值不可信" % waited,
+                        "status": st}
+            time.sleep(interval)
 
     def reset(self) -> dict:
         """复位目标。

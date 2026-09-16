@@ -23,6 +23,7 @@ class UVInterface:
     MAX_RECV = 65536        # 单次 recv 最大字节数
     TIMEOUT_UNIT = 0.1      # socket 超时（秒）
     TIMEOUT_COUNTS = 100    # 允许的最大超时次数
+    MAX_STALE_FRAMES = 64   # 响应配对时最多丢弃的陈旧响应帧数（防死等）
 
     def __init__(self, host: str = "127.0.0.1", port: int = 4823):
         self.host = host
@@ -151,24 +152,36 @@ class UVInterface:
             self.async_log.clear()
         return out
 
-    def send(self, data: bytes) -> bytes | None:
-        """发送已打包的命令，并阻塞接收完整响应帧（或 None，超时/异常）。"""
+    def send(self, data: bytes, expect_cmd: int | None = None) -> bytes | None:
+        """发送已打包的命令，并阻塞接收完整响应帧（或 None，超时/异常）。
+
+        expect_cmd 传本次请求的命令码时，recv 会丢弃 r_cmd 不匹配的陈旧响应帧。
+        真实 Keil 的响应队列可能残留历史请求的响应（跨会话/命令被拒后尤其明显），
+        不做配对就会"拿到上一条命令的响应"，表现为读内存返回 status=6 或断点返回 22，
+        但同一会话里的其他命令其实都正常。
+        """
         if self.sock is None:
             raise UVError("连接未建立，请先 open()")
         self._drain_async()                 # 收集 socket 中堆积的异步帧
         self._parse_frames(self.recv_buf)   # 处理上次 recv 残留帧，缓存其中异步帧
         self.recv_buf = b""
         self.sock.sendall(data)
-        return self.recv(ack=None)
+        return self.recv(ack=None, expect_cmd=expect_cmd)
 
-    def recv(self, ack=None):
+    def recv(self, ack=None, expect_cmd: int | None = None):
         """
         接收响应。按帧切分字节流：异步推送帧（0x5020/0x4000/0x5002）解析缓存到
         console_log/async_log 后继续读；首个非异步的 UV_CMD_RESPONSE 响应帧返回。
         这样读响应时不会因混入异步帧而解析错位，命令输出/报错也能闭环读到。
         超时累计超过上限则返回 None。
+
+        expect_cmd 非 None 时做"请求-响应"配对：响应帧头 r_cmd 必须等于请求命令码，
+        不匹配的帧视为陈旧残留并丢弃（最多 MAX_STALE_FRAMES 个，避免死等）。
+        真机实测 r_cmd 恒等于请求命令码（GET_VERSION/MEM_READ/STATUS/EXEC_CMD 等均一致，
+        而 m_Id 不回显），故 r_cmd 是可靠的配对依据。
         """
         timeout_counts = 0
+        stale = 0
         while timeout_counts < self.TIMEOUT_COUNTS:
             try:
                 chunk = self.sock.recv(self.MAX_RECV)
@@ -185,6 +198,18 @@ class UVInterface:
                         if ecmd in _ASYNC_CMDS:
                             self._parse_frames(frame)   # 缓存命令输出/报错
                             continue
+                        if expect_cmd is not None and len(frame) >= 40:
+                            r_cmd = struct.unpack('<I', frame[32:36])[0]
+                            if r_cmd != expect_cmd:
+                                stale += 1
+                                if stale <= self.MAX_STALE_FRAMES:
+                                    continue     # 陈旧/错位响应，丢弃继续等
+                                logger.warning(
+                                    "丢弃 %d 个不匹配响应帧后仍未等到 0x%04X 的响应，"
+                                    "返回最后一个 r_cmd=0x%04X", stale, expect_cmd, r_cmd)
+                            elif stale:
+                                logger.info("跳过 %d 个陈旧响应帧后取到 0x%04X 的响应",
+                                            stale, expect_cmd)
                         return frame                    # 响应帧
                     if ack is not None and ack in self.recv_buf:
                         return self.recv_buf

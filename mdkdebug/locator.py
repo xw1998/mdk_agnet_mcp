@@ -142,6 +142,44 @@ class Locator:
             logger.warning("读取 .axf 符号表失败: %s", e)
             return []
 
+    def symbol_addr(self, name: str):
+        """按符号名精确查地址。返回 {name, addr(int), type, bind, size} 或 None。
+
+        用于让 read_mem/write_mem 等地址参数直接接受符号名。仅匹配精确同名的
+        func/object 符号（过滤 .debug 伪符号，跳过地址为 0）；函数符号 st_value
+        的 bit0 是 Thumb 标志，返回前清掉，使其与 Keil 断点地址/行号表语义一致。
+        """
+        name = (name or "").strip()
+        if not name:
+            return None
+        self._ensure_loaded()
+        try:
+            with open(self.axf_path, "rb") as f:
+                elf = ELFFile(f)
+                sec = elf.get_section_by_name(".symtab")
+                if sec is None:
+                    sec = elf.get_section_by_name(".dynsym")
+                if sec is None:
+                    return None
+                for sym in sec.iter_symbols():
+                    if sym.name != name:
+                        continue
+                    addr = sym.entry["st_value"]
+                    if addr == 0:
+                        continue
+                    st = sym.entry["st_info"]
+                    tname = str(st["type"]).replace("STT_", "").lower()
+                    bname = str(st["bind"]).replace("STB_", "").lower()
+                    if tname not in ("func", "object"):
+                        continue
+                    if tname == "func":
+                        addr &= ~1  # 清 Thumb 标志位，与 Keil/行号表偶数地址一致
+                    return {"name": sym.name, "addr": addr, "type": tname,
+                            "bind": bname, "size": sym.entry.get("st_size", 0)}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("按符号名查地址失败: %s", e)
+        return None
+
     def addr_to_location(self, addr: int):
         """地址 -> {file, line}（取 <=addr 的最近行条目）。"""
         self._ensure_loaded()
