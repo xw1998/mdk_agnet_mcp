@@ -118,7 +118,7 @@ async def main():
         r = await call(server, "set_breakpoint", {"expr": "main"})
         check("MCP set_breakpoint", '"ok": true' in r, r)
         r = await call(server, "list_breakpoints", {})
-        check("MCP list_breakpoints 含 main", '0: main' in r, r)
+        check("MCP list_breakpoints 含 main", '"expr": "main"' in r, r)
         r = await call(server, "clear_breakpoint", {"expr": "main"})
         check("MCP clear_breakpoint", '"ok": true' in r, r)
         r = await call(server, "exit_debug", {})

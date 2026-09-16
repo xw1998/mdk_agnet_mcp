@@ -53,6 +53,7 @@ class MockUVSOCKServer:
             "v2": (uvsock.VTT_float, base + 8, 4, 1, 4),
             "v3": (uvsock.VTT_ushort, base + 12, 2, 1, 2),
             "arr": (uvsock.VTT_uint, base + 16, 32, 8, 4),
+            "main": (uvsock.VTT_uint, 0x08000DB5, 4, 1, 4),  # 供 set_breakpoint 解析 &main
         }
         # CPU 寄存器（供 read_registers / set_register），R0=返回值/首参，R1-R3=后续参数
         self.reg_map = {"__currentPC()": 0x8000DB4, "PC": 0x8000DB4, "R15": 0x8000DB4,

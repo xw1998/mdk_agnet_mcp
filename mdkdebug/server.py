@@ -40,8 +40,21 @@ _client: UVClient | None = None
 # 编译/烧录配置（UV4.exe 路径与默认工程）
 _builder_cfg = {"uv4": None, "default_project": None}
 # 符号定位配置（.axf 路径与 Locator 实例）
-_symbol_cfg = {"locator": None, "axf": None}
-_breakpoints: list = []  # 内部断点记录（expr/address/file/line），因 BL 输出不经 socket 回传
+_symbol_cfg = {"locator": None, "axf": None, "source_type": None}
+# 预登记候选符号工程注册表：AI 可据此切换/自动匹配当前调试固件的符号文件。
+# flash 区段用于 PC 自动匹配（辅助定位，固件 flash 可能重叠，手动 set_symbol_file 为主）。
+_SYMBOL_PROJECTS = [
+    {"name": "SVCRTOS_TEST 内核",
+     "axf": r"D:/工作/git_project/svcrtos_new/example/stm32f427/kernel/SVCRTOS_TEST/MDK-ARM/SVCRTOS_TEST/SVCRTOS_TEST.axf",
+     "map": r"D:/工作/git_project/svcrtos_new/example/stm32f427/kernel/SVCRTOS_TEST/MDK-ARM/SVCRTOS_TEST/SVCRTOS_TEST.map",
+     "flash_start": 0x08000000, "flash_size": 0x100000},
+    {"name": "mdk_test",
+     "axf": r"D:/工作/git_project/mdk_agent/example_mdk_project/mdk_test/MDK-ARM/mdk_test/mdk_test.axf",
+     "map": r"D:/工作/git_project/mdk_agent/example_mdk_project/mdk_test/MDK-ARM/mdk_test/mdk_test.map",
+     "flash_start": 0x08000000, "flash_size": 0x80000},
+]
+_breakpoints: list = []  # 内部断点记录（id/expr/address/file/line），因 BL 输出不经 socket 回传
+_bp_counter: int = 0  # 断点/数据断点 id 自增
 _watchpoints: list = []  # 内部数据断点（watchpoint）记录
 _snapshot_baseline: dict | None = None  # snapshot_diff 对比基线
 
@@ -254,6 +267,133 @@ def _get_locator() -> Locator | None:
     return _symbol_cfg.get("locator")
 
 
+
+
+class MapLocator:
+    """用 .map 的 Image Symbol Table 作为符号源（无 DWARF，仅函数/全局符号地址）。
+
+    提供与 Locator 对齐的接口（search_symbols / addr_to_location / is_ready），
+    addr_to_location 只能返回函数名级（无 file/line），source_type 标记为 map。
+    """
+
+    def __init__(self, map_path: str):
+        self.map_path = os.path.abspath(map_path)
+        self._syms: list = []  # [(addr, name)] 按 addr 升序
+        self._loaded = False
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            r = mapfile.parse_map_file(self.map_path)
+            if r.get("ok") is False:
+                logger.warning("解析 map 失败: %s", r.get("error"))
+                return
+            syms = sorted((s["addr"], s["name"])
+                          for s in r.get("symbols", []) if s.get("addr"))
+            self._syms = syms
+            logger.info("MapLocator 加载 %d 个符号（%s）", len(syms), self.map_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("加载 map 失败: %s", e)
+
+    def is_ready(self) -> bool:
+        self._ensure_loaded()
+        return bool(self._syms)
+
+    def total_entries(self) -> int:
+        self._ensure_loaded()
+        return len(self._syms)
+
+    def search_symbols(self, query: str = "", limit: int = 50, kind: str = "all"):
+        self._ensure_loaded()
+        q = (query or "").lower()
+        out = []
+        for addr, name in self._syms:
+            if q and q not in name.lower():
+                continue
+            out.append({"name": name, "type": "func", "bind": "global",
+                        "addr": "0x%08x" % addr, "size": 0})
+            if len(out) >= max(1, min(limit, 200)):
+                break
+        return out
+
+    def addr_to_location(self, addr: int):
+        """二分找 <= addr 的最近符号（函数名级），无 file/line。"""
+        self._ensure_loaded()
+        lo, hi, best = 0, len(self._syms) - 1, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._syms[mid][0] <= addr:
+                best = self._syms[mid]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best is None:
+            return None
+        return {"file": None, "line": None, "address": best[0], "function": best[1],
+                "source_type": "map"}
+
+
+def _load_symbol_file(path: str):
+    """加载符号文件（.axf 或 .map），更新 _symbol_cfg。返回 (ok, message, count)。"""
+    global _symbol_cfg
+    p = (path or "").strip().strip('"')
+    if not p:
+        return False, "未指定符号文件路径", 0
+    if not os.path.isfile(p):
+        return False, f"符号文件不存在: {p}", 0
+    ext = os.path.splitext(p)[1].lower()
+    if ext == ".map":
+        loc = MapLocator(p)
+        loc._ensure_loaded()
+        if not loc.is_ready():
+            return False, f".map 未解析到任何符号: {p}", 0
+        _symbol_cfg = {"locator": loc, "axf": None, "source_type": "map"}
+        return True, f"已加载 .map 符号（{loc.total_entries()} 条，无 DWARF 行号）", loc.total_entries()
+    try:
+        loc = Locator(p)
+        n = loc.total_entries()
+    except Exception as e:  # noqa: BLE001
+        return False, f"加载 .axf 失败: {e}", 0
+    _symbol_cfg = {"locator": loc, "axf": os.path.abspath(p), "source_type": "axf"}
+    return True, f"已加载 .axf 符号（{n} 条）", n
+
+
+def _pc_in_flash(pc) -> bool:
+    """判断 PC 是否落在任意预登记固件的 flash 区段。"""
+    if not isinstance(pc, int):
+        return False
+    for pr in _SYMBOL_PROJECTS:
+        fs, sz = pr.get("flash_start"), pr.get("flash_size")
+        if fs and fs <= pc < fs + sz:
+            return True
+    return False
+
+
+def _auto_match_symbol(client):
+    """按当前 PC 自动匹配预登记固件并切换符号。返回切换说明 dict 或 None。"""
+    try:
+        regs = client.read_cpu_registers_stable()
+        pc = regs.get("pc")
+        if not isinstance(pc, int):
+            return None
+        for pr in _SYMBOL_PROJECTS:
+            fs, sz = pr.get("flash_start"), pr.get("flash_size")
+            if fs and fs <= pc < fs + sz:
+                axf = pr.get("axf")
+                if axf and os.path.isfile(axf):
+                    cur = _symbol_cfg.get("axf")
+                    if cur and os.path.normcase(os.path.abspath(cur)) == os.path.normcase(os.path.abspath(axf)):
+                        return None  # 已是当前符号文件
+                    ok, msg, _n = _load_symbol_file(axf)
+                    if ok:
+                        return {"auto_switched": True, "project": pr["name"],
+                                "axf": axf, "message": msg, "pc": hex(pc)}
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("PC 自动匹配符号失败: %s", e)
+        return None
 def _resolve_map() -> str:
     """从已配置的 .axf 推断同目录同名 .map 路径；不存在返回空串。"""
     axf = _symbol_cfg.get("axf")
@@ -375,8 +515,6 @@ def _build_location(client):
     warning(可选), hit_breakpoint(可选)}；.axf 未就绪返回 None；无法读寄存器返回 {ok:False}。
     """
     loc = _get_locator()
-    if not loc or not loc.is_ready():
-        return None
     regs = client.read_cpu_registers_stable()
     if not regs.get("ok"):
         return {"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "detail": regs}
@@ -384,7 +522,30 @@ def _build_location(client):
     lr = regs.get("lr")
     sp = regs.get("sp")
     result = {"ok": True, "pc": hex(pc) if isinstance(pc, int) else pc, "registers": regs}
-    cur = loc.addr_to_location(pc) if isinstance(pc, int) else None
+    # 汇编级降级：符号未就绪或 PC 无法解析时，仍返回地址级信息并显式告警，不硬套源码
+    if not loc or not loc.is_ready() or not isinstance(pc, int):
+        result["warning"] = ("符号定位未就绪，仅返回汇编/地址级信息；"
+                             "请用 set_symbol_file 指定当前固件的 .axf/.map")
+        result["callstack"] = []
+        if isinstance(pc, int):
+            result["address"] = hex(pc)
+        return result
+    cur = loc.addr_to_location(pc)
+    if cur is None:
+        # PC 自动匹配：尝试按当前 PC 切到预登记固件符号，避免符号漂移误判
+        switched = _auto_match_symbol(client)
+        if switched:
+            result["auto_symbol"] = switched
+            loc2 = _get_locator()
+            cur = loc2.addr_to_location(pc) if loc2 else None
+            if cur is not None:
+                loc = loc2
+        if cur is None:
+            result["warning"] = (f"当前 PC({hex(pc)}) 未能在当前符号文件解析，符号可能与固件不匹配；"
+                                 "请 set_symbol_file 切换符号文件，或以地址级信息为准")
+            result["address"] = hex(pc)
+            result["callstack"] = _backtrace(client, loc, pc, lr, sp)
+            return result
     if cur:
         result["file"] = cur["file"]
         result["line"] = cur["line"]
@@ -591,6 +752,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def set_breakpoint(expr: str) -> str:
+        global _bp_counter
         try:
             client = _get_client()
             e = (expr or "").strip()
@@ -617,8 +779,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 if l:
                     out["file"] = l["file"]
                     out["line"] = l["line"]
-                _breakpoints.append({"expr": expr, "address": hex(addr),
+                _bp_counter += 1
+                _breakpoints.append({"id": _bp_counter, "expr": expr, "address": hex(addr),
                                      "file": out.get("file"), "line": out.get("line")})
+                out["breakpoint_id"] = _bp_counter
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "expr": expr, "error": str(e)})
@@ -633,6 +797,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def set_conditional_breakpoint(expr: str, condition: str, count: int = 1) -> str:
+        global _bp_counter
         try:
             client = _get_client()
             e = (expr or "").strip()
@@ -664,8 +829,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 if l:
                     out["file"] = l["file"]
                     out["line"] = l["line"]
-                _breakpoints.append({"expr": expr, "address": hex(addr), "condition": cond,
+                _bp_counter += 1
+                _breakpoints.append({"id": _bp_counter, "expr": expr, "address": hex(addr), "condition": cond,
                                      "count": count, "file": out.get("file"), "line": out.get("line")})
+                out["breakpoint_id"] = _bp_counter
             if not r.get("ok"):
                 out["error"] = f"设置条件断点失败: {r}"
             return _js(out)
@@ -683,6 +850,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def set_watchpoint(expr: str, access: str = "write", count: int = 1) -> str:
+        global _bp_counter
         try:
             client = _get_client()
             e = (expr or "").strip()
@@ -719,9 +887,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if l:
                 out["file"] = l["file"]
                 out["line"] = l["line"]
-            _watchpoints.append({"expr": expr, "address": hex(addr), "access": acc,
+            _bp_counter += 1
+            _watchpoints.append({"id": _bp_counter, "expr": expr, "address": hex(addr), "access": acc,
                                  "count": count, "file": out.get("file"),
                                  "line": out.get("line")})
+            out["watchpoint_id"] = _bp_counter
             out["message"] = f"已设置{acc}数据断点，命中即暂停"
             return _js(out)
         except Exception as e:  # noqa: BLE001
@@ -732,16 +902,37 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="清除数据断点",
         description="清除指定地址/变量的数据断点（命令窗口 BK）。expr 为变量名或 0x 地址。注意：清除不存在的地址返回 ok 但无副作用；需与 set_watchpoint 配合在调试会话内使用。",
     )
-    async def clear_watchpoint(expr: str) -> str:
+    async def clear_watchpoint(expr: str = "", bp_id: int | None = None) -> str:
         try:
             client = _get_client()
             e = (expr or "").strip()
-            r = client.exec_command(f"BK {e}")
-            _watchpoints[:] = [w for w in _watchpoints
-                               if w.get("expr") != e and w.get("address") != e]
-            return _js(r)
+            removed = []
+            target = e
+            if bp_id is not None:
+                match = [w for w in _watchpoints if w.get("id") == bp_id]
+                if not match:
+                    return _js({"ok": False, "bp_id": bp_id,
+                                "error": f"内部数据断点表中无 id={bp_id}（可用 list_watchpoints 查看）"})
+                removed = match
+                target = removed[0].get("address") or removed[0].get("expr")
+            elif e:
+                removed = [w for w in _watchpoints
+                           if w.get("expr") == e or w.get("address") == e]
+            if not target:
+                return _js({"ok": False, "error": "需提供 expr 或 bp_id 指定要清除的数据断点"})
+            r = client.exec_command(f"BK {target}")
+            ids = {w.get("id") for w in removed}
+            _watchpoints[:] = [w for w in _watchpoints if w.get("id") not in ids]
+            out = {"ok": r.get("ok"), "cleared_target": target,
+                   "status_text": r.get("status_text"), "removed": removed,
+                   "remaining": len(_watchpoints)}
+            if not r.get("ok"):
+                out["error"] = f"Keil 清除命令未确认成功: {r}"
+            # 数据断点依赖硬件 DWT，清除后相关槽位应已释放
+            out["note"] = "数据断点依赖硬件 DWT（可同时生效 2-4 个），清除后相关触发槽位应已释放"
+            return _js(out)
         except Exception as e:  # noqa: BLE001
-            return _js({"ok": False, "expr": expr, "error": str(e)})
+            return _js({"ok": False, "expr": expr, "bp_id": bp_id, "error": str(e)})
 
     @server.tool(
         name="list_watchpoints",
@@ -750,7 +941,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def list_watchpoints() -> str:
         try:
-            return _js({"ok": True, "watchpoints": list(_watchpoints)})
+            return _js({"ok": True, "watchpoints": list(_watchpoints),
+                        "total": len(_watchpoints),
+                        "note": "数据断点依赖硬件 DWT，支持个数有限；本列表为本服务内部 id 记录，用于按 bp_id 清除。"})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -759,13 +952,38 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="清除断点",
         description="清除指定符号或断点编号处的断点（命令窗口 BK）。注意：清除断点同样走命令窗口并触发异步消息，清除后立即 run/step 前建议稍等。需已进入调试。",
     )
-    async def clear_breakpoint(expr: str) -> str:
+    async def clear_breakpoint(expr: str = "", bp_id: int | None = None) -> str:
         try:
-            r = _get_client().clear_breakpoint(expr)
-            _breakpoints[:] = [b for b in _breakpoints if b.get("expr") != expr]
-            return _js(r)
+            # 定位清除目标：优先内部断点 id，其次按地址/符号名；用确切地址发 BK 更可靠
+            target = (expr or "").strip()
+            removed = []
+            if bp_id is not None:
+                match = [b for b in _breakpoints if b.get("id") == bp_id]
+                if not match:
+                    return _js({"ok": False, "bp_id": bp_id,
+                                "error": f"内部断点表中无 id={bp_id}（可用 list_breakpoints 查看）"})
+                removed = match
+                target = removed[0].get("address") or removed[0].get("expr")
+            elif target:
+                removed = [b for b in _breakpoints
+                           if b.get("address") == target or b.get("expr") == target]
+            if not target:
+                return _js({"ok": False, "error": "需提供 expr（符号/地址）或 bp_id 指定要清除的断点"})
+            r = _get_client().clear_breakpoint(target)  # BK target：用确切地址更可靠
+            ids = {b.get("id") for b in removed}
+            _breakpoints[:] = [b for b in _breakpoints if b.get("id") not in ids]
+            out = {"ok": r.get("ok"), "cleared_target": target,
+                   "status_text": r.get("status_text"),
+                   "removed": removed, "remaining": len(_breakpoints),
+                   "command": r.get("command")}
+            if not r.get("ok"):
+                out["error"] = f"Keil 清除命令未确认成功: {r}"
+            # Flash 软件断点提示：断点会改写 Flash 指令，移除标记后建议重新烧录恢复原指令
+            out["note"] = ("若该断点为 Flash 软件断点（地址落在 Flash 段），Keil 已改写其中指令；"
+                           "如需恢复原指令建议重新 build_and_flash 后再运行")
+            return _js(out)
         except Exception as e:  # noqa: BLE001
-            return _js({"ok": False, "expr": expr, "error": str(e)})
+            return _js({"ok": False, "expr": expr, "bp_id": bp_id, "error": str(e)})
 
     @server.tool(
         name="list_breakpoints",
@@ -774,13 +992,120 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def list_breakpoints() -> str:
         try:
-            if _breakpoints:
-                return _js({"ok": True, "breakpoints": list(_breakpoints)})
-            return _js(_get_client().list_breakpoints())
+            return _js({"ok": True, "breakpoints": list(_breakpoints),
+                        "total": len(_breakpoints),
+                        "note": "Keil 命令窗口 BL 的输出不经 socket 回传（协议限制），无法枚举真实断点；"
+                                "本列表为本服务内部 id 记录，用于按 bp_id 可靠清除。"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="clear_all_breakpoints",
+        title="清除全部软件断点",
+        description=(
+            "清除本服务内部记录的全部软件断点（逐个按确切地址发 BK），并清空内部断点表。"
+            "用于一次清干净，避免残留断点导致运行异常。注意：Flash 软件断点会改写 Flash 指令，"
+            "清除标记后建议重新 build_and_flash 恢复原指令；内部表清空后如需按 bp_id 管理请重新设置。"
+        ),
+    )
+    async def clear_all_breakpoints() -> str:
+        try:
+            client = _get_client()
+            if not _breakpoints:
+                return _js({"ok": True, "cleared": 0, "message": "内部断点表已为空"})
+            cleared = []
+            for b in list(_breakpoints):
+                target = b.get("address") or b.get("expr")
+                try:
+                    r = client.clear_breakpoint(target)
+                    cleared.append({"id": b.get("id"), "expr": b.get("expr"),
+                                    "address": b.get("address"), "ok": r.get("ok")})
+                except Exception as e:  # noqa: BLE001
+                    cleared.append({"id": b.get("id"), "expr": b.get("expr"),
+                                    "address": b.get("address"), "ok": False, "error": str(e)})
+            _breakpoints[:] = []
+            return _js({"ok": True, "cleared": len(cleared), "items": cleared,
+                        "note": "Flash 软件断点清除标记后建议重新 build_and_flash 恢复被改写的指令"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="clear_all_watchpoints",
+        title="清除全部数据断点",
+        description=(
+            "清除本服务内部记录的全部数据断点（逐个发 BK），并清空内部数据断点表。"
+            "用于一次释放所有 DWT 数据断点槽位。注意：数据断点依赖硬件 DWT，全清后槽位应全部释放。"
+        ),
+    )
+    async def clear_all_watchpoints() -> str:
+        try:
+            client = _get_client()
+            if not _watchpoints:
+                return _js({"ok": True, "cleared": 0, "message": "内部数据断点表已为空"})
+            cleared = []
+            for w in list(_watchpoints):
+                target = w.get("address") or w.get("expr")
+                try:
+                    r = client.exec_command(f"BK {target}")
+                    cleared.append({"id": w.get("id"), "expr": w.get("expr"),
+                                    "address": w.get("address"), "ok": r.get("ok")})
+                except Exception as e:  # noqa: BLE001
+                    cleared.append({"id": w.get("id"), "expr": w.get("expr"),
+                                    "address": w.get("address"), "ok": False, "error": str(e)})
+            _watchpoints[:] = []
+            return _js({"ok": True, "cleared": len(cleared), "items": cleared})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
     # ---------------- 符号检索 ----------------
+    @server.tool(
+        name="set_symbol_file",
+        title="设置/切换当前调试符号文件",
+        description=(
+            "运行时切换调试符号文件，解决符号绑定错误（find_symbol/get_current_location/"
+            "断点行号解析到错误的 .axf）问题。path 支持 .axf（完整 DWARF 行号/局部变量）"
+            "或 .map（函数/全局符号地址，无行号）。加载成功返回符号条目数；失败给出明确错误"
+            "（文件不存在/无DWARF/格式不支持）。注意：建议 AI 落地后先 list_symbol_projects "
+            "查看候选，再 set_symbol_file 切到当前正在调试的固件符号，避免符号漂移误判。"
+        ),
+    )
+    async def set_symbol_file(path: str) -> str:
+        try:
+            ok, msg, n = _load_symbol_file(path)
+            if not ok:
+                return _js({"ok": False, "error": msg})
+            return _js({"ok": True, "message": msg, "entries": n,
+                        "source_type": _symbol_cfg.get("source_type")})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="list_symbol_projects",
+        title="列出预登记候选符号工程",
+        description=(
+            "返回预登记的可切换符号工程（如 SVCRTOS_TEST 内核、mdk_test），含 .axf/.map "
+            "路径与 flash 地址段。AI 据此了解可切换的符号目标，并可与 set_symbol_file 配合"
+            "把符号切到当前调试固件。flash 段用于 PC 自动匹配（辅助）。注意：仅列出本机存在的候选。"
+        ),
+    )
+    async def list_symbol_projects() -> str:
+        try:
+            proj = []
+            for p in _SYMBOL_PROJECTS:
+                proj.append({
+                    "name": p["name"],
+                    "axf": p.get("axf"),
+                    "map": p.get("map"),
+                    "flash_start": "0x%08x" % p["flash_start"],
+                    "flash_size": "0x%x" % p["flash_size"],
+                    "axf_exists": bool(p.get("axf") and os.path.isfile(p["axf"])),
+                    "map_exists": bool(p.get("map") and os.path.isfile(p["map"])),
+                })
+            return _js({"ok": True, "count": len(proj), "projects": proj,
+                        "current_axf": _symbol_cfg.get("axf"),
+                        "current_source_type": _symbol_cfg.get("source_type")})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
     @server.tool(
         name="find_symbol",
         title="检索符号",
@@ -1505,7 +1830,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             # 视为"已运行并停在断点"，据此判定运行成功
             run_ok = r.get("ok") or r.get("status") == 22
             client.clear_breakpoint(hex(addr))
-            _breakpoints[:] = [b for b in _breakpoints if b.get("expr") != hex(addr)]
+            _breakpoints[:] = [b for b in _breakpoints
+                               if b.get("address") != hex(addr)]
             if not run_ok:
                 return _js({"ok": False, "target": target, "addr": hex(addr),
                             "error": f"运行失败: {r}"})
