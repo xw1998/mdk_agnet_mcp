@@ -192,7 +192,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **83** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / 编译烧录 / Keil 生命周期管理 / **宿主机串口日志** / 环境自检引导）：
+共 **85** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / 编译烧录 / Keil 生命周期管理 / **宿主机串口日志** / **看门狗冻结与 Cache 感知** / 环境自检引导）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -200,11 +200,13 @@ python run_server.py --transport http --http-port 8300
 | `get_status` | 查询是否处于调试、目标是否运行、状态码，并附**当前符号文件路径 + 时间戳**（`symbol_file`/`symbol_mtime_text`）、**符号陈旧判定**（`symbol_stale` + `symbol_stale_warning`：编译/烧录后旧会话符号过期，求值会报 status 13）、**串行化与并发视图**（`serialization`，含其他 mdkdebug 实例清点） | — |
 | `calc_expression` | 计算并读取表达式 / 变量值 | `expr` |
 | `read_variable` | 按变量名查地址/值/大小，支持数组逐元素与整块内存；App 侧重定位场景可配 `reloc_delta` 自动换算运行地址 | `name`、`count?`、`reloc_delta?` |
-| `read_mem` | 读取目标内存（`n_bytes` 可写作别名 `length`；`reloc_delta` 用于 App 侧重定位后按运行地址读）。**脏读防护**（`verify`，默认 `auto`）：stop 后紧跟的首次读可能整帧返 0（真机实测 0x08022000 读出 16 个 `00`，重读即正确）——`auto` 在「首帧整帧退化（全 `0x00`/全 `0xFF`）或距最近一次 stop 不足 1 秒」时自动复读、**连续两次一致才采纳**，并返回 `read_confidence`/`reread_count`/`reread_consistent`/`degenerate`/`since_stop_s`；首帧是脏值时用 `first_read_hex` 留证。`verify=true` 强制确认、`false` 关闭（**布尔/字符串都收**，`verify=false` 与 `"false"` 等价）；Flash 区稳定读出全 `0xFF` 判为**已擦除的预期内容**（`content_note`，不降置信度） | `addr`（`0x…` 或十进制）、`n_bytes`、`reloc_delta?`、`verify?`（默认 `auto`，可传布尔） |
-| `write_mem` | 写入目标内存，**默认写后回读校验**（`verify=true` → `verified`/`readback_hex`）：写入被静默忽略（目标运行中/只读区/另一实例并发写）时给出 `verified=false` 与原因，不再「看着成功其实没写进去」 | `addr`、`data_hex`（十六进制串，可带空格）、`verify?`（默认 true） |
+| `read_mem` | 读取目标内存（`n_bytes` 可写作别名 `length`；`reloc_delta` 用于 App 侧重定位后按运行地址读）。**脏读防护**（`verify`，默认 `auto`）：stop 后紧跟的首次读可能整帧返 0（真机实测 0x08022000 读出 16 个 `00`，重读即正确）——`auto` 在「首帧整帧退化（全 `0x00`/全 `0xFF`）或距最近一次 stop 不足 1 秒」时自动复读、**连续两次一致才采纳**，并返回 `read_confidence`/`reread_count`/`reread_consistent`/`degenerate`/`since_stop_s`；首帧是脏值时用 `first_read_hex` 留证。`verify=true` 强制确认、`false` 关闭（**布尔/字符串都收**，`verify=false` 与 `"false"` 等价）；Flash 区稳定读出全 `0xFF` 判为**已擦除的预期内容**（`content_note`，不降置信度）。**D-Cache 感知**：读 SRAM 且目标 D-Cache 已使能时附 `cache` 字段，提醒「DAP 直读可能拿到内存旧值（CPU 新值还在脏行里）」 | `addr`（`0x…` 或十进制）、`n_bytes`、`reloc_delta?`、`verify?`（默认 `auto`，可传布尔） |
+| `write_mem` | 写入目标内存，**默认写后回读校验**（`verify=true` → `verified`/`readback_hex`）：写入被静默忽略（目标运行中/只读区/另一实例并发写）时给出 `verified=false` 与原因，不再「看着成功其实没写进去」。**D-Cache 感知**：写 SRAM 且目标 D-Cache 已使能时附 `cache` 字段，提醒「写下的值可能稍后被脏行回写覆盖（写入仍报成功）」 | `addr`、`data_hex`（十六进制串，可带空格）、`verify?`（默认 true） |
+| `cache_info` | 读 `SCB->CCR` 判定目标是否使能 D-Cache / I-Cache（并粗略解析 CCSIDR 得到行/路/组与容量）。**为什么重要**：D-Cache 开着时 DAP **直读 RAM 可能是陈旧值**、**直写 RAM 可能被脏行回写覆盖**，两者都不报错——`read_mem`/`write_mem` 命中 SRAM 时也会附 `cache` 字段提示（探测结果 5 秒 TTL 缓存，不额外拖慢读写）；M3/M4 无 D-Cache、M7 默认不开，此时不产生任何噪声字段 | — |
 | `run` | 全速运行 | — |
 | `run_timeout` | 全速运行 N 毫秒后自动暂停并返回停靠位置，用于验证时序；返回 `requested_run_ms` / `actual_run_ms` / `stop_wait_ms` / `total_ms` 四段计时，排查时序不再只能看一个含糊的 `waited_ms` | `timeout_ms`（默认 1000） |
-| `stop` | 暂停执行，**默认带停止确证**：停止是异步生效的（真机实测 stop 回 ok 后紧跟的 `get_status` 仍报「执行中」），故返回 `stopped`/`stop_verified`/`waited_ms`/`state_after_stop`，`verify=false` 可只发命令不确认 | `verify?`（默认 true）、`timeout?` |
+| `stop` | 暂停执行，**默认带停止确证**：停止是异步生效的（真机实测 stop 回 ok 后紧跟的 `get_status` 仍报「执行中」），故返回 `stopped`/`stop_verified`/`waited_ms`/`state_after_stop`，`verify=false` 可只发命令不确认。**看门狗防御**：暂停期间看门狗（IWDG）仍在计数，halt 超过溢出时间就被复位、RAM 现场全丢——默认自动置位 DBGMCU 冻结位并返回 `watchdog_freeze`，`freeze_watchdogs=false` 可关闭 | `verify?`（默认 true）、`timeout?`、`freeze_watchdogs?`（默认 true） |
+| `watchdog_freeze` | 查询/置位 DBGMCU 的 IWDG/WWDG **调试冻结位**。新会话/目标复位后冻结位会被清零（真机实测 APB1FZ=0x00000000），此时 halt 超过看门狗溢出时间就被复位、RAM 现场全丢；置位后 halt 期间看门狗停止计数。基址**运行时探测**（读 IDCODE 校验 DEV_ID，兼顾 F1/F4/F7 的 0xE0042000 与 H7 的 0x5C001000），不按内核硬编码 | `action?`：`status`（默认）/`enable`/`disable`（含 `on`/`off`/`get` 等别名） |
 | `reset` | 复位目标（变量回初值、断点保留）。**真机实测：复位后停在复位向量、处于停止态，不会自行往下跑**——必须再 `run`（或 `run_timeout`/`run_to_line`）才开始执行；返回 `state_after_reset`/`stopped_after_reset` 与 `hint`；`run_after=true` 可复位后自动 run | `run_after?`（默认 false） |
 | `step` | 单步执行，成功后自动附带停靠位置（`stopped_file`/`stopped_line`/`stopped_address`）+ 源码上下文 + 调用栈 | `mode`：`into`/`over`/`out`/`instruction` |
 | `run_to_line` | 运行到指定行（run to cursor），接受 `文件:行号` 或 `0x地址` | `target`（如 `main.c:77`） |
@@ -245,9 +247,9 @@ python run_server.py --transport http --http-port 8300
 | `target_info` | 查询目标器件信息：实时读 DBGMCU->IDCODE 判 DEV_ID/REV_ID 映射型号 + SCB->CPUID 判内核 + 标称 Flash/RAM 容量与内存布局，排查资源吃紧/选错型号/容量不符 | — |
 | `profile_sampling` | 采样剖析定位热点：让目标运行，周期性暂停采 PC 归到函数统计占比（run/stop 采样，非硬件 ETM，会轻微扰动时序），找哪个函数占 CPU 最多 | `duration_ms`、`interval_ms`、`max_samples` |
 | `mdk_guide` | 环境自检+工作流引导：一键自检 Keil/UVSOCK/UV4/.axf/源码漂移/调试态/RTOS 类型，返回推荐调试工作流与各场景应调用的工具，AI 落地第一件事先调它 | — |
-| `enter_debug` | 自动进入 Keil 调试模式；**已在调试态时返回 `already_in_debug=true`**，不再报失败（省一轮 `exit`/`enter`）；注意副作用：工程勾选 Update Target before Debugging 时会**自动下载最新程序进 Flash** | —；进调试时会**报告 `.uvoptx` 遗留断点**（这些断点会随进调试被 Keil 自动恢复，软件断点命令清不掉，是「目标行为诡异」的隐蔽干扰源） |
+| `enter_debug` | 自动进入 Keil 调试模式；**已在调试态时返回 `already_in_debug=true`**，不再报失败（省一轮 `exit`/`enter`）；注意副作用：工程勾选 Update Target before Debugging 时会**自动下载最新程序进 Flash**。进调试后**默认自动冻结看门狗**（`freeze_watchdogs`） | `freeze_watchdogs?`（默认 true）；进调试时会**报告 `.uvoptx` 遗留断点**（这些断点会随进调试被 Keil 自动恢复，软件断点命令清不掉，是「目标行为诡异」的隐蔽干扰源） |
 | `exit_debug` | 自动退出 Keil 调试模式 | — |
-| `set_breakpoint` | 在符号 / 地址处设软件断点；已存在时 Keil 报 `error 145`，按成功处理并附 `already_exists` | `expr`（如 `main`、`0x08001034`） |
+| `set_breakpoint` | 在符号 / 地址处设软件断点；已存在时 Keil 报 `error 145`，按成功处理并附 `already_exists`。**地址路径与符号路径同一套归一**：入参地址带 Thumb 位（bit0=1）时自动按偶地址下断并返回 `thumb_bit_stripped`/`address_normalized`（真机实测 Keil 的 `BS` 对奇数地址一律报 `error 57: illegal address`）；失败时返回 `diagnosis`（错误码含义 + 地址落在哪个内存区 + 是否在 .axf 覆盖范围 + 下一步建议） | `expr`（如 `main`、`0x08001034`；奇地址会自动清 bit0） |
 | `clear_breakpoint` | 清除断点：`expr`（符号/地址）、`bp_id`（内部 id）、`keil_number`（Keil 界面/BL 里的**真实断点编号**，数据观察点只能这样清）；`bp_id` 在内部表找不到时自动按 Keil 编号处理并给 `resolve_note` | `expr?`、`bp_id?`、`keil_number?` |
 | `list_breakpoints` | 列出断点（含对应的 文件:行号 位置）；`real` / `real_total` 给出 Keil 侧**真实断点表**（编号/类型/访问方式/地址/长度/命中计数/启用状态） | — |
 | `launch_uvision` | 可见方式拉起 Keil 打开工程；已有同工程窗口则**复用并前置**，不新开；以 `CREATE_BREAKAWAY_FROM_JOB` **脱离父进程 job** 启动，不会随调用链被回收 | `project`、`reuse?`（默认 true） |

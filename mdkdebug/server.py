@@ -95,6 +95,174 @@ def _items_arg(value):
         return _csv_tokens(s)
     return [value]
 
+#: Keil 命令窗口错误码中「地址类」的已知含义（真机实证）
+_BP_ERR_MEANING = {
+    57: "illegal address（地址非法）",
+    65: "cannot access memory / 无效的地址表达式",
+    72: "invalid item number（该项不存在：常见于按地址清数据观察点）",
+    145: "Redefinition: item already exists（断点已存在，对「设置」语义视为成功）",
+}
+
+
+def _thumb_even(addr):
+    """把带 Thumb 位（bit0=1）的**代码地址**归一为偶地址。
+
+    真机实测（批次32）：Keil 的 ``BS`` 命令对奇数地址一律报
+    ``*** error 57: illegal address (0x08000DB5)``——同一个函数换成偶地址
+    ``0x08000DB4`` 就成功。而 ``calc_expression("&main")`` 返回的是**偶地址**，
+    函数指针的值却常带 bit0（Thumb 位），于是「用裸地址设断点」会莫名其妙失败，
+    用符号名却成功——这正是用户报的「裸地址路径绕过了解析」的根因。
+
+    只在代码区（< 0x20000000）且确实为奇数时才清 bit0：
+    0x20000000 以上的 RAM 数据地址（数据观察点、重定位区）不动，
+    避免把合法的奇数数据地址改坏。
+
+    返回 ``(归一后的地址或 None, 是否清过位)``。
+    """
+    if not isinstance(addr, int):
+        return None, False
+    if addr and (addr & 1) and addr < 0x20000000:
+        return addr & ~1, True
+    return addr, False
+
+
+def _bp_failure_hint(client, addr, r, loc=None):
+    """断点设置失败时给出可操作的诊断（而不是只回一句 error 57）。"""
+    # 同一个错误可能同时经命令窗口(0x5020)与异步消息(0x4000)抵达，去重后更好读
+    codes = []
+    for e in (r.get("errors") or []):
+        if isinstance(e, dict) and e.get("code") is not None \
+                and e.get("code") not in codes:
+            codes.append(e.get("code"))
+    out = {"status": r.get("status"), "status_text": r.get("status_text"),
+           "errors": r.get("errors")}
+    if codes:
+        out["codes"] = codes
+        out["meaning"] = [_BP_ERR_MEANING.get(c, "未知错误码") for c in codes]
+    hints = []
+    if addr is None:
+        # 地址没解析出来时**也要**保留错误码专属建议（原先直接 return，
+        # 于是「error 145 断点已存在」这类结论被吞掉，只剩一句符号提示）
+        checks = {"addr": None,
+                  "addr_note": "未能从符号名解析出地址（不在当前 .axf 符号表内）"}
+        hints.append("未解析出地址：符号名可能不在当前 .axf 里——用 find_symbol 搜索，"
+                     "或 set_symbol_file 切到与目标固件匹配的 .axf。")
+    else:
+        checks = {"addr": "0x%08X" % addr,
+                  "addr_odd": bool(addr & 1),
+                  "addr_hex_input": "0x%08X" % addr}
+        try:
+            mm = _query_memory_map(addr)
+            if mm.get("matched"):
+                checks["region"] = mm["region"]["name"]
+                checks["region_desc"] = mm["region"]["desc"]
+            else:
+                checks["region"] = None
+                checks["region_note"] = "该地址不在内置内存区表内（可能是外设/保留区）"
+        except Exception:  # noqa: BLE001
+            pass
+        if loc is not None:
+            try:
+                l = loc.locate(addr)
+                checks["in_symbol_coverage"] = bool(l and l.get("covered"))
+                if l and l.get("file"):
+                    checks["symbol_location"] = "%s:%s" % (l.get("file"), l.get("line"))
+            except Exception:  # noqa: BLE001
+                pass
+    out["checks"] = checks
+    if 57 in codes:
+        hints.append("error 57 = illegal address：Keil 认为这个地址不能下断点。"
+                     "已自动处理 Thumb 位（bit0）问题，若仍报此错，常见原因是——")
+        hints.append("① 地址不落在**当前调试镜像的代码区**：确认目标固件与 .axf 是否匹配"
+                     "（get_status 的 symbol_stale/symbol_file、find_symbol 交叉核对），"
+                     "不匹配时先 set_symbol_file 或重新 flash_debug。")
+        hints.append("② 地址在 Flash 但不在 .axf 覆盖范围内（例如板上跑的是别的固件）："
+                     "find_symbol 搜符号名，或用 list_symbol_projects / set_symbol_file 切符号。")
+        hints.append("③ App 重定位场景：下断点要用**运行地址**，可先 set_reloc_delta 设一次"
+                     "偏移量，再按符号名设断点（符号名会自动换算）。")
+        hints.append("④ 该地址若属于当前正在运行的固件且确实在代码区，改用符号名设断点"
+                     "（符号名路径会先 calc_expression 取地址，Keil 自己算出的地址一定合法）。")
+    if 145 in codes:
+        hints.append("error 145 表示断点已存在——对「设置」语义本就成功，"
+                     "可用 list_breakpoints 的 real 字段核对。")
+    if not hints:
+        hints.append("未识别的失败原因：%s（errors=%s）"
+                     % (r.get("status_text"), r.get("errors")))
+    out["hints"] = hints
+    return out
+
+#: D-Cache 状态探测结果缓存（避免每次读/写内存都多打一轮 UVSOCK）
+_CACHE_PROBE = {"ts": 0.0, "state": None}
+
+def _ram_region(addr) -> bool:
+    """地址是否落在 SRAM（0x2000_0000~0x3FFF_FFFF）：只有这里才和 D-Cache 打交道。"""
+    return isinstance(addr, int) and (0x20000000 <= addr < 0x40000000)
+
+def _cache_advisory(client, addr, op: str, ttl: float = 5.0):
+    """D-Cache 已使能且目标地址在 SRAM 时，给出「DAP 直读/直写不可全信」的提示。
+
+    真机反馈（第17轮③）：H7 开着 D-Cache 时，DAP 直读 RAM 可能是陈旧值、直写可能被
+    脏行回写覆盖，而工具全程没有任何提示。这里把这件事显式报出来。
+    只在 SRAM 地址 + 确实检测到 D-Cache 使能时才给，M3/M4（无 D-Cache）不会多出噪声字段。
+    探测结果带 TTL 缓存，避免每次读写都多一轮寄存器访问。
+    """
+    if not _ram_region(addr):
+        return None
+    now = time.time()
+    st = _CACHE_PROBE["state"]
+    if st is None or (now - _CACHE_PROBE["ts"]) > ttl:
+        try:
+            st = client.get_cache_state()
+        except Exception:  # noqa: BLE001
+            return None
+        _CACHE_PROBE["ts"] = now
+        _CACHE_PROBE["state"] = st
+    if not isinstance(st, dict) or not st.get("ok") or not st.get("dcache"):
+        return None
+    ccr = st.get("ccr")
+    out = {"dcache": True, "ccr": ccr,
+           "probed_ago_s": round(max(0.0, time.time() - _CACHE_PROBE["ts"]), 1)}
+    if op == "read":
+        out["note"] = (
+            "目标 D-Cache 已使能（SCB->CCR=%s）：本值由调试器经 DAP **直接读内存**取得，"
+            "若 CPU 刚写过该地址且脏行尚未回写，这里读到的会是**内存中的旧值**——"
+            "调试器无法保证它等于 CPU 视角的值。要据此下结论（如判定变量被清零/被改）时，"
+            "请先让目标做缓存维护（SCB_CleanDCache）或复位后复读核对，不要只看一次直读。" % ccr)
+    else:
+        out["note"] = (
+            "目标 D-Cache 已使能（SCB->CCR=%s）：本写入由调试器经 DAP **直接写内存**，"
+            "若 CPU 侧同一地址存在**脏缓存行**，该行稍后被回写时会**覆盖掉你刚写下的值**"
+            "（且写入本身仍报成功）。改内存变量/标志位时请留意，"
+            "必要时先让目标 clean/invalidate 再写，或写后隔一会儿重读复核。" % ccr)
+    return out
+
+def _auto_freeze_watchdogs(client):
+    """halt/进调试后自动置位 DBGMCU 的 IWDG/WWDG 冻结位（失败只报信息，不影响主流程）。
+
+    真机反馈（第17轮②）：新会话/复位后 DBGMCU 冻结位会被清零，目标停机超过看门狗
+    溢出时间就被 IWDG 复位、RAM 现场全丢。故 stop / enter_debug 默认自动补上这一步。
+    """
+    try:
+        r = client.set_watchdog_freeze(True)
+    except Exception as e:  # noqa: BLE001
+        return {"attempted": True, "ok": False, "error": str(e),
+                "warning": "自动冻结 IWDG/WWDG 时异常：%s。停机过久可能被看门狗复位，"
+                           "可手动调 watchdog_freeze(action=\"enable\") 重试。" % e}
+    if not isinstance(r, dict):
+        return {"attempted": True, "ok": False, "error": "返回体非字典",
+                "warning": "自动冻结 IWDG/WWDG 未取得可解析结果，请手动用 watchdog_freeze 复核。"}
+    r = dict(r)
+    r["attempted"] = True
+    if not r.get("ok"):
+        r["warning"] = ("自动冻结 IWDG/WWDG 失败（%s）：目标停机超过看门狗溢出时间仍会被复位、"
+                        "RAM 现场丢失。可先确认目标已进入调试并暂停，再调 "
+                        "watchdog_freeze(action=\"enable\") 重试。"
+                        % (r.get("error") or "未知原因"))
+    elif not r.get("all_frozen"):
+        r["warning"] = ("自动冻结后回读仍未全部置起（IWDG/WWDG），看门狗可能仍在计数，"
+                        "请用 watchdog_freeze(action=\"status\") 复核。")
+    return r
+
 def _addr_arg(value):
     """地址/表达式类参数的类型兼容：整数地址也能直接用。
 
@@ -1408,6 +1576,7 @@ def _batch_alias_args(tool: str, args: dict) -> dict:
 # 这些工具的关键可选参数直接决定调用成败，示例里一并给出（照抄即可用）
 _KEY_OPTIONALS = {
     "serial_write": {"text": "help", "eol": "crlf"},
+    "watchdog_freeze": {"action": "status"},
 }
 
 
@@ -1806,6 +1975,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             delta, _dnote = _eff_reloc_delta(reloc_delta)
             a, note = _resolve_addr_with_reloc(addr, client, delta)
             out = client.read_mem_verified(a, n, verify=verify)
+            ca = _cache_advisory(client, a, "read")
+            if ca and isinstance(out, dict):
+                out = dict(out)
+                out["cache"] = ca
             if note and isinstance(out, dict):
                 out = dict(out)
                 out["addr"] = hex(a)
@@ -1837,6 +2010,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             except ValueError as e:
                 return _js({"ok": False, "addr": str(addr), "error": f"data_hex 非法: {e}"})
             out = dict(client.write_mem(a, payload))
+            ca = _cache_advisory(client, a, "write")
+            if ca:
+                out["cache"] = ca
             if note:
                 out["addr_note"] = note
             # 批次29：写后回读校验——把「写入被静默吞掉」变成显式 verified=false
@@ -1870,9 +2046,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "期间紧接的读内存/表达式/断点命令会返回 status=6（Target is not in debug mode）。"
             "本工具已自动轮询等待就绪（默认最多 6s），返回 ready 与 ready_waited_ms；"
             "若超时未就绪会给出 warning，此时先读内存会失败，请检查目标板连接或 Keil 是否弹窗待确认。"
+            "**看门狗防御（真机踩过）**：新会话/复位后 DBGMCU 的 IWDG/WWDG 冻结位会被清零，"
+            "目标 halt 超过看门狗溢出时间（典型 ~1.6~26s）就会**被看门狗复位、RAM 现场全丢**。"
+            "本工具默认在就绪后自动置位冻结位（freeze_watchdogs=true），返回 watchdog_freeze "
+            "供核对；万一失败会带 warning，此时请尽快手动调 watchdog_freeze(action=\"enable\")。"
         ),
     )
-    async def enter_debug() -> str:
+    async def enter_debug(freeze_watchdogs: bool = True) -> str:
         try:
             r = _get_client().enter_debug()
             out = dict(r)
@@ -1924,6 +2104,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 # 批次29：记录本次调试会话加载的符号基线（.axf 路径 + 时间戳），
                 # 之后 .axf 被重编/重烧即可判定「会话符号已过期」。
                 out["symbol_session"] = _mark_debug_session("enter_debug")
+            if freeze_watchdogs and out.get("ok"):
+                out["watchdog_freeze"] = _auto_freeze_watchdogs(_get_client())
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -1991,7 +2173,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="设置断点",
         description=(
             "在指定符号或地址处设置软件断点。expr 可为函数名/变量名"
-            "（如 'main'）或地址（如 '0x08001034'）。返回是否成功。注意：设断点走命令窗口 BS，会触发 Keil 异步推送断点消息，紧随其后的命令响应可能被污染（本工具已改为先 calc_expression 取地址再 BS 0xaddr）；设断点后立即 run/step 前需稍等异步消息落地。需已进入调试且配置 .axf。"
+            "（如 'main'）或地址（如 '0x08001034'）。返回是否成功。"
+            "**地址路径与符号路径做同一套归一**：入参地址若带 Thumb 位（bit0=1，常见于函数指针）"
+            "会自动按偶地址下断并返回 thumb_bit_stripped/address_normalized——真机实测 "
+            "Keil 的 BS 对奇数地址一律报 `error 57: illegal address`，而符号名路径经 "
+            "calc_expression 拿到的是偶地址，所以只有裸地址会踩这个坑。"
+            "设断点失败时返回 diagnosis（错误码含义 + 地址落在哪个区 + 是否在 .axf 覆盖范围 + 下一步建议）。"
+            "另外：设断点走命令窗口 BS，会触发 Keil 异步推送断点消息，紧随其后的命令响应可能被污染"
+            "（本工具已改为先 calc_expression 取地址再 BS 0xaddr）；设断点后立即 run/step 前需稍等异步消息落地。"
+            "需已进入调试且配置 .axf。"
         ),
     )
     async def set_breakpoint(expr: str | int) -> str:
@@ -2012,10 +2202,21 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 ar = client.calc_expression(f"&{e}")
                 if ar.get("ok") and isinstance(ar.get("value"), int):
                     addr = ar["value"]
+            # 裸地址同样过一遍 Thumb 位归一：真机实测 BS 对奇数地址报 error 57
+            # illegal address，而函数指针常带 bit0（符号名路径经 calc_expression
+            # 拿到的是偶地址，所以只有裸地址会踩这个坑）。
+            addr_even, thumb_stripped = _thumb_even(addr)
+            if addr_even is not None:
+                addr = addr_even
             # 用解析出的地址设断点，更精确且能拿到位置信息
             r = client.set_breakpoint(hex(addr) if addr is not None else expr)
             out = {"expr": expr}
             out.update(r)
+            if thumb_stripped:
+                out["thumb_bit_stripped"] = True
+                out["address_normalized"] = (
+                    "入参地址带 Thumb 位（bit0=1），已按偶地址 0x%08X 下断"
+                    "（Keil 的 BS 对奇数地址报 error 57 illegal address）。" % addr)
             loc = _get_locator()
             if addr is not None:
                 out["address"] = hex(addr)
@@ -2030,6 +2231,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 _breakpoints.append({"id": _bp_counter, "expr": expr, "address": hex(addr),
                                      "file": out.get("file"), "line": out.get("line")})
                 out["breakpoint_id"] = _bp_counter
+            if not r.get("ok"):
+                out["diagnosis"] = _bp_failure_hint(client, addr, r, loc)
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "expr": expr, "error": str(e)})
@@ -2062,6 +2265,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 ar = client.calc_expression(f"&{e}")
                 if ar.get("ok") and isinstance(ar.get("value"), int):
                     addr = ar["value"]
+            addr_even, thumb_stripped = _thumb_even(addr)
+            if addr_even is not None:
+                addr = addr_even
             loc = _get_locator()
             target = hex(addr) if addr is not None else expr
             cmd = f"BS {target}, {cond}"
@@ -2070,6 +2276,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             r = client.exec_command(cmd)
             out = {"ok": r.get("ok"), "expr": expr, "condition": cond, "count": count,
                    "command": cmd, "status_text": r.get("status_text")}
+            if thumb_stripped:
+                out["thumb_bit_stripped"] = True
+                out["address_normalized"] = (
+                    "入参地址带 Thumb 位（bit0=1），已按偶地址 0x%08X 下条件断点。"
+                    % (addr or 0))
             if addr is not None:
                 out["address"] = hex(addr)
                 l = loc.locate(addr) if loc else None
@@ -2291,6 +2502,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     out["internal_sync"] = sync
                 return _js(out)
             cb_swap = None
+            cb_thumb = None
+            if target.lower().startswith("0x"):
+                try:
+                    _t = int(target, 16)
+                    _t2, _stripped = _thumb_even(_t)
+                    if _stripped:
+                        cb_thumb = target
+                        target = hex(_t2)
+                except ValueError:
+                    pass
             if target:
                 removed = [b for b in _breakpoints
                            if b.get("address") == target or b.get("expr") == target]
@@ -2307,6 +2528,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                    "status_text": r.get("status_text"),
                    "removed": removed, "remaining": len(_breakpoints),
                    "command": r.get("command")}
+            if cb_thumb:
+                out["thumb_bit_stripped"] = True
+                out["address_normalized"] = {"from": cb_thumb, "to": target,
+                                             "reason": "原地址带 Thumb 位（bit0=1），"
+                                                       "已清位后交给 Keil（真机实测奇数地址报 error 57）"}
             if cb_swap:
                 out["resolve_note"] = ("已改用内部记录的确切地址 %s 清除（原 expr：%s），"
                                        "避免按符号名发 BK 解析不到编号" % (target, cb_swap))
@@ -3801,9 +4027,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "**stop_verified=false 表示没能确证目标已停，此时不要读内存/寄存器、也不要据其下结论**，"
             "可重试 stop 或稍后再读（与 run_timeout 的 stop_verified 同一口径）。"
             "verify=false 则只发命令不做确认（快，但需自行承担读到脏值的风险）。"
+            "**看门狗防御（真机踩过）**：暂停期间目标虽不跑代码，**看门狗（IWDG）仍在计数**——"
+            "新会话/复位后 DBGMCU 冻结位会被清零，halt 超过溢出时间就被复位、RAM 现场全丢。"
+            "本工具默认在 stop 后自动置位 DBGMCU 的 IWDG/WWDG 冻结位（freeze_watchdogs=true），"
+            "返回 watchdog_freeze 字段供核对（含 all_frozen）；不需要可传 freeze_watchdogs=false。"
         ),
     )
-    async def stop(verify: bool = True, timeout: float = 1.0) -> str:
+    async def stop(verify: bool = True, timeout: float = 1.0,
+                   freeze_watchdogs: bool = True) -> str:
         try:
             client = _get_client()
             out = dict(client.stop())
@@ -3821,6 +4052,82 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                         % (ws.get("waited_ms") or 0, ws.get("error") or "未知原因"))
             elif not out.get("ok"):
                 out.setdefault("stop_verified", False)
+            if freeze_watchdogs and out.get("ok"):
+                out["watchdog_freeze"] = _auto_freeze_watchdogs(client)
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="watchdog_freeze",
+        title="看门狗调试冻结（IWDG/WWDG）",
+        description=(
+            "查询/置位 DBGMCU 的独立看门狗（IWDG）与窗口看门狗（WWDG）**调试冻结位**。"
+            "**为什么需要它（真机踩过）**：目标 halt 期间 CPU 不执行喂狗代码，但看门狗仍在计数——"
+            "新会话/目标复位后 DBGMCU 冻结位会被清零，此时停机超过溢出时间（典型 1.6~26s）"
+            "就**被 IWDG 复位、RAM 现场全丢**，表现为「停下来看一会儿，变量就全变初值、断点也没了」。"
+            "置位冻结位后 halt 期间看门狗停止计数，可长时间停留分析现场。"
+            "action：status（查当前冻结状态）/ enable（置位，默认）/ disable（清除，恢复真实行为）。"
+            "stop 与 enter_debug 默认会自动 enable，本工具用于手动复核或重试。"
+            "返回值：dbgmcu_base/dev_id（运行时探测，不按内核硬编码）、apb1fz、"
+            "iwdg_stopped/wwdg_stopped/all_frozen；未全部置起时带 warning 说明风险。"
+            "适用 STM32（F1/F4/F7/H7 等）；非 STM32 或读取被挡会返回 error 与已尝试的基址。"
+        ),
+    )
+    async def watchdog_freeze(action: str = "status") -> str:
+        try:
+            a = (action or "status").strip().lower()
+            enable_set = ("enable", "on", "set", "true", "1", "freeze", "yes")
+            disable_set = ("disable", "off", "clear", "false", "0", "unfreeze", "no")
+            status_set = ("status", "get", "query", "read", "show", "")
+            client = _get_client()
+            if a not in enable_set and a not in disable_set and a not in status_set:
+                return _js({"ok": False, "action": action,
+                            "error": "action 取值非法：%s" % action,
+                            "valid_actions": ["status", "enable", "disable"],
+                            "hint": "status=查当前冻结状态；enable=置位（halt 期间冻结看门狗）；"
+                                    "disable=清除（恢复看门狗真实行为）。"})
+            if a in status_set:
+                out = client.get_watchdog_freeze()
+            else:
+                out = client.set_watchdog_freeze(a in enable_set)
+            if isinstance(out, dict) and not out.get("ok"):
+                out = dict(out)
+                out.setdefault("hint", (
+                    "读取失败通常是「目标未进入调试 / 未暂停」或不是 STM32。"
+                    "先 enter_debug 并 stop，再重试；非 STM32 目标请忽略本工具。"))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "action": str(action), "error": str(e)})
+
+    @server.tool(
+        name="cache_info",
+        title="目标 Cache 状态（D-Cache / I-Cache）",
+        description=(
+            "读 SCB->CCR 判定目标是否使能了 D-Cache / I-Cache（M7 有 D-Cache，M3/M4 没有，"
+            "M7 默认也不开、需软件显式使能），并给出 D-Cache 容量的粗略信息。"
+            "**为什么重要（真机反馈第17轮③）**：D-Cache 开着时，调试器（DAP）**直读 RAM 可能是陈旧值**"
+            "（CPU 刚写的新值还在脏行里未回写），**直写 RAM 也可能被脏行回写覆盖**，两者都**不会报错**——"
+            "于是「读到的 0」可能只是缓存没刷、「我写下去了」也可能稍后被覆盖。"
+            "本工具把这些风险显式报出来；read_mem/write_mem 命中 SRAM 地址且 D-Cache 使能时，"
+            "返回体里也会带 cache 字段提示同一件事（探测结果有 5 秒 TTL 缓存，不额外拖慢读写）。"
+            "dcache=true 时请对内存结论留有余量：必要时先让目标做 SCB 缓存维护或复位后复读核对。"
+        ),
+    )
+    async def cache_info() -> str:
+        try:
+            out = _get_client().get_cache_state()
+            if isinstance(out, dict) and out.get("ok"):
+                out = dict(out)
+                out["impact"] = {
+                    "read_mem": "SRAM 直读可能落后于 CPU 视角（脏行未回写）" if out.get("dcache")
+                                else "SRAM 直读按内存真实状态生效",
+                    "write_mem": "SRAM 直写可能被脏行回写覆盖（写入仍报成功）" if out.get("dcache")
+                                 else "SRAM 直写按内存真实状态生效",
+                }
+            elif isinstance(out, dict):
+                out = dict(out)
+                out.setdefault("hint", "读取 SCB->CCR 失败：请先 enter_debug 并 stop 后重试。")
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})

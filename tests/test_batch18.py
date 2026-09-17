@@ -259,7 +259,7 @@ async def main():
             d = (tools[n].description or "") if n in tools else ""
             check("F-%s 描述说明自愈行为" % n,
                   "ensure_debug_channel" in d and "keil_recovered" in d, d[:160])
-        check("F1 工具数 81→83（批次30 新增 clear_faults / serial_write）", len(tools) == 83, str(len(tools)))
+        check("F1 工具数 81→85（批次30 加 2、批次32 加 2）", len(tools) == 85, str(len(tools)))
 
         # ---------- G. 钩子接线 ----------
         check("G1 server 已注入连接复位钩子",

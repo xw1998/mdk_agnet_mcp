@@ -1891,6 +1891,161 @@ class UVClient:
         return out
 
     # ------------------------------------------------------------------
+    # DBGMCU 调试冻结位（批次32 反馈②：看门狗在 halt 期间继续跑）
+    # ------------------------------------------------------------------
+    #: DBGMCU 候选基址（按内核代数排序，运行时探测哪个可读）
+    DBGMCU_BASES = ((0xE0042000, "Cortex-M3/M4/M7（STM32F1/F4/F7 等）"),
+                    (0x5C001000, "Cortex-M7（STM32H7 系列）"))
+    #: 冻结寄存器偏移与位定义（F4/F7/H7 的 IWDG/WWDG 停止位语义一致）
+    DBGMCU_APB1FZ_OFF = 0x08
+    DBGMCU_APB2FZ_OFF = 0x0C
+    DBG_FREEZE_BITS = (("iwdg", 12), ("wwdg", 11))
+    #: SCB->CCR（D-Cache 使能位）
+    SCB_CCR_ADDR = 0xE000ED14
+    SCB_CCR_DC = 1 << 16
+    SCB_CCR_IC = 1 << 17
+
+    def _u32(self, addr: int):
+        """读一个 32 位小端寄存器，返回 (值, 错误信息)。"""
+        r = self.read_mem(addr, 4)
+        hx = (r.get("data_hex") or "")
+        if not r.get("ok") or len(hx) < 8:
+            return None, (r.get("status_text") or "读取失败")
+        return int.from_bytes(bytes.fromhex(hx[:8]), "little"), None
+
+    def dbgmcu_base(self) -> dict:
+        """探测 DBGMCU 基址：逐个候选读 IDCODE 并校验 DEV_ID 是否合法。
+
+        真机实测：STM32F4（Cortex-M4）在 0xE0042000 读到 IDCODE=0x10016433；
+        0x5C001000（H7 基址）在 M4 上读失败——所以用「能读到且 DEV_ID 合法」作判据，
+        比按内核型号硬编码更稳（同一内核家族的系列基址也可能不同）。
+        """
+        tried = []
+        for base, desc in self.DBGMCU_BASES:
+            val, err = self._u32(base)
+            if val is None:
+                tried.append({"base": "0x%08X" % base, "ok": False, "note": err})
+                continue
+            dev = val & 0x0FFF
+            if dev in (0x000, 0xFFF):
+                tried.append({"base": "0x%08X" % base, "ok": False,
+                              "idcode": "0x%08X" % val,
+                              "note": "DEV_ID 非法（该基址无 DBGMCU）"})
+                continue
+            return {"ok": True, "base": base, "desc": desc, "idcode": val,
+                    "dev_id": dev, "rev_id": (val >> 16) & 0xFFFF, "tried": tried}
+        return {"ok": False, "tried": tried,
+                "error": "未找到可用的 DBGMCU 基址（已尝试：%s）。"
+                         "目标可能不是 STM32，或读取被挡住（需先进入调试并暂停）。"
+                         % (", ".join("%s %s" % (t.get("base"), t.get("note"))
+                                      for t in tried) or "无")}
+
+    def get_watchdog_freeze(self) -> dict:
+        """读 DBGMCU 冻结位：halt 期间 IWDG/WWDG 是否被冻结。"""
+        b = self.dbgmcu_base()
+        if not b.get("ok"):
+            return {"ok": False, "error": b.get("error"), "tried": b.get("tried")}
+        base = b["base"]
+        val, err = self._u32(base + self.DBGMCU_APB1FZ_OFF)
+        if val is None:
+            return {"ok": False, "error": "读取 DBGMCU_APB1FZ 失败：%s" % err,
+                    "dbgmcu_base": "0x%08X" % base}
+        bits = {name: bool(val & (1 << bit)) for name, bit in self.DBG_FREEZE_BITS}
+        out = {"ok": True,
+               "dbgmcu_base": "0x%08X" % base, "dbgmcu_desc": b["desc"],
+               "dev_id": "0x%03X" % b["dev_id"], "rev_id": "0x%04X" % b["rev_id"],
+               "apb1fz_addr": "0x%08X" % (base + self.DBGMCU_APB1FZ_OFF),
+               "apb1fz": "0x%08X" % val,
+               "iwdg_stopped": bits["iwdg"], "wwdg_stopped": bits["wwdg"],
+               "all_frozen": bits["iwdg"] and bits["wwdg"]}
+        if not out["all_frozen"]:
+            out["warning"] = (
+                "DBGMCU 冻结位未全部置起：目标暂停（halt）期间 IWDG/WWDG 仍继续计数，"
+                "停机超过看门狗溢出时间就会被复位、RAM 现场全丢（真机踩过）。"
+                "置位后 halt 期间看门狗停止计数。")
+        return out
+
+    def set_watchdog_freeze(self, enable: bool = True) -> dict:
+        """置位/清除 DBGMCU 的 IWDG/WWDG 冻结位（读-改-写 + 回读确认）。
+
+        注意：新会话 / 目标复位后 DBGMCU 冻结位会被清零，需要重新置位——
+        所以 stop / enter_debug 现在会自动调用（见 server 侧）。
+        """
+        b = self.dbgmcu_base()
+        if not b.get("ok"):
+            return {"ok": False, "error": b.get("error"), "tried": b.get("tried")}
+        base = b["base"]
+        addr = base + self.DBGMCU_APB1FZ_OFF
+        before, err = self._u32(addr)
+        if before is None:
+            return {"ok": False, "error": "读取 DBGMCU_APB1FZ 失败：%s" % err,
+                    "dbgmcu_base": "0x%08X" % base, "addr": "0x%08X" % addr}
+        mask = 0
+        for _n, bit in self.DBG_FREEZE_BITS:
+            mask |= (1 << bit)
+        want = (before | mask) if enable else (before & ~mask)
+        out = {"ok": True, "dbgmcu_base": "0x%08X" % base, "addr": "0x%08X" % addr,
+               "before": "0x%08X" % before, "requested_enable": bool(enable)}
+        after = before  # 未发生变更时下面直接用 before 当作 after（避免未定义）
+        if want == before:
+            out.update({"changed": False, "after": "0x%08X" % before, "verified": True})
+        else:
+            w = self.write_mem(addr, want.to_bytes(4, "little"))
+            if not w.get("ok"):
+                return {"ok": False, "error": "写 DBGMCU_APB1FZ 失败：%s"
+                        % (w.get("status_text") or "未知"), **out}
+            after, err2 = self._u32(addr)
+            out.update({"changed": True,
+                        "after": ("0x%08X" % after) if after is not None else None,
+                        "verified": after == want,
+                        "write_note": err2})
+        val = after if out.get("after") else before
+        if isinstance(val, str):
+            val = int(val, 16)
+        bits = {name: bool(val & (1 << bit)) for name, bit in self.DBG_FREEZE_BITS}
+        out.update({"iwdg_stopped": bits["iwdg"], "wwdg_stopped": bits["wwdg"],
+                    "all_frozen": bits["iwdg"] and bits["wwdg"]})
+        if not out.get("verified"):
+            out["warning"] = ("回读值与写入值不一致：该寄存器可能被硬件限制（部分位只读）"
+                              "或写入被忽略，请用 watchdog_freeze(action='status') 复核。")
+        return out
+
+    # ------------------------------------------------------------------
+    # Cache 状态（批次32 反馈③：H7 开 D-Cache 时 DAP 直读/直写不可信）
+    # ------------------------------------------------------------------
+    def get_cache_state(self) -> dict:
+        """读 SCB->CCR 判定 I-Cache / D-Cache；D-Cache 开启时附维护建议。"""
+        val, err = self._u32(self.SCB_CCR_ADDR)
+        if val is None:
+            return {"ok": False, "error": "读取 SCB->CCR 失败：%s" % err,
+                    "ccr_addr": "0x%08X" % self.SCB_CCR_ADDR}
+        dc = bool(val & self.SCB_CCR_DC)
+        ic = bool(val & self.SCB_CCR_IC)
+        out = {"ok": True, "ccr_addr": "0x%08X" % self.SCB_CCR_ADDR,
+               "ccr": "0x%08X" % val, "dcache": dc, "icache": ic}
+        # D-Cache 容量（CCSIDR + CLIDR，仅部分内核实现）
+        cssidr, _e1 = self._u32(0xE000ED80)
+        clidr, _e2 = self._u32(0xE000ED78)
+        if cssidr:
+            ls = (cssidr & 0x7) + 4               # LineSize = 2^(LS+4) bytes
+            ways = ((cssidr >> 3) & 0x3FF) + 1
+            sets = ((cssidr >> 13) & 0x7FFF) + 1
+            size = ways * sets * (1 << ls)
+            out.update({"cache_line_bytes": 1 << ls, "cache_ways": ways,
+                        "cache_sets": sets, "cache_size_kb": round(size / 1024.0, 1)})
+        if dc:
+            out["warning"] = (
+                "目标 D-Cache 已开启：调试器（DAP）**直读 RAM 可能读到缓存里的陈旧值**"
+                "（内存被改过但脏行未回写），**直写 RAM 也可能被脏行回写覆盖**——"
+                "读到的值/写下去的值都不代表内存真实状态，且不会报错。"
+                "核对现场前建议先让目标经 SCB 维护（clean/invalidate），或改用"
+                "cache_info 给出的判断口径，别仅凭一次直读下结论。")
+        else:
+            out["note"] = ("未检测到已使能的 D-Cache（CCR.DC=0）：直读/直写按内存真实状态生效。"
+                           "Cortex-M3/M4 无 D-Cache；M7（H7 等）默认不开，需软件显式使能。")
+        return out
+
+    # ------------------------------------------------------------------
     # 工具
     # ------------------------------------------------------------------
     @staticmethod

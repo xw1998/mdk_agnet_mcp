@@ -77,6 +77,10 @@ class MockUVSOCKServer:
                     "mmfar": 0, "bfar": 0}
         # DBGMCU IDCODE（供 target_info）：DEV_ID=0x423(STM32F401)、REV_ID=0x0000
         self.idcode = 0x00000423
+        # DBGMCU 段（0xE0042000 - 0xE0042FFF）：偏移 0x00=IDCODE，0x08=APB1FZ，0x0C=APB2FZ
+        self.dbgmcu = bytearray(0x1000)
+        # False 时模拟「该基址读不到」（非 STM32 / 基址不对），供 DBGMCU 探测失败路径测试
+        self.dbgmcu_enabled = True
         # 外设寄存器内存（供 read_peripheral）：0x40000000 段与 0xE0000000 段
         self.periph = bytearray(0x100000)      # 0x40000000 - 0x400FFFFF
         self.sys = bytearray(0x20000)          # 0xE0000000 - 0xE001FFFF (SysTick/NVIC/SCB/...)
@@ -109,6 +113,10 @@ class MockUVSOCKServer:
         # >0 时：enter_debug 后仍需 N 次 STATUS 查询才报"已进入调试态"（模拟异步就绪）
         self.enter_ready_delay = 0
         self._enter_pending = 0
+        # True 时模拟真机 BS 行为：奇数地址（Thumb 位 bit0=1）报 *** error 57: illegal address
+        self.bs_odd_addr_error = False
+        # 非 None 时：BS 一律失败，并把该文本当命令窗口报错推送（供诊断字段测试）
+        self.bs_fail_text = None
         # BS 命令返回码覆盖（真机成功时可能返回 22 BP_CREATED 而非 0）
         self.bs_status = None
         # True 时 BS 响应携带二进制 payload（模拟真机断点结构，考察 output 乱码处理）
@@ -433,6 +441,20 @@ class MockUVSOCKServer:
             self._push_console(t)      # 窗口报错行（如 *** error 72: invalid item number）
             self._push_async(uvsock.UV_DBG_EXEC_CMD, uvsock.UV_STATUS_FAILED, t)
         if op == 'BS' and rest:
+            _a = None
+            try:
+                _a = int(rest[0], 16) if rest[0].lower().startswith('0x') else None
+            except ValueError:
+                _a = None
+            _err = None
+            if self.bs_odd_addr_error and _a is not None and (_a & 1):
+                _err = '*** error 57: illegal address (%s)' % rest[0]
+            if self.bs_fail_text:
+                _err = self.bs_fail_text
+            if _err:
+                self._push_console(_err)
+                self._push_async(uvsock.UV_DBG_EXEC_CMD, uvsock.UV_STATUS_FAILED, _err)
+                return uvsock.UV_STATUS_FAILED, b""
             if rest[0] not in self.breakpoints:
                 self.breakpoints.append(rest[0])
             st = self.bs_status if self.bs_status is not None else uvsock.UV_STATUS_SUCCESS
@@ -613,8 +635,14 @@ class MockUVSOCKServer:
         elif nAddr in (0xE0001020, 0xE0001030, 0xE0001040, 0xE0001050):  # DWT_COMP0..3
             _i = (nAddr - 0xE0001020) // 0x10
             payload = struct.pack('<I', self.dwt_comps[_i] & 0xFFFFFFFF)
-        elif nAddr == 0xE0042000:  # DBGMCU->IDCODE（供 target_info）
-            payload = struct.pack('<I', self.idcode & 0xFFFFFFFF)
+        elif 0xE0042000 <= nAddr < 0xE0042000 + len(self.dbgmcu):  # DBGMCU 段
+            if not self.dbgmcu_enabled:
+                return uvsock.UV_STATUS_NO_MEM_ACCESS, b""
+            off = nAddr - 0xE0042000
+            if off == 0:
+                payload = struct.pack('<I', self.idcode & 0xFFFFFFFF)  # IDCODE
+            else:
+                payload = bytes(self.dbgmcu[off:off + nBytes])
         elif 0x40000000 <= nAddr < 0x40000000 + len(self.periph):  # 外设段
             off = nAddr - 0x40000000
             payload = bytes(self.periph[off:off + nBytes])
@@ -648,6 +676,16 @@ class MockUVSOCKServer:
         if nAddr in (0xE0001020, 0xE0001030, 0xE0001040, 0xE0001050):  # DWT_COMP0..3
             _i = (nAddr - 0xE0001020) // 0x10
             self.dwt_comps[_i] = struct.unpack('<I', payload[:4])[0]
+            resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
+            return uvsock.UV_STATUS_SUCCESS, resp
+        if 0xE0042000 <= nAddr < 0xE0042000 + len(self.dbgmcu):  # DBGMCU 段
+            if not self.dbgmcu_enabled:
+                return uvsock.UV_STATUS_NO_MEM_ACCESS, b""
+            off = nAddr - 0xE0042000
+            if off == 0:
+                self.idcode = struct.unpack('<I', payload[:4])[0]
+            else:
+                self.dbgmcu[off:off + len(payload)] = payload
             resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
             return uvsock.UV_STATUS_SUCCESS, resp
         if 0x40000000 <= nAddr < 0x40000000 + len(self.periph):
