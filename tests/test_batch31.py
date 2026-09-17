@@ -324,7 +324,7 @@ async def group_e_tools(server):
           "serial_write" in note and "eol" in note, note)
 
     r2 = await call(server, "list_tools", {})
-    check("E6 total 与工具数一致（98）", r2.get("total") == 98, r2.get("total"))
+    check("E6 total 与工具数一致（99）", r2.get("total") == 99, r2.get("total"))
 
 
 # ----------------------------------------------------------------------
@@ -333,7 +333,7 @@ async def group_e_tools(server):
 async def group_f_surface(server):
     print("F. 工具面回归")
     tools = {t.name: t for t in await server.list_tools()}
-    check("F1 工具总数为 98（批次35 新增 10 个：keil_command/explain_build_error/batch_debug_script/wait_state/svd_list/svd_decode/uvprojx_read/uvprojx_edit/address_for_line/capabilities）", len(tools) == 98, len(tools))
+    check("F1 工具总数为 99（批次35 新增 10 个：keil_command/explain_build_error/batch_debug_script/wait_state/svd_list/svd_decode/uvprojx_read/uvprojx_edit/address_for_line/capabilities；批次34 新增 session_state）", len(tools) == 99, len(tools))
     d = tools["serial_write"].description or ""
     check("F2 描述列出全部 eol 取值（crlf/lf/cr/none/auto）",
           all(k in d for k in ("'crlf'", "'lf'", "'cr'", "'none'", "'auto'")), d[:200])

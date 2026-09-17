@@ -26,7 +26,8 @@ BATCHES = [
     "test_batch9", "test_batch10", "test_batch13", "test_batch14",
     "test_batch15", "test_batch16", "test_batch18", "test_batch25",
     "test_batch26", "test_batch28", "test_batch29", "test_batch30",
-    "test_batch31", "test_batch32", "test_batch33", "test_batch35",
+    "test_batch31", "test_batch32", "test_batch33", "test_batch34",
+    "test_batch35",
 ]
 
 PATTERNS = [
@@ -61,7 +62,13 @@ def actual_tool_count():
 
 
 def scan_test_counts(n):
-    """返回 [(文件, 行号, 行文本, 断言值)]。只认同时含『工具数(总)』与 `==` 的行。"""
+    """返回 [(文件, 行号, 行文本, 断言值)]。
+
+    认两种写法：
+      • 同一行内同时有『工具数(总)』与 `== N`；
+      • 断言标签在上一行、`== N` 在下一行（多行 check 写法）——
+        这类最容易被漏掉，正是本检查要防的情况。
+    """
     hits = []
     tdir = os.path.join(ROOT, "tests")
     for fn in sorted(os.listdir(tdir)):
@@ -69,12 +76,14 @@ def scan_test_counts(n):
             continue
         path = os.path.join(tdir, fn)
         text = dec(open(path, "rb").read())
-        for i, line in enumerate(text.splitlines(), 1):
-            if "==" not in line or not re.search(r"工具(?:总|个)?数", line):
-                continue
+        lines = text.splitlines()
+        for i, line in enumerate(lines, 1):
             if line.lstrip().startswith("#"):
                 continue
-            for v in re.findall(r"==\s*(\d+)\b", line):
+            if not re.search(r"工具(?:总|个)?数", line):
+                continue
+            seg = line if "==" in line else "\n".join(lines[i - 1:i + 2])
+            for v in re.findall(r"==\s*(\d+)\b", seg):
                 hits.append((fn, i, line.strip(), int(v)))
     return hits
 

@@ -58,6 +58,21 @@
 - **CMSIS-SVD 解码**：`svd_list` / `svd_decode` 按芯片厂商的 SVD 解释寄存器值（比内置硬编码表更权威、换型号也能用）：支持 `derivedFrom` 继承、`cluster`、数组与枚举位域；**地址反查**按 `<addressBlock>` 界定真实范围（固定窗口会在外设密集排布处串台），结果附 `matched_by` 标可信度、附 `svd_device` 标明用的是哪份 SVD；不给器件时按当前工程 `<Device>` 推断，**绝不盲挑盘上第一份 .svd**；
 - **工程文件受控编辑**：`uvprojx_read` / `uvprojx_edit` 只读查看与增删包含路径/文件；改前默认备份、文本级替换不重排工程、锚点唯一性校验后再写，空改动不落盘（不写坏用户工程）；
 - **通用等待与能力自述**：`wait_state` 一次完成「等待 + 超时 + 现场」（`timeout` / `unreachable` / `never_debugging` 三种超时分开报）；`capabilities` 一次问清当前环境两条通道、内置模块与工具面；`address_for_line` 补齐「源码行 → 地址」反查（返回偶数地址，避开 Keil 的 `error 57`）；
+- **跨会话状态（`session_state`）**：把「上次调到哪」存成文件——工程 / 符号文件 / UV4 路径 / 串口 /
+  调试态 / 断点 / 数据断点 / SVD 器件 / 工具集 / 快照基线一键 `save` 到 `state.json`（默认 `~/.mdkdebug/state.json`，
+  可用 `path` 或 `MDKDEBUG_STATE_FILE` 指定，多工程各存一份）；`load` 默认**只对比不应用**，
+  `apply=true` 也只做**主机侧可逆动作**（切换符号文件），断点 / 内存 / 运行态一律标 `never_auto_applied`
+  ——恢复现场交给人/AI 决定，工具不替调用方猜。原子写 + 旧版 `.bak`，文件损坏 / 结构不符 / `schema` 不符
+  都明确报错，不假装「没有状态」；
+- **高输出工具的输出控制三件套（`compact` / `max_lines` / `full`）**：`list_tools`、`snapshot`、
+  `read_registers`、`parse_map`、`serial_read` 等 36 个「列表 + 长说明」型工具的返回体容易吃掉上下文预算。
+  受控工具额外接受三个**可选**参数：`max_lines=N` 只留 N 条、`compact=true` 去空值字段 + 把元素间完全相同的
+  字段提到 `output.shared` + 把说明类长文本截断到 200 字符、`full=true` 取全量（覆盖环境变量默认与 `max_lines`）。
+  **不传参数时行为与以前一字不差**；**裁了就报**（`output.truncated` / `dropped` / `hint`），
+  **不碰真值**（数值与 line/text/value/data 这类内容字段绝不截断，列表元素不改写）；
+- **随附 companion 技能 `skills/mdkdebug/SKILL.md`**：把「怎么用这套工具」写成 AI 可直接读的技能文件
+  （先自检再动手、四条主线工作流、`session_state` 接续、三个输出控制旋钮、参数与工具面约定、出错先看谁），
+  避免每次冷启动都从 `list_tools` 摸索；
 - **随附模拟调试器**：无需硬件即可离线联调与跑测试。
 
 ## 工作原理
@@ -152,7 +167,13 @@ mdk_agent/
 │   ├── locator.py            # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
 │   ├── periph.py             # 内置 STM32F4 常用外设寄存器表（RCC/GPIO/USART/SPI/I2C/TIM/...）+ 内存区域地图
 │   ├── mapfile.py            # .map 链接映射文件解析（Program Size/sections/symbols/栈使用/未用段）
-│   └── server.py             # MCP Server 与 98 个工具定义
+│   ├── outctl.py             # 高输出工具的输出控制（compact / max_lines / full）
+│   ├── session.py            # 跨会话状态存储（state.json：原子写 + 旧版备份 + diff）
+│   └── server.py             # MCP Server 与 99 个工具定义
+├── skills/
+│   └── mdkdebug/SKILL.md     # 随附 companion 技能（工作流 / 参数约定 / 输出控制 / 排障入口）
+├── tools/
+│   └── run_all_tests.py      # 统一测试闸门（工具数一致性检查 + 逐批回归）
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_batch*.py        # 各批次 mock 回归（批次 8 拆为 8a/8b/8cd；逐批覆盖该批新增工具）
@@ -191,7 +212,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **98** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导）：
+共 **99** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -285,6 +306,7 @@ python run_server.py --transport http --http-port 8300
 | `set_symbol_file` | 设置/切换当前调试符号文件 | `path` |
 | `list_symbol_projects` | 列出预登记候选符号工程 | — |
 | `set_reloc_delta` | 设置 App 侧重定位偏移（运行地址 = 链接地址 + delta，如 SVCrtOS 的 `0xF000`）：设一次全局生效，`read_variable` / `read_mem` / `find_symbol` / `wait_breakpoint` 会按符号名自动换算；**只偏移符号名，显式数字地址不偏移** | `delta`（`0x` 或十进制，可负，`0x0` 清除） |
+| `session_state` | **跨会话状态**：`save` 把当前主机侧上下文（工程 / 符号文件 / UV4 / 串口 / 调试态 / 断点 / 数据断点 / SVD 器件 / 工具集 / 快照基线）写入 `state.json`；`load` 默认**只对比不应用**，`apply=true` 只做主机侧可逆动作（切符号文件，符号文件不存在时 `skipped` 并引导 `list_symbol_projects`），断点 / 内存 / 运行态标 `never_auto_applied`；`show` 给磁盘态与当前差异；`clear` 需 `confirm=true`。原子写 + 旧版 `.bak`；损坏 / 结构不符 / `schema` 不符均明确报错，不假装「没有状态」 | `action`（`show`/`save`/`load`/`clear`）、`path?`、`apply?`、`confirm?` |
 | `list_tools` | 列出全部工具的名称/用途/**必填参数**/别名与最小调用示例（`example_args` 可直接照抄成 args），`keyword` 按工具名或用途过滤——AI 冷启动不必再靠 `Field required` 报错试错 | `keyword?` |
 | `wait_state` | **通用等待**：轮询等目标进入 `stopped` / `running` / `not_debugging` / `expr`（表达式成立），把「等待 + 超时 + 现场」一次做完，省掉 AI 自己 sleep + 查状态的轮询循环；超时给 `timeout_kind`（`timeout` 到点未达 / `unreachable` 通道连不上 / `never_debugging` 目标根本没进调试）与最终 `observed`，不再「超时了还不知道现场是什么」。**断点命中请用 `wait_breakpoint`**（认断点 id 与命中计数，比轮询 PC 可靠）| `state`（默认 stopped）、`timeout_s?`、`poll_ms?`、`expr?` |
 | `wait_breakpoint` | 带超时等待断点命中（symbol/address 或 .uvoptx 持久化断点），命中即回源码位置并计数；支持**数据观察点命中判定**（返回 `hit_kind` = code/watch、`hit_entry` 命中断点项与来源、`cnt_note` 判定依据强度）；**只认等待期间新发生的停止**（调用时目标已停着则 `hit=false`、`stop_is_new=false`、`new_stop_basis=not_new`，`note` 说明「目标在等待期间未曾运行」）；未命中时给 `note` 说明 PC 与候选地址并提示下一步 | `symbol?`、`address?`、`timeout_s?`、`poll_ms?`、`use_project_breakpoints?`、`project?`、`reloc_delta?` |
@@ -304,7 +326,7 @@ python run_server.py --transport http --http-port 8300
 
 | 组名 | 内容 |
 |---|---|
-| `core` | 进出调试 / 运行控制 / 状态（32 个） |
+| `core` | 进出调试 / 运行控制 / 状态 / 跨会话状态（33 个） |
 | `mem` | 内存与外设读写（10 个） |
 | `symbol` | 符号与源码定位（8 个） |
 | `build` | 编译 / 清理 / 烧录 / 工程配置（13 个） |
@@ -337,6 +359,30 @@ python run_server.py --transport http --http-port 8300
   并在消息里列出该工具接受的参数与可用别名（`_` 前缀的元参数除外）；
 - **别名不遮蔽真实参数，且主名优先**：与某工具真实参数同名的别名会被剔除（如 `read_mem` 真有
   `length` 就不再拿它当 `n_bytes` 的别名）；主名与别名同时出现时只认主名。
+
+### 高输出工具的输出控制（`compact` / `max_lines` / `full`）
+
+长链路调试里最先被吃掉的不是 token 预算，而是**注意力**：`list_tools` 99 条、`snapshot` 整份现场、
+`parse_map` 全表、`serial_read` 几千行日志。36 个高输出工具因此额外接受三个**可选**参数：
+
+| 参数 | 作用 |
+|------|------|
+| `max_lines=N` | 只留「元素为对象的列表」里的前 N 条（`tools` / `results` / `items` / `breakpoints`…），其余丢弃并如实上报；`0`＝不限 |
+| `compact=true` | 删空值字段、把列表元素间**取值完全相同**的字段提到 `output.shared` 一次、把 `usage`/`note`/`hint` 这类**说明性**长文本截断到 200 字符 |
+| `full=true` | 强制不裁剪，覆盖环境变量默认与 `max_lines`（「我就是要全量」时的唯一开关） |
+
+不传参数＝行为与以前**一字不差**（返回体里连 `output` 键都不会出现）。也可以用环境变量给全局默认：
+`MDKDEBUG_COMPACT=1`、`MDKDEBUG_MAX_LINES=200`；`capabilities` 会回报当前受控工具数与环境默认值。
+
+两条底线：
+
+1. **裁了就报**：只要扔掉过任何东西，信封里必有 `output.truncated=true`、`output.dropped`、
+   以及 `output.hint` 说明怎么取回全量——绝不静默丢数据让调用方以为「这就是全部」；
+2. **不碰真值**：只删空值字段 / 重复字段 / 说明性长文本，**绝不修改任何数值**，绝不截断
+   `line`/`text`/`value`/`bytes`/`data` 这类内容字段，列表元素本身也不改写。
+   注意 `count` / `total` 这类计数字段仍是**全量**口径（不会被 `max_lines` 改写），`hint` 里会写明这一点。
+
+`batch` 内的子命令同样支持（`args` 里写这三个键即可），与单工具直调等价。
 
 ## 接入 AI 工具客户端
 
@@ -430,7 +476,7 @@ AI 修改代码后，可按如下顺序实现"自己编译、自己烧录、自�
 
 无需真实 Keil，使用 `tests/mock_uvsock_server.py` 模拟调试器：
 
-**跑全部**（推荐，先做一致性检查再跑 20 个测试模块）：
+**跑全部**（推荐，先做一致性检查再跑 21 个测试模块）：
 
 ```bash
 python tools/run_all_tests.py          # 实际工具数 vs tests/README 里写死的断言 + 跑全部测试
@@ -463,6 +509,7 @@ python -m tests.mock_uvsock_server --port 4823
 | 停目标 | `stop` 默认轮询确证，返回 `stopped` / `stop_verified` / `waited_ms` / `state_after_stop` | `stop_verified=false` 时别读内存/寄存器，也别据其下结论 |
 | 看故障 | `CFSR`/`HFSR` 是粘滞位，`fault_report` 用 `fault_timing.timeliness` 区分 `current`（正在 fault handler 里）/ `sticky`（历史残位）/ `none` | `timeliness=sticky` 时别当当前故障处理。确证新异常：`clear_faults()` → `run()` → `fault_report()` |
 | 并发调用 | 所有 UVSOCK 命令经统一闸门串行化（进程内 `RLock` + 跨进程锁文件），多实例竞争会在 `keil_health` / `get_status` 里报出来 | 同一台调试器上跑多个 MCP 实例时，写入可能被静默覆盖；需要严格顺序的多步写入请用 `batch` 一次提交 |
+| 输出裁剪 | 受控工具支持 `compact` / `max_lines` / `full`，**裁了就报**：丢过东西必有 `output.truncated` / `dropped` / `hint`，计数字段仍是全量 | `output.truncated=true` 时别当这就是全部；要全量用 `full=true`（细节见上节「高输出工具的输出控制」） |
 | 串口占用 | 调试结束 / 烧录 / 关 Keil 时自动释放端口（**释放只还口、日志保留**），另有空闲超时与进程退出兜底 | 同一个串口别被两处同时打开（本服务 + Keil 串口窗口会互相抢占，`WinError=5`） |
 
 **串口可收也可发**：端口按可读可写打开，收与发共用同一句柄；拿不到写权限时退回只读并置
@@ -480,6 +527,8 @@ exit_debug()                                     # 调试结束 → 自动还口
 
 - **连接缓存**：常驻服务内共享一条 TCP 连接，`idle_timeout` 空闲自动断开、下次调用自动重连，兼顾实时性与资源释放；
 - **可靠性优先**：不可信的数据不参与结论（脏读防护 / 停止确证 / 粘滞位时效）、并发调用统一串行化、串口用完就还——速查见上节「可靠性约定」，实测数据与踩坑过程见 [docs/PITFALLS.md](./docs/PITFALLS.md)；
+- **输出控制做在调用出口**：`compact` / `max_lines` / `full` 统一在 MCP 调用出口实现（含 `batch` 子命令），
+  而不是逐个改 99 个工具——新增工具自动继承，也不会有人漏改；非受控工具（如 `write_mem`）保持原样；
 - **内存读写分块**：超过单次上限（16 KB）自动分块读，规避 Keil 协议长度限制；
 - **地址解析**：工具层统一支持 `0x` / `0b` / `0o` 前缀或纯十进制；
 - **编译烧录选型**：采用 Keil 官方 `UV4.exe` 命令行（`-b`/`-r`/`-f`/`-o`），退出码 0=成功、1=成功有警告、2=有错误、≥3=不完整；编译输出经 `-o` 重定向到临时日志文件捕获；`build_and_flash` 在编译成功后自动接烧录，形成闭环；

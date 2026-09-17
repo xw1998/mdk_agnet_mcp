@@ -38,6 +38,8 @@ from . import keilkb as _keilkb
 from . import cmdscript as _cmdscript
 from . import svd as _svd
 from . import uvprojx as _uvprojx
+from . import session as _session
+from . import outctl as _outctl
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -1601,7 +1603,7 @@ _TOOLSETS = {
         "keil_command", "batch_debug_script", "keil_health", "diagnose",
         "restart_keil", "launch_uvision", "close_uvision", "list_uvision_instances",
         "read_console_output", "read_async_messages", "dismiss_dialog",
-        "mdk_guide", "target_info",
+        "mdk_guide", "target_info", "session_state",
     },
     "mem": {
         "read_mem_multi", "fill_mem", "search_mem", "snapshot", "snapshot_diff",
@@ -1830,6 +1832,9 @@ class AliasMCPServer(MCPServer):
         return arguments, applied
 
     async def call_tool(self, name, arguments, context=None):
+        # 批次34：输出控制三件套（compact/max_lines/full）先摘出来——它们是
+        # 「返回体整形」参数，工具函数本身并不认识，留着会被未知参数检查拒掉。
+        arguments, _out_params = _outctl.split_args(arguments or {})
         arguments, applied = self.prepare_arguments(name, arguments)
         if applied:
             logger.info("参数别名归一 %s: %s", name, "、".join(applied))
@@ -1848,10 +1853,18 @@ class AliasMCPServer(MCPServer):
         # 做在调用出口这一层而不是逐个改 88 个工具——契约要「所有工具都有」，
         # 靠逐个补一定会漏，且后续新增工具又会退回原样。
         try:
-            return _errors.apply_to_result(str(name), result)
-        except Exception:  # noqa: BLE001
+            result = _errors.apply_to_result(str(name), result)
+        except Exception as e:  # noqa: BLE001
             logger.debug("结果信封处理失败：%s", name, exc_info=True)
-            return result
+        # 批次34：输出控制（compact / max_lines / full）。放在信封之后——先保证
+        # status / next_actions 这类结构性字段齐全，再谈瘦身；没有任何控制生效时
+        # apply_to_result 原样返回，默认行为与以前完全一致。
+        if _out_params:
+            try:
+                result = _outctl.apply_to_result(result, str(name), _out_params)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("输出控制失败：%s（已按原样返回）", name, exc_info=True)
+        return result
 
     async def list_tools(self):
         # 描述里补「主名 ← 别名」与「风险级别」，只补一次（重复调用不会叠加）
@@ -5524,6 +5537,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     one["error"] = f"batch 不支持工具: {tool}（不是本服务已注册的工具名）"
                 else:
                     args = _batch_alias_args(tool, args)
+                    # 批次34：batch 的既有承诺是「与单工具直调完全等价」，故这里也把
+                    # 三个输出控制参数摘出来，作用到该条子结果上（否则它们会以「未知参数」被拒）。
+                    args, _sub_out = _outctl.split_args(args)
                     # 批次28：batch 内的参数与单工具直调**必须走同一层**——别名归一
                     # （族展开 + 单位换算）与未知参数拒绝都在 prepare_arguments 里，
                     # 不再直接拿注册表里的裸函数调用。
@@ -5555,6 +5571,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                             data = json.loads(raw) if isinstance(raw, str) else raw
                         except Exception:  # noqa: BLE001
                             data = {"result": raw}
+                        if _sub_out:
+                            data, _m = _outctl.apply(tool, data, **_sub_out)
+                            if isinstance(_m, dict):
+                                one["output"] = _m
                         if isinstance(data, dict):
                             one.update(data)
                         else:
@@ -6620,6 +6640,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                            "known_command_codes": len(_keilkb.known_debug_codes())},
                 "serial": {"available": True, "detail": "串口监视/读写（端口占用与释放语义见 serial_monitor_start）"},
                 "builder": {"available": bool(uv4), "detail": "UV4 命令行编译/烧录（-b/-f，隐藏窗口，日志捕获）"},
+                "session": dict(
+                    {"available": True,
+                     "detail": "跨会话状态 state.json：把工程/符号/断点等上下文落盘，"
+                               "下个会话可读回（session_state）",
+                     "state_file": _session.state_path()},
+                    **{k: v for k, v in _session.load().items()
+                       if k in ("ok", "exists", "saved_at", "size", "error")}),
+                "output_control": dict({"available": True}, **_outctl.summary()),
             }
             env = {"uv4_path": uv4,
                    "default_project": _builder_cfg.get("default_project"),
@@ -6642,6 +6670,191 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                         "mdk_guide 看典型工作流"]})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
+
+    # ---------------- 批次34：跨会话状态（state.json） ----------------
+    # MCP 工具本身无状态，而一次真实调试要配一堆上下文（工程/符号/断点/串口/器件）。
+    # 会话一断就全丢，AI 只能重问一遍或从零摸索——最痛的是**符号文件漂移**：接着上次
+    # 的会话调试却加载了别的 .axf，表达式集体解析失败，还去怀疑目标代码。
+    # 这里把「这次是怎么配起来的」落盘，三点约束：只存观察到的（采不到就明说）、
+    # 读回来默认不自动应用（apply=true 才动手，且只做主机侧可逆动作）、写盘要原子。
+    def _session_context() -> dict:
+        """采集当前会话上下文：只放观察得到的，采不到就标 available=False + 原因。"""
+        ctx = {"host": getattr(_client, "host", None),
+               "uvsock_port": getattr(_client, "port", None)}
+        dp = _builder_cfg.get("default_project")
+        if dp:
+            ctx["project"] = {"path": dp, "exists": os.path.isfile(dp)}
+        else:
+            ctx["project"] = {"available": False,
+                              "note": "本服务未配置默认工程（启动参数 --default-project 可指定）"}
+        ctx["uv4"] = _builder_cfg.get("uv4")
+        loc = (_symbol_cfg or {}).get("locator")
+        axf = (_symbol_cfg or {}).get("axf")
+        if axf or (_symbol_cfg or {}).get("source_type"):
+            ctx["symbol"] = {"path": axf,
+                             "source_type": (_symbol_cfg or {}).get("source_type"),
+                             "exists": bool(axf and os.path.isfile(axf)),
+                             "entries": (loc.total_entries() if loc is not None else None)}
+        else:
+            ctx["symbol"] = {"available": False, "note": "尚未设置符号文件"}
+        ctx["debug_session"] = dict(_debug_session)
+        ctx["breakpoints"] = [dict(b) for b in _breakpoints]
+        ctx["watchpoints"] = [dict(w) for w in _watchpoints]
+        try:
+            if serialmon.has_monitor():
+                st = serialmon.status()
+                ctx["serial"] = {"port": st.get("port"), "baud": st.get("baud"),
+                                 "state": st.get("state"), "running": st.get("running"),
+                                 "port_held": st.get("port_held"), "lines": st.get("lines")}
+            else:
+                ctx["serial"] = {"available": False, "note": "当前没有串口监听"}
+        except Exception as e:  # noqa: BLE001
+            ctx["serial"] = {"available": False, "error": str(e)}
+        try:
+            if _svd.loaded():
+                ctx["svd_device"] = _svd.device()
+            else:
+                ctx["svd_device"] = {"available": False,
+                                     "note": "尚未加载 SVD（svd_list/svd_decode 会按工程器件自动推断）"}
+        except Exception as e:  # noqa: BLE001
+            ctx["svd_device"] = {"available": False, "error": str(e)}
+        if isinstance(_snapshot_baseline, dict):
+            ctx["snapshot_baseline"] = {"entries": len(_snapshot_baseline),
+                                        "keys_sample": sorted(_snapshot_baseline.keys())[:20]}
+        else:
+            ctx["snapshot_baseline"] = {"available": False, "note": "没有 snapshot_diff 基线"}
+        ctx["toolsets_env"] = os.environ.get("MDKDEBUG_TOOLSETS", "")
+        return ctx
+
+    def _session_apply_plan(saved_ctx, do_apply: bool) -> list:
+        """列出（do_apply 时执行）从状态文件可恢复的动作。
+
+        只做**主机侧可逆动作**（当前仅符号文件切换）；目标侧状态（断点/内存/运行态）
+        任何情况下都不自动重放——那属于改目标，必须由调用方显式下命令。
+        """
+        acts = []
+        saved_ctx = saved_ctx or {}
+        proj = (saved_ctx.get("project") or {})
+        cur_proj = _builder_cfg.get("default_project")
+        if proj.get("path") and cur_proj and os.path.abspath(proj["path"]) != os.path.abspath(cur_proj):
+            acts.append({"item": "project", "action": "not_auto_applied",
+                         "saved": proj.get("path"), "current": cur_proj,
+                         "reason": "默认工程由服务启动参数决定，不自动切换；要按状态里的工程操作，"
+                                   "请在对应工具上用 project 参数显式传入"})
+        sym = saved_ctx.get("symbol") or {}
+        axf = sym.get("path")
+        cur_axf = (_symbol_cfg or {}).get("axf")
+        if not axf:
+            acts.append({"item": "symbol_file", "action": "skipped",
+                         "reason": "状态文件里没有记录符号文件（保存时尚未设置）"})
+        elif cur_axf and os.path.abspath(cur_axf) == os.path.abspath(axf):
+            acts.append({"item": "symbol_file", "action": "already_current", "path": axf,
+                         "reason": "当前符号文件与状态一致，无需切换"})
+        elif not os.path.isfile(axf):
+            acts.append({"item": "symbol_file", "action": "skipped", "path": axf,
+                         "reason": "状态里记录的符号文件已不存在——不猜替代品；"
+                                   "先 list_symbol_projects 看候选，再 set_symbol_file 指定"})
+        elif not do_apply:
+            acts.append({"item": "symbol_file", "action": "pending", "path": axf,
+                         "current": cur_axf,
+                         "reason": "可恢复（需 apply=true）：把符号文件切回状态里记录的那份"})
+        else:
+            ok, msg, cnt = _load_symbol_file(axf)
+            one = {"item": "symbol_file", "action": ("applied" if ok else "failed"),
+                   "path": axf, "current_before": cur_axf, "message": msg}
+            if ok:
+                one["entries"] = cnt
+            else:
+                one["error"] = msg
+            acts.append(one)
+        lost = []
+        if saved_ctx.get("breakpoints"):
+            lost.append("breakpoints:%d" % len(saved_ctx["breakpoints"]))
+        if saved_ctx.get("watchpoints"):
+            lost.append("watchpoints:%d" % len(saved_ctx["watchpoints"]))
+        if lost:
+            acts.append({"item": "target_side_state", "action": "never_auto_applied",
+                         "what": lost,
+                         "reason": "断点/数据断点在目标侧，属改目标操作，不自动重放；"
+                                   "需要时按状态里的 expr 重新 set_breakpoint / set_watchpoint"})
+        return acts
+
+    @server.tool(
+        name="session_state",
+        title="跨会话状态：保存/读取上次调试上下文",
+        description=(
+            "把「这次调试是怎么配起来的」落盘成 state.json，供下个会话接续，解决 MCP 工具"
+            "无状态、会话一断上下文全丢的问题（最典型的是符号文件漂移：接着上次调试却加载了"
+            "别的 .axf，表达式集体解析失败）。记录内容：默认工程、符号文件、调试会话标记、"
+            "内部断点/数据断点清单、串口端口与波特率、SVD 器件、snapshot_diff 基线等。"
+            "action：show（默认，看当前上下文与磁盘态差异）/ save（落盘，旧文件自动备份为 .bak）"
+            "/ load（读回；apply=true 才执行可恢复动作）/ clear（删除，需 confirm=true）。"
+            "两条约定：① 只存观察到的，采不到的字段标 available=false 与原因，不填默认值假装成功；"
+            "② load 默认只对比不应用，apply=true 也只恢复**主机侧可逆项**（目前仅符号文件切换），"
+            "断点/内存/运行态等目标侧状态永不自动重放。路径可用 path 指定，"
+            "或用环境变量 MDKDEBUG_STATE_FILE，默认 ~/.mdkdebug/state.json。"
+        ),
+    )
+    async def session_state(action: str = "show", path: str = "",
+                            apply: bool = False, confirm: bool = False) -> str:
+        try:
+            a = (action or "show").strip().lower()
+            if a in ("status", "read", "current"):
+                a = "show"
+            if a not in ("show", "save", "load", "clear"):
+                return _js({"ok": False,
+                            "error": "未知 action：%s（可用：show / save / load / clear）" % action,
+                            "hint": "show=看当前上下文与磁盘态对比；save=落盘；"
+                                    "load=读回（apply=true 才恢复）；clear=删除（需 confirm=true）"})
+            p = _session.state_path(path)
+            current = _session_context()
+            if a == "save":
+                r = _session.save(current, path)
+                if not r.get("ok"):
+                    return _js({"ok": False, "action": "save", "path": r.get("path"),
+                                "error": r.get("error")})
+                return _js({"ok": True, "action": "save", "path": r["path"],
+                            "backup": r.get("backup"), "bytes": r.get("bytes"),
+                            "saved_at": r.get("saved_at"), "schema": r.get("schema"),
+                            "saved_keys": sorted(current.keys()),
+                            "note": "已落盘。下个会话用 session_state(action=load, apply=true) 接续"
+                                    "（apply 只恢复主机侧可逆项，断点/目标内存不自动重放）"})
+            if a == "clear":
+                if not confirm:
+                    st0 = _session.load(path)
+                    return _js({"ok": False, "action": "clear", "path": p,
+                                "error": "clear 会删除状态文件，需 confirm=true 确认",
+                                "exists": st0.get("exists"),
+                                "hint": "确认无误后重调 session_state(action=clear, confirm=true)"})
+                r = _session.clear(path)
+                return _js(dict({"action": "clear"}, **r))
+            st = _session.load(path)
+            if a == "show":
+                out = {"ok": True, "action": "show", "path": p,
+                       "state_file": {"exists": st.get("exists"), "ok": st.get("ok"),
+                                      "saved_at": st.get("saved_at"), "size": st.get("size"),
+                                      "error": st.get("error")},
+                       "current": current}
+                if st.get("ok"):
+                    out["diff"] = _session.diff(st.get("context"), current)
+                    out["apply_plan"] = _session_apply_plan(st.get("context"), False)
+                return _js(out)
+            if not st.get("ok"):
+                return _js({"ok": False, "action": "load", "path": p,
+                            "exists": st.get("exists"), "error": st.get("error"),
+                            "hint": "文件缺失或损坏时不猜内容；可用 session_state(action=save) 重建"})
+            out = {"ok": True, "action": "load", "path": p, "saved_at": st.get("saved_at"),
+                   "schema": st.get("schema"), "warning": st.get("warning"),
+                   "context": st.get("context"),
+                   "diff": _session.diff(st.get("context"), current),
+                   "apply_plan": _session_apply_plan(st.get("context"), bool(apply))}
+            if not apply:
+                out["note"] = ("默认只读不应用（apply=false）：apply_plan 是「会做什么」的预告。"
+                               "断点/内存/运行态等目标侧状态任何情况下都不会自动重放，"
+                               "需要时请按 context 里的 expr 自己下命令")
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "action": action, "error": str(e)})
 
     @server.tool(
         name="list_tools",
@@ -6718,10 +6931,30 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     except Exception as _e:  # noqa: BLE001
         logger.warning("工具面裁剪失败（按不裁剪继续）：%s", _e)
 
+    # 批次34：给高输出工具的 schema 补 compact/max_lines/full（必须在 _apply_param_hints
+    # 之前——提示块是按 schema 算出来的，先注入才能出现在【参数】说明里）。
+    try:
+        _outctl.inject_params(server)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("输出控制参数注入失败（不影响其余功能）：%s", _e)
+
     # 为每个工具描述追加【参数】/【调用示例】：AI 冷启动可直接照抄参数名，
     # 不必靠 "Field required" 反复试错。
     hinted = _apply_param_hints(server)
     logger.info("已为 %d 个工具补充参数调用示例", hinted)
+
+    # 批次34：启动时只**提示**上次会话状态的存在，不自动应用——上下文接续由调用方
+    # 显式调 session_state(action="load", apply=true) 决定（工具不替 AI 猜该用哪份上下文）。
+    try:
+        _st = _session.load()
+        if _st.get("ok"):
+            logger.info("跨会话状态：%s（保存于 %s）——需要接续上次上下文时调 "
+                        "session_state(action=load, apply=true)",
+                        _st.get("path"), _st.get("saved_at"))
+        elif _st.get("exists"):
+            logger.warning("跨会话状态文件有问题（不影响本次启动）：%s", _st.get("error"))
+    except Exception as _e:  # noqa: BLE001
+        logger.debug("读取跨会话状态失败：%s", _e)
 
     return server
 
