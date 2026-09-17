@@ -33,6 +33,7 @@ from .locator import Locator
 from . import builder, mapfile, winutil, uvoptx as _uvoptx, __version__
 from . import serialmon
 from . import aliases as _aliases
+from . import errors as _errors
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -1577,6 +1578,9 @@ def _batch_alias_args(tool: str, args: dict) -> dict:
 _KEY_OPTIONALS = {
     "serial_write": {"text": "help", "eol": "crlf"},
     "watchdog_freeze": {"action": "status"},
+    "serial_expect": {"pattern": "msh />", "timeout_s": 5, "send": "help", "eol": "auto"},
+    "clean_project": {},
+    "serial_list_ports": {},
 }
 
 
@@ -1729,17 +1733,43 @@ class AliasMCPServer(MCPServer):
         if _tool_concurrency["in_flight"] > _tool_concurrency["max_in_flight"]:
             _tool_concurrency["max_in_flight"] = _tool_concurrency["in_flight"]
         try:
-            return await super().call_tool(name, arguments, context)
+            result = await super().call_tool(name, arguments, context)
         finally:
             _tool_concurrency["in_flight"] -= 1
+        # 批次33：统一结果信封（status / next_actions / error_code / risk）。
+        # 做在调用出口这一层而不是逐个改 88 个工具——契约要「所有工具都有」，
+        # 靠逐个补一定会漏，且后续新增工具又会退回原样。
+        try:
+            return _errors.apply_to_result(str(name), result)
+        except Exception:  # noqa: BLE001
+            logger.debug("结果信封处理失败：%s", name, exc_info=True)
+            return result
 
     async def list_tools(self):
-        # 描述里补「主名 ← 别名」，只补一次（重复调用不会叠加）
+        # 描述里补「主名 ← 别名」与「风险级别」，只补一次（重复调用不会叠加）
         for info in self._tool_manager.list_tools():
+            desc = info.description or ""
+            # 风险标注：高风险＝会改目标 Flash/内存或会动用户的 Keil，属不可逆操作。
+            # 吸收 embeddedskills 的 operation_mode 分级——调用方在长链路里最容易忘掉
+            # 「我刚做了一次不可逆操作」，所以在描述里显式标出来。
+            if "\n【风险】" not in desc:
+                if info.name in _errors.RISK_HIGH:
+                    _risk_note = ("\n【风险】高——**不可逆**：会改写目标 Flash/内存，"
+                                  "或关闭/重启用户的 Keil 实例。执行前确认目标与工程正确。")
+                elif info.name in _errors.RISK_MEDIUM:
+                    _risk_note = ("\n【风险】中——会改变目标状态或占用共享资源"
+                                  "（调试态/串口/Keil 实例），必要时可回退。")
+                else:
+                    _risk_note = ""
+                if _risk_note:
+                    try:
+                        info.description = desc + _risk_note
+                        desc = info.description
+                    except Exception:  # noqa: BLE001
+                        logger.debug("未能写入风险说明：%s", info.name, exc_info=True)
             note = _aliases.alias_note(info.name, self._real_params(info.name))
             if not note:
                 continue
-            desc = info.description or ""
             if "\n【参数别名】" in desc:
                 continue
             try:
@@ -4206,15 +4236,71 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     # ---------------- 编译 / 烧录（UV4 命令行） ----------------
+    def _find_project_candidates(max_depth: int = 2, cap: int = 200) -> list:
+        """有界搜索 .uvprojx，供「没给工程 / 工程不存在」时把候选列出来。
+
+        吸收 embeddedskills / Serial-Agent 的硬规则：多候选时**不许替调用方挑一个**。
+        此前只有一句「未指定工程路径」，调用方还得自己去找工程在哪——这里直接把
+        候选摊开。深度与目录数都设了上限，避免在大盘上走成一次全盘扫描。
+        """
+        roots = []
+        dp = _builder_cfg.get("default_project")
+        if dp:
+            roots.append(os.path.dirname(str(dp)))
+        try:
+            roots.append(os.getcwd())
+        except OSError:
+            pass
+        out, seen, scanned = [], set(), 0
+        for root in roots:
+            if not root or not os.path.isdir(root):
+                continue
+            base_depth = root.rstrip("\\/").count(os.sep)
+            for cur, dirs, files in os.walk(root):
+                scanned += 1
+                if scanned > cap:
+                    break
+                if cur.count(os.sep) - base_depth >= max_depth:
+                    dirs[:] = []
+                dirs[:] = [d for d in dirs
+                           if d.lower() not in (".git", "__pycache__", "node_modules",
+                                                ".pytest_cache", "obj", "bin")]
+                for fn in files:
+                    if fn.lower().endswith(".uvprojx"):
+                        full = os.path.join(cur, fn)
+                        if full not in seen:
+                            seen.add(full)
+                            out.append(full)
+            if out:
+                break
+        return out[:20]
+
     def _resolve_project(project: str) -> str:
-        """解析待操作工程：参数优先，其次服务配置的默认工程。"""
+        """解析待操作工程：参数优先，其次服务配置的默认工程。
+
+        没给工程或工程不存在时，把找到的候选一并写进报错——多候选不替调用方决定。
+        """
         if _builder_cfg["uv4"] is None:
             raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定编译工具路径")
-        if project.strip():
-            return project.strip()
+        p = project.strip()
+        if p:
+            if not os.path.isfile(p):
+                cands = _find_project_candidates()
+                raise RuntimeError(
+                    "工程文件不存在：%s%s" % (
+                        p,
+                        ("；本机找到的候选工程：%s" % "、".join(cands)) if cands else
+                        "（未在附近找到任何 .uvprojx）"))
+            return p
         if _builder_cfg["default_project"]:
-            return _builder_cfg["default_project"]
-        raise RuntimeError("未指定工程路径，请传入 project 参数或配置默认工程")
+            dp = _builder_cfg["default_project"]
+            if not os.path.isfile(dp):
+                raise RuntimeError("默认工程已失效（文件不存在）：%s；请传入 project 参数" % dp)
+            return dp
+        cands = _find_project_candidates()
+        raise RuntimeError(
+            "未指定工程路径，请传入 project 参数或配置默认工程（--default-project）"
+            + ("；本机找到的候选工程：%s" % "、".join(cands) if cands else ""))
 
     @server.tool(
         name="keil_health",
@@ -4403,7 +4489,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "编译 Keil 工程（UV4 -b，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，可省略以用默认工程；"
             "target 为可选目标名。timeout_s 为可选超时秒数（0=默认 1800s）；大型工程/首次全量编译可显式调大，超时会返回 exit_code=-1 并说明。"
-            "返回退出码与编译日志。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。注意：UV4 -b 会新起独立隐藏进程，构建输出经 -o 捕获返回（不会显示在你已打开的 Keil 窗口）；退出码 0/1=成功,2=有错误,>=3=不完整。Keil 处于调试态时编译可能失败，建议先退出调试。"
+            "返回退出码与编译日志。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。注意：UV4 -b 会新起独立隐藏进程，构建输出经 -o 捕获返回（不会显示在你已打开的 Keil 窗口）；退出码完整表见返回值 exit_code_text / exit_code_meaning：0/1=成功,2=有错误,3=致命错误,11=工程打不开,12=器件库缺失,13=写入错误,15=UV4 被占用,20=未知；失败时 next_actions 按码给出下一步，failure_bucket 给出归类桶。Keil 处于调试态时编译可能失败，建议先退出调试。"
         ),
     )
     async def build_project(project: str = "", target: str = "",
@@ -4422,17 +4508,44 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "重新编译 Keil 工程（UV4 -r，全量重编，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
             "可省略以用默认工程；target 为可选目标名。timeout_s 为可选超时秒数（0=默认 1800s），全量重编耗时更久，建议按需调大。"
-            "注意：UV4 -r 全量重编，同上——新起隐藏进程、输出经 -o 捕获；退出码语义同 build。Keil 处于调试态时编译可能失败。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。"
+            "clean_first（默认 false）：true 时改用 **UV4 -cr 先清理再重建**，比 -r 更彻底——-r 只是不做增量，仍可能复用未被判定为过期的产物；-cr 先删掉全部产物再重建，适合改了构建配置/预处理脚本（如 gen_scatter.py）后结果不对的场合。注意：UV4 -r/-cr 全量重编，同上——新起隐藏进程、输出经 -o 捕获；退出码语义同 build，完整码表见返回值 exit_code_text / exit_code_meaning（11=工程打不开、12=器件库缺失、13=写入错误、15=UV4 被占用），失败时 next_actions 直接给下一步。Keil 处于调试态时编译可能失败。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。"
         ),
     )
     async def rebuild_project(project: str = "", target: str = "",
                               timeout_s: int = 0,
-                              ensure_debug_channel: bool = True) -> str:
+                              ensure_debug_channel: bool = True,
+                              clean_first: bool = False) -> str:
         try:
             p = _resolve_project(project)
             t = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_BUILD_TIMEOUT
             return _js(builder.rebuild_project(_builder_cfg["uv4"], p, target.strip() or None, t,
-                                               ensure_debug_channel=ensure_debug_channel))
+                                               ensure_debug_channel=ensure_debug_channel,
+                                               clean_first=bool(clean_first)))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="clean_project",
+        title="清理构建产物（UV4 -c）",
+        description=(
+            "清理 Keil 工程的构建产物（UV4 -c，等价于 Keil 菜单的 Clean Targets）：删掉该 target 的中间文件"
+            "与产物（.o/.axf/.hex 等）。project 可省略用默认工程；target 可选。"
+            "**有副作用**：清理后**必须重新编译**才有可下载的镜像，否则烧录/调试会拿不到产物（返回值里的 note 会提醒）。"
+            "什么时候需要它：怀疑增量构建残留导致行为诡异（改了预处理脚本如 gen_scatter.py、改了构建配置、"
+            "产物时间戳比源码新）——此时 rebuild_project 的 -r 可能仍复用未被判定过期的产物，"
+            "用本工具（或 rebuild_project(clean_first=true) 的 -cr）先清干净再编。"
+            "配套 read_project_config 可先确认 target 名；返回值含 exit_code_text / exit_code_meaning / "
+            "next_actions（失败时按 UV4 退出码给下一步，如 15=UV4 被占用、11=工程打不开、13=写入错误）。"
+        ),
+    )
+    async def clean_project(project: str = "", target: str = "",
+                            timeout_s: int = 0,
+                            ensure_debug_channel: bool = True) -> str:
+        try:
+            p = _resolve_project(project)
+            t = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_CLEAN_TIMEOUT
+            return _js(builder.clean_project(_builder_cfg["uv4"], p, target.strip() or None, t,
+                                             ensure_debug_channel=ensure_debug_channel))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -5369,6 +5482,54 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     # 调试链路上多了一个手工步骤。这里做成「后台线程收 + ring buffer + 增量 read」，
     # 与 RT-Thread 的 rt_kprintf/ULOG 配合时能直接在同一次会话里看日志。
     @server.tool(
+        name="serial_list_ports",
+        title="列出本机串口（含芯片推断）",
+        description=(
+            "列出本机当前可用的串口，**不只是 COM 号**：每个口附设备描述、硬件 ID(VID/PID) "
+            "与 likely_chip 芯片推断（CH340 / CP2102 / FT232R / STM32 VCP / DAPLink VCP / 蓝牙虚拟口…），"
+            "让选口有依据，而不是靠试。"
+            "选口规则（吸收 embeddedskills / Serial-Agent 的 playbook 第一条）：**只有一个候选才自动采用**"
+            "（auto_select 字段给出），多个候选一律不替调用方决定——返回 candidates 让你按 likely_chip 显式指定。"
+            "返回 {ok, count, ports:[{port, description, hwid, vid, pid, likely_chip, source}], "
+            "candidates, auto_select, need_choice, selection_rule, monitoring, current_port}。"
+            "典型用法：serial_monitor_start 之前先调它确认 COM 号；日志收不到时也先调它确认口没写错。"
+            "detail=false 只返回端口名（更快）。本工具是只读的，不会占用端口。"
+        ),
+    )
+    async def serial_list_ports(detail: bool = True) -> str:
+        try:
+            if detail:
+                ports = serialmon.list_ports_detailed()
+            else:
+                ports = [{"port": p} for p in serialmon.list_ports()]
+            pick = serialmon.pick_port(ports=ports)
+            out = {"ok": True, "count": len(ports), "ports": ports,
+                   "candidates": [p.get("port") for p in ports],
+                   "auto_select": pick.get("port") or None,
+                   "need_choice": bool(pick.get("need_choice")),
+                   "selection_rule": pick.get("reason")}
+            m = serialmon.current()
+            out["monitoring"] = m is not None
+            if m is not None:
+                out["current_port"] = m.port
+            if not ports:
+                out["hint"] = ("本机未发现任何串口：确认 USB-TTL 已插好、驱动已装"
+                               "（设备管理器能看到端口）后再试")
+            elif pick.get("need_choice"):
+                out["hint"] = ("有 %d 个候选串口，未自动选择——请按 likely_chip 判断哪个是目标板的日志口，"
+                               "再把 port 显式传给 serial_monitor_start" % len(ports))
+            elif pick.get("port"):
+                out["hint"] = ("唯一候选 %s，可直接 serial_monitor_start(port=\"%s\")"
+                               % (pick["port"], pick["port"]))
+            if m is not None and pick.get("port") and pick["port"] != m.port:
+                out["port_conflict_note"] = ("当前监听的是 %s，与本次枚举的首选候选 %s 不同——"
+                                             "同一进程只监听一个口，切换需重新 start。"
+                                             % (m.port, pick["port"]))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="serial_monitor_start",
         title="启动串口日志监听（宿主机）",
         description=(
@@ -5402,15 +5563,30 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         try:
             ports = serialmon.list_ports()
             p = str(port or "").strip()
+            _auto_port = None
             if not p:
                 if not ports:
                     return _js({"ok": False, "error": "本机未发现任何串口",
                                 "available_ports": []})
                 p = ports[0]
+                # 保持既有的「省略 port 就用第一个」行为（不打断已有调用），
+                # 但多候选时**明示这是自动选的**并列出其余候选——否则「选错口」
+                # 会变成一个只能靠猜的问题（吸收 embeddedskills 的多候选规则）。
+                if len(ports) > 1:
+                    _auto_port = {
+                        "port_auto_selected": True,
+                        "port_candidates": ports,
+                        "port_choice_hint": (
+                            "本机有 %d 个串口，未指定 port 时自动采用了 %s；"
+                            "若目标板日志口不是它，请带 port=... 重调本工具"
+                            "（serial_list_ports 可看各口的芯片推断）。" % (len(ports), p)),
+                    }
             st = dict(serialmon.start_monitor(
                 p, baud=baud, databits=databits, parity=parity, stopbits=stopbits,
                 capacity=capacity, encoding=encoding, label=label, restart=restart,
                 idle_release_s=idle_release_s))
+            if _auto_port:
+                st.update(_auto_port)
             st["available_ports"] = ports
             if st.get("state") == "stopped":
                 st["ok"] = "conflict" not in st
@@ -5538,6 +5714,95 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e),
+                        "available_ports": serialmon.list_ports()})
+
+    @server.tool(
+        name="serial_expect",
+        title="下发并等待串口出现指定内容（原子 send+wait）",
+        description=(
+            "**请求-响应式串口交互的首选工具**（吸收 Serial-Agent 的 send_and_wait）：可以先下发一段数据，"
+            "再等到目标回显中出现匹配 pattern 的内容为止，一次调用拿全「发了什么 + 等到了什么」；"
+            "也可以只等不发（配合之前 serial_write 下发的命令）。"
+            "**只认本次等待期间新出现的内容**（与 wait_breakpoint 同一口径）：省略 since 时以调用瞬间为基线，"
+            "缓冲区里的老日志不会被当成命中——避免「目标早就在刷这句话」被误判成这次请求的响应；"
+            "确实要看老内容时传 since=0（或上一条日志的 next_seq）。"
+            "include_partial（默认 true）把「还没等到换行的半行」也纳入匹配：**rt_kprintf 这类输出常常不带 \\n**，"
+            "只匹配整行会永远等不到，命中时 matched_source=\"partial\" 说明命中的是半行。"
+            "参数：pattern 要等待的内容（默认按正则；regex=false 则按字面文本匹配，不用转义 [ ] ( ) 等）；"
+            "timeout_s 默认 5；case_sensitive 默认 true；poll_ms 轮询间隔默认 50。"
+            "可选下发：send（文本，按 encoding 编码）或 hex（十六进制串）二选一，eol 语义与 serial_write 完全一致"
+            "（crlf 默认 / lf / cr / none / auto）；不下发就只等。"
+            "返回 {ok, matched, matched_text, matched_group, matched_source, matched_line, waited_ms, "
+            "new_lines, lines, bytes_new, next_seq, partial, sent_hex, sent_bytes}。"
+            "**未命中不会静默**：note 会区分「一个字节都没新增」（多半是请求没被目标接受/波特率不对）与"
+            "「有新增但不匹配」（放宽 pattern 或加大超时），并原样给出已收到的行作为线索。"
+            "依赖监听持有端口（收与发同一个句柄）：没有监听时 ok=false 并提示先 serial_monitor_start。"
+        ),
+    )
+    async def serial_expect(pattern: str = "", timeout_s: float = 5.0, since: int = -1,
+                            regex: bool = True, case_sensitive: bool = True,
+                            poll_ms: int = 50, max_lines: int = 200,
+                            include_partial: bool = True,
+                            send: str = "", hex: str = "", eol: str = "crlf",
+                            encoding: str = "utf-8") -> str:
+        try:
+            raw = b""
+            hex_s = _csv_tokens(hex)
+            if hex_s:
+                try:
+                    raw = bytes.fromhex("".join(hex_s).replace("0x", "").replace("0X", ""))
+                except ValueError as e:
+                    return _js({"ok": False, "matched": False,
+                                "error": "hex 解析失败（应为偶数长度的十六进制字节串）：%s" % e})
+            eol_name = eol_bytes = None
+            eol_warn = ""
+            if send:
+                eol_name, eol_bytes, eol_warn = _norm_eol(eol)
+                try:
+                    raw += str(send).encode(encoding or "utf-8")
+                except Exception as e:  # noqa: BLE001
+                    return _js({"ok": False, "matched": False,
+                                "error": "send 编码失败（encoding=%s）：%s" % (encoding, e)})
+                raw += eol_bytes
+            base = int(since) if since is not None and int(since) >= 0 else None
+            sent = None
+            if raw:
+                w = dict(serialmon.write_bytes(raw, wait_ms=0, max_items=1, read_after=False))
+                if not w.get("ok"):
+                    w.setdefault("matched", False)
+                    return _js(w)
+                if base is None:
+                    base = w.get("next_seq_before")
+                # 只发 hex 不带 send 时没有行尾可归一（eol_bytes 为 None）：
+                # 显式写 null/空串，别让 hex-only 下发在 .hex() 上崩掉。
+                sent = {"sent_hex": raw.hex(), "sent_bytes": len(raw),
+                        "eol_input": ("" if eol is None else str(eol)),
+                        "eol_applied": eol_name,
+                        "eol_bytes_hex": (eol_bytes.hex() if eol_bytes else "")}
+                if not send:
+                    sent["eol_note"] = ("本次按 hex 原样下发，未追加行尾"
+                                       "（eol 仅在 send 文本时生效）")
+                if eol_warn:
+                    sent["eol_unrecognized"] = True
+                    sent["warning"] = eol_warn
+                    sent["eol_hint"] = _EOL_HELP
+            out = dict(serialmon.expect(
+                pattern, timeout_s=float(timeout_s or 0), since=base,
+                regex=bool(regex), case_sensitive=bool(case_sensitive),
+                poll_ms=int(poll_ms or 50), max_lines=int(max_lines or 200),
+                include_partial=bool(include_partial), encoding=encoding))
+            if sent:
+                out.update(sent)
+                out["sent"] = True
+            else:
+                out["sent"] = False
+            if out.get("ok") and not raw:
+                out.setdefault("note", "")
+                out["note"] = ("命中的是等待期间新出现的内容（未下发数据，纯等待）。"
+                               + str(out.get("note") or ""))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "matched": False, "error": str(e),
                         "available_ports": serialmon.list_ports()})
 
     @server.tool(

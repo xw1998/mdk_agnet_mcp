@@ -32,6 +32,7 @@ import atexit
 import ctypes
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -171,6 +172,338 @@ def list_ports() -> list:
     except Exception:  # noqa: BLE001
         return []
     return sorted(set(out), key=lambda s: (len(s), s))
+
+# ----------------------------------------------------------------------
+# 串口详细枚举（批次33：吸收 embeddedskills / Serial-Agent 的「先列口再动手」）
+# ----------------------------------------------------------------------
+# 为什么需要单列一个「详细枚举」：只有 COM9/COM10 这样的名字时，AI 无从判断哪个口
+# 才是目标板载 USB-TTL（还是调试器的 VCP、还是一个蓝牙虚拟口）。这里补上
+# 「设备描述 + 硬件 ID(VID/PID) + 芯片推断」，让选口有依据，而不是靠试。
+_CHIP_VIDPID = {
+    "1A86:7523": "CH340（USB-TTL，最常见的廉价小板）",
+    "1A86:7522": "CH340 变体",
+    "1A86:5523": "CH341",
+    "1A86:55D4": "CH9102（CH340 后续型号）",
+    "10C4:EA60": "CP2102/CP210x（USB-TTL）",
+    "10C4:EA70": "CP2105",
+    "10C4:EA71": "CP2108",
+    "0403:6001": "FT232R（USB-TTL）",
+    "0403:6010": "FT2232（双通道，常用于调试器自带 VCP）",
+    "0403:6011": "FT4232",
+    "0403:6014": "FT232H",
+    "0403:6015": "FT231X",
+    "067B:2303": "PL2303（老款 USB-TTL）",
+    "0483:5740": "STM32 Virtual COM Port（ST 官方 VCP，多为 ST-Link/板载 USB）",
+    "2341:0043": "Arduino Uno",
+    "2341:0001": "Arduino",
+    "0D28:0204": "mbed / DAPLink VCP",
+    "2E8A:0005": "Raspberry Pi Pico（PicoProbe VCP）",
+}
+# 描述不含 VID/PID 时（个别驱动只给名字）的关键词兜底
+_CHIP_KEYWORDS = (
+    ("ch340", "CH340（USB-TTL）"),
+    ("ch341", "CH341"),
+    ("ch9102", "CH9102"),
+    ("cp210", "CP210x（USB-TTL）"),
+    ("ft232", "FT232R"),
+    ("pl2303", "PL2303"),
+    ("stlink", "ST-Link（含 VCP）"),
+    ("st-link", "ST-Link（含 VCP）"),
+    ("jlink", "J-Link（含 VCP）"),
+    ("virtual com", "虚拟串口（VCP，通常来自调试器或板载 USB）"),
+    ("蓝牙", "蓝牙虚拟串口（通常不是目标板日志口）"),
+    ("bluetooth", "蓝牙虚拟串口（通常不是目标板日志口）"),
+)
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_uint8 * 8)]
+
+class _SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint32), ("ClassGuid", _GUID),
+                ("DevInst", ctypes.c_uint32), ("Reserved", ctypes.c_size_t)]
+
+# {86E0D1E0-8089-11D0-9CE4-08003E301F73} = GUID_DEVINTERFACE_COMPORT
+_GUID_COMPORT = _GUID(0x86E0D1E0, 0x8089, 0x11D0,
+                      (ctypes.c_uint8 * 8)(0x9C, 0xE4, 0x08, 0x00, 0x3E, 0x30, 0x1F, 0x73))
+_DIGCF_PRESENT = 0x02
+_DIGCF_DEVICEINTERFACE = 0x10
+_SPDRP_DEVICEDESC = 0x00
+_SPDRP_HARDWAREID = 0x01
+_SPDRP_FRIENDLYNAME = 0x0C
+_DICS_FLAG_GLOBAL = 0x01
+_DIREG_DEV = 0x01
+_KEY_READ = 0x20019
+
+def _dev_prop(setupapi, h, di, prop) -> str:
+    buf = ctypes.create_unicode_buffer(1024)
+    need = ctypes.c_uint32(0)
+    ok = setupapi.SetupDiGetDeviceRegistryPropertyW(
+        h, ctypes.byref(di), ctypes.c_uint32(prop), None, buf,
+        ctypes.c_uint32(ctypes.sizeof(buf)), ctypes.byref(need))
+    if not ok:
+        return ""
+    return buf.value.strip()
+
+def _dev_port(setupapi, advapi, h, di) -> str:
+    key = setupapi.SetupDiOpenDevRegKey(h, ctypes.byref(di), ctypes.c_uint32(_DICS_FLAG_GLOBAL),
+                                        ctypes.c_uint32(0), ctypes.c_uint32(_DIREG_DEV),
+                                        ctypes.c_uint32(_KEY_READ))
+    if not key or key == ctypes.c_void_p(-1).value:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        size = ctypes.c_uint32(ctypes.sizeof(buf))
+        r = advapi.RegQueryValueExW(key, ctypes.c_wchar_p("PortName"), None, None,
+                                    buf, ctypes.byref(size))
+        if r != 0:
+            return ""
+        return buf.value.strip()
+    finally:
+        advapi.RegCloseKey(key)
+
+def _chip_from(hwid: str, desc: str) -> str:
+    m = re.search(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})", hwid or "",
+                  re.IGNORECASE)
+    if m:
+        key = "%s:%s" % (m.group(1).upper(), m.group(2).upper())
+        if key in _CHIP_VIDPID:
+            return _CHIP_VIDPID[key]
+        return "未收录的 VID/PID：%s" % key
+    d = (desc or "").lower()
+    for kw, name in _CHIP_KEYWORDS:
+        if kw in d:
+            return name
+    return ""
+
+def _setupapi_ports() -> list:
+    """用 SetupAPI 枚举串口设备（描述 / 硬件 ID / PortName）。失败返回空表。"""
+    if sys.platform != "win32":
+        return []
+    out = []
+    try:
+        setupapi = ctypes.WinDLL("setupapi")
+        advapi = ctypes.WinDLL("advapi32")
+        setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+        setupapi.SetupDiGetClassDevsW.argtypes = [
+            ctypes.POINTER(_GUID), ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
+        setupapi.SetupDiEnumDeviceInfo.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_SP_DEVINFO_DATA)]
+        setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(_SP_DEVINFO_DATA), ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+        setupapi.SetupDiOpenDevRegKey.restype = ctypes.c_void_p
+        setupapi.SetupDiOpenDevRegKey.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(_SP_DEVINFO_DATA), ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
+        h = setupapi.SetupDiGetClassDevsW(ctypes.byref(_GUID_COMPORT), None, None,
+                                          _DIGCF_PRESENT | _DIGCF_DEVICEINTERFACE)
+        if not h or h == ctypes.c_void_p(-1).value:
+            return []
+        try:
+            i = 0
+            while True:
+                di = _SP_DEVINFO_DATA()
+                di.cbSize = ctypes.sizeof(_SP_DEVINFO_DATA)
+                if not setupapi.SetupDiEnumDeviceInfo(h, ctypes.c_uint32(i), ctypes.byref(di)):
+                    break
+                i += 1
+                port = _dev_port(setupapi, advapi, h, di)
+                if not port:
+                    continue
+                desc = _dev_prop(setupapi, h, di, _SPDRP_FRIENDLYNAME) or \
+                       _dev_prop(setupapi, h, di, _SPDRP_DEVICEDESC)
+                hwid = _dev_prop(setupapi, h, di, _SPDRP_HARDWAREID)
+                vm = re.search(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})", hwid or "")
+                out.append({
+                    "port": port,
+                    "description": desc,
+                    "hwid": hwid,
+                    "vid": vm.group(1).upper() if vm else "",
+                    "pid": vm.group(2).upper() if vm else "",
+                    "likely_chip": _chip_from(hwid, desc),
+                    "source": "setupapi",
+                })
+        finally:
+            try:
+                setupapi.SetupDiDestroyDeviceInfoList(ctypes.c_void_p(h))
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as e:  # noqa: BLE001
+        logger.debug("SetupAPI 枚举串口失败（退回注册表模式）：%s", e)
+        return []
+    return out
+
+def list_ports_detailed() -> list:
+    """枚举本机串口，附带描述 / VID / PID / 芯片推断。
+
+    注册表（SERIALCOMM）为准——它列出的就是当前真正存在的 COM 名；
+    SetupAPI 用来补描述与硬件 ID。两条路都没结果时返回空表（不抛错）。
+    """
+    detail = {}
+    for d in _setupapi_ports():
+        detail[str(d.get("port") or "").upper()] = d
+    names = list_ports()
+    out = []
+    for p in names:
+        d = detail.get(str(p).upper())
+        if d:
+            out.append(d)
+        else:
+            out.append({"port": p, "description": "", "hwid": "", "vid": "", "pid": "",
+                        "likely_chip": "", "source": "registry"})
+    for key, d in detail.items():
+        if key not in {str(x).upper() for x in names}:
+            out.append(d)
+    return out
+
+def pick_port(prefer: str = "", ports: list | None = None) -> dict:
+    """按「显式优先 → 唯一候选自动 → 多候选列候选 → 无候选报错」选串口。
+
+    这条规则吸收自 embeddedskills / Serial-Agent 的 playbook 第一条：
+    多候选时**不许替调用方挑一个**，要把候选摊开让它确认。
+    """
+    plist = ports if ports is not None else list_ports_detailed()
+    names = []
+    for x in plist:
+        n = str(x.get("port") if isinstance(x, dict) else x)
+        if n:
+            names.append(n)
+    want = str(prefer or "").strip()
+    if want:
+        w = want.upper()
+        wnum = w[3:] if w.startswith("COM") else w
+        for n in names:
+            nu = n.upper()
+            if nu == w or (nu.startswith("COM") and nu[3:] == wnum):
+                return {"port": n, "auto": False, "candidates": names, "need_choice": False,
+                        "source": "explicit", "reason": "使用调用方显式指定的串口"}
+        return {"port": "", "auto": False, "candidates": names, "need_choice": bool(names),
+                "source": "explicit",
+                "reason": "显式指定的 %s 不在本机串口列表中" % want}
+    if len(names) == 1:
+        return {"port": names[0], "auto": True, "candidates": names, "need_choice": False,
+                "source": "auto", "reason": "本机只有一个串口，已自动采用"}
+    if not names:
+        return {"port": "", "auto": False, "candidates": [], "need_choice": False,
+                "source": "auto", "reason": "本机未发现任何串口"}
+    return {"port": "", "auto": False, "candidates": names, "need_choice": True,
+            "source": "auto",
+            "reason": "本机有 %d 个串口，多候选不自动选择，请按 candidates 显式指定" % len(names)}
+
+def expect(pattern: str, timeout_s: float = 5.0, since: int | None = None,
+           regex: bool = True, case_sensitive: bool = True,
+           poll_ms: int = 50, max_lines: int = 200,
+           include_partial: bool = True, encoding: str = "utf-8") -> dict:
+    """等待串口出现匹配 pattern 的新内容（原子「发完就等」的等待侧）。
+
+    与 wait_breakpoint 同一口径：**只认本次等待期间新出现的内容**——
+    since 省略时取调用瞬间的 next_seq 作为基线，缓冲区里的老日志不会被当成命中，
+    避免「目标早就在刷这句话」被误判成这次请求得到了响应。
+
+    include_partial=True 时把「还没等到换行的半行」也纳入匹配：rt_kprintf 之类的
+    输出常常没有 \n，只匹配整行会永远等不到（这是真实调试里最容易踩的一格）。
+    """
+    m = _monitor
+    if m is None:
+        return {"ok": False, "matched": False,
+                "error": "当前没有串口监听在运行",
+                "hint": "serial_expect 依赖监听持有端口：先 serial_monitor_start(port=..., baud=...)",
+                "available_ports": list_ports()}
+    if not str(pattern or ""):
+        return {"ok": False, "matched": False,
+                "error": "参数不足：pattern（要等待的内容）不能为空"}
+    flags = 0 if case_sensitive else re.IGNORECASE
+    if regex:
+        try:
+            rx = re.compile(pattern, flags)
+        except re.error as e:
+            return {"ok": False, "matched": False,
+                    "error": "正则编译失败（pattern=%s）：%s。若想按字面文本匹配请传 regex=false"
+                             % (pattern, e)}
+    else:
+        rx = re.compile(re.escape(pattern), flags)
+
+    m.touch()
+    base = m.rb.stats()["next_seq"] if since is None else int(since)
+    bytes_before = m.bytes_total
+    t0 = time.time()
+    deadline = t0 + max(float(timeout_s or 0), 0.0)
+    poll = max(0.01, min(float(poll_ms or 50) / 1000.0, 1.0))
+    seen = {"count": 0, "next_seq": base, "last_error": None}
+    while True:
+        r = m.read(max_items=max(int(max_lines or 200), 1), since=base)
+        seen["count"] = r.get("count") or 0
+        seen["next_seq"] = r.get("next_seq")
+        seen["last_error"] = r.get("last_error")
+        lines = [str(x) for x in (r.get("lines") or [])]
+        partial = str(r.get("partial") or "")
+        text = "\n".join(lines)
+        hit = None
+        where = ""
+        mo = rx.search(text)
+        if mo is not None:
+            hit, where = mo, "line"
+        elif include_partial and partial:
+            mo2 = rx.search(partial)
+            if mo2 is not None:
+                hit, where = mo2, "partial"
+        if hit is not None:
+            idx = text[:hit.start()].count("\n") if where == "line" else len(lines)
+            return {
+                "ok": True, "matched": True, "pattern": pattern,
+                "regex": bool(regex), "case_sensitive": bool(case_sensitive),
+                "matched_text": hit.group(0), "matched_group": (
+                    hit.group(1) if hit.groups() else None),
+                "matched_source": where,
+                "matched_line": (lines[idx] if (where == "line" and idx < len(lines)) else partial),
+                "matched_index": idx if where == "line" else None,
+                "waited_ms": int((time.time() - t0) * 1000),
+                "timeout_s": float(timeout_s or 0), "since": base,
+                "next_seq": r.get("next_seq"),
+                "new_lines": seen["count"],
+                "items": r.get("items"), "lines": lines,
+                "bytes_new": int(m.bytes_total) - bytes_before,
+                "first_seq": r.get("first_seq"), "dropped": r.get("dropped"),
+                "truncated": r.get("truncated"), "partial": partial,
+                "port": m.port,
+                "note": "命中等待期间新出现的内容（since=%d）；matched_source=%s" % (base, where),
+            }
+        if time.time() >= deadline:
+            break
+        time.sleep(poll)
+
+    waited = int((time.time() - t0) * 1000)
+    r = m.read(max_items=max(int(max_lines or 200), 1), since=base)
+    lines = [str(x) for x in (r.get("lines") or [])]
+    out = {
+        "ok": False, "matched": False, "pattern": pattern,
+        "regex": bool(regex), "case_sensitive": bool(case_sensitive),
+        "waited_ms": waited, "timeout_s": float(timeout_s or 0), "since": base,
+        "next_seq": r.get("next_seq"), "new_lines": r.get("count"),
+        "items": r.get("items"), "lines": lines,
+        "bytes_new": int(m.bytes_total) - bytes_before,
+        "first_seq": r.get("first_seq"), "dropped": r.get("dropped"),
+        "truncated": r.get("truncated"), "partial": r.get("partial") or "",
+        "port": m.port, "last_error": seen.get("last_error"),
+    }
+    # 超时不是「调用失败」而是「没等到」——给出机器可读的区分，别让它落进 unknown-error：
+    # no-data  = 一个字节都没新增（目标没输出 / 下发没被接受 / 波特率接线不对）
+    # no-match = 有输出但对不上 pattern（pattern 太严或等错了内容）
+    no_data = (not int(r.get("count") or 0)) and (not (int(m.bytes_total) - bytes_before))
+    out["timeout"] = True
+    out["timeout_kind"] = "no-data" if no_data else "no-match"
+    out["error_code"] = ("serial-expect-timeout-no-data" if no_data
+                         else "serial-expect-timeout-no-match")
+    if no_data:
+        out["note"] = ("%dms 内串口**一个字节都没有新增**：目标可能没在输出、"
+                       "或本次请求根本没被目标接受（先确认下发是否成功、波特率是否正确）。"
+                       "当前缓冲区里的老日志会被刻意忽略，不作为命中。" % waited)
+    else:
+        out["note"] = ("%dms 内新增 %s 行但都不匹配：把 pattern 放宽（regex=false 按字面匹配、"
+                       "或不区分大小写），也可加大 timeout_s 或把上述 lines 作为线索。"
+                       % (waited, r.get("count")))
+    return out
 
 def resolve_port(port) -> str:
     """把 'COM9' / 9 / '\\\\.\\COM9' 统一成 CreateFile 可用的 '\\\\.\\COM9'。"""

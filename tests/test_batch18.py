@@ -28,6 +28,9 @@ from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
 from mdkdebug.server import create_server, _get_client  # noqa: E402
 from mdkdebug import builder, winutil  # noqa: E402
 
+REAL_PROJ = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))),
+    "example_mdk_project", "mdk_test", "MDK-ARM", "mdk_test.uvprojx")
 PORT = 14882
 PASS, FAIL = [], []
 
@@ -226,10 +229,10 @@ async def main():
         builder.build_project = fake_build
         try:
             out = load(await call(server, "build_project",
-                                  {"project": "C:/fake/x.uvprojx", "ensure_debug_channel": False}))
+                                  {"project": REAL_PROJ, "ensure_debug_channel": False}))
             check("E1 build_project 工具透传 ensure_debug_channel=false",
                   captured.get("ensure") is False, str(captured))
-            out = load(await call(server, "build_project", {"project": "C:/fake/x.uvprojx"}))
+            out = load(await call(server, "build_project", {"project": REAL_PROJ}))
             check("E2 默认 ensure_debug_channel=true", captured.get("ensure") is True, str(captured))
 
             real_baf = builder.build_and_flash
@@ -242,7 +245,7 @@ async def main():
             builder.build_and_flash = fake_baf
             try:
                 await call(server, "build_and_flash",
-                           {"project": "C:/fake/x.uvprojx", "ensure_debug_channel": False})
+                           {"project": REAL_PROJ, "ensure_debug_channel": False})
             finally:
                 builder.build_and_flash = real_baf
             check("E3 build_and_flash 工具透传 ensure_debug_channel",
@@ -259,7 +262,7 @@ async def main():
             d = (tools[n].description or "") if n in tools else ""
             check("F-%s 描述说明自愈行为" % n,
                   "ensure_debug_channel" in d and "keil_recovered" in d, d[:160])
-        check("F1 工具数 81→85（批次30 加 2、批次32 加 2）", len(tools) == 85, str(len(tools)))
+        check("F1 工具数 81→88（批次33 再 +3）", len(tools) == 88, str(len(tools)))
 
         # ---------- G. 钩子接线 ----------
         check("G1 server 已注入连接复位钩子",

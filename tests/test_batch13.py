@@ -180,8 +180,14 @@ async def main():
             check("read_mem 符号名走 .axf 符号表（main）",
                   d.get("ok") is True and d.get("addr_note", "").find("符号 'main'") >= 0,
                   r[:220])
+            # 示例工程会持续演进，地址不写死：按当前 .axf 现算 main 的地址
+            from mdkdebug.locator import Locator as _Loc13
+            _main13 = (_Loc13(_MDK_AXF).symbol_addr("main") or {}).get("addr")
+            _exp13 = "0x%x" % _main13 if _main13 else None
             check("符号函数地址已清 Thumb 位（偶数）",
-                  d.get("addr") == "0x8000db4", str(d.get("addr")))
+                  _exp13 is not None and d.get("addr") == _exp13
+                  and int(d["addr"], 16) % 2 == 0,
+                  "%s vs %s" % (d.get("addr"), _exp13))
 
         r = await call(server, "read_mem", {"addr": "no_such_symbol_xyz", "n_bytes": 4})
         d = load(r)

@@ -9,7 +9,8 @@ UV4 命令行构建封装 —— 编译 / 重编译 / 烧录 Keil 工程。
     UV4 -c project.uvprojx               # 清理
     UV4 -o out.txt                       # 把构建输出重定向到文件
 
-UV4 退出码约定：0=成功，1=成功但有警告，2=有错误，>=3=构建不完整/其他错误。
+UV4 退出码约定（完整表见 `_UV4_EXIT_MEANING`）：0=成功，1=成功但有警告，2=有错误，
+3=致命错误，11=工程打不开，12=器件库缺失，13=写入错误，15=UV4 被占用，20=未知。
 """
 
 from __future__ import annotations
@@ -71,25 +72,81 @@ def find_uv4(explicit: str | None = None) -> str | None:
 # 明显不够，会把"还在编译"误判成失败。默认放宽，并允许调用方按工程调整。
 DEFAULT_BUILD_TIMEOUT = 1800
 DEFAULT_FLASH_TIMEOUT = 600
+DEFAULT_CLEAN_TIMEOUT = 300
 
+
+# ----------------------------------------------------------------------
+# UV4 退出码完整表（批次33：吸收 keil-project-tools/references/compiler-notes.md）
+# ----------------------------------------------------------------------
+# 为什么值得单独做成表：旧实现只认识 0/1/2/3，其余一律「失败（退出码 N）」——
+# 而 11/12/13/15 是**四个各不相同的故障**，处置办法完全不一样：
+# 工程打不开要查路径与占用、器件库缺失要装 Pack、写入错误要看输出目录权限、
+# UV4 被占用要先去关实例。只说「退出码 15」等于让调用方从头排查一遍。
+# 负数是我们自己的合成码（进程级失败），与 UV4 无关，一并列在这里免得混淆。
+_UV4_EXIT_MEANING = {
+    0: ("success", "无错误、无警告"),
+    1: ("warning", "有警告，构建产物已生成"),
+    2: ("build-error", "有错误，构建失败"),
+    3: ("fatal", "致命错误：许可证缺失 / 工程损坏 / 工具链不可用"),
+    4: ("fatal", "致命错误（UV4 报告构建未完成）"),
+    5: ("fatal", "致命错误（UV4 报告构建未完成）"),
+    11: ("project-open-failed", "无法打开工程文件（路径错误、被占用或文件损坏）"),
+    12: ("device-db-missing", "设备数据库缺失（对应 Device Family Pack 未安装）"),
+    13: ("write-error", "写入错误（输出目录只读 / 磁盘空间不足 / 产物文件被占用）"),
+    15: ("uv4-busy", "UV4 访问错误：已有实例占用（该工程正被另一个 Keil 实例打开着）"),
+    20: ("unknown-error", "未知错误"),
+    -1: ("timeout", "超时（UV4 未在限定时间内退出，进程已被终止）"),
+    -2: ("uv4-not-found", "找不到 UV4 可执行文件"),
+    -3: ("launch-failed", "调用 UV4 失败"),
+}
+
+def _exit_meaning(exit_code: int) -> str:
+    """返回 UV4 退出码的机器可读名（status code）。"""
+    info = _UV4_EXIT_MEANING.get(int(exit_code))
+    return info[0] if info else "unmapped-exit-code"
 
 def _status_text(exit_code: int) -> str:
-    """把 UV4 退出码映射为可读文本。"""
+    """把 UV4 退出码映射为可读文本（含完整码表）。"""
     if exit_code == 0:
         return "成功"
     if exit_code == 1:
         return "成功（有警告）"
-    if exit_code == 2:
-        return "有错误"
-    if exit_code == 3:
-        return "构建不完整（可能缺少工具链）"
-    if exit_code == -1:
-        return "超时（UV4 未在限定时间内退出，本次进程已被终止）"
-    if exit_code == -2:
-        return "找不到 UV4 可执行文件"
-    if exit_code == -3:
-        return "调用 UV4 失败"
-    return f"失败（退出码 {exit_code}）"
+    info = _UV4_EXIT_MEANING.get(int(exit_code))
+    if info:
+        return "失败：%s（退出码 %d）" % (info[1], int(exit_code))
+    return "失败（退出码 %d，未收录的 UV4 退出码）" % int(exit_code)
+
+def _exit_next_actions(exit_code: int, action: str = "") -> list:
+    """按退出码给出「下一步做什么」——这是本工具链最值钱的部分，做成表统一给。"""
+    code = int(exit_code)
+    if code in (0, 1):
+        return []
+    table = {
+        2: ["读 output 里的第一条 error 行定位问题", "改完代码后重试本工具"],
+        3: ["确认 Keil 许可证状态（UV4 能正常打开该工程且能手工构建）",
+            "确认工程未被损坏：用 Keil 打开一次看是否有弹窗报错"],
+        4: ["用 Keil 打开工程手工构建一次，看弹窗提示（多半是工具链/许可证问题）"],
+        5: ["用 Keil 打开工程手工构建一次，看弹窗提示（多半是工具链/许可证问题）"],
+        11: ["确认 project 路径拼写正确、文件确实存在（用 read_project_config 或 list_uvision_instances 核对）",
+             "若工程正被 Keil 打开着导致占用，先 close_uvision 再重试"],
+        12: ["安装对应器件的 Device Family Pack（Keil Pack Installer），"
+             "或确认 target 名与已安装器件匹配（read_project_config 可看当前 target）"],
+        13: ["检查输出目录（Objects/Listings 等）是否只读、磁盘是否已满",
+             "关闭可能占用产物文件的程序（Keil 调试器、hex 查看器、烧录工具）后重试"],
+        15: ["Keil 已有实例占用该工程：先 keil_health 看清状态，再 close_uvision 关闭实例后重试",
+             "若需保留当前实例，改为在该实例里手工构建"],
+        20: ["用 Keil 打开工程手工构建一次取得更明确的报错", "调 keil_health 排查调试通道与模态框"],
+        -1: ["调大 timeout_s 后重试（大型工程/首次全量编译常超默认上限）"],
+        -2: ["用 --uv4-path 指定 UV4.exe 路径，或确认 Keil 安装目录未被移动"],
+        -3: ["确认 UV4.exe 可正常启动（手工双击一次）", "调 keil_health 看是否有模态框阻塞"],
+    }
+    acts = list(table.get(code, []))
+    if not acts:
+        acts = ["调 keil_health 查看 Keil 侧状态", "用 Keil 打开工程手工执行一次以取得更明确的报错"]
+    if action:
+        acts = acts + ["%s成功后可接着 flash_download / enter_debug 验证板上行为" % action]
+    return acts
+
 
 
 def _run_uv4(uv4: str, args: list[str], timeout: int,
@@ -243,9 +300,13 @@ def _result(action: str, exit_code: int, output: str, keil_before: dict | None =
         recovery = _recover_debug_channel(uv4, project, recover_wait)
         if recovery.get("keil_after"):
             keil_after = recovery["keil_after"]
+    ok = exit_code in (0, 1)
     d = {
-        "ok": exit_code in (0, 1),
+        "ok": ok,
+        "status": ("ok" if ok else "error"),
         "exit_code": exit_code,
+        "exit_code_text": _status_text(exit_code),
+        "exit_code_meaning": _exit_meaning(exit_code),
         "status_text": _status_text(exit_code),
         "action": action,
         "output": output.strip() or "",
@@ -269,8 +330,105 @@ def _result(action: str, exit_code: int, output: str, keil_before: dict | None =
     elif not keil_after.get("uvsock_ready"):
         d["keil_note"] = ("调试通道当前不可用（code=%s）；若需调试请先 restart_keil 或"
                           "用 keil_health 查看建议" % keil_after.get("code"))
+    # 统一的 next_actions：失败时按退出码给下一步；半成功（有警告）也给一句。
+    acts = _exit_next_actions(exit_code, action)
+    if not ok:
+        d["next_actions"] = acts
+        if exit_code == 15:
+            d["failure_bucket"] = "keil-busy"
+        elif exit_code == 11:
+            d["failure_bucket"] = "project-unavailable"
+        elif exit_code == 12:
+            d["failure_bucket"] = "toolchain-not-ready"
+        elif exit_code == 13:
+            d["failure_bucket"] = "output-write-failed"
+        elif exit_code in (2, 4, 5, 20):
+            d["failure_bucket"] = "build-failed"
+        elif exit_code == -1:
+            d["failure_bucket"] = "timeout"
+        else:
+            d["failure_bucket"] = "toolchain-not-ready"
+    elif exit_code == 1:
+        d["next_actions"] = ["有警告但产物已生成，可继续 flash_download / enter_debug；"
+                             "若行为异常再回看 output 里的 warning"]
+    met = _parse_build_metrics(output)
+    if met:
+        d["metrics"] = met
+    arts = _find_artifacts(project)
+    if arts:
+        d["artifacts"] = arts
+        if not ok:
+            d["artifacts_note"] = ("本次构建未成功，下列产物可能是**上一次**留下的——"
+                                   "不要据此认为镜像已更新。")
     return d
 
+
+# ----------------------------------------------------------------------
+# 构建产物与编译统计（批次33：对齐 embeddedskills 信封的 artifacts / metrics）
+# ----------------------------------------------------------------------
+# 为什么值得做：调用方拿到的如果只有一段几十上百行的编译日志，就得自己去找
+# 「错误几个、警告几个、产物在哪」——而这三件事恰恰是决定下一步做什么的全部依据。
+# 这里把它们从日志里结构化出来，日志照旧原样返回（不丢信息，只多给索引）。
+_METRIC_RX = re.compile(r"(\d+)\s*Error\(s\)\s*,?\s*(\d+)\s*Warning\(s\)", re.IGNORECASE)
+_METRIC_RX2 = re.compile(r"(\d+)\s*Errors?\s*,?\s*(\d+)\s*Warnings?", re.IGNORECASE)
+_ARTIFACT_EXT = (".axf", ".hex", ".bin", ".map", ".elf", ".sct", ".htm")
+
+def _parse_build_metrics(output: str) -> dict:
+    """从 UV4 构建日志里提取 错误数 / 警告数。"""
+    txt = str(output or "")
+    m = _METRIC_RX.search(txt) or _METRIC_RX2.search(txt)
+    if not m:
+        return {}
+    try:
+        return {"errors": int(m.group(1)), "warnings": int(m.group(2)),
+                "source": "parsed-from-output"}
+    except (TypeError, ValueError):
+        return {}
+
+def _find_artifacts(project: str, max_depth: int = 2) -> dict:
+    """在工程目录下有界递归查找构建产物。
+
+    输出目录名不是固定的（Keil 默认 Objects，但工程常被改成与工程同名的目录，
+    如 MDK-ARM/mdk_test/），写死几个候选目录一定会漏，故改用有界递归
+    （工程目录起 2 层），并按文件名主干过滤，避免把别的工程的产物算进来。
+    """
+    if not project:
+        return {}
+    base = Path(project).parent
+    stem = Path(project).stem
+    out = {}
+    seen = set()
+
+    def _walk(d: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            entries = sorted(d.iterdir())
+        except OSError:
+            return
+        for p in entries:
+            if p.is_dir():
+                _walk(p, depth + 1)
+                continue
+            ext = p.suffix.lower()
+            if ext not in _ARTIFACT_EXT:
+                continue
+            # 只收与工程同名的产物；.map/.htm 允许任意主干（UV4 命名不完全一致）
+            if p.stem.lower() != stem.lower() and ext not in (".map", ".htm"):
+                continue
+            key = ext.lstrip(".")
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                st = p.stat()
+                out[key] = {"path": str(p), "size": st.st_size,
+                            "mtime": int(st.st_mtime)}
+            except OSError:
+                out[key] = {"path": str(p)}
+
+    _walk(base, 0)
+    return out
 
 def build_project(uv4: str, project: str, target: str | None = None,
                   timeout: int = DEFAULT_BUILD_TIMEOUT,
@@ -287,19 +445,47 @@ def build_project(uv4: str, project: str, target: str | None = None,
                    ensure_debug_channel=ensure_debug_channel, project=project)
 
 
+def clean_project(uv4: str, project: str, target: str | None = None,
+                  timeout: int = DEFAULT_CLEAN_TIMEOUT,
+                  ensure_debug_channel: bool = True) -> dict:
+    """清理工程构建产物（UV4 -c）。
+
+    **有副作用**：会删掉该 target 的中间文件与产物（.axf/.hex/.o 等），
+    清理后必须重新编译才能烧录。用于「怀疑增量构建残留导致行为诡异」的场合，
+    等价于 Keil 菜单的 Clean Targets。
+    """
+    keil_before = _channel_snapshot()
+    args = ["-c", project] + (["-t", target] if target else [])
+    code, out = _run_uv4(uv4, args, timeout)
+    d = _result("清理", code, out, keil_before=keil_before, uv4=uv4,
+                ensure_debug_channel=ensure_debug_channel, project=project)
+    if d.get("ok"):
+        d["note"] = ("已清理构建产物：后续必须重新编译（build_project / rebuild_project）"
+                     "才能烧录或调试，否则没有可下载的镜像。")
+    return d
+
 def rebuild_project(uv4: str, project: str, target: str | None = None,
                     timeout: int = DEFAULT_BUILD_TIMEOUT,
-                    ensure_debug_channel: bool = True) -> dict:
-    """重新编译工程（UV4 -r，全量重编）。
+                    ensure_debug_channel: bool = True,
+                    clean_first: bool = False) -> dict:
+    """重新编译工程（UV4 -r 全量重编；clean_first=True 时用 -cr 先清理再重建）。
 
     ensure_debug_channel=True 时：执行前记录调试通道健康快照，执行后若发现
     "编译前可用、编译后丢失"，则自动拉起 Keil 并重建 UVSOCK 连接。
+
+    clean_first=True（-cr）比 -r 更彻底：-r 只是不做增量，仍可能复用未被判定为
+    过期的产物；-cr 先删掉全部产物再重建，用于「改了构建配置/预编译脚本（如
+    gen_scatter.py）后结果不对」这类场合。
     """
     keil_before = _channel_snapshot()
-    args = ["-r", project] + (["-t", target] if target else [])
+    args = ["-cr" if clean_first else "-r", project] + (["-t", target] if target else [])
     code, out = _run_uv4(uv4, args, timeout)
-    return _result("重新编译", code, out, keil_before=keil_before, uv4=uv4,
-                   ensure_debug_channel=ensure_debug_channel, project=project)
+    act = "清理并重新编译" if clean_first else "重新编译"
+    d = _result(act, code, out, keil_before=keil_before, uv4=uv4,
+                ensure_debug_channel=ensure_debug_channel, project=project)
+    d["clean_first"] = bool(clean_first)
+    d["uv4_args"] = args[0]
+    return d
 
 
 def flash_download(uv4: str, project: str, target: str | None = None,

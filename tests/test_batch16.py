@@ -26,6 +26,9 @@ from mdkdebug.server import create_server, _get_client  # noqa: E402
 from mdkdebug.client import UVClient, UVSOCKConnectError  # noqa: E402
 from mdkdebug import builder, winutil, uvsock  # noqa: E402
 
+REAL_PROJ = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))),
+    "example_mdk_project", "mdk_test", "MDK-ARM", "mdk_test.uvprojx")
 PORT = 14881
 PASS, FAIL = [], []
 
@@ -174,7 +177,7 @@ async def main():
         builder.close_uvision = lambda force=True: {"ok": True, "closed": [], "note": "mock"}
         try:
             r = load(await call(server, "restart_keil",
-                                {"project": r"C:\fake\x.uvprojx", "wait_ready": 3.0}))
+                                {"project": REAL_PROJ, "wait_ready": 3.0}))
         finally:
             builder.launch_uvision, builder.close_uvision = real_launch2, real_close
             winutil.uv4_pids = _real_uv4_pids
@@ -232,7 +235,7 @@ async def main():
         check("D-keil_health 描述提到模态框", "模态" in (tools["keil_health"].description or ""), "")
         check("D-restart_keil 描述提示会关闭所有实例",
               "关闭所有 Keil 实例" in (tools["restart_keil"].description or ""), "")
-        check("D1 工具数 68→85", len(tools) == 85, str(len(tools)))
+        check("D1 工具数 68→88", len(tools) == 88, str(len(tools)))
 
         await call(server, "exit_debug", {})
     finally:

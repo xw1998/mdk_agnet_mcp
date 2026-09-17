@@ -147,7 +147,7 @@ mdk_agent/
 │   ├── locator.py            # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
 │   ├── periph.py             # 内置 STM32F4 常用外设寄存器表（RCC/GPIO/USART/SPI/I2C/TIM/...）+ 内存区域地图
 │   ├── mapfile.py            # .map 链接映射文件解析（Program Size/sections/symbols/栈使用/未用段）
-│   └── server.py             # MCP Server 与 85 个工具定义
+│   └── server.py             # MCP Server 与 88 个工具定义
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_batch*.py        # 各批次 mock 回归（批次 8 拆为 8a/8b/8cd；逐批覆盖该批新增工具）
@@ -186,7 +186,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **85** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / 编译烧录 / Keil 生命周期管理 / **宿主机串口日志** / **看门狗冻结与 Cache 感知** / 环境自检引导）：
+共 **88** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -250,7 +250,8 @@ python run_server.py --transport http --http-port 8300
 | `list_uvision_instances` | 列出当前 Keil 实例（PID / 启动时间 / 打开的工程），一眼看清是否残留多个窗口 | `project?` |
 | `close_uvision` | 关闭 Keil 实例；`keep="latest"/"oldest"` 可**只保留一个窗口**、其余关闭 | `force?`、`keep?`、`project?` |
 | `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口；编译后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
-| `rebuild_project` | 全量重编译（`UV4 -r`，编译后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
+| `rebuild_project` | 全量重编译（`UV4 -r`，编译后自动检查调试通道）；`clean_first=true` 用 `-cr` **先清理再重建**（比 `-r` 更彻底，增量误判残留也能清掉） | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`clean_first?` |
+| `clean_project` | 清理工程（`UV4 -c`，删除中间产物不动源码）；编译失败的 `next_actions` 会指到这里——增量编译残留可疑时先 clean 再 build | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
 | `flash_download` | 烧录到目标 Flash（`UV4 -f`，烧录后自动检查调试通道）；**烧录后若仍在调试态则自动退出调试**（`exit_debug_after`，旧会话符号已过期），返回值 `debug_session` 说明处理过程 | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
 | `build_and_flash` | 编译成功后才烧录，AI 全流程闭环（自带通道自愈）；烧录后同样自动退出旧调试会话（`exit_debug_after`，返回 `debug_session`） | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
 | `flash_debug` | 「关旧 Keil→新固件上板→开新→进调试」一体闭环，规避旧窗口调试旧代码；上板方式自动选路（`flash_plan`：`debug_download` 由 Keil 进调试时自动下载 / `explicit_flash` 显式烧录） | `project`、`target` |
@@ -261,6 +262,8 @@ python run_server.py --transport http --http-port 8300
 | `serial_read` | 读取串口日志，**支持增量**：把上次返回的 `next_seq` 当 `since` 传入即只取新行，配合 `rt_kprintf`/ULOG 做迭代调试；返回 `items`/`lines`/`dropped`/`partial`（未满一行的半行） | `max_items?`、`clear?`、`since?` |
 | `serial_monitor_status` | 串口监听状态（`state`/`bytes_total`/`lines`/`dropped`/`reopen_count`/`last_error`、是否**仍占着口** `port_held`、端口是否**真正打开** `port_ready`、`auto_released`/`release_reason`/`idle_s`、能否下发 `can_write`）+ 本机全部可用串口；**未监听时不报错**（`running=false`），适合先探再启 | — |
 | `serial_monitor_stop` | 停止监听并**释放串口**（不释放的话 Keil 串口窗口/其他工具会打不开，报 WinError=5）。**默认保留已收日志**（`clear_buffer=true` 才清空），释放后 `serial_read` 仍可读、重新 start 复用同一实例；正常情况下不必手工调它——调试/烧录/关 Keil 都会自动释放；未监听时也返回 `ok=true` | `clear_buffer?` |
+| `serial_list_ports` | **扫描本机串口**：列 `port`/`description`/`hwid`，并按 VID/PID 推断挂的芯片（CH340/CP210x/FTDI/mbed-DAPLink…，大小写不敏感；未收录的给原始 VID/PID）；**唯一候选自动采用、多候选只列名单不瞎猜**（`port_auto_selected`/`port_candidates`/`need_choice`） | `detail?` |
+| `serial_expect` | **串口原子 send+wait**：下发命令并等到匹配内容或超时，一步完成请求-响应；只认**调用之后新增**的输出（不拿缓冲区旧日志冒充命中）。支持 `pattern` 正则、`since` 增量、`case_sensitive`、`send`+`eol`（同 serial_write 口径）或 `hex` 原样下发；命中给 `matched_text`/`matched_group`/`waited_ms`，未命中区分「零字节新增」与「有输出但不匹配」 | `pattern`、`timeout_s?`、`send?`、`hex?`、`eol?`、`since?`、`regex?`、`case_sensitive?`、`max_lines?` |
 | `list_uvoptx_breakpoints` | 读取持久化断点(.uvoptx) | `project?` |
 | `clear_uvoptx_breakpoints` | 清除持久化断点(.uvoptx) | `project?`、`backup?` |
 | `clear_all_breakpoints` | 清除全部软件断点；`hard=true` 用 `BK *` 一次性清空 Keil 侧全部断点（含 .uvoptx 持久化断点），附 `real_after` 复核 | `include_uvoptx?`、`hard?` |

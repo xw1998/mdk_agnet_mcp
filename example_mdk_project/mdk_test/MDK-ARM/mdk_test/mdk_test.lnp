@@ -4,6 +4,7 @@
 "mdk_test\gpio.o"
 "mdk_test\stm32f4xx_it.o"
 "mdk_test\stm32f4xx_hal_msp.o"
+"mdk_test\usart.o"
 "mdk_test\stm32f4xx_hal_rcc.o"
 "mdk_test\stm32f4xx_hal_rcc_ex.o"
 "mdk_test\stm32f4xx_hal_flash.o"
@@ -17,6 +18,7 @@
 "mdk_test\stm32f4xx_hal_cortex.o"
 "mdk_test\stm32f4xx_hal.o"
 "mdk_test\stm32f4xx_hal_exti.o"
+"mdk_test\stm32f4xx_hal_uart.o"
 "mdk_test\system_stm32f4xx.o"
 --strict --scatter "mdk_test\mdk_test.sct"
 --summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols

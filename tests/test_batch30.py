@@ -437,8 +437,8 @@ async def group_g_tools(server):
     tools = {t.name: t for t in await server.list_tools()}
     for nm in ("clear_faults", "serial_write"):
         check("G1 工具已注册：%s" % nm, nm in tools)
-    check("G2 工具总数 81→85（批次30 加 2、批次32 加 2）",
-          len(tools) == 85, len(tools))
+    check("G2 工具总数 81→88（批次33 再 +3）",
+          len(tools) == 88, len(tools))
     d = tools["serial_write"].description or ""
     check("G3 serial_write 描述点明「一边收一边发」与依赖监听持口",
           "一边收一边发" in d and "serial_monitor_start" in d, d[:160])

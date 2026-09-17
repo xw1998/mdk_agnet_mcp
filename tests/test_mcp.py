@@ -10,6 +10,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
 from mdkdebug.server import create_server  # noqa: E402
 
+REAL_PROJ = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))),
+    "example_mdk_project", "mdk_test", "MDK-ARM", "mdk_test.uvprojx")
 PORT = 14824
 PASS, FAIL = [], []
 
@@ -128,18 +131,23 @@ async def main():
         import mdkdebug.server as _srv
         _orig_close = _srv.builder.close_uvision
         _orig_bf = _srv.builder.build_and_flash
+        _orig_bp = _srv.builder.build_project
         _orig_launch = _srv.builder.launch_uvision
         _srv.builder.close_uvision = lambda force=False, timeout=10: {"ok": True, "closed": 0}
         _srv.builder.build_and_flash = lambda *a, **k: {"ok": False, "stage": "编译", "status_text": "编译未通过"}
+        # 工程勾选 Update Target before Debugging 时 flash_debug 只编译不显式烧录
+        # （走 build_project），两条路径都要打桩，否则会真的去调 UV4。
+        _srv.builder.build_project = lambda *a, **k: {"ok": False, "stage": "编译", "status_text": "编译未通过"}
         _srv.builder.launch_uvision = lambda *a, **k: {"ok": True}
         try:
-            r = await call(server, "flash_debug", {"project": "P.uvprojx"})
-            ok_fail = ('"stage": "编译烧录"' in r and '"ok": false' in r
+            r = await call(server, "flash_debug", {"project": REAL_PROJ})
+            ok_fail = ('"stage": "编译"' in r and '"ok": false' in r
                        and "未重开工程进入调试" in r and "launch_uvision" not in r)
             check("flash_debug 编译失败不重开不进调试", ok_fail, r)
         finally:
             _srv.builder.close_uvision = _orig_close
             _srv.builder.build_and_flash = _orig_bf
+            _srv.builder.build_project = _orig_bp
             _srv.builder.launch_uvision = _orig_launch
 
         # Locator 符号定位：地址↔文件:行 往返 + 源码读取
@@ -148,9 +156,12 @@ async def main():
         _pdir = "example_mdk_project/mdk_test/MDK-ARM"
         if os.path.isfile(_axf):
             _loc = Locator(_axf, project_dir=_pdir)
-            _lm = _loc.addr_to_location(0x8000db5)
+            # 同样不写死地址：取 main（Thumb 位清掉后的偶数地址），带上 bit0 探测往返
+            _main = (_loc.symbol_addr("main") or {}).get("addr")
+            _probe = (_main | 1) if _main else 0x8000db5
+            _lm = _loc.addr_to_location(_probe)
             _round = _loc.line_to_addr(_lm["file"], _lm["line"]) if _lm else None
-            check("Locator addr↔line 往返", bool(_lm) and _round == 0x8000db4,
+            check("Locator addr↔line 往返", bool(_lm) and _round == (_main or 0x8000db4),
                   f"lm={_lm} round={_round}")
             _src = _loc.read_source(_lm["file"], _lm["line"], 1) if _lm else None
             check("Locator 读源码上下文", bool(_src) and any(

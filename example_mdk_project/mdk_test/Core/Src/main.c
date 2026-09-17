@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "gpio.h"
+#include "usart.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -68,6 +69,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+  uint32_t last_blink = 0;
 
   /* USER CODE END 1 */
 
@@ -90,6 +92,8 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
+  MX_USART2_UART_Init();   /* PA2=TX PA3=RX 115200 8N1 */
+  uart_banner();           /* 上电先打 banner，接线对不对一眼可见 */
 
   /* USER CODE END 2 */
 
@@ -97,11 +101,15 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-	  (void)test_array[0];
-	  HAL_Delay(500);
-	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-	  HAL_Delay(500);
+	  /* 非阻塞闪烁：500ms 翻转一次，主循环保持在毫秒级，
+	     这样串口命令与心跳不会被 HAL_Delay 拖住（也能随时被调试器 halt） */
+	  if ((HAL_GetTick() - last_blink) >= 500U)
+	  {
+		  last_blink = HAL_GetTick();
+		  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+		  (void)test_array[0];
+	  }
+	  uart_poll();   /* 取一行命令 + 每 1s 心跳 hb <tick> */
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

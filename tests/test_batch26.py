@@ -33,7 +33,11 @@ from mdkdebug.server import create_server  # noqa: E402
 PORT = 14898
 PASS, FAIL = [], []
 _AXF = "example_mdk_project/mdk_test/MDK-ARM/mdk_test/mdk_test.axf"
-PROJ = r"D:\work\demo\MDK-ARM\demo.uvprojx"
+# 批次33 起 _resolve_project 会校验工程文件真实存在（不存在时报错并把附近找到的
+# .uvprojx 作为候选列出），故这里指向一个真实存在的工程；本段只验证
+# launch_uvision 的复用分支，与工程内容无关。
+PROJ = os.path.join(ROOT, "example_mdk_project", "mdk_test", "MDK-ARM",
+                    "mdk_test.uvprojx")
 
 
 def check(name, ok, detail=""):
