@@ -745,6 +745,7 @@ def write_bytes(data: bytes, wait_ms: int = 300, max_items: int = 200,
                 "available_ports": list_ports()}
     m.touch()
     before = m.rb.stats()["next_seq"]
+    bytes_before = m.bytes_total          # 用于判断「有没有任何回显」（比行数更灵敏）
     res = m.write(data)
     res["bytes_sent"] = len(data)
     res["next_seq_before"] = before
@@ -757,6 +758,7 @@ def write_bytes(data: bytes, wait_ms: int = 300, max_items: int = 200,
         r = m.read(max_items=max_items, since=before)
         ra = {"ok": True, "count": r.get("count"), "items": r.get("items"),
               "lines": r.get("lines"), "first_seq": r.get("first_seq"),
+              "bytes_new": int(m.bytes_total) - bytes_before,
               "next_seq": r.get("next_seq"), "truncated": r.get("truncated"),
               "dropped": r.get("dropped"), "partial": r.get("partial")}
         if not r.get("count"):

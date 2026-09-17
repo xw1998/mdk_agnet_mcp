@@ -552,6 +552,41 @@ _FAULT_MASK = {3: 0xFFFFFFFF,        # HardFault：可能是子级 fault 升级�
                5: 0x0000FF00,        # BusFault：BFSR
                6: 0xFFFF0000}        # UsageFault：UFSR
 
+# eol 取值 → (规范名, 追加字节)
+_EOL_TABLE = {
+    "crlf": ("crlf", b"\r\n"), "cr+lf": ("crlf", b"\r\n"), "crlfcrlf": ("crlf", b"\r\n"),
+    "windows": ("crlf", b"\r\n"), "dos": ("crlf", b"\r\n"),
+    "\\r\\n": ("crlf", b"\r\n"),
+    "lf": ("lf", b"\n"), "unix": ("lf", b"\n"), "\\n": ("lf", b"\n"),
+    "cr": ("cr", b"\r"), "mac": ("cr", b"\r"), "\\r": ("cr", b"\r"),
+    "none": ("none", b""), "off": ("none", b""), "no": ("none", b""),
+    "raw": ("none", b""), "": ("none", b""),
+}
+_EOL_HELP = ("可用取值：'crlf'（默认，=\\r\\n）/ 'lf'（=\\n）/ 'cr'（=\\r）/ 'none'（不追加）/ "
+             "'auto'（先 crlf，无任何回显再补发单个 \\r）；也可直接传转义写法 \"\\r\" / \"\\n\" / \"\\r\\n\"。")
+
+def _norm_eol(eol):
+    """把 eol 参数归一成 (规范名, 追加字节, warning)。
+
+    真机反馈（批次30 复验）：传真实转义字符（JSON 里的 "\\r"）会被旧实现的
+    ``str(eol).strip()`` 吃掉 —— ``\\r`` 本身就是空白字符，strip 后成空串，落到
+    所有分支之外，于是**换行根本没发出去，工具却仍然返回 ok:true**，只能靠
+    read_after 的「没有新行」间接暴露（真机表现为命令逐字符回显但不执行、
+    行缓冲累积到下次才一起执行并报 Command not found）。
+
+    现在先取原始串（不做 strip 前置），把真实控制字符映射成转义写法后再归一；
+    无法识别时明确返回 warning + 可用取值，不再静默。
+    """
+    raw = "" if eol is None else str(eol)
+    key = (raw.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+           .replace(" ", "").strip().lower())
+    if key in _EOL_TABLE:
+        name, b = _EOL_TABLE[key]
+        return name, b, None
+    return None, b"", ("eol 取值无法识别（收到 %r）：本次**未追加任何行尾**，"
+                       "命令可能因此不被目标执行。" % raw)
+
+
 def _norm_tristate(v, default: str = "auto") -> str:
     """把「真/假/自动」三态参数归一成 "true"/"false"/"auto"。
 
@@ -1370,14 +1405,32 @@ def _batch_alias_args(tool: str, args: dict) -> dict:
     return a
 
 
-def _usage_summary(desc: str, limit: int = 90) -> str:
-    """从工具描述里取一句用途摘要（去掉追加的【参数】块，截到第一个句号）。"""
+# 这些工具的关键可选参数直接决定调用成败，示例里一并给出（照抄即可用）
+_KEY_OPTIONALS = {
+    "serial_write": {"text": "help", "eol": "crlf"},
+}
+
+
+def _usage_summary(desc: str, limit: int = 170) -> str:
+    """从工具描述里取一句用途摘要（去掉追加的【参数】块）。
+
+    真机反馈：原实现按 90 字符硬切，会把句子切在词中间（serial_write 被截成
+    「…给 bo」），冷启动照抄摘要反而漏掉关键信息。现在放宽到 170，优先取完整
+    一句；确实过长时在标点处断开并加省略号，不再切在词中间。
+    """
     t = (desc or "").split("【参数】")[0].replace("\n", " ").strip()
     for sep in ("。", "；", ". "):
         i = t.find(sep)
         if 0 <= i <= limit:
             return t[:i]
-    return t[:limit]
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    for sep in ("。", "；", "，", "、", "：", ", "):
+        i = cut.rfind(sep)
+        if i >= limit // 2:
+            return cut[:i + 1].rstrip("，、, ")
+    return cut.rstrip() + "…"
 
 
 def _apply_param_hints(server) -> int:
@@ -5081,11 +5134,18 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "这是「一边收一边发」的用法：下发 shell/msh 命令并立刻看回显、给 bootloader 发命令、"
             "分段下发镜像/升级数据。"
             "参数：text（文本，按 encoding 编码，默认 utf-8）与 hex（十六进制串，如 '7e 01 00 ff'，"
-            "自动去空格/逗号/横线）**二选一**；eol 控制文本末尾追加的行尾（'crlf' 默认 / 'lf' / 'cr' / 'none'，"
-            "串口终端一般要 crlf）；wait_ms（默认 300）为写完等待多久再取新行；"
+            "自动去空格/逗号/横线）**二选一**；eol 控制文本末尾追加的行尾，"
+            "**可用取值：'crlf'（默认=\\r\\n）/ 'lf'（=\\n）/ 'cr'（=\\r）/ 'none'（不追加）/ "
+            "'auto'（先 crlf，若目标毫无回显则补发单个 \\r，兼容 SVCrtOS shell、RT-Thread msh 这类只需 \\r 的口）**，"
+            "也可直接传转义写法 \"\\r\" / \"\\n\"（两种写法等价）；"
+            "无法识别的取值会**明确返回 warning + eol_hint**，不会静默不发行尾；wait_ms（默认 300）为写完等待多久再取新行；"
             "read_after=true（默认）时**把这次下发之后新增的日志行一起返回**（按写前 next_seq 增量取，"
             "不会重复老日志），省掉再调一次 serial_read。"
-            "返回 {ok, written, bytes_sent, port, next_seq_before, read_after:{count, lines, next_seq, note}}；"
+            "返回 {ok, written, bytes_sent, sent_hex, sent_bytes, eol_input, eol_applied, eol_bytes_hex, "
+            "port, next_seq_before, read_after:{count, lines, bytes_new, next_seq, note}}；"
+            "**sent_hex 是本次真正发出去的完整字节（含行尾）**，eol_applied 是归一后的行尾名——"
+            "若行尾没发出去，eol_applied 会是 null 并附 warning，不再出现「看着 ok 其实换行没发」；"
+            "文本下发后目标**毫无回显**时会附 no_echo_hint（提示改 'cr'/'auto' 或走 hex）；"
             "next_seq 可直接作为下次 serial_read 的 since。"
             "**依赖监听持有端口**：没有监听时 ok=false 并提示先 serial_monitor_start；"
             "端口只读到（can_write=false）、已被拔出/关闭、或正在重连时，ok=false 并给出 last_error，"
@@ -5105,24 +5165,70 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 except ValueError as e:
                     return _js({"ok": False,
                                 "error": "hex 解析失败（应为偶数长度的十六进制字节串）：%s" % e})
+            eol_raw = "" if eol is None else str(eol)
+            auto = (eol_raw.replace("\r", "\\r").replace("\n", "\\n")
+                    .strip().lower() == "auto")
+            eol_name, eol_bytes, eol_warn = _norm_eol("crlf" if auto else eol)
             if text:
                 try:
                     raw += text.encode(encoding or "utf-8")
                 except Exception as e:  # noqa: BLE001
                     return _js({"ok": False,
                                 "error": "text 编码失败（encoding=%s）：%s" % (encoding, e)})
-                e = str(eol or "").strip().lower()
-                if e in ("crlf", "cr+lf", "windows"):
-                    raw += b"\r\n"
-                elif e in ("lf", "unix", "\\n"):
-                    raw += b"\n"
-                elif e in ("cr", "\\r"):
-                    raw += b"\r"
+                raw += eol_bytes
             if not raw:
                 return _js({"ok": False,
                             "error": "参数不足：text（文本）与 hex（十六进制串）至少给一个（都不为空）"})
-            return _js(serialmon.write_bytes(raw, wait_ms=wait_ms,
-                                             max_items=max_items, read_after=read_after))
+            out = dict(serialmon.write_bytes(raw, wait_ms=wait_ms,
+                                             max_items=max_items, read_after=True))
+            # 口径与 write_mem 的 verified/readback_hex 对齐：把「到底发出去了什么字节」摊开
+            out["eol_input"] = eol_raw
+            out["eol_applied"] = eol_name
+            out["eol_bytes_hex"] = eol_bytes.hex()
+            out["sent_hex"] = raw.hex()
+            out["sent_bytes"] = len(raw)
+            if eol_warn:
+                out["eol_unrecognized"] = True
+                out["warning"] = eol_warn
+                out["eol_hint"] = _EOL_HELP
+            elif not text and eol_bytes and hex_s:
+                out["note"] = ("eol 只对 text 生效：本次只给了 hex，未追加行尾；"
+                               "需要行尾请把它写进 hex（如 '...0d0a'）。")
+            if auto and out.get("ok"):
+                ra = out.get("read_after") or {}
+                no_echo = (not int(ra.get("count") or 0)
+                           and not int(ra.get("bytes_new") or 0))
+                if no_echo:
+                    r2 = serialmon.write_bytes(b"\r", wait_ms=wait_ms,
+                                               max_items=max_items, read_after=True)
+                    ra2 = r2.get("read_after") or {}
+                    merged = dict(ra)
+                    merged["count"] = int(ra.get("count") or 0) + int(ra2.get("count") or 0)
+                    merged["items"] = (ra.get("items") or []) + (ra2.get("items") or [])
+                    merged["lines"] = (ra.get("lines") or []) + (ra2.get("lines") or [])
+                    merged["bytes_new"] = int(ra.get("bytes_new") or 0) + int(ra2.get("bytes_new") or 0)
+                    if ra2.get("next_seq") is not None:
+                        merged["next_seq"] = ra2.get("next_seq")
+                    merged.pop("note", None)
+                    out["read_after"] = merged
+                    out["eol_fallback"] = "cr"
+                    out["eol_bytes_hex"] = (eol_bytes + b"\r").hex()
+                    out["sent_hex"] = (raw + b"\r").hex()
+                    out["sent_bytes"] = len(raw) + 1
+                    out["note"] = ("eol=auto：crlf 下发后 %dms 内目标没有任何回显，"
+                                   "已补发单个 CR（多数只需 \\r 的 shell，如 SVCrtOS shell / "
+                                   "RT-Thread msh，据此即可执行）——两次下发见 sent_hex。"
+                                   % int(wait_ms))
+            if text and not auto and out.get("ok"):
+                ra = out.get("read_after") or {}
+                if not int(ra.get("count") or 0) and not int(ra.get("bytes_new") or 0):
+                    out["no_echo_hint"] = (
+                        "目标在 %dms 内没有任何回显：若该 shell 只认单 \\r"
+                        "（SVCrtOS shell / RT-Thread msh），把 eol 改成 'cr' 或 'auto' 再试；"
+                        "需要精确控字节时用 eol='none' 配合 hex。%s" % (int(wait_ms), _EOL_HELP))
+            if read_after is False:
+                out.pop("read_after", None)
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e),
                         "available_ports": serialmon.list_ports()})
@@ -5287,6 +5393,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 for n in required:
                     spec = props.get(n) if isinstance(props.get(n), dict) else {}
                     example[n] = _example_value(n, spec or {})
+                # 关键可选参数也进示例：真机反馈「照抄 example_args 恰好漏掉 eol 这类参数」，
+                # 这里的工具其可选参数直接决定成败，示例里带上才能照抄即用。
+                example.update(_KEY_OPTIONALS.get(nm) or {})
                 items.append({"tool": nm, "title": title,
                               "required": required,
                               "optional": [n for n in props if n not in required],
@@ -5295,7 +5404,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                               "usage": _usage_summary(desc)})
             return _js({"ok": True, "count": len(items), "total": len(tools),
                         "keyword": keyword, "tools": items,
-                        "note": "example_args 只含必填参数，可直接作为 args 传入；"
+                        "note": "example_args 含必填参数（少数工具另含关键可选参数，"
+                                "如 serial_write 的 text/eol），可直接作为 args 传入；"
                                 "aliases 给出该工具接受的参数别名（如 n_bytes/length 等价）；"
                                 "required 中的参数哪怕 schema 标了默认值也必须给（如 read_mem 的 n_bytes）。"
                                 "每个工具的完整说明见其 description 末尾的【参数】/【调用示例】"})

@@ -257,6 +257,37 @@ serial_write(hex="7e 01 00 ff", eol="none")      # 二进制/镜像片段
 serial_read(since=上次 next_seq)                  # 长响应可继续增量取
 ```
 
+#### 坑：`eol` 传转义字符被 `.strip()` 静默吃掉（批次31）
+
+旧实现里 `eol` 先做 `str(eol).strip().lower()` 再匹配 `crlf` / `lf` / `cr` 三组关键字。
+而 `"\r"`、`"\n"` 本身就是**空白字符**，`strip()` 之后变成空串，落进所有分支之外 ——
+结果是**换行一个字节都没发出去，工具却照样返回 `ok:true`**，只能靠 `read_after`
+「没有新行」间接暴露。真机实测（同一块板、同一根线）：
+
+| 调用 | 旧 `written` | 旧结果 |
+|------|-------------|--------|
+| `text:"pool"`（不传 eol） | 6 | 执行成功（默认 crlf 生效） |
+| `text:"pool", eol:"cr"` | 5 | 执行成功 |
+| `text:"pool", eol:"\r"` | 4 | **命令不执行**（换行没发出去） |
+| `text:"info", eol:"\r"` 后 `text:"help"` | 4 / 4 | 两次都没换行，行缓冲累积，直到改用 hex 发 `0x0D` 才执行，报 `Command not found: infohelphelp` |
+
+更要命的是**「回显 ≠ 执行」**：目标对收到的每个字符照样回显，看着字节通了，命令却没跑。
+现在的做法：
+
+- `eol` 归一化**先取原始串、把真实控制字符映射成转义写法再比对**，`"\r"`（JSON 转义）
+  与字面 `\\r` 等价，另收 `cr+lf` / `windows` / `dos` / `unix` / `mac` / `off` / `raw` 等别名；
+- 无法识别的取值**明确返回 `eol_unrecognized` + `warning` + `eol_hint`**（列出全部可用取值），
+  不再静默按默认值发；
+- 返回值把「到底发出去了什么」摊开：`sent_hex` / `sent_bytes` / `eol_input` / `eol_applied` /
+  `eol_bytes_hex`，口径与 `write_mem` 的 `verified` / `readback_hex` 对齐 ——
+  行尾没发出去时 `eol_applied` 是 `null` 并附 `warning`；
+- 回显判定改用**字节增量** `read_after.bytes_new`（比「新增了几行」灵敏，半行/逐字符回显也能察觉）；
+- `eol="auto"`：先按 `crlf` 发，若毫无回显再补发单个 `\r`（SVCrtOS shell、RT-Thread msh 这类
+  只认单 `\r` 的目标），返回 `eol_fallback:"cr"` 且 `sent_hex` 含两次下发；
+- 没用 `auto` 又毫无回显时附 `no_echo_hint`，直接把可用取值与替代做法（`eol="cr"` 或走 hex）点出来。
+
+> 教训：**参数归一化不要在有意义的字符上做 `strip()`**。「发出去的字节」必须可被调用方看见，
+> 否则 `ok:true` 会掩盖「其实什么都没发」——这与 `write_mem` 需要 `verified` 是同一类问题。
 
 ## 五、历次改进留档（按批次）
 
