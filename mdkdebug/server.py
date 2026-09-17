@@ -6493,15 +6493,24 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         真机踩过的坑：盘上有几十份不同厂商的 .svd，不指定器件就会挑到别的芯片，
         把 0x40020000(GPIOA) 判成 TIMER2——**看似权威的错答案比报错更危险**。
         """
+        # 真机踩坑：只看「服务默认工程」时，用工具参数指定过工程的会话依然推不出型号
+        # （_resolve_project("") 无默认工程就抛异常），于是一整盘 20+ 份 .svd 只好拒绝。
+        # 与符号懒加载同理：再退一步用「本次会话用过的工程」，仍无则如实返回空。
+        cands = []
         try:
-            p = _resolve_project("")
-            if p and os.path.isfile(p):
-                cfg = _uvprojx.read_config(p)
-                dev = str(cfg.get("device") or "").strip()
-                if dev:
-                    return dev
+            cands.append(_resolve_project(""))
         except Exception:  # noqa: BLE001
             pass
+        if _last_project:
+            cands.append(_last_project)
+        for p in cands:
+            try:
+                if p and os.path.isfile(p):
+                    dev = str((_uvprojx.read_config(p) or {}).get("device") or "").strip()
+                    if dev:
+                        return dev
+            except Exception:  # noqa: BLE001
+                continue
         return ""
 
     @server.tool(
