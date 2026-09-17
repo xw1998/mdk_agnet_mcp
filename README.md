@@ -146,7 +146,7 @@ mdk_agent/
 │   ├── locator.py             # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
 │   ├── periph.py             # 内置 STM32F4 常用外设寄存器表（RCC/GPIO/USART/SPI/I2C/TIM/...）+ 内存区域地图
 │   ├── mapfile.py            # .map 链接映射文件解析（Program Size/sections/symbols/栈使用/未用段）
-│   └── server.py             # MCP Server 与 57 个工具定义（45 调试 + 4 编译烧录 + 5 工程分析 + 2 Keil 管理 + 1 一体闭环）
+│   └── server.py             # MCP Server 与 73 个工具定义
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_e2e.py           # UVClient 协议闭环测试
@@ -191,7 +191,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **57** 个（45 个调试工具 + 4 个编译烧录工具 + 5 个工程分析工具 + 2 个 Keil 管理工具 + 1 个 `flash_debug` 一体闭环）：
+共 **73** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / 编译烧录 / Keil 生命周期管理 / 环境自检引导）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -255,6 +255,20 @@ python run_server.py --transport http --http-port 8300
 | `flash_download` | 烧录到目标 Flash（`UV4 -f`） | `project`、`target` |
 | `build_and_flash` | 编译成功后才烧录，AI 全流程闭环 | `project`、`target` |
 | `flash_debug` | 「关旧 Keil→编烧→开新→进调试」一体闭环，规避旧窗口调试旧代码 | `project`、`target` |
+
+| `read_console_output` | 读取命令窗口输出 | clear? |
+| `read_async_messages` | 读取异步消息/报错 | clear? |
+| `list_uvoptx_breakpoints` | 读取持久化断点(.uvoptx) | project? |
+| `clear_uvoptx_breakpoints` | 清除持久化断点(.uvoptx) | project?、backup? |
+| `clear_all_breakpoints` | 清除全部软件断点 | include_uvoptx? |
+| `clear_all_watchpoints` | 清除全部数据断点 | — |
+| `set_symbol_file` | 设置/切换当前调试符号文件 | path |
+| `list_symbol_projects` | 列出预登记候选符号工程 | — |
+| `wait_breakpoint` | 带超时等待断点命中（symbol/address 或 .uvoptx 持久化断点），命中即回源码位置并计数 | symbol?、address?、timeout_s?、poll_ms?、use_project_breakpoints?、project? |
+| `breakpoint_stats` | 断点命中统计 | — |
+| `keil_health` | Keil 调试通道健康自检（UV4 进程 / UVSOCK 端口 / 模态框），Keil 未运行也能返回 | — |
+| `reset_connection` | 只重置 UVSOCK 连接（不重启 Keil）：丢弃 socket 与残留缓冲，下次调用自动重连 | reason? |
+| `restart_keil` | 一键重启 Keil：关全部实例 → 脱离父进程重启 → 等 UVSOCK 就绪 → 重连 | project?、force?、wait_ready? |
 
 > 编译烧录工具均以**隐藏窗口**后台执行，不闪现 Keil 界面；`launch_uvision` 则以**可见**方式打开 Keil 供调试查看。
 
