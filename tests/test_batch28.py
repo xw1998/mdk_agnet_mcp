@@ -251,7 +251,7 @@ async def group_c_async(server):
     tools = await server.list_tools()
     names = [t.name for t in tools]
     check("C1 dismiss_dialog 已注册", "dismiss_dialog" in names, "缺失")
-    check("C2 工具总数 76→77", len(names) == 77, len(names))
+    check("C2 工具总数 76→81", len(names) == 81, len(names))
     d = {t.name: (t.description or "") for t in tools}
     check("C3 描述说明会读正文与按钮",
           "正文" in d.get("dismiss_dialog", "") and "按钮" in d.get("dismiss_dialog", ""))

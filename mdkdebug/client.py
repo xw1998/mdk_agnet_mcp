@@ -22,6 +22,7 @@ import time
 
 from . import uvsock
 from . import winutil
+from . import guard
 from .interface import UVInterface
 from .uvsock import (
     UVSOCK_CMD, UV_STATUS_SUCCESS, UV_STATUS_TEXT, status_text, UVError, UVStatusError,
@@ -105,6 +106,10 @@ class UVClient:
         self._last_stop_obs_ts = 0.0
         self._last_used = 0.0
         self.phy = UVInterface(host=host, port=port)
+        # 批次29：跨进程互斥闸门（多个 mdkdebug 实例抢同一 UVSOCK 时，命令会互相
+        # 穿插并静默吃掉写入）+ 实例心跳（供 keil_health / get_status 清点）。
+        self.guard = guard.EndpointGuard(host=host, port=port)
+        self.presence_extra = {}
         self._stop_pc_hist = []   # 最近几次停止点 PC，用于识别「同一地址反复出现」
         self._bp_hits = {}        # 断点命中计数 {addr: count}（本进程内累计）
         # 批次24：被观察地址的历史值（设点时 / 上一停止点读到的），作为数据观察点
@@ -143,8 +148,12 @@ class UVClient:
     def _request(self, cmd_code: int, data: bytes = b'',
                  expect_status: bool = True):
         """加锁执行一次命令，返回 (r_status, 响应数据解析结果)。"""
-        with self._lock:
+        # 两层锁：self._lock 管本进程的线程；guard.hold() 管**其他 mdkdebug 进程**
+        # （文件锁）。缺少后者时，两个服务实例各持一条 UVSOCK 连接会互相穿插，
+        # 典型后果是「write_mem 返回成功但值被另一条命令覆盖」的静默丢失。
+        with self._lock, self.guard.hold():
             self._ensure_connected()
+            guard.touch_presence(self.port, getattr(self, "presence_extra", None))
             uv = UVSOCK_CMD(cmd_code, data=data)
             try:
                 raw = self.phy.send(uv.pack(), expect_cmd=cmd_code)
@@ -196,6 +205,10 @@ class UVClient:
                 "reason": reason or "手动复位",
                 "msg": "连接已丢弃，下次调用会重新建立；若仍异常可用 restart_keil 重启 Keil",
                 "keil": health}
+
+    def serialization_snapshot(self) -> dict:
+        """当前串行化方式 + 并发竞争遥测 + 其他 mdkdebug 实例（get_status 用）。"""
+        return guard.concurrency_report(self.port, self.guard)
 
     def _timeout_diagnostics(self, cmd_code: int) -> str:
         """命令超时时的可操作诊断：Keil 健康 + 模态对话框检测。"""

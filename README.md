@@ -52,7 +52,7 @@
 - **编译烧录输出集中返回**：每次编译/烧录的完整日志（含警告/错误）经 `-o` 捕获并由 AI 完整返回，在对话中即可查看，无需盯 Keil 窗口；
 - **UV4 自动探测**：优先显式 `--uv4-path`，其次探测常见安装目录，再查 Windows 注册表；
 - **连接缓存**：常驻服务内共享一条 TCP 连接，空闲自动断开、下次调用自动重连；
-- **线程安全**：连接状态以锁保护，可被 MCP 并发调用；
+- **并发调用可安全并行**：所有 UVSOCK 命令经**统一闸门串行化**——进程内 RLock（同进程多线程）+ 跨进程锁文件（多个 mdkdebug 实例共用同一调试通道时也只允许一个发命令），超时降级并如实记入遥测；`get_status` / `keil_health` 会回报**其他 mdkdebug 实例**（PID + 心跳年龄）并在有竞争时给出 `concurrency_warning`，把「写入被静默吞掉」从猜测变成可见证据；详见「并发调用与串行化」；
 - **随附模拟调试器**：无需硬件即可离线联调与跑测试。
 
 ## 工作原理
@@ -147,7 +147,7 @@ mdk_agent/
 │   ├── locator.py             # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
 │   ├── periph.py             # 内置 STM32F4 常用外设寄存器表（RCC/GPIO/USART/SPI/I2C/TIM/...）+ 内存区域地图
 │   ├── mapfile.py            # .map 链接映射文件解析（Program Size/sections/symbols/栈使用/未用段）
-│   └── server.py             # MCP Server 与 77 个工具定义
+│   └── server.py             # MCP Server 与 81 个工具定义
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_e2e.py           # UVClient 协议闭环测试
@@ -192,16 +192,16 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **77** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / 编译烧录 / Keil 生命周期管理 / 环境自检引导）：
+共 **81** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / 编译烧录 / Keil 生命周期管理 / **宿主机串口日志** / 环境自检引导）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
 | `get_version` | 查询 UVSOCK 插件版本 | — |
-| `get_status` | 查询是否处于调试、目标是否运行、状态码 | — |
+| `get_status` | 查询是否处于调试、目标是否运行、状态码，并附**当前符号文件路径 + 时间戳**（`symbol_file`/`symbol_mtime_text`）、**符号陈旧判定**（`symbol_stale` + `symbol_stale_warning`：编译/烧录后旧会话符号过期，求值会报 status 13）、**串行化与并发视图**（`serialization`，含其他 mdkdebug 实例清点） | — |
 | `calc_expression` | 计算并读取表达式 / 变量值 | `expr` |
 | `read_variable` | 按变量名查地址/值/大小，支持数组逐元素与整块内存；App 侧重定位场景可配 `reloc_delta` 自动换算运行地址 | `name`、`count?`、`reloc_delta?` |
 | `read_mem` | 读取目标内存（`n_bytes` 可写作别名 `length`；`reloc_delta` 用于 App 侧重定位后按运行地址读） | `addr`（`0x…` 或十进制）、`n_bytes`、`reloc_delta?` |
-| `write_mem` | 写入目标内存 | `addr`、`data_hex`（十六进制串，可带空格） |
+| `write_mem` | 写入目标内存，**默认写后回读校验**（`verify=true` → `verified`/`readback_hex`）：写入被静默忽略（目标运行中/只读区/另一实例并发写）时给出 `verified=false` 与原因，不再「看着成功其实没写进去」 | `addr`、`data_hex`（十六进制串，可带空格）、`verify?`（默认 true） |
 | `run` | 全速运行 | — |
 | `run_timeout` | 全速运行 N 毫秒后自动暂停并返回停靠位置，用于验证时序；返回 `requested_run_ms` / `actual_run_ms` / `stop_wait_ms` / `total_ms` 四段计时，排查时序不再只能看一个含糊的 `waited_ms` | `timeout_ms`（默认 1000） |
 | `stop` | 暂停执行 | — |
@@ -254,12 +254,16 @@ python run_server.py --transport http --http-port 8300
 | `close_uvision` | 关闭 Keil 实例；`keep="latest"/"oldest"` 可**只保留一个窗口**、其余关闭 | `force?`、`keep?`、`project?` |
 | `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口；编译后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
 | `rebuild_project` | 全量重编译（`UV4 -r`，编译后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
-| `flash_download` | 烧录到目标 Flash（`UV4 -f`，烧录后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
-| `build_and_flash` | 编译成功后才烧录，AI 全流程闭环（自带通道自愈） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
+| `flash_download` | 烧录到目标 Flash（`UV4 -f`，烧录后自动检查调试通道）；**烧录后若仍在调试态则自动退出调试**（`exit_debug_after`，旧会话符号已过期），返回值 `debug_session` 说明处理过程 | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
+| `build_and_flash` | 编译成功后才烧录，AI 全流程闭环（自带通道自愈）；烧录后同样自动退出旧调试会话（`exit_debug_after`，返回 `debug_session`） | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
 | `flash_debug` | 「关旧 Keil→新固件上板→开新→进调试」一体闭环，规避旧窗口调试旧代码；上板方式自动选路（`flash_plan`：`debug_download` 由 Keil 进调试时自动下载 / `explicit_flash` 显式烧录） | `project`、`target` |
 
 | `read_console_output` | 读取命令窗口输出 | clear? |
 | `read_async_messages` | 读取异步消息/报错 | clear? |
+| `serial_monitor_start` | **宿主机串口日志监听**（后台线程收 → 按行切分 → ring buffer）：`port` 可写 `"COM9"` 或 `9`（留空取第一个可用口），`baud` 默认 115200，`capacity` 默认保留 2000 行；端口不存在/被占用时 `ok=false` 并附 `available_ports`，不会静默失败；重复 start 时 `restart=false` 可避免抢占。**用完就还**：`idle_release_s`（默认 900s，0=不自动）为无人访问多久后自动释放端口——释放只放掉 COM 口，已收日志仍保留、可继续 `serial_read`，需要接着采集重新 start 会复用同一实例（`resumed=true`）不丢日志 | `port?`、`baud?`、`databits?`、`parity?`、`stopbits?`、`capacity?`、`encoding?`、`label?`、`restart?`、`idle_release_s?` |
+| `serial_read` | 读取串口日志，**支持增量**：把上次返回的 `next_seq` 当 `since` 传入即只取新行，配合 `rt_kprintf`/ULOG 做迭代调试；返回 `items`/`lines`/`dropped`/`partial`（未满一行的半行） | `max_items?`、`clear?`、`since?` |
+| `serial_monitor_status` | 串口监听状态（`state`/`bytes_total`/`lines`/`dropped`/`reopen_count`/`last_error`、是否**仍占着口** `port_held`、`auto_released`/`release_reason`/`idle_s`）+ 本机全部可用串口；**未监听时不报错**（`running=false`），适合先探再启 | — |
+| `serial_monitor_stop` | 停止监听并**释放串口**（不释放的话 Keil 串口窗口/其他工具会打不开，报 WinError=5）。**默认保留已收日志**（`clear_buffer=true` 才清空），释放后 `serial_read` 仍可读、重新 start 复用同一实例；正常情况下不必手工调它——调试/烧录/关 Keil 都会自动释放；未监听时也返回 `ok=true` | `clear_buffer?` |
 | `list_uvoptx_breakpoints` | 读取持久化断点(.uvoptx) | project? |
 | `clear_uvoptx_breakpoints` | 清除持久化断点(.uvoptx) | project?、backup? |
 | `clear_all_breakpoints` | 清除全部软件断点；`hard=true` 用 `BK *` 一次性清空 Keil 侧全部断点（含 .uvoptx 持久化断点），附 `real_after` 复核 | include_uvoptx?、hard? |
@@ -539,10 +543,65 @@ python tests/test_stdio.py   # stdio 全链路客户端握手（7 项）
 python -m tests.mock_uvsock_server --port 4823
 ```
 
+## 并发调用与串行化（重要）
+
+**一条 UVSOCK 通道上并发发命令会互相穿插，写入可能被静默吞掉。** 真机踩过：并行发多条
+`write_mem` 到同一 UVSOCK，其中一次写入被另一次静默覆盖，导致误判为「看门狗又复位了」，
+绕了很大一圈。mdkdebug 现在从三层把这件事管住，调用方不必再靠「自己记得串行」：
+
+| 层次 | 机制 | 能挡住什么 |
+|------|------|-----------|
+| 进程内 | `threading.RLock`（客户端连接层） | 同一服务进程内多线程/多任务交错发命令 |
+| 跨进程 | 锁文件 `uvsock_<port>.lock`（`EndpointGuard`，可重入、超时降级） | **多个 mdkdebug/MCP 实例**各持一条连接抢同一台调试器 |
+| 可观测 | 实例心跳 `inst_<pid>.json` + 遥测统计 | 让「还有谁在抢」**看得见**：`keil_health.mdkdebug_instances`、`get_status.serialization` |
+
+要点：
+
+- 闸门是**可重入**的，`batch` 内逐条调用子工具不会自锁；
+- 闸门**从不阻塞到失败**：等锁超过 `LOCK_WAIT_DEFAULT`（15s）即降级放行，并把这次竞争如实
+  记入 `stats`（`lock_timeouts` / `foreign_pid` / `degraded`），`keil_health` 会据此给出
+  `concurrency_warning`——不为了「绝不阻塞」把工具卡死，也不假装没发生；
+- 检测到**其他实例**（心跳新鲜且进程存活）时，警告会直接列出对手 PID：
+  「检测到还有 N 个 mdkdebug 进程（PID …）在驱动同一 UVSOCK：并发调用会互相穿插，写入可能被
+  静默覆盖。请只保留一个 MCP 服务实例（关掉多余的客户端连接/旧进程）后重试。」
+
+**调用方建议**：
+
+1. 需要严格顺序的多步写入，用 `batch` 一次提交（内部逐条串行），比并发单发更可靠；
+2. 关键写入用 `write_mem` 的默认回读校验（`verified=false` 即「没写进去」，别据此推断目标行为）；
+3. 出现可疑的「自己变了」现象时，先看 `keil_health` / `get_status` 的并发字段，再怀疑代码；
+4. 同一个串口不要被两处同时打开（本服务串口监听 + Keil 串口窗口会互相抢占，报 WinError=5）。
+
+## 串口「用完就还」
+
+**调试完了串口还被 MCP 占着**，会导致 Keil 串口窗口、其他串口工具打不开（`WinError=5`）。
+mdkdebug 的做法是：**把「端口占用」和「日志生命周期」拆开**——释放端口不等于丢日志。
+
+| 触发点 | 说明 |
+|--------|------|
+| `exit_debug` 成功 | 调试这一段结束，顺带释放（返回 `serial_release`） |
+| `flash_download` / `build_and_flash` | 有 `release_serial`（默认 `true`）；想边烧录边看日志可设 `false` |
+| `flash_debug` / `close_uvision` / `restart_keil` | 关掉 Keil 实例后口自然该还（新实例/串口窗口可能要开这个口） |
+| 空闲兜底 | `idle_release_s`（默认 900 秒，`0`=关闭）内无人访问即自动释放 |
+| 进程退出 | `atexit` 钩子释放，不把 COM 口带走 |
+
+**释放后日志还在**：ring buffer 不受释放影响，`serial_read` 照旧按 `since` 增量读；
+返回值会带 `release_note` 说明「已释放 + 已收 N 行仍保留 + 需要继续采集请重新 start」。
+重新 `serial_monitor_start()` 同端口同波特率会**复用同一实例**（`resumed=true`），不会丢已收日志。
+
+```text
+serial_monitor_start(port="COM9")          # 开始收日志
+run()                                      # 跑一段
+serial_read(since=上次 next_seq)            # 取增量
+exit_debug()                               # 调试结束 → 自动释放 COM9（日志保留）
+serial_read()                              # 仍能读到之前收到的行
+```
+
 ## 设计要点
 
 - **连接缓存**：常驻服务内共享一条 TCP 连接，`idle_timeout` 空闲自动断开、下次调用自动重连，兼顾实时性与资源释放；
-- **线程安全**：连接状态以锁保护，可被 MCP 并发调用；
+- **并发调用可安全并行**：所有 UVSOCK 命令经统一闸门串行化（进程内 RLock + 跨进程锁文件），并在 `get_status` / `keil_health` 里回报实例清点与竞争遥测，详见「并发调用与串行化」；
+- **串口用完就还**：串口监听在调试/烧录/关 Keil 等生命周期节点自动释放端口，另有空闲超时与进程退出兜底；释放只放端口、保留 ring buffer，日志不丢，可随时重新 start 复用，详见「串口「用完就还」」；
 - **内存读写分块**：超过单次上限（16 KB）自动分块读，规避 Keil 协议长度限制；
 - **地址解析**：工具层统一支持 `0x` / `0b` / `0o` 前缀或纯十进制；
 - **编译烧录选型**：采用 Keil 官方 `UV4.exe` 命令行（`-b`/`-r`/`-f`/`-o`），退出码 0=成功、1=成功有警告、2=有错误、≥3=不完整；编译输出经 `-o` 重定向到临时日志文件捕获；`build_and_flash` 在编译成功后自动接烧录，形成闭环；

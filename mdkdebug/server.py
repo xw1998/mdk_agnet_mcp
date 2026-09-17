@@ -31,6 +31,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from .client import UVClient, UVSOCKConnectError
 from .locator import Locator
 from . import builder, mapfile, winutil, uvoptx as _uvoptx, __version__
+from . import serialmon
 from . import aliases as _aliases
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
@@ -484,6 +485,261 @@ def _load_symbol_file(path: str):
         return False, f"加载 .axf 失败: {e}", 0
     _symbol_cfg = {"locator": loc, "axf": os.path.abspath(p), "source_type": "axf"}
     return True, f"已加载 .axf 符号（{n} 条）", n
+
+# ----------------------------------------------------------------------
+# 批次29：符号文件状态、调试会话快照、串行化遥测
+# ----------------------------------------------------------------------
+# 「运行镜像 vs 符号文件」不一致是极隐蔽的一类坑：flash_download/编译之后旧调试会话的
+# 符号就已经过期，此时表达式求值集体报 status 13「解析错误」，调用方容易去怀疑目标代码
+# 而不是「符号旧了」。故记录进入调试时的符号文件签名，之后任何读取都据此报陈旧。
+_debug_session = {"axf": None, "mtime": None, "mtime_text": None,
+                  "since": None, "reason": None}
+_firmware_events: list = []          # 最近几次编译/烧录（时间 + 原因）
+_tool_concurrency = {"in_flight": 0, "max_in_flight": 0, "tool_calls": 0, "last_tool": ""}
+_debugging_cache = {"ts": 0.0, "value": None}
+
+
+def _file_mtime_text(mtime) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(mtime)))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _mark_debug_session(reason: str = "") -> dict:
+    """记录「本次调试会话加载的是哪个 .axf（及其时间戳）」。"""
+    axf = (_symbol_cfg or {}).get("axf") or ""
+    mtime = None
+    try:
+        if axf:
+            mtime = os.stat(axf).st_mtime
+    except OSError:
+        mtime = None
+    _debug_session.update({"axf": axf or None, "mtime": mtime,
+                           "mtime_text": _file_mtime_text(mtime) if mtime else None,
+                           "since": time.strftime("%Y-%m-%d %H:%M:%S"),
+                           "reason": reason or ""})
+    _debugging_cache["ts"] = 0.0
+    _debugging_cache["value"] = True
+    return dict(_debug_session)
+
+
+def _clear_debug_session(reason: str = "") -> None:
+    """调试会话结束：清空快照（下次进入调试会重新记录）。"""
+    _debug_session.update({"axf": None, "mtime": None, "mtime_text": None,
+                           "since": None, "reason": reason or ""})
+    _debugging_cache["ts"] = 0.0
+    _debugging_cache["value"] = False
+
+
+def _note_firmware_event(reason: str) -> None:
+    """记录一次编译/烧录（供 get_status 说明「固件是什么时候换的」）。"""
+    _firmware_events.append({"reason": reason, "ts": time.time(),
+                             "time_text": _file_mtime_text(time.time())})
+    del _firmware_events[:-5]
+
+
+def _is_debugging(client=None, ttl: float = 1.0):
+    """带短缓存的「是否处于调试态」（错误路径补提示用，避免额外往返）。"""
+    now = time.monotonic()
+    if _debugging_cache["value"] is not None and now - _debugging_cache["ts"] < ttl:
+        return _debugging_cache["value"]
+    val = None
+    try:
+        st = (client or _get_client()).get_status()
+        val = bool(st.get("debugging"))
+    except Exception:  # noqa: BLE001
+        val = None
+    _debugging_cache.update({"ts": now, "value": val})
+    return val
+
+
+def _symbol_state(debugging=None) -> dict:
+    """符号文件（.axf/.map）路径 + 时间戳 + 是否已与当前调试会话不一致。"""
+    cfg = _symbol_cfg or {}
+    axf = cfg.get("axf") or ""
+    out = {"symbol_file": axf or None,
+           "symbol_source_type": cfg.get("source_type"),
+           "symbol_entries": None,
+           "symbol_stale": False}
+    try:
+        loc = cfg.get("locator")
+        out["symbol_entries"] = loc.total_entries() if loc is not None else None
+    except Exception:  # noqa: BLE001
+        pass
+    mtime = None
+    if axf:
+        try:
+            st = os.stat(axf)
+            mtime = st.st_mtime
+            out["symbol_mtime"] = round(mtime, 3)
+            out["symbol_mtime_text"] = _file_mtime_text(mtime)
+            out["symbol_size"] = st.st_size
+        except OSError as e:
+            out["symbol_file_error"] = str(e)
+    snap = _debug_session
+    if debugging:
+        if snap.get("mtime") is None:
+            # 首次观察到调试态：以此为基线（此前发生了什么已无从判断，如实说明）
+            _mark_debug_session("首次观察到调试态，自动记录基线")
+            out["debug_session_since"] = _debug_session.get("since")
+            out["debug_session_note"] = "本进程首次观察到调试态，已以此为符号基线"
+        elif snap.get("axf") and axf and \
+                os.path.normcase(os.path.abspath(snap["axf"])) != os.path.normcase(os.path.abspath(axf)):
+            out["symbol_stale"] = True
+            out["symbol_stale_note"] = (
+                "当前调试会话加载的是 %s 的符号，但符号文件已切到 %s：表达式/断点会解析到"
+                "错误符号（报解析错误或给出无意义地址）。请 exit_debug + enter_debug 重新加载，"
+                "或用 set_symbol_file 切回本次调试的固件符号。" % (snap.get("axf"), axf or "(无)"))
+        elif snap.get("mtime") is not None and mtime is not None and \
+                abs(float(snap["mtime"]) - mtime) > 1e-6:
+            out["symbol_stale"] = True
+            out["symbol_stale_note"] = (
+                "符号文件在进入本次调试之后被重新生成（%s → %s）：**当前调试会话用的仍是旧符号**，"
+                "表达式求值/断点解析会报 status 13 之类的解析错误——这不代表目标代码有问题。"
+                "请 exit_debug + enter_debug 重新加载符号，或直接用 flash_debug（关旧Keil→编烧→重开→进调试）"
+                "一步闭环。" % (snap.get("mtime_text") or "?", out.get("symbol_mtime_text") or "?"))
+    out["debug_session_since"] = snap.get("since")
+    out["debug_session_symbol"] = snap.get("axf")
+    if _firmware_events:
+        out["last_firmware_event"] = _firmware_events[-1]
+    return out
+
+
+def _symbol_stale_hint(client=None) -> str:
+    """符号与当前会话不一致时的提示文本（空串＝无异常）。用于错误路径附言。"""
+    try:
+        st = _symbol_state(debugging=_is_debugging(client))
+    except Exception:  # noqa: BLE001
+        return ""
+    return st.get("symbol_stale_note") or ""
+
+
+def _serialization_fields() -> dict:
+    """串行化方式 + 并发竞争遥测 + 其他 mdkdebug 实例（get_status / keil_health 共用）。"""
+    try:
+        out = dict(_get_client().serialization_snapshot())
+    except Exception as e:  # noqa: BLE001
+        out = {"mode": "serialized", "error": str(e)}
+    out["in_process"] = dict(_tool_concurrency)
+    stats = out.get("stats") or {}
+    if not out.get("warning") and int(stats.get("lock_timeouts") or 0) > 0:
+        out["warning"] = (
+            "跨进程互斥锁曾超时 %d 次（对手 PID=%s）：确有另一个进程在用同一 UVSOCK，"
+            "并发调用时命令会互相穿插。" % (int(stats["lock_timeouts"]), stats.get("foreign_pid")))
+    elif not out.get("warning") and int(stats.get("waits") or 0) > 0:
+        out["contention_note"] = (
+            "出现过 %d 次命令闸门等待（最长 %.1fms）：说明有并发调用进入了串行队列，"
+            "已被互斥挡住，未丢失命令。" % (int(stats["waits"]), float(stats.get("max_wait_ms") or 0)))
+    return out
+
+
+def _verify_write(client, addr: int, payload: bytes) -> dict:
+    """写后回读校验：写入是否真的落地。
+
+    批次29（真机反馈）：并发、目标运行中、或写只读/未擦写区域时，write_mem 可能返回成功
+    而值并未改变（被另一条命令覆盖，或被调试器静默忽略），调用方却以为写成功了——
+    「看门狗又复位了」这类误判往往由此而来。故写后立刻回读比对，不一致就显式报出来。
+    """
+    n = len(payload)
+    try:
+        rb = client.read_mem(addr, n)
+    except Exception as e:  # noqa: BLE001
+        return {"verified": False, "verify_note": "写入已发出，但回读校验失败：%s" % e}
+    if not rb.get("ok"):
+        return {"verified": False, "verify_note":
+                "写入已发出，但回读校验失败（%s）：无法确认是否落地（目标可能在运行中，"
+                "或该地址不可读）" % rb.get("status_text"),
+                "verify_status": rb.get("status")}
+    got = bytes.fromhex(rb.get("data_hex") or "")
+    if got[:n] == payload:
+        return {"verified": True, "readback_hex": got[:n].hex()}
+    return {"verified": False, "readback_hex": got[:n].hex(),
+            "verify_note": (
+                "回读与写入不一致——**写入没有真正落地**（已读回 %s）。常见原因："
+                "① 目标在运行中，内存写入被调试器忽略（先 stop 再写）；"
+                "② 地址是只读/需解锁的寄存器，或 Flash 未擦写；"
+                "③ 有另一个 mdkdebug 实例并发写同一处（get_status 看 serialization）。"
+                % got[:n].hex())}
+
+
+def _post_flash_debug_state(client, do_exit: bool = True) -> dict:
+    """编译/烧录之后处理旧调试会话——批次29 反馈②。
+
+    flash_download 之后旧调试会话的符号就是陈旧的（新固件已在板上、.axf 已重生成），
+    继续用它做表达式求值会集体报 status 13，工具却一声不响。这里要么自动退出调试
+    （默认，退出前必要时先 stop），要么保留会话但**显式提示**符号已过期。
+    """
+    out = {"checked": True, "exit_debug_after": bool(do_exit)}
+    try:
+        st = client.get_status()
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)
+        out["note"] = "无法读取调试状态（%s）：若原来在调试，请手动 exit_debug 后重进以刷新符号。" % e
+        return out
+    out["debugging_before"] = bool(st.get("debugging"))
+    out["target_running_before"] = bool(st.get("running"))
+    if not out["debugging_before"]:
+        out["note"] = "编译/烧录前未处于调试态，无旧符号残留"
+        _clear_debug_session("编译/烧录前未处于调试态")
+        return out
+    if out["target_running_before"]:
+        try:
+            out["stop"] = client.stop()
+            try:
+                client.wait_until_stopped(timeout=1.0)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as e:  # noqa: BLE001
+            out["stop"] = {"ok": False, "error": str(e)}
+    if not do_exit:
+        out["exited_debug"] = False
+        out["note"] = (
+            "已按 exit_debug_after=false 保留旧调试会话：**该会话的符号已过期**（.axf 刚被"
+            "重新编译/烧录），此后表达式与断点解析可能报 status 13 解析错误。"
+            "要继续调试请 exit_debug + enter_debug（或 flash_debug）重新加载符号。")
+        return out
+    try:
+        ex = client.exit_debug()
+    except Exception as e:  # noqa: BLE001
+        ex = {"ok": False, "error": str(e)}
+    out["exit_debug"] = ex
+    out["exited_debug"] = bool(ex.get("ok"))
+    if out["exited_debug"]:
+        out["note"] = ("旧调试会话的符号已过期，已自动退出调试（%s）；要重新调试请 "
+                       "enter_debug 或 flash_debug 以加载新符号。"
+                       % ("目标运行中，先 stop 再退出" if out["target_running_before"] else "直接退出"))
+        _clear_debug_session("编译/烧录后自动退出调试")
+    else:
+        out["note"] = ("旧调试会话的符号已过期，自动退出调试未成功（%s）；请手动 stop 后 "
+                       "exit_debug 再重进，否则表达式求值会报解析错误。"
+                       % (ex.get("error") or ex.get("status_text") or ex.get("status")))
+    return out
+
+
+
+
+def _release_serial(reason: str, out: dict | None = None,
+                    key: str = "serial_release") -> dict:
+    """串口「用完就还」：释放 COM 口占用，但**保留已收日志**。
+
+    释放只放掉端口（不释放的话 Keil 串口窗口/其他串口工具会打不开，WinError=5），
+    ring buffer 里的行照旧保留、serial_read 仍可增量读；需要接着采集时重新
+    serial_monitor_start() 即可——同端口同波特率会复用同一实例，不丢已收日志。
+    没有在监听时返回 {}，不打扰主流程。
+    """
+    try:
+        if not serialmon.has_monitor():
+            return {}
+        r = serialmon.release_monitor(reason)
+        if out is not None and isinstance(r, dict) and r.get("ok"):
+            out[key] = {k: r.get(k) for k in
+                        ("released", "port", "lines", "release_reason", "release_note")}
+            out[key] = {k: v for k, v in out[key].items() if v is not None}
+        return r
+    except Exception as e:  # noqa: BLE001
+        logger.debug("释放串口失败（不影响主流程）: %s", e)
+        return {"ok": False, "error": str(e)}
 
 
 def _pc_in_flash(pc) -> bool:
@@ -1213,7 +1469,17 @@ class AliasMCPServer(MCPServer):
         arguments, applied = self.prepare_arguments(name, arguments)
         if applied:
             logger.info("参数别名归一 %s: %s", name, "、".join(applied))
-        return await super().call_tool(name, arguments, context)
+        # 批次29：记录工具级并发度——出现 in_flight>1 说明框架确实并发派发了调用，
+        # 这既解释了「命令互相穿插」，也是 get_status.serialization 里的证据。
+        _tool_concurrency["in_flight"] += 1
+        _tool_concurrency["tool_calls"] += 1
+        _tool_concurrency["last_tool"] = str(name)
+        if _tool_concurrency["in_flight"] > _tool_concurrency["max_in_flight"]:
+            _tool_concurrency["max_in_flight"] = _tool_concurrency["in_flight"]
+        try:
+            return await super().call_tool(name, arguments, context)
+        finally:
+            _tool_concurrency["in_flight"] -= 1
 
     async def list_tools(self):
         # 描述里补「主名 ← 别名」，只补一次（重复调用不会叠加）
@@ -1260,7 +1526,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         logger.info("符号定位：axf=%s 条目=%d", axf, locator.total_entries())
     elif not axf:
         logger.warning("未定位到 .axf，位置定位工具(get_current_location/run_to_line)不可用")
-    _symbol_cfg = {"locator": locator, "axf": axf}
+    _symbol_cfg = {"locator": locator, "axf": axf,
+                   "source_type": ("axf" if locator is not None else None)}
     logger.info("Mdkdebug 已就绪：UVSOCK@%s:%d  idle_timeout=%ss", host, port, idle_timeout)
     logger.info("构建配置：UV4=%s  默认工程=%s", uv4, default_project)
 
@@ -1292,13 +1559,25 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="get_status",
         title="查询调试/目标状态",
         description=(
-            "查询当前调试状态：是否处于调试会话、目标是否在运行、"
-            "以及 UVSOCK 状态码。可用于判断可否安全读写内存。注意：UVSOCK 响应的 r_status 恒为 0，真实运行状态在 data 低字节（0=停止,1=执行中），本工具已正确解析。目标运行中可查状态，但此时不可安全读内存。"
+            "查询当前调试状态：是否处于调试会话、目标是否在运行、以及 UVSOCK 状态码，"
+            "并额外返回 **symbol_file / symbol_mtime / symbol_stale**（当前符号文件路径、"
+            "时间戳，以及「符号是否已与本次调试会话不一致」——编译或烧录之后旧会话的符号即过期，"
+            "继续求值会报 status 13 解析错误）与 **serialization**（串行化方式、并发竞争遥测、"
+            "是否还有别的 mdkdebug 进程在抢同一 UVSOCK）。可用于判断可否安全读写内存。注意：UVSOCK 响应的 r_status 恒为 0，真实运行状态在 data 低字节（0=停止,1=执行中），本工具已正确解析。目标运行中可查状态，但此时不可安全读内存。"
         ),
     )
     async def get_status() -> str:
         try:
-            return _js(_get_client().get_status())
+            client = _get_client()
+            out = dict(client.get_status())
+            # 批次29：符号文件路径/时间戳 + 陈旧判定；串行化与并发竞争视图
+            out.update(_symbol_state(debugging=out.get('debugging')))
+            out['serialization'] = _serialization_fields()
+            if out.get('symbol_stale'):
+                out['symbol_stale_warning'] = out.get('symbol_stale_note')
+            if (out.get('serialization') or {}).get('warning'):
+                out['concurrency_warning'] = out['serialization']['warning']
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -1352,10 +1631,23 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def calc_expression(expr: str) -> str:
+        client = None
         try:
-            return _js(_get_client().calc_expression(expr))
+            client = _get_client()
+            out = dict(client.calc_expression(expr))
+            # 批次29：编译/烧录后旧调试会话的符号是陈旧的，此时求值会集体报 status 13
+            # 「解析错误」——在原位点明原因，省掉一轮错误方向的排查。
+            if not out.get("ok"):
+                hint = _symbol_stale_hint(client)
+                if hint:
+                    out["symbol_stale_warning"] = hint
+            return _js(out)
         except Exception as e:  # noqa: BLE001
-            return _js({"ok": False, "expression": expr, "error": str(e)})
+            out = {"ok": False, "expression": expr, "error": str(e)}
+            hint = _symbol_stale_hint(client)
+            if hint:
+                out["symbol_stale_warning"] = hint
+            return _js(out)
 
     @server.tool(
         name="read_variable",
@@ -1376,15 +1668,23 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def read_variable(name: str, count: int = 0, read_memory: bool = True,
                             reloc_delta: str = "") -> str:
+        client = None
         try:
             client = _get_client()
             delta, dnote = _eff_reloc_delta(reloc_delta)
             if not delta:
-                return _js(client.read_variable(name, count=int(count or 0),
+                out = dict(client.read_variable(name, count=int(count or 0),
                                                 read_memory=bool(read_memory)))
-            return _js(_read_variable_reloc(client, name, count, read_memory, delta, dnote))
+            else:
+                out = dict(_read_variable_reloc(client, name, count, read_memory,
+                                                delta, dnote))
         except Exception as e:  # noqa: BLE001
-            return _js({"ok": False, "name": str(name), "error": str(e)})
+            out = {"ok": False, "name": str(name), "error": str(e)}
+        if not out.get("ok"):
+            hint = _symbol_stale_hint(client)
+            if hint:
+                out["symbol_stale_warning"] = hint
+        return _js(out)
 
     # ---------------- 内存读写 ----------------
     @server.tool(
@@ -1424,20 +1724,35 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="写入目标内存",
         description=(
             "向指定内存地址写入字节。data_hex 为十六进制字节串（偶数长度），"
-            "如 'de ad be ef' 或 'deadbeef'（自动去空格）。返回实际写入长度。注意：需目标暂停，运行中写入会失败/错位。写外设寄存器/关键内存有副作用，写入前确认地址与值正确（可先 read_mem 备份）。"
+            "如 'de ad be ef' 或 'deadbeef'（自动去空格）。返回实际写入长度，"
+            "并默认做**写后回读校验**（verify=true，返回 verified/readback_hex）："
+            "并发写入、目标运行中、或写只读/未擦写区域时，写入可能被静默忽略——"
+            "verified=false 即明确告诉你「写下去了但没生效」，不要据此推断目标行为"
+            "（如误判为看门狗复位）。addr 支持十六进制/十进制/符号名。注意：需目标暂停，运行中写入会失败/错位（回读校验会报 verified=false）。写外设寄存器/关键内存有副作用，写入前确认地址与值正确（可先 read_mem 备份）。"
         ),
     )
-    async def write_mem(addr: str | int, data_hex: str) -> str:
+    async def write_mem(addr: str | int, data_hex: str, verify: bool = True) -> str:
         addr = _addr_arg(addr)
         try:
             client = _get_client()
-            a, _note = _resolve_addr_arg(addr, client)
+            a, note = _resolve_addr_arg(addr, client)
             hex_str = "".join((data_hex or "").split())
             try:
                 payload = bytes.fromhex(hex_str)
             except ValueError as e:
                 return _js({"ok": False, "addr": str(addr), "error": f"data_hex 非法: {e}"})
-            return _js(client.write_mem(a, payload))
+            out = dict(client.write_mem(a, payload))
+            if note:
+                out["addr_note"] = note
+            # 批次29：写后回读校验——把「写入被静默吞掉」变成显式 verified=false
+            if verify and out.get("ok"):
+                out.update(_verify_write(client, a, payload))
+                if out.get("verified") is False:
+                    out["warning"] = out.get("verify_note")
+            elif not verify:
+                out["verified"] = None
+                out["verify_note"] = "已按 verify=false 跳过回读校验（无法确认写入是否落地）"
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "addr": str(addr), "error": str(e)})
 
@@ -1510,6 +1825,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                         "② 工程是否已编译出 .axf（缺失/过旧时 Keil 无法加载符号，可先 build_project 或 flash_debug）；"
                         "③ 是否已在调试态（重复 enter 会被拒）。若 Keil 弹出需人工确认的窗口，请在界面处理。"
                     )
+            if out.get("ok"):
+                # 批次29：记录本次调试会话加载的符号基线（.axf 路径 + 时间戳），
+                # 之后 .axf 被重编/重烧即可判定「会话符号已过期」。
+                out["symbol_session"] = _mark_debug_session("enter_debug")
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -1517,12 +1836,17 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="exit_debug",
         title="退出调试模式",
-        description="自动退出 Keil 调试模式（UV_DBG_EXIT）。注意：目标处于运行状态时退出会被拒（status=11），需先 stop 再 exit_debug。",
+        description=("自动退出 Keil 调试模式（UV_DBG_EXIT）。注意：目标处于运行状态时退出会被拒（status=11），需先 stop 再 exit_debug。"
+                     "退出成功后会顺带释放宿主机串口监听占用的 COM 口（否则调试完了串口还占着，Keil 串口窗口/其他工具打不开，WinError=5）；"
+                     "释放只放端口，已收日志仍保留、serial_read 继续可读，需要接着采集重新 serial_monitor_start() 即可。"),
     )
     async def exit_debug() -> str:
         try:
             r = _get_client().exit_debug()
             if r.get("ok"):
+                _clear_debug_session("exit_debug 成功")
+                # 调试结束＝串口用完就还（端口释放，已收日志保留）
+                _release_serial("退出调试（exit_debug 成功）", r)
                 return _js(r)
             out = dict(r)
             try:
@@ -3347,7 +3671,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "检查 Keil 调试通道的健康状态：UV4 进程是否存在、UVSOCK 端口是否监听、"
             "是否有模态对话框阻塞。返回 keil_alive / uv4_pids / port / port_listening / "
-            "uvsock_ready / code / diagnosis / suggestion；检测到 Keil 模态框时一并给出"
+            "uvsock_ready / code / diagnosis / suggestion；**mdkdebug_instances** 给出"
+            "串行化方式、并发竞争遥测（等待次数/最长等待/锁超时）与**其他仍在驱动同一 UVSOCK "
+            "的 mdkdebug 进程**（多个实例并存会互相穿插、静默吃掉写入，这是最隐蔽的一类故障）；"
+            "检测到 Keil 模态框时一并给出"
             "modal_dialogs[{title, message, button_texts}]——**正文与可点按钮都有**，"
             "知道框里写了什么、该点哪个（配套 dismiss_dialog 直接关框，不必再去界面手点）。"
             "用途：命令超时或「操作了没反应」时先调它，直接看清断在哪一环（keil_not_running / "
@@ -3361,6 +3688,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             # with_dialogs：一并取回模态框的**正文与按钮**——第 11 轮反馈指出"只给标题"
             # 帮助有限（知道有个 μVision 框，却不知道框里写什么、该点哪个）。
             h = winutil.keil_health(port, with_dialogs=True)
+            # 批次29：实例清点——多个 mdkdebug 进程抢同一 UVSOCK 是「写入被静默吞掉」
+            # 最可能的成因，这里直接报出来（含 PID、心跳年龄与并发遥测）。
+            try:
+                conc = _serialization_fields()
+                h["mdkdebug_instances"] = conc
+                if conc.get("warning"):
+                    h["concurrency_warning"] = conc["warning"]
+                    h["suggestion"] = ((h.get("suggestion") or "") + " " + conc["warning"])
+            except Exception as e:  # noqa: BLE001
+                h["mdkdebug_instances"] = {"error": str(e)}
             if h.get("modal_blocked_suspected"):
                 h["suggestion"] = ((h.get("suggestion") or "")
                                    + " 接下来用 dismiss_dialog 查看正文并按按钮关闭"
@@ -3428,6 +3765,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             out = {"action": "重启 Keil", "project": p}
             out["pids_before"] = winutil.uv4_pids()
             out["close"] = builder.close_uvision(force=force)
+            _release_serial("重启 Keil（restart_keil）", out)
             out["exit_wait"] = winutil.wait_uv4_exit(timeout=6.0 if force else 12.0)
             out["launch"] = builder.launch_uvision(_builder_cfg["uv4"], p)
             try:
@@ -3504,7 +3842,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                             project: str = "") -> str:
         try:
             p = _resolve_project(project) if project else ""
-            return _js(builder.close_uvision(force=force, keep=keep, project=p))
+            out = dict(builder.close_uvision(force=force, keep=keep, project=p))
+            _release_serial("关闭 Keil（close_uvision）", out)
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -3551,17 +3891,34 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "烧录 Keil 工程到目标 Flash（UV4 -f，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
             "可省略以用默认工程；target 为可选目标名。timeout_s 为可选超时秒数（0=默认 600s）。"
-            "注意：UV4 -f 烧录，需目标板与烧录器已连接且工程烧录算法配置正确；Keil 处于调试态时烧录可能失败，建议先退出调试。烧录会覆盖目标 Flash，属有副作用操作。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。"
+            "注意：UV4 -f 烧录，需目标板与烧录器已连接且工程烧录算法配置正确；Keil 处于调试态时烧录可能失败，建议先退出调试。烧录会覆盖目标 Flash，属有副作用操作。"
+            "exit_debug_after（默认 true）：烧录后若目标仍处于调试态，自动退出调试——因为旧会话的符号已过期"
+            "（新固件已在板上、.axf 已重生成），继续用它求值会报 status 13 解析错误；退出前若目标在运行会先 stop。"
+            "返回 debug_session 字段说明本次如何处理（debugging_before / stop / exited_debug / note）；设为 false 则保留会话但显式提示符号已过期。release_serial（默认 true）：烧录后释放串口监听占用的 COM 口（日志保留，仍可 serial_read），设为 false 可保留占用；没有串口监听时该参数无副作用。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。"
         ),
     )
     async def flash_download(project: str = "", target: str = "",
                              timeout_s: int = 0,
-                             ensure_debug_channel: bool = True) -> str:
+                             ensure_debug_channel: bool = True,
+                             exit_debug_after: bool = True,
+                             release_serial: bool = True) -> str:
         try:
             p = _resolve_project(project)
             t = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_FLASH_TIMEOUT
-            return _js(builder.flash_download(_builder_cfg["uv4"], p, target.strip() or None, t,
+            out = dict(builder.flash_download(_builder_cfg["uv4"], p, target.strip() or None, t,
                                               ensure_debug_channel=ensure_debug_channel))
+            _note_firmware_event("flash_download")
+            # 批次29：烧录后旧调试会话的符号已过期——处理它（默认自动退出），
+            # 避免调用方拿着旧符号求值却得到一堆 status 13 解析错误。
+            try:
+                out["debug_session"] = _post_flash_debug_state(_get_client(),
+                                                               do_exit=bool(exit_debug_after))
+            except Exception as e:  # noqa: BLE001
+                out["debug_session"] = {"error": str(e)}
+            # 烧录＝上次调试这一段结束，串口用完就还（日志保留）
+            if release_serial:
+                _release_serial("烧录新固件（flash_download）", out)
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -3571,19 +3928,32 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "编译并烧录闭环（后台隐藏窗口，不闪现界面）：先编译，成功后才烧录（UV4 -b 成功后 -f）。"
             "project 为 .uvprojx 路径，可省略以用默认工程；target 为可选目标名。"
             "timeout_s 为可选超时秒数（0=用默认：编译 1800s、烧录 600s）；大型工程或首次全量编译建议显式调大。"
-            "注意：先编译成功才烧录（编译失败不烧录）；编译/烧录均新起隐藏 UV4 进程、输出经 -o 捕获。Keil 处于调试态时建议先退出再执行。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。"
+            "注意：先编译成功才烧录（编译失败不烧录）；编译/烧录均新起隐藏 UV4 进程、输出经 -o 捕获。Keil 处于调试态时建议先退出再执行。"
+            "exit_debug_after（默认 true）：烧录后若仍处于调试态则自动退出调试（旧会话符号已过期，否则求值报 status 13），"
+            "返回值含 debug_session 说明处理过程；设为 false 则保留会话但显式提示符号已过期。release_serial（默认 true）：烧录后释放串口监听占用的 COM 口（日志保留）。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。"
         ),
     )
     async def build_and_flash(project: str = "", target: str = "",
                               timeout_s: int = 0,
-                              ensure_debug_channel: bool = True) -> str:
+                              ensure_debug_channel: bool = True,
+                              exit_debug_after: bool = True,
+                              release_serial: bool = True) -> str:
         try:
             p = _resolve_project(project)
             bt = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_BUILD_TIMEOUT
             ft = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_FLASH_TIMEOUT
-            return _js(builder.build_and_flash(_builder_cfg["uv4"], p,
+            out = dict(builder.build_and_flash(_builder_cfg["uv4"], p,
                                                target.strip() or None, bt, ft,
                                                ensure_debug_channel=ensure_debug_channel))
+            _note_firmware_event("build_and_flash")
+            try:
+                out["debug_session"] = _post_flash_debug_state(_get_client(),
+                                                               do_exit=bool(exit_debug_after))
+            except Exception as e:  # noqa: BLE001
+                out["debug_session"] = {"error": str(e)}
+            if release_serial:
+                _release_serial("烧录新固件（build_and_flash）", out)
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -3608,6 +3978,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定")
             # 1) 关闭所有 Keil 实例，确保后续用干净实例加载新固件
             close = builder.close_uvision(force=False)
+            # 关掉所有 Keil 实例后，串口也没理由继续占着（新实例/串口窗口可能要开这个口）
+            serial_release = _release_serial("flash_debug 关闭 Keil 实例")
             # 2) 让新固件上板：
             #    UpdateFlashBeforeDebugging=1 时 Keil 进入调试会自动下载（用户实测 + .uvprojx 可查），
             #    故这里只编译，省掉一次显式烧录（全片擦写 + 一次 UV4 -f 往返）；
@@ -3626,6 +3998,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     "stage": "编译" if auto_dl else "编译烧录",
                     "flash_plan": flash_plan,
                     "close_uvision": close, "build_flash": bf,
+                    "serial_release": serial_release,
                     "status_text": ("编译未通过，未重开工程进入调试" if auto_dl
                                     else "编译/烧录未通过，未重开工程进入调试"),
                 })
@@ -3647,11 +4020,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     break
             if enter is None:
                 enter = {"ok": False, "error": last_error or "进入调试失败"}
+            if enter.get("ok"):
+                _note_firmware_event("flash_debug")
+                _mark_debug_session("flash_debug")   # 新会话＝新固件符号，重新记基线
             return _js({
                 "ok": enter.get("ok", False),
                 "action": "flash_debug", "stage": "调试",
                 "close_uvision": close,
                 "flash_plan": flash_plan,
+                "serial_release": serial_release,
                 "flash_note": ("工程已勾选 Update Target before Debugging，进调试时由 Keil 自动下载"
                                "最新程序，本次未显式烧录（省掉一次全片擦写）"
                                if auto_dl else
@@ -4437,6 +4814,129 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
+    # ---------------- 串口日志监听（宿主机侧，ring buffer） ----------------
+    # 用户反馈（第 13 轮）：COM9 的日志此前是用 MCP 之外的 Python 脚本抓的，
+    # 调试链路上多了一个手工步骤。这里做成「后台线程收 + ring buffer + 增量 read」，
+    # 与 RT-Thread 的 rt_kprintf/ULOG 配合时能直接在同一次会话里看日志。
+    @server.tool(
+        name="serial_monitor_start",
+        title="启动串口日志监听（宿主机）",
+        description=(
+            "在**宿主机**打开串口并后台收日志，按行切分后进 ring buffer，供 serial_read 增量读取——"
+            "不必再在 MCP 之外另开 Python 脚本抓口。典型场景：RT-Thread 的 rt_kprintf / ULOG 输出、"
+            "验证 App 是否真的跑起来、看复位原因。"
+            "port 传 \"COM9\" 或 \"9\"（留空则自动取本机第一个可用串口，并在 available_ports 里列出全部）；"
+            "baud 默认 115200；databits/parity/stopbits 默认 8/none/1。"
+            "capacity 为保留行数（默认 2000，超出丢最旧行并计入 dropped）。"
+            "同一进程只监听一个串口：重复 start 且端口或波特率不同时，restart=true（默认）切换旧监听，"
+            "restart=false 则返回 conflict 且不抢占。"
+            "返回 {ok, port, state, capacity, available_ports}；端口不存在或被别的程序占用时 ok=false、"
+            "并给出 last_error 与可用端口（不会静默失败）；监听线程会按固定间隔自动重连（reopen_count 计数）。"
+            "**用完就还**：idle_release_s（默认 900 秒，0=不自动）为无人访问多久后自动释放端口——"
+            "释放只放掉 COM 口占用，已收日志仍保留、serial_read 继续可读，"
+            "需要接着采集重新调本工具即可（同端口同波特率复用同一实例，不丢已收日志）。"
+            "另外 exit_debug / flash_download / build_and_flash / flash_debug / close_uvision / restart_keil "
+            "都会顺带释放端口，进程退出也会自动释放——正常调用下不必担心调试完了串口还被占着。"
+            "注意：监听期间不要在别处（Keil 串口窗口、其他工具）再打开同一个口，会互相抢占（WinError=5）。"
+        ),
+    )
+    async def serial_monitor_start(port: str = "", baud: int = 115200,
+                                   databits: int = 8, parity: str = "none",
+                                   stopbits: int = 1, capacity: int = 2000,
+                                   encoding: str = "utf-8", label: str = "",
+                                   restart: bool = True,
+                                   idle_release_s: float = 900.0) -> str:
+        try:
+            ports = serialmon.list_ports()
+            p = str(port or "").strip()
+            if not p:
+                if not ports:
+                    return _js({"ok": False, "error": "本机未发现任何串口",
+                                "available_ports": []})
+                p = ports[0]
+            st = dict(serialmon.start_monitor(
+                p, baud=baud, databits=databits, parity=parity, stopbits=stopbits,
+                capacity=capacity, encoding=encoding, label=label, restart=restart,
+                idle_release_s=idle_release_s))
+            st["available_ports"] = ports
+            if st.get("state") == "stopped":
+                st["ok"] = "conflict" not in st
+            else:
+                # 打开动作在后台线程里做，失败要过一小会儿才反映到 state 上。
+                # 这里多等一眼，把「启动就失败」当场告诉调用方，而不是让它去 read 一个空 buffer。
+                await asyncio.sleep(0.4)
+                fresh = serialmon.status()
+                st["state"] = fresh.get("state")
+                st["last_error"] = fresh.get("last_error")
+                st["reopen_count"] = fresh.get("reopen_count")
+                if fresh.get("state") == "error":
+                    st["ok"] = False
+                    st["hint"] = ("串口打开失败，监听线程正在自动重试；"
+                                  "请确认端口号/波特率正确，且该口没被别的程序占用")
+                else:
+                    st["ok"] = True
+            return _js(st)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e),
+                        "available_ports": serialmon.list_ports()})
+
+    @server.tool(
+        name="serial_read",
+        title="读取串口日志（支持增量）",
+        description=(
+            "读取 serial_monitor_start 收上来的日志行。"
+            "**增量读法**：把上一次返回里的 next_seq 记下来，下次当 since 传入，就只拿新行、不重复——"
+            "适合「跑一段 → 读新日志 → 再跑一段」的迭代调试。"
+            "max_items 取最近 N 行（默认 200，被截断时 truncated=true）；clear=true 表示读后清空 buffer。"
+            "返回 {ok, items:[{seq,text,t}], lines:[文本...], count, next_seq, first_seq, dropped, "
+            "truncated, partial, bytes_total, last_error}。"
+            "partial 是「还没等到换行的半行」（例如 rt_kprintf 没带 \\n），末尾日志不完整时可看它。"
+            "若当前没有监听：ok=false，提示先 serial_monitor_start，并附 available_ports。"
+        ),
+    )
+    async def serial_read(max_items: int = 200, clear: bool = False,
+                          since: int | None = None) -> str:
+        try:
+            return _js(serialmon.read_lines(max_items=max_items, clear=clear, since=since))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e),
+                        "available_ports": serialmon.list_ports()})
+
+    @server.tool(
+        name="serial_monitor_status",
+        title="串口监听状态",
+        description=(
+            "查询宿主机串口监听的当前状态：port/baud/state(running/error/stopped)/running/"
+            "bytes_total/lines/capacity/dropped/next_seq/reopen_count/last_error/partial_len，"
+            "并附本机全部可用串口 available_ports（用来确认 COM 号写没写错）。"
+            "**没在监听时不会报错**，而是 ok=true、running=false + available_ports，适合先探一下再决定要不要 start。"
+            "last_error 非空说明曾经打开失败或被拔线（线程仍在自动重连）。"
+        ),
+    )
+    async def serial_monitor_status() -> str:
+        try:
+            return _js(serialmon.status())
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e),
+                        "available_ports": serialmon.list_ports()})
+
+    @server.tool(
+        name="serial_monitor_stop",
+        title="停止串口监听",
+        description=(
+            "停止宿主机串口监听并释放串口（返回停之前的最后一帧状态，含未满一行的 partial）。"
+            "**默认保留已收日志**（clear_buffer=true 才清空）：释放只放掉 COM 口，ring buffer 里的行仍在，"
+            "serial_read 继续可读，需要接着采集重新 serial_monitor_start() 会复用同一实例、不丢日志。"
+            "正常情况下不必手工调它——exit_debug / 烧录 / 关 Keil 等都会自动释放，另有空闲超时与进程退出兜底；"
+            "本工具用于「明确要现在就把口让出去」的场合。没在监听时也返回 ok=true，不会报错。"
+        ),
+    )
+    async def serial_monitor_stop(clear_buffer: bool = False) -> str:
+        try:
+            return _js(serialmon.stop_monitor(clear_buffer=clear_buffer))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
     @server.tool(
         name="mdk_guide",
         title="环境自检与调试工作流引导",
@@ -4486,6 +4986,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 "6. 性能：profile_sampling 找热点函数，profile_function 测单函数耗时",
                 "7. 行为不同：project_targets/set_debug_target/read_project_config 对比 target 宏/优化",
                 "8. 改代码上板：build_and_flash / flash_debug；收尾 exit_debug 退出调试",
+                "9. 看串口日志：serial_monitor_start(port=\"COM9\") → run → serial_read(since=上次next_seq) → serial_monitor_stop"
+                "（串口用完就还：exit_debug/烧录/关 Keil 都会自动释放端口，释放后已收日志仍可 serial_read）",
             ]
             scene_tools = {
                 "看程序停在哪": "get_current_location / snapshot",
@@ -4495,6 +4997,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 "内存被改坏": "set_watchpoint / search_mem / snapshot_diff",
                 "不同target行为不同": "project_targets / set_debug_target / read_project_config",
                 "串口不打印/时钟问题": "list_peripherals / read_peripheral / itm_trace",
+                "抓宿主机串口日志(rt_kprintf/ULOG)": "serial_monitor_start / serial_read / serial_monitor_stop",
+                "串口被占用/打不开(WinError=5)": "serial_monitor_stop（释放端口，日志保留）→ 或等空闲自动释放（idle_release_s）",
                 "改代码重新上板": "build_and_flash / flash_debug",
             }
             return _js({"ok": True, "environment": env,
