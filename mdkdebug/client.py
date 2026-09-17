@@ -422,6 +422,134 @@ class UVClient:
                 "n_bytes": n_bytes, "data_hex": result.hex(),
                 "ascii": self._to_ascii(result)}
 
+    # ---- 带脏读防护的内存读取（批次30 反馈①） ----
+    @staticmethod
+    def _degenerate_kind(data: bytes) -> str:
+        """识别「整帧退化」：整片全 0x00 或全 0xFF。真实内存很少整片同值。"""
+        if not data:
+            return ""
+        if data[0] == 0x00 and all(b == 0x00 for b in data):
+            return "all_zero"
+        if data[0] == 0xFF and all(b == 0xFF for b in data):
+            return "all_ff"
+        return ""
+
+    def read_mem_verified(self, addr: int, n_bytes: int, verify: str = "auto") -> dict:
+        """带「脏读防护」的内存读取。
+
+        来自真机反馈：stop 之后紧跟的第一次读，可能整帧返回全 0（实测 0x08022000
+        连读两次都是 16 个 00，重读即正确）。get_current_location 已为 PC 做过
+        「读数收敛判定」，内存读取同样需要——否则极易「读到 0 就下结论」，把排查带偏。
+
+        策略：
+        - verify="auto"（默认）只在**可疑**时才复读，不做无条件双倍开销：
+          首帧整帧退化（全 0x00 / 全 0xFF），或距最近一次 stop 不足 1 秒
+          （停止是异步生效的，这期间的读最容易拿到脏值）；
+        - 复读最多 3 次，**连续两次一致**才采纳（与 _annotate_stop 同一套判定语言）；
+        - verify=true 总是复读（对某次结果不放心时强制确认）；
+          verify=false 完全关闭（大块搬运/读只读区时省时间）。
+
+        在原 read_mem 结果上补：read_confidence(high/low)、reread_count、
+        reread_consistent、degenerate、since_stop_s，以及 warning /
+        first_read_hex / degenerate_note（视情况）。
+        """
+        mode = str(verify if verify is not None else "auto").strip().lower()
+        if mode in ("0", "no", "off", "never"):
+            mode = "false"
+        elif mode in ("1", "yes", "on", "always", "force"):
+            mode = "true"
+        elif mode not in ("auto", "true", "false"):
+            mode = "auto"
+        first = self.read_mem(addr, n_bytes)
+        out = dict(first)
+        out["verify"] = mode
+        out["read_confidence"] = "high" if first.get("ok") else "low"
+        out["reread_count"] = 0
+        out["reread_consistent"] = None
+        if not first.get("ok"):
+            return out
+        data = bytes.fromhex(first.get("data_hex") or "")
+        degenerate = self._degenerate_kind(data)
+        since_stop = None
+        if self._last_stop_obs_ts:
+            since_stop = round(time.time() - self._last_stop_obs_ts, 3)
+        out["since_stop_s"] = since_stop
+        flash_like = 0x08000000 <= addr < 0x20000000
+        # Flash 区段读出全 0xFF 是「已擦除」的**预期内容**，不是脏读——
+        # 真机实测读已擦除的 0x08022000 得到全 FF，若也判 low confidence 会造成误报。
+        expected_ff = bool(degenerate == "all_ff" and flash_like)
+        if degenerate:
+            out["degenerate"] = degenerate
+            if degenerate == "all_zero" and flash_like:
+                out["degenerate_note"] = (
+                    "整帧读出全 0x00，而该地址落在 Flash 区段：已擦除的 Flash 应读出 0xFF，"
+                    "全 0 更像是读取失败（目标未真正停止 / 响应错位）造成的脏读，不可当真实内容。")
+            elif expected_ff:
+                out["content_note"] = (
+                    "该地址落在 Flash 区段，已擦除的 Flash 读出全 0xFF 是**预期内容**"
+                    "（不是脏读）；若此处本该有代码/常量，说明对应区域尚未烧写或被擦除。")
+            else:
+                out["degenerate_note"] = (
+                    "整帧读出全 %s：整片同值通常不是真实内容，而是读取失败或该区域未初始化。"
+                    % ("0x00" if degenerate == "all_zero" else "0xFF"))
+        need = (mode == "true" or bool(degenerate)
+                or (since_stop is not None and since_stop < 1.0))
+        if mode == "false" or not need:
+            if degenerate:
+                out["read_confidence"] = "low"
+                out["warning"] = (
+                    "首帧整帧退化（%s），且本次未启用复读（verify=false）：该结果不可信，"
+                    "建议改用 verify=\"auto\" 重读。" % degenerate)
+            return out
+        prev = data
+        last = out
+        for i in range(1, 3):
+            time.sleep(0.05)
+            nxt = self.read_mem(addr, n_bytes)
+            out["reread_count"] = i
+            if not nxt.get("ok"):
+                out["reread_error"] = nxt.get("status_text") or "复读失败"
+                break
+            cur = bytes.fromhex(nxt.get("data_hex") or "")
+            if cur == prev:
+                out["reread_consistent"] = True
+                out["data_hex"] = nxt.get("data_hex", "")
+                out["ascii"] = nxt.get("ascii", "")
+                if cur != data:
+                    out.pop("degenerate", None)
+                    out.pop("degenerate_note", None)
+                    out["first_read_hex"] = data.hex()
+                    out["read_confidence"] = "high"
+                    out["warning"] = (
+                        "首帧读数是脏值（真机实测 stop 后的首次读会整帧返 0），已自动复读并采用"
+                        "连续 %d 次一致的值；首帧 data_hex=%s 不可信、已被替换。"
+                        % (i + 1, data.hex()))
+                elif degenerate:
+                    if expected_ff:
+                        # 已擦除 Flash 的稳定全 FF 是正常内容，不降置信度
+                        out["read_confidence"] = "high"
+                    else:
+                        out["read_confidence"] = "low"
+                        out["warning"] = (
+                            "连续 %d 次读取都是整帧 %s：这不是单次脏读，可能是该区域确实如此，"
+                            "也可能是读取通路异常；请结合 query_memory_map 或其他地址交叉确认。"
+                            % (i + 1, degenerate))
+                else:
+                    out["read_confidence"] = "high"
+                return out
+            prev = cur
+            last = nxt
+        if out.get("reread_consistent") is None:
+            out["reread_consistent"] = False
+            out["read_confidence"] = "low"
+            if last is not out:
+                out["data_hex"] = last.get("data_hex", out.get("data_hex"))
+                out["ascii"] = last.get("ascii", out.get("ascii"))
+            out["warning"] = (
+                "复读未能确认（%s）：当前读数不可信，请先 get_status 确认目标已停止"
+                "（必要时 wait_until_stopped）后重读。" % (out.get("reread_error") or "读数一直在变"))
+        return out
+
     def write_mem(self, addr: int, data: bytes) -> dict:
         """向指定地址写入字节（自动分块，支持大块/批量填充）。返回实际写入长度。"""
         if not data:

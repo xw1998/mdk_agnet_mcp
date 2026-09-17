@@ -10,13 +10,17 @@ ITM/SWO）。此前只能"用外部 Python 脚本抓一份"，AI 自己看不到
 
 设计要点
 --------
-- **零新依赖**：Windows 串口用 ctypes（CreateFile/SetCommState/ReadFile），不引入 pyserial，
+- **零新依赖**：Windows 串口用 ctypes（CreateFile/SetCommState/ReadFile/WriteFile），不引入 pyserial，
   部署端不需要重装依赖。
 - **ring buffer 而不是文件**：容量有限（默认 2000 行）、按 seq 增量读，
   支持 ``since``/``clear``，长时间监听不会把内存吃爆，也不会让 AI 反复重读全部日志。
 - **断线自愈**：USB 串口拔插/被占用会报错，监听线程记录 ``last_error`` 并按退避重连，
   不静默死掉（``status`` 里能看到 ``reopen_count`` 与错误原因）。
 - **默认按行切分**：日志是行导向的，半行留在 ``partial`` 里，状态查询可见。
+- **可收也可发**：端口打开时优先按「可读可写」获取（``GENERIC_READ|GENERIC_WRITE``），
+  因此能在同一条调试链路上「一边收日志、一边下发 shell 命令 / 镜像片段」；
+  若驱动或占用只允许只读，则自动退回只读并置 ``can_write=False``，不影响监听（``serial_write``
+  会明确告诉你该口当前不可写）。
 - **用完就还**：调试/烧录一结束就主动释放 COM 口（否则 Keil 串口窗口等会被 WinError=5 挡住）。
   释放只放掉**端口**，ring buffer 里的日志照旧保留、``serial_read`` 继续可读；
   需要接着采集时重新 ``serial_monitor_start()``，同端口同波特率会**复用同一实例**，不丢已收日志。
@@ -204,6 +208,8 @@ class HostSerial:
         self.stopbits = sb
         self.handle = None
         self._k32 = None
+        self.can_write = False          # 打开时是否拿到了写权限（批次30 反馈⑤）
+        self._wlock = threading.Lock()  # 串行化写入，避免与监听线程互相穿插
 
     # ---- 打开 / 关闭 ----
     def open(self) -> None:
@@ -213,9 +219,17 @@ class HostSerial:
         k32 = self._k32
         k32.CreateFileW.restype = ctypes.c_void_p
         GENERIC_READ = 0x80000000
+        GENERIC_WRITE = 0x40000000
         OPEN_EXISTING = 3
-        h = k32.CreateFileW(ctypes.c_wchar_p(self.path), GENERIC_READ, 0, None,
-                            OPEN_EXISTING, 0, None)
+        # 优先「可读可写」：调 shell / 下发镜像需要能写（批次30 反馈⑤）。拿不到写权限
+        # 时退回只读，宁可能收日志但发不出去，也不要整个监听打不开。
+        h = k32.CreateFileW(ctypes.c_wchar_p(self.path), GENERIC_READ | GENERIC_WRITE,
+                            0, None, OPEN_EXISTING, 0, None)
+        self.can_write = True
+        if not h or h == ctypes.c_void_p(-1).value:
+            h = k32.CreateFileW(ctypes.c_wchar_p(self.path), GENERIC_READ, 0, None,
+                                OPEN_EXISTING, 0, None)
+            self.can_write = False
         if not h or h == ctypes.c_void_p(-1).value:
             err = ctypes.get_last_error()
             raise OSError(self._explain_open_error(err))
@@ -269,6 +283,37 @@ class HostSerial:
             raise OSError("ReadFile 失败（err=%d）：串口可能已被拔出/关闭"
                           % ctypes.get_last_error())
         return buf.raw[:int(got.value)]
+
+    _WRITE_CHUNK = 4096
+
+    def write(self, data: bytes) -> int:
+        """向串口写入字节（分块 + 串行化）。返回实际写入的字节数。"""
+        if self.handle is None:
+            raise OSError("串口未打开")
+        if not data:
+            return 0
+        if not self.can_write:
+            raise OSError("串口以只读方式打开（该口打开时未拿到写权限），无法下发数据；"
+                          "请确认端口未被独占，或改用支持双向的口/驱动")
+        k32 = self._k32
+        buf = bytes(data)
+        total = 0
+        with self._wlock:
+            while total < len(buf):
+                blk = buf[total:total + self._WRITE_CHUNK]
+                wrote = ctypes.c_uint32(0)
+                ok = k32.WriteFile(ctypes.c_void_p(self.handle), blk, len(blk),
+                                   ctypes.byref(wrote), None)
+                if not ok:
+                    raise OSError("WriteFile 失败（err=%d）：串口可能已被拔出/关闭"
+                                  % ctypes.get_last_error())
+                if int(wrote.value) <= 0:
+                    raise OSError("WriteFile 未写入任何字节（已写 %d/%d）：端口可能已断开"
+                                  % (total, len(buf)))
+                total += int(wrote.value)
+                if total < len(buf):
+                    time.sleep(0.002)
+        return total
 
     def close(self) -> None:
         h, self.handle = self.handle, None
@@ -326,6 +371,8 @@ class SerialMonitor:
         self._thread = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._dev = None                 # 当前打开的设备（由 _loop 发布给写入方）
+        self._dev_lock = threading.Lock()
 
     # ---- 数据入口（线程与测试共用） ----
     def feed(self, data: bytes) -> int:
@@ -373,6 +420,25 @@ class SerialMonitor:
             self._thread = threading.Thread(target=self._loop, name="mdkdebug-serial",
                                             daemon=True)
             self._thread.start()
+        # 真机反馈：start() 返回的瞬间端口还没真正打开（_dev 仍是 None，约 0.2s 后才就绪），
+        # 此时返回的 can_write 会误报 false，让人以为「这个口只能收不能发」。
+        # 这里等端口就绪（或明确报错）再返回，并带上 port_ready 说明。
+        return self.wait_ready()
+
+    def wait_ready(self, timeout: float = 1.5) -> dict:
+        """等端口真正打开（_dev 就绪）或明确报错，返回最新状态；超时不算失败、如实反映。
+
+        真机实测：SerialMonitor.start() 立即返回时 _dev 尚未建立、can_write=false，
+        0.2s 后才变为 true。调用方若据此判断「发不出去」会被误导。
+        """
+        deadline = time.time() + max(0.0, float(timeout))
+        while time.time() < deadline:
+            with self._dev_lock:
+                if self._dev is not None:
+                    break
+            if self.state == "error" and self.last_error:
+                break
+            time.sleep(0.02)
         return self.status()
 
     def _open(self):
@@ -381,12 +447,43 @@ class SerialMonitor:
         dev.open()
         return dev
 
+    def _set_dev(self, dev) -> None:
+        with self._dev_lock:
+            self._dev = dev
+
+    @property
+    def port_ready(self) -> bool:
+        """端口是否已真正打开（此刻可读；是否可写另看 can_write）。"""
+        with self._dev_lock:
+            return self._dev is not None
+
+    @property
+    def can_write(self) -> bool:
+        """当前是否可下发数据（端口打开且拿到了写权限）。"""
+        with self._dev_lock:
+            return bool(self._dev is not None and self._dev.can_write)
+
+    def write(self, data: bytes) -> dict:
+        """向串口下发数据（收与发共用同一个已打开的句柄，互不干扰）。"""
+        with self._dev_lock:
+            dev = self._dev
+        if dev is None:
+            return {"ok": False, "error": "串口当前未打开（监听未运行或正在重连）",
+                    "state": self.state, "last_error": self.last_error,
+                    "hint": "请先 serial_monitor_start() 打开端口，或用 serial_monitor_status 查看 last_error"}
+        try:
+            n = dev.write(data)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e), "port": self.port}
+        return {"ok": True, "written": n, "port": self.port}
+
     def _loop(self) -> None:
         dev = None
         while not self._stop.is_set():
             if dev is None:
                 try:
                     dev = self._open()
+                    self._set_dev(dev)
                     if self.last_error:
                         self.reopen_count += 1
                     self.last_error = ""
@@ -408,7 +505,9 @@ class SerialMonitor:
                 except Exception:  # noqa: BLE001
                     pass
                 dev = None
+                self._set_dev(None)
                 self._stop.wait(max(0.2, self.reopen_delay))
+        self._set_dev(None)
         if dev is not None:
             try:
                 dev.close()
@@ -491,6 +590,8 @@ class SerialMonitor:
                                             time.localtime(self.started_at))
                               if self.started_at else None),
                "port_held": self.state != "stopped",
+               "port_ready": self.port_ready,
+               "can_write": self.can_write,
                "idle_release_s": self.idle_release_s,
                "idle_s": round(time.time() - self.last_access, 1),
                "auto_released": self.auto_released,
@@ -514,6 +615,8 @@ class SerialMonitor:
             r["lines"] = [it.get("text") for it in r["items"]]
         r.update({"port": self.port, "running": self.state != "stopped",
                   "port_held": self.state != "stopped",
+                  "port_ready": self.port_ready,
+                  "can_write": self.can_write,
                   "last_error": self.last_error, "bytes_total": self.bytes_total,
                   "partial": self.partial[-200:],
                   "auto_released": self.auto_released,
@@ -545,6 +648,9 @@ def start_monitor(port: str, baud: int = DEFAULT_BAUD, databits: int = 8,
 
     - 同端口同波特率且**已被释放**时复用同一实例（保留已收日志），只重新占口；
     - ``idle_release_s>0``：超过该秒数无人访问则自动释放端口（日志仍保留），0=不自动。
+
+    返回体带 ``port_ready``（端口是否已真正打开）与 ``can_write``（是否拿到写权限）：
+    本函数会等端口就绪再返回，所以这两个字段可直接采信。
     """
     global _monitor
     with _monitor_lock:
@@ -623,6 +729,44 @@ def read_lines(max_items: int = 200, clear: bool = False,
     out = m.read(max_items=max_items, clear=clear, since=since)
     out["ok"] = True
     return out
+
+def write_bytes(data: bytes, wait_ms: int = 300, max_items: int = 200,
+                read_after: bool = True) -> dict:
+    """向监听中的串口下发字节；默认「写后等一小会儿，把新增日志行一起带回来」。
+
+    服务「一边收一边发」的用法（下发 shell 命令 / 镜像片段后立刻看回显），
+    省掉调用方再补一次 serial_read。
+    """
+    m = _monitor
+    if m is None:
+        return {"ok": False, "error": "当前没有串口监听在运行",
+                "hint": "serial_write 依赖监听持有端口（收与发用同一个句柄）："
+                        "先调 serial_monitor_start(port=\"COM9\", baud=115200) 再下发",
+                "available_ports": list_ports()}
+    m.touch()
+    before = m.rb.stats()["next_seq"]
+    res = m.write(data)
+    res["bytes_sent"] = len(data)
+    res["next_seq_before"] = before
+    if not res.get("ok"):
+        res.setdefault("port", m.port)
+        return res
+    if read_after:
+        if int(wait_ms) > 0:
+            time.sleep(min(max(int(wait_ms), 0), 10000) / 1000.0)
+        r = m.read(max_items=max_items, since=before)
+        ra = {"ok": True, "count": r.get("count"), "items": r.get("items"),
+              "lines": r.get("lines"), "first_seq": r.get("first_seq"),
+              "next_seq": r.get("next_seq"), "truncated": r.get("truncated"),
+              "dropped": r.get("dropped"), "partial": r.get("partial")}
+        if not r.get("count"):
+            ra["note"] = ("写完等了 %dms 没有新行：可能目标没有回显（不是命令口/未开启回显），"
+                          "也可能响应更慢；可加大 wait_ms，或用 serial_read(since=%d) 稍后再取。"
+                          % (int(wait_ms), before))
+        res["read_after"] = ra
+    else:
+        res["next_seq_hint"] = "稍后用 serial_read(since=%d) 取本次下发之后的新行" % before
+    return res
 
 def status() -> dict:
     m = _monitor

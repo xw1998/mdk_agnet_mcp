@@ -539,6 +539,36 @@ def _note_firmware_event(reason: str) -> None:
     del _firmware_events[:-5]
 
 
+# CFSR/HFSR 是**粘滞位**（sticky）：写 1 清除或复位才归零，不会因为异常处理完自动清。
+# 因此「读到 UsageFault」并不等于「此刻正在 UsageFault」——很可能只是上一次异常留下的残位。
+# 这里跟踪「本进程内首次/最近观察到置位」与「最近一次显式清除」，让 fault_report 能给出
+# 时效与来源判断（批次30 反馈③：AI 曾把历史残留位当成当前故障，差点查错方向）。
+_FAULT_TRACK = {"cfsr_first_seen": None, "cfsr_last_seen": None,
+                "cfsr_last_value": 0, "hfsr_last_value": 0,
+                "last_cleared": None}
+
+_FAULT_MASK = {3: 0xFFFFFFFF,        # HardFault：可能是子级 fault 升级而来，任何位都算
+               4: 0x000000FF,        # MemManage：MMFSR
+               5: 0x0000FF00,        # BusFault：BFSR
+               6: 0xFFFF0000}        # UsageFault：UFSR
+
+def _norm_tristate(v, default: str = "auto") -> str:
+    """把「真/假/自动」三态参数归一成 "true"/"false"/"auto"。
+
+    真机反馈：verify 这类三态参数，调用方常按 JSON 习惯传布尔 false，
+    旧签名只接受 str，会被参数校验直接拒绝（validation error），
+    调用方拿到的只是一句类型错误、而不是它想要的「关掉复读」。
+    """
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    s = str(v if v is not None else default).strip().lower()
+    if s in ("0", "no", "off", "never", "false"):
+        return "false"
+    if s in ("1", "yes", "on", "always", "force", "true"):
+        return "true"
+    return "auto"
+
+
 def _is_debugging(client=None, ttl: float = 1.0):
     """带短缓存的「是否处于调试态」（错误路径补提示用，避免额外往返）。"""
     now = time.monotonic()
@@ -1696,12 +1726,24 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "'svcrt_task_table'——自动查当前 .axf 符号表解析，命中时返回 addr_note 说明来源）；"
             "读 App 侧符号可传 reloc_delta=\"0xF000\"（或先用 set_reloc_delta 设全局），"
             "工具会把符号的链接地址偏到运行地址；**显式数字地址不会被偏移**；"
-            "返回十六进制字节串及 ASCII 视图。注意：需目标暂停——目标运行期间 UVSOCK 推送异步消息会堆积，导致读取响应错位（典型报错 AMEM 响应数据过短），务必先 stop 再读。勿越界读外设保留区，可先 query_memory_map 确认范围。"
+            "返回十六进制字节串及 ASCII 视图。"
+            "**脏读防护（verify，默认 \"auto\"）**：stop 之后紧跟的第一次读可能整帧返回全 0"
+            "（真机实测 0x08022000 读出 16 个 00，重读即正确）——auto 会在「首帧整帧退化（全 0x00/全 0xFF）"
+            "或距最近一次 stop 不足 1 秒」时自动复读，连续两次一致才采纳，并返回 read_confidence"
+            "（high/low）、reread_count、reread_consistent、degenerate、since_stop_s；"
+            "首帧是脏值时用 first_read_hex 留证、data_hex 换成可靠值并给 warning。"
+            "verify=true 总是复读（强制确认），verify=false 关闭（大块搬运省时间）；"
+            "verify 可传字符串也可传 JSON 布尔（true/false 等价于 \"true\"/\"false\"）。"
+            "**看到 read_confidence=\"low\" 或 degenerate 时不要据此下结论（例如「读到 0 就判定变量被清零」），"
+            "先 get_status 确认目标已停止再重读。**"
+            "注意：需目标暂停——目标运行期间 UVSOCK 推送异步消息会堆积，导致读取响应错位（典型报错 AMEM 响应数据过短），务必先 stop 再读。勿越界读外设保留区，可先 query_memory_map 确认范围。"
         ),
     )
     async def read_mem(addr: str | int, n_bytes: int = 0, length: int = 0,
-                       reloc_delta: str = "") -> str:
+                       reloc_delta: str = "", verify: str | bool = "auto") -> str:
         addr = _addr_arg(addr)
+        # verify 同时接受 "auto"/"true"/"false" 与 JSON 布尔 true/false
+        verify = _norm_tristate(verify)
         try:
             client = _get_client()
             n = int(n_bytes or 0) or int(length or 0)
@@ -1710,7 +1752,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                             "error": "参数不足：必须指定读取字节数 n_bytes（别名 length），应为正整数"})
             delta, _dnote = _eff_reloc_delta(reloc_delta)
             a, note = _resolve_addr_with_reloc(addr, client, delta)
-            out = client.read_mem(a, n)
+            out = client.read_mem_verified(a, n, verify=verify)
             if note and isinstance(out, dict):
                 out = dict(out)
                 out["addr"] = hex(a)
@@ -3102,6 +3144,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "读取 SCB 异常寄存器（ICSR/HFSR/CFSR/MMFAR/BFAR）判断当前异常类型与原因，"
             "并从异常栈帧恢复现场（异常发生时 R0-R3/R12/LR/PC/xPSR）。排查死机/跑飞/复位循环时使用："
             "先看 exception 是什么异常、cfsr.reasons 给出原因，再看 fault_frame.pc 定位出错指令。"
+            "**CFSR/HFSR 是粘滞位（sticky）**：写 1 清除或复位才归零——读到 UsageFault 并不代表此刻正在 "
+            "UsageFault，也可能只是此前异常的残留。本工具因此返回 fault_timing："
+            "timeliness=current（ICSR 显示当前正处在 fault handler 里，是当下故障）/ "
+            "sticky（粘滞位，可能来自更早的异常，含上次调试或上次上电以来）/ none（未置位），"
+            "并给出 first_seen（本进程内首次观察到置位的时间）、last_seen、last_cleared（最近一次 clear_faults）。"
+            "**看到 timeliness=sticky 就不要按当前故障处理**；想确证是否还有新异常，先调 clear_faults 清位、"
+            "再让程序跑一段，然后重新 fault_report：位又置起来才是新发生的。"
             "需已进入调试且停在异常处理程序（best-effort，handler 已运行时栈帧可能偏移）。注意：需已进入调试且目标停在异常处理程序（HardFault_Handler 等）；若异常已导致复位/死循环重入，寄存器现场可能已被破坏或读不准（best-effort）。"
         ),
     )
@@ -3118,7 +3167,48 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 else _FAULT_NAME.get(vect, f"异常{vect}")
             out = {"ok": True, "exception": {"vector": vect, "name": exc}}
             reasons = _decode_cfsr(cfsr)
-            out["cfsr"] = {"value": "0x%08x" % (cfsr or 0), "reasons": reasons}
+            out["cfsr"] = {"value": "0x%08x" % (cfsr or 0), "reasons": reasons,
+                           "sticky": True,
+                           "sticky_note": ("CFSR 为粘滞位：写 1 清除或复位才归零，"
+                                           "置位不代表此刻仍有该故障")}
+            # 时效/来源判定（批次30 反馈③）
+            now_text = _file_mtime_text(time.time())
+            in_fault_handler = vect in (3, 4, 5, 6)
+            if cfsr or hfsr:
+                if _FAULT_TRACK["cfsr_first_seen"] is None:
+                    _FAULT_TRACK["cfsr_first_seen"] = now_text
+                _FAULT_TRACK["cfsr_last_seen"] = now_text
+            _FAULT_TRACK["cfsr_last_value"] = int(cfsr or 0)
+            _FAULT_TRACK["hfsr_last_value"] = int(hfsr or 0)
+            if not (cfsr or hfsr):
+                timeliness = "none"
+                timing_note = "CFSR/HFSR 均未置位：当前没有记录到任何故障状态位。"
+            elif in_fault_handler and (cfsr or hfsr):
+                timeliness = "current"
+                timing_note = ("ICSR 显示目标此刻正处在 %s 处理程序中，因此这些置位属于**当前故障**，"
+                               "reasons 可直接当作本次异常的原因。" % exc)
+            else:
+                timeliness = "sticky"
+                timing_note = (
+                    "这些故障位置着，但 ICSR 显示目标当前**不在**任何 fault handler 里"
+                    "（当前向量为 %s）——CFSR/HFSR 是粘滞位，不会自动清，所以更可能是**更早发生的异常残位**"
+                    "（上一次调试、或上次上电以来未被清除），不能当作当前故障。"
+                    "确证方法：clear_faults 清位 → 让程序继续跑一段 → 重新 fault_report，"
+                    "位再置起来才是新发生的。" % exc)
+            out["fault_timing"] = {
+                "timeliness": timeliness,
+                "first_seen": _FAULT_TRACK["cfsr_first_seen"],
+                "last_seen": _FAULT_TRACK["cfsr_last_seen"],
+                "last_cleared": _FAULT_TRACK["last_cleared"],
+                "sticky_bits": True,
+                "note": timing_note}
+            if timeliness == "sticky":
+                out["hint"] = ("fault_timing.timeliness=sticky：请勿直接按当前故障处理；"
+                               "先 clear_faults 清位再跑一段复现，重新 fault_report 才能确认新异常。")
+            # 无论是否置位都给出 hfsr，避免调用方把「没有该字段」误读成「读不到 HFSR」
+            out["hfsr"] = {"value": "0x%08x" % (hfsr or 0), "sticky": True,
+                           "sticky_note": ("HFSR 同为粘滞位：写 1 清除或复位才归零；"
+                                           "0x00000000 表示自上次清位以来未记录到硬故障")}
             if hfsr:
                 hf = []
                 if hfsr & 0x40000000: hf.append("HFSR:FORCED 强制异常(由子级 fault 升级)")
@@ -3151,6 +3241,54 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                           "r2": "0x%08x" % r2, "r3": "0x%08x" % r3,
                                           "r12": "0x%08x" % r12, "lr": "0x%08x" % flr,
                                           "pc": "0x%08x" % fpc, "xpsr": "0x%08x" % fxpsr}
+            if hfsr:
+                out["hfsr_sticky"] = True
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="clear_faults",
+        title="清除故障状态位（区分新旧异常）",
+        description=(
+            "清除 CFSR(0xE000ED28) 与 HFSR(0xE000ED2C) 的粘滞故障位——这两个寄存器是 W1C"
+            "（写 1 清除），本工具按 ARM 规定向它们写 0xFFFFFFFF 完成清除，并顺便清掉 "
+            "MMFAR/BFAR 的 VALID 位，返回 before/after 值供对照。"
+            "**用途**：区分「当前故障」与「历史残留位」——fault_report 报 timeliness=sticky 时，"
+            "先 clear_faults 清位，再让程序继续跑一段（run / run_timeout），然后重新 fault_report："
+            "位若又置起来，说明确实新发生了异常；位保持为 0，则原先那些是历史残留。"
+            "注意：需已进入调试且目标已停止；清除只影响状态位，不改变程序行为，也不清除寄存器现场。"
+            "若某些位置清不掉（读回仍非 0），说明是新异常在持续发生。"
+        ),
+    )
+    async def clear_faults() -> str:
+        try:
+            client = _get_client()
+            b_cfsr = _dwt_read_u32(client, 0xE000ED28)
+            b_hfsr = _dwt_read_u32(client, 0xE000ED2C)
+            ok_c = _dwt_write_u32(client, 0xE000ED28, 0xFFFFFFFF)
+            ok_h = _dwt_write_u32(client, 0xE000ED2C, 0xFFFFFFFF)
+            a_cfsr = _dwt_read_u32(client, 0xE000ED28)
+            a_hfsr = _dwt_read_u32(client, 0xE000ED2C)
+            out = {"ok": bool(ok_c and ok_h),
+                   "before": {"cfsr": None if b_cfsr is None else "0x%08x" % b_cfsr,
+                              "hfsr": None if b_hfsr is None else "0x%08x" % b_hfsr},
+                   "after": {"cfsr": None if a_cfsr is None else "0x%08x" % a_cfsr,
+                             "hfsr": None if a_hfsr is None else "0x%08x" % a_hfsr},
+                   "cleared": {"cfsr": bool(a_cfsr == 0), "hfsr": bool(a_hfsr == 0)}}
+            if out["ok"]:
+                _FAULT_TRACK.update({"cfsr_first_seen": None, "cfsr_last_seen": None,
+                                     "cfsr_last_value": 0, "hfsr_last_value": 0,
+                                     "last_cleared": _file_mtime_text(time.time())})
+                out["last_cleared"] = _FAULT_TRACK["last_cleared"]
+            if a_cfsr or a_hfsr:
+                out["warning"] = ("清除后仍有位保持置位：说明新异常正在持续发生"
+                                  "（或目标仍在运行、写入未生效）——请先确认目标已停止，"
+                                  "稍后再 clear_faults 并重新 fault_report。")
+                out["ok"] = False
+            else:
+                out["hint"] = ("已清位。现在让程序继续跑一段（run / run_timeout）再重新 fault_report："
+                               "位又置起来即为新发生的异常；保持 0 则此前那些是历史残留位。")
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -3601,23 +3739,75 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
 
     @server.tool(
         name="stop",
-        title="暂停执行",
-        description="暂停目标 MCU 的执行（进入断点/挂起状态）。注意：stop 后目标进入挂起态，此时才可安全读内存/寄存器/表达式。停止瞬间个别读取可能读到脏值，必要时重试。",
+        title="暂停执行（含停止确证）",
+        description=(
+            "暂停目标 MCU 的执行（进入断点/挂起状态），此时才可安全读内存/寄存器/表达式。"
+            "**停止是异步生效的**：命令返回不代表目标已停（真机实测 stop 回 ok 后紧跟的 get_status 仍报\"执行中\"），"
+            "这期间读到的内存/寄存器可能是脏值或陈旧值。本工具默认在 stop 之后轮询确认"
+            "（verify=true），返回 stopped / stop_verified / waited_ms / state_after_stop："
+            "**stop_verified=false 表示没能确证目标已停，此时不要读内存/寄存器、也不要据其下结论**，"
+            "可重试 stop 或稍后再读（与 run_timeout 的 stop_verified 同一口径）。"
+            "verify=false 则只发命令不做确认（快，但需自行承担读到脏值的风险）。"
+        ),
     )
-    async def stop() -> str:
+    async def stop(verify: bool = True, timeout: float = 1.0) -> str:
         try:
-            return _js(_get_client().stop())
+            client = _get_client()
+            out = dict(client.stop())
+            if verify and out.get("ok"):
+                ws = client.wait_until_stopped(timeout=timeout)
+                stopped = bool(ws.get("stopped"))
+                out["stopped"] = stopped
+                out["stop_verified"] = stopped
+                out["waited_ms"] = ws.get("waited_ms")
+                out["state_after_stop"] = "stopped" if stopped else "running"
+                if not stopped:
+                    out["warning"] = (
+                        "stop 命令已受理，但 %dms 内未确证目标已停止（%s）：此时读内存/寄存器会拿到脏值"
+                        "或陈旧值，请重试 stop 或稍后再读。"
+                        % (ws.get("waited_ms") or 0, ws.get("error") or "未知原因"))
+            elif not out.get("ok"):
+                out.setdefault("stop_verified", False)
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
         name="reset",
         title="复位目标",
-        description="复位目标 MCU。注意：复位后程序从复位向量重新运行，变量回到初值、断点保留；若复位后立即读内存，目标可能已重新运行，需先 stop。",
+        description=(
+            "复位目标 MCU（变量回到初值、断点保留）。"
+            "**行为说明（真机实测，与旧描述不同）**：复位后目标**停在复位向量、处于停止态**，"
+            "程序不会自行往下跑——必须再调 run（或 run_timeout / run_to_line）才会开始执行；"
+            "实测复位后 get_status 返回\"已停止\"，正因为不 run 就没有任何串口输出。"
+            "返回带 state_after_reset（stopped/running）与 stopped_after_reset 说明这一点；"
+            "run_after=true 可在复位成功后自动 run（等价于复位后自己再调一次 run），"
+            "适合「重新跑一遍看串口输出」的场景。"
+        ),
     )
-    async def reset() -> str:
+    async def reset(run_after: bool = False) -> str:
         try:
-            return _js(_get_client().reset())
+            client = _get_client()
+            out = dict(client.reset())
+            if out.get("ok"):
+                ws = client.wait_until_stopped(timeout=0.6)
+                stopped = bool(ws.get("stopped"))
+                out["stopped_after_reset"] = stopped
+                out["state_after_reset"] = "stopped" if stopped else "running"
+                if run_after:
+                    rr = dict(client.run())
+                    out["ran"] = bool(rr.get("ok"))
+                    if not rr.get("ok"):
+                        out["run_error"] = rr.get("status_text") or rr.get("error")
+                    out["hint"] = ("复位后已按 run_after=true 继续运行程序；"
+                                   "需要停下来读内存/寄存器时调用 stop（会确证停止）。")
+                elif stopped:
+                    out["hint"] = ("复位后目标停在复位向量、处于停止态，程序不会自行运行；"
+                                   "需要它跑起来请调用 run（或 run_timeout / run_to_line）。")
+                else:
+                    out["hint"] = ("复位后目标已在运行；若要读内存/寄存器，先 stop 并确认已停止"
+                                   "（stop 会返回 stop_verified）。")
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -4837,6 +5027,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "需要接着采集重新调本工具即可（同端口同波特率复用同一实例，不丢已收日志）。"
             "另外 exit_debug / flash_download / build_and_flash / flash_debug / close_uvision / restart_keil "
             "都会顺带释放端口，进程退出也会自动释放——正常调用下不必担心调试完了串口还被占着。"
+            "**本监听同时支持下发**（serial_write）：端口打开时优先按「可读可写」取得，"
+            "因此可以一边收日志一边发 shell 命令/镜像片段；拿不到写权限时会退回只读，"
+            "状态里的 can_write=false 表示当前这个口发不出去。"
             "注意：监听期间不要在别处（Keil 串口窗口、其他工具）再打开同一个口，会互相抢占（WinError=5）。"
         ),
     )
@@ -4876,6 +5069,60 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 else:
                     st["ok"] = True
             return _js(st)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e),
+                        "available_ports": serialmon.list_ports()})
+
+    @server.tool(
+        name="serial_write",
+        title="向串口下发数据（一边收一边发）",
+        description=(
+            "向 serial_monitor_start 已打开的串口**下发数据**，收与发共用同一个句柄——"
+            "这是「一边收一边发」的用法：下发 shell/msh 命令并立刻看回显、给 bootloader 发命令、"
+            "分段下发镜像/升级数据。"
+            "参数：text（文本，按 encoding 编码，默认 utf-8）与 hex（十六进制串，如 '7e 01 00 ff'，"
+            "自动去空格/逗号/横线）**二选一**；eol 控制文本末尾追加的行尾（'crlf' 默认 / 'lf' / 'cr' / 'none'，"
+            "串口终端一般要 crlf）；wait_ms（默认 300）为写完等待多久再取新行；"
+            "read_after=true（默认）时**把这次下发之后新增的日志行一起返回**（按写前 next_seq 增量取，"
+            "不会重复老日志），省掉再调一次 serial_read。"
+            "返回 {ok, written, bytes_sent, port, next_seq_before, read_after:{count, lines, next_seq, note}}；"
+            "next_seq 可直接作为下次 serial_read 的 since。"
+            "**依赖监听持有端口**：没有监听时 ok=false 并提示先 serial_monitor_start；"
+            "端口只读到（can_write=false）、已被拔出/关闭、或正在重连时，ok=false 并给出 last_error，"
+            "不会静默丢数据。注意：本工具只回报「写了多少字节」，命令是否被目标接受要看回显"
+            "（read_after.lines）——wait_ms 内没等到新行不代表下发失败。"
+        ),
+    )
+    async def serial_write(text: str = "", hex: str = "", eol: str = "crlf",
+                           encoding: str = "utf-8", wait_ms: int = 300,
+                           read_after: bool = True, max_items: int = 200) -> str:
+        try:
+            raw = b""
+            hex_s = _csv_tokens(hex)
+            if hex_s:
+                try:
+                    raw = bytes.fromhex("".join(hex_s).replace("0x", "").replace("0X", ""))
+                except ValueError as e:
+                    return _js({"ok": False,
+                                "error": "hex 解析失败（应为偶数长度的十六进制字节串）：%s" % e})
+            if text:
+                try:
+                    raw += text.encode(encoding or "utf-8")
+                except Exception as e:  # noqa: BLE001
+                    return _js({"ok": False,
+                                "error": "text 编码失败（encoding=%s）：%s" % (encoding, e)})
+                e = str(eol or "").strip().lower()
+                if e in ("crlf", "cr+lf", "windows"):
+                    raw += b"\r\n"
+                elif e in ("lf", "unix", "\\n"):
+                    raw += b"\n"
+                elif e in ("cr", "\\r"):
+                    raw += b"\r"
+            if not raw:
+                return _js({"ok": False,
+                            "error": "参数不足：text（文本）与 hex（十六进制串）至少给一个（都不为空）"})
+            return _js(serialmon.write_bytes(raw, wait_ms=wait_ms,
+                                             max_items=max_items, read_after=read_after))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e),
                         "available_ports": serialmon.list_ports()})
@@ -4988,6 +5235,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 "8. 改代码上板：build_and_flash / flash_debug；收尾 exit_debug 退出调试",
                 "9. 看串口日志：serial_monitor_start(port=\"COM9\") → run → serial_read(since=上次next_seq) → serial_monitor_stop"
                 "（串口用完就还：exit_debug/烧录/关 Keil 都会自动释放端口，释放后已收日志仍可 serial_read）",
+                "10. 要下发命令/数据（shell、bootloader、镜像片段）：serial_write(text=\"help\")"
+                "（收与发共用同一句柄，写后自动把新增回显带回来）",
             ]
             scene_tools = {
                 "看程序停在哪": "get_current_location / snapshot",
@@ -4998,6 +5247,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 "不同target行为不同": "project_targets / set_debug_target / read_project_config",
                 "串口不打印/时钟问题": "list_peripherals / read_peripheral / itm_trace",
                 "抓宿主机串口日志(rt_kprintf/ULOG)": "serial_monitor_start / serial_read / serial_monitor_stop",
+                "串口下发命令/数据(一边收一边发)": "serial_monitor_start（持有端口）→ serial_write → serial_read",
                 "串口被占用/打不开(WinError=5)": "serial_monitor_stop（释放端口，日志保留）→ 或等空闲自动释放（idle_release_s）",
                 "改代码重新上板": "build_and_flash / flash_debug",
             }

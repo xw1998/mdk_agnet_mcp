@@ -639,6 +639,12 @@ class MockUVSOCKServer:
             self.dfsr &= (~_val) & 0xFFFFFFFF
             resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
             return uvsock.UV_STATUS_SUCCESS, resp
+        if nAddr in (0xE000ED28, 0xE000ED2C):  # CFSR / HFSR：同样是 W1C（真机行为）
+            _k = {0xE000ED28: "cfsr", 0xE000ED2C: "hfsr"}[nAddr]
+            _val = struct.unpack('<I', payload[:4])[0]
+            self.scb[_k] &= (~_val) & 0xFFFFFFFF
+            resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
+            return uvsock.UV_STATUS_SUCCESS, resp
         if nAddr in (0xE0001020, 0xE0001030, 0xE0001040, 0xE0001050):  # DWT_COMP0..3
             _i = (nAddr - 0xE0001020) // 0x10
             self.dwt_comps[_i] = struct.unpack('<I', payload[:4])[0]

@@ -147,7 +147,7 @@ mdk_agent/
 │   ├── locator.py             # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
 │   ├── periph.py             # 内置 STM32F4 常用外设寄存器表（RCC/GPIO/USART/SPI/I2C/TIM/...）+ 内存区域地图
 │   ├── mapfile.py            # .map 链接映射文件解析（Program Size/sections/symbols/栈使用/未用段）
-│   └── server.py             # MCP Server 与 81 个工具定义
+│   └── server.py             # MCP Server 与 83 个工具定义
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_e2e.py           # UVClient 协议闭环测试
@@ -200,12 +200,12 @@ python run_server.py --transport http --http-port 8300
 | `get_status` | 查询是否处于调试、目标是否运行、状态码，并附**当前符号文件路径 + 时间戳**（`symbol_file`/`symbol_mtime_text`）、**符号陈旧判定**（`symbol_stale` + `symbol_stale_warning`：编译/烧录后旧会话符号过期，求值会报 status 13）、**串行化与并发视图**（`serialization`，含其他 mdkdebug 实例清点） | — |
 | `calc_expression` | 计算并读取表达式 / 变量值 | `expr` |
 | `read_variable` | 按变量名查地址/值/大小，支持数组逐元素与整块内存；App 侧重定位场景可配 `reloc_delta` 自动换算运行地址 | `name`、`count?`、`reloc_delta?` |
-| `read_mem` | 读取目标内存（`n_bytes` 可写作别名 `length`；`reloc_delta` 用于 App 侧重定位后按运行地址读） | `addr`（`0x…` 或十进制）、`n_bytes`、`reloc_delta?` |
+| `read_mem` | 读取目标内存（`n_bytes` 可写作别名 `length`；`reloc_delta` 用于 App 侧重定位后按运行地址读）。**脏读防护**（`verify`，默认 `auto`）：stop 后紧跟的首次读可能整帧返 0（真机实测 0x08022000 读出 16 个 `00`，重读即正确）——`auto` 在「首帧整帧退化（全 `0x00`/全 `0xFF`）或距最近一次 stop 不足 1 秒」时自动复读、**连续两次一致才采纳**，并返回 `read_confidence`/`reread_count`/`reread_consistent`/`degenerate`/`since_stop_s`；首帧是脏值时用 `first_read_hex` 留证。`verify=true` 强制确认、`false` 关闭（**布尔/字符串都收**，`verify=false` 与 `"false"` 等价）；Flash 区稳定读出全 `0xFF` 判为**已擦除的预期内容**（`content_note`，不降置信度） | `addr`（`0x…` 或十进制）、`n_bytes`、`reloc_delta?`、`verify?`（默认 `auto`，可传布尔） |
 | `write_mem` | 写入目标内存，**默认写后回读校验**（`verify=true` → `verified`/`readback_hex`）：写入被静默忽略（目标运行中/只读区/另一实例并发写）时给出 `verified=false` 与原因，不再「看着成功其实没写进去」 | `addr`、`data_hex`（十六进制串，可带空格）、`verify?`（默认 true） |
 | `run` | 全速运行 | — |
 | `run_timeout` | 全速运行 N 毫秒后自动暂停并返回停靠位置，用于验证时序；返回 `requested_run_ms` / `actual_run_ms` / `stop_wait_ms` / `total_ms` 四段计时，排查时序不再只能看一个含糊的 `waited_ms` | `timeout_ms`（默认 1000） |
-| `stop` | 暂停执行 | — |
-| `reset` | 复位目标 | — |
+| `stop` | 暂停执行，**默认带停止确证**：停止是异步生效的（真机实测 stop 回 ok 后紧跟的 `get_status` 仍报「执行中」），故返回 `stopped`/`stop_verified`/`waited_ms`/`state_after_stop`，`verify=false` 可只发命令不确认 | `verify?`（默认 true）、`timeout?` |
+| `reset` | 复位目标（变量回初值、断点保留）。**真机实测：复位后停在复位向量、处于停止态，不会自行往下跑**——必须再 `run`（或 `run_timeout`/`run_to_line`）才开始执行；返回 `state_after_reset`/`stopped_after_reset` 与 `hint`；`run_after=true` 可复位后自动 run | `run_after?`（默认 false） |
 | `step` | 单步执行，成功后自动附带停靠位置（`stopped_file`/`stopped_line`/`stopped_address`）+ 源码上下文 + 调用栈 | `mode`：`into`/`over`/`out`/`instruction` |
 | `run_to_line` | 运行到指定行（run to cursor），接受 `文件:行号` 或 `0x地址` | `target`（如 `main.c:77`） |
 | `get_current_location` | 读取当前 PC，定位到 文件:行号 + 源码上下文 + 完整调用栈回溯 + 源码漂移提示 + 断点命中反馈 | — |
@@ -222,7 +222,8 @@ python run_server.py --transport http --http-port 8300
 | `find_symbol` | 符号检索：从 .axf ELF 符号表模糊检索函数/全局变量（返回名字/类型/地址/大小），AI 读符号不再靠猜名字；`query` 可写作别名 `name`，配 `reloc_delta` 时附 `run_addr` | `query`、`kind`（all/func/object/global/local）、`limit`、`reloc_delta?` |
 | `set_register` | 写寄存器/改 PC：向 R0-R12/SP/LR/PC/xPSR 写值并读回验证，可修正现场、改返回值、改 PC 跳转执行 | `register`、`value` |
 | `dwt` | DWT 周期计数器：读 CYCCNT（自动使能），配合两次采样算代码段执行周期数与耗时 | — |
-| `fault_report` | HardFault/异常定位：读 SCB（ICSR/HFSR/CFSR/MMFAR/BFAR）判异常类型+原因，从异常栈帧恢复 PC/LR/R0-R3/xPSR，排查死机/跑飞 | — |
+| `fault_report` | HardFault/异常定位：读 SCB（ICSR/HFSR/CFSR/MMFAR/BFAR）判异常类型+原因，从异常栈帧恢复 PC/LR/R0-R3/xPSR，排查死机/跑飞。**CFSR/HFSR 是粘滞位**（写 1 清除或复位才归零），故返回 `fault_timing`：`timeliness`=`current`（正处在 fault handler，即当下故障）/`sticky`（很可能只是历史残位，别当当前故障）/`none`，并给出 `first_seen`/`last_seen`/`last_cleared` | — |
+| `clear_faults` | 清除 CFSR/HFSR 粘滞位（W1C，写 `0xFFFFFFFF`，同时清 MMFAR/BFAR 的 VALID），返回 `before`/`after`/`cleared` 供对照——用于**区分新旧异常**：清位 → 跑一段 → 重新 `fault_report`，位又置起来才是新发生的 | — |
 | `set_conditional_breakpoint` | 条件断点：仅在 condition（C 表达式如 R0==5）成立/第 count 次命中时才停，减少无关中断 | `expr`、`condition`、`count` |
 | `read_peripheral` | 外设寄存器一键读：内置 STM32F4 外设表（RCC/GPIO/USART/SPI/I2C/TIM/...），读指定外设寄存器并解析关键位域；`regs` 只取指定寄存器（如 `MODER,OTYPER`，裸名/前缀名都可，**也接受字符串数组 `["MODER","ODR"]`**）、`fields=off` 关位域解读，避免整表输出撑爆上下文 | `periph`、`regs?`、`fields?` |
 | `list_peripherals` | 列出内置外设寄存器表（外设名+基址+说明） | — |
@@ -261,8 +262,9 @@ python run_server.py --transport http --http-port 8300
 | `read_console_output` | 读取命令窗口输出 | clear? |
 | `read_async_messages` | 读取异步消息/报错 | clear? |
 | `serial_monitor_start` | **宿主机串口日志监听**（后台线程收 → 按行切分 → ring buffer）：`port` 可写 `"COM9"` 或 `9`（留空取第一个可用口），`baud` 默认 115200，`capacity` 默认保留 2000 行；端口不存在/被占用时 `ok=false` 并附 `available_ports`，不会静默失败；重复 start 时 `restart=false` 可避免抢占。**用完就还**：`idle_release_s`（默认 900s，0=不自动）为无人访问多久后自动释放端口——释放只放掉 COM 口，已收日志仍保留、可继续 `serial_read`，需要接着采集重新 start 会复用同一实例（`resumed=true`）不丢日志 | `port?`、`baud?`、`databits?`、`parity?`、`stopbits?`、`capacity?`、`encoding?`、`label?`、`restart?`、`idle_release_s?` |
+| `serial_write` | **向串口下发数据（一边收一边发）**：`text` 与 `hex` 二选一，`eol` 控制行尾（`crlf` 默认/`lf`/`cr`/`none`）；`read_after=true`（默认）时把这次下发之后**新增的回显行**一起返回（按写前 `next_seq` 增量取，不重复老日志）。用于下发 shell/msh 命令、给 bootloader 发指令、分段下发镜像 | `text?`、`hex?`、`eol?`、`encoding?`、`wait_ms?`、`read_after?`、`max_items?` |
 | `serial_read` | 读取串口日志，**支持增量**：把上次返回的 `next_seq` 当 `since` 传入即只取新行，配合 `rt_kprintf`/ULOG 做迭代调试；返回 `items`/`lines`/`dropped`/`partial`（未满一行的半行） | `max_items?`、`clear?`、`since?` |
-| `serial_monitor_status` | 串口监听状态（`state`/`bytes_total`/`lines`/`dropped`/`reopen_count`/`last_error`、是否**仍占着口** `port_held`、`auto_released`/`release_reason`/`idle_s`）+ 本机全部可用串口；**未监听时不报错**（`running=false`），适合先探再启 | — |
+| `serial_monitor_status` | 串口监听状态（`state`/`bytes_total`/`lines`/`dropped`/`reopen_count`/`last_error`、是否**仍占着口** `port_held`、端口是否**真正打开** `port_ready`、`auto_released`/`release_reason`/`idle_s`、能否下发 `can_write`）+ 本机全部可用串口；**未监听时不报错**（`running=false`），适合先探再启 | — |
 | `serial_monitor_stop` | 停止监听并**释放串口**（不释放的话 Keil 串口窗口/其他工具会打不开，报 WinError=5）。**默认保留已收日志**（`clear_buffer=true` 才清空），释放后 `serial_read` 仍可读、重新 start 复用同一实例；正常情况下不必手工调它——调试/烧录/关 Keil 都会自动释放；未监听时也返回 `ok=true` | `clear_buffer?` |
 | `list_uvoptx_breakpoints` | 读取持久化断点(.uvoptx) | project? |
 | `clear_uvoptx_breakpoints` | 清除持久化断点(.uvoptx) | project?、backup? |
@@ -572,6 +574,43 @@ python -m tests.mock_uvsock_server --port 4823
 3. 出现可疑的「自己变了」现象时，先看 `keil_health` / `get_status` 的并发字段，再怀疑代码；
 4. 同一个串口不要被两处同时打开（本服务串口监听 + Keil 串口窗口会互相抢占，报 WinError=5）。
 
+## 读到的东西到底算不算数（脏读防护 / 停止确证 / 粘滞位）
+
+调试工具最贵的一类错误是「**用不可信的数据下了结论**」——读到整帧 0 就说变量被清零、看到 `UsageFault` 位就说刚才跑飞了、`stop` 回 ok 就当目标已经停下来。批次30 针对这三件事各加了一道防线：
+
+**① `read_mem` 的脏读防护（`verify`，默认 `auto`）**
+
+- 触发复读的两个条件：首帧**整帧退化**（整片全 `0x00` / 全 `0xFF`），或距最近一次 `stop` 不足 1 秒（停止是异步生效的，这期间的读最容易拿到脏值）；
+- 复读最多 3 次，**连续两次一致才采纳**（与 `get_current_location` 的 PC 收敛判定同一套语言）；
+- 返回 `read_confidence`（`high`/`low`）、`reread_count`、`reread_consistent`、`degenerate`、`since_stop_s`；首帧是脏值时 `first_read_hex` 留证、`data_hex` 换成可靠值并附 `warning`；
+- Flash 区段读出全 `0x00` 时另给专门提示（**已擦除的 Flash 应读出 `0xFF`**，全 0 更像读取失败）；
+- 反过来，Flash 区**稳定**读出全 `0xFF` 按「已擦除」处理：给 `content_note` 说明这是预期内容、置信度保持 `high`（真机读 `0x08022000` 即如此，避免把正常内容误报成脏读）；
+- `verify=true` 无条件确认（对某次结果不放心时），`verify=false` 关闭（大块搬运省时间）。
+
+> **看到 `read_confidence=low` 或 `degenerate` 就不要据此下结论**，先 `get_status` 确认目标已停止再重读。
+
+**② `stop` 的停止确证**
+
+`stop` 命令返回不代表目标已停（真机实测 stop 回 ok 后紧跟的 `get_status` 仍报「执行中」，`run_timeout` 内部一直有 `wait_stopped` 而单独的 `stop` 没有）。现在 `stop` 默认轮询确证并返回 `stopped` / `stop_verified` / `waited_ms` / `state_after_stop`——**`stop_verified=false` 时不要读内存/寄存器、也不要据其下结论**。
+
+**③ `CFSR`/`HFSR` 是粘滞位**
+
+读到 `UsageFault` 不代表此刻正在 `UsageFault`：这两个寄存器**写 1 清除或复位才归零**，异常处理完不会自动清。故 `fault_report` 返回 `fault_timing`（且**无论是否置位都给出 `cfsr`/`hfsr` 字段**，避免把「字段缺失」误读成「读不到」）：
+
+| `timeliness` | 含义 | 该怎么做 |
+|--------------|------|----------|
+| `current` | ICSR 显示目标正处在 fault handler 里 | 可以直接把 `cfsr.reasons` 当作本次异常原因 |
+| `sticky` | 位置着，但当前不在任何 fault handler | **别当当前故障**；很可能是上次调试/上次上电以来的残位 |
+| `none` | 两个寄存器都没置位 | 当前没有记录到故障 |
+
+确证「是否还有新异常」的固定套路：
+
+```text
+clear_faults()                 # 清位（W1C），并记录 last_cleared
+run()                          # 让程序继续跑一段
+fault_report()                 # 位又置起来 → 新发生的；保持 0 → 原先那些是历史残位
+```
+
 ## 串口「用完就还」
 
 **调试完了串口还被 MCP 占着**，会导致 Keil 串口窗口、其他串口工具打不开（`WinError=5`）。
@@ -597,11 +636,30 @@ exit_debug()                               # 调试结束 → 自动释放 COM9�
 serial_read()                              # 仍能读到之前收到的行
 ```
 
+### 一边收一边发：`serial_write`
+
+只读的监听器覆盖不了「下发 shell 命令 / 给 bootloader 发指令 / 分段下发镜像」的用法。
+现在端口按**可读可写**（`GENERIC_READ|GENERIC_WRITE`）打开，收与发共用同一个句柄；
+拿不到写权限时自动退回只读（监听照常工作，`can_write=false` 明确告诉你这个口发不出去）。
+`serial_monitor_start` / `serial_monitor_status` 返回 `port_ready`（端口是否已真正打开）与 `can_write`；
+**启动接口会等端口就绪再返回**（真机实测 start 返回瞬间端口还没打开，`can_write` 会误报 `false`，
+让人以为这个口只能收不能发——现在这两个字段可直接采信）。
+
+```text
+serial_monitor_start(port="COM9", baud=115200)   # 持有端口
+serial_write(text="help")                        # 下发命令（默认追加 CRLF）
+# → {written: 6, read_after: {count: 2, lines: ["msh />help", "   commands: ..."]}}
+serial_write(hex="7e 01 00 ff", eol="none")      # 二进制/镜像片段
+serial_read(since=上次 next_seq)                  # 长响应可继续增量取
+```
+
 ## 设计要点
 
 - **连接缓存**：常驻服务内共享一条 TCP 连接，`idle_timeout` 空闲自动断开、下次调用自动重连，兼顾实时性与资源释放；
 - **并发调用可安全并行**：所有 UVSOCK 命令经统一闸门串行化（进程内 RLock + 跨进程锁文件），并在 `get_status` / `keil_health` 里回报实例清点与竞争遥测，详见「并发调用与串行化」；
 - **串口用完就还**：串口监听在调试/烧录/关 Keil 等生命周期节点自动释放端口，另有空闲超时与进程退出兜底；释放只放端口、保留 ring buffer，日志不丢，可随时重新 start 复用，详见「串口「用完就还」」；
+- **不可信数据不参与结论**：`read_mem` 的脏读防护（退化帧/刚 stop 过则复读至连续两次一致）、`stop` 的停止确证（`stop_verified`）、`fault_report` 的粘滞位时效判定（`timeliness`）与 `clear_faults`，都是为「别用不可信的数据下结论」服务的，详见「读到的东西到底算不算数」；
+- **串口可收也可发**：监听按可读可写打开，`serial_write` 与 `serial_read` 共用同一句柄，下发后可直接带回新增回显；无写权限时退回只读并用 `can_write=false` 如实告知；启动接口**等端口真正打开才返回**（`port_ready`），不会把「刚启动还没打开」误报成「发不出去」；
 - **内存读写分块**：超过单次上限（16 KB）自动分块读，规避 Keil 协议长度限制；
 - **地址解析**：工具层统一支持 `0x` / `0b` / `0o` 前缀或纯十进制；
 - **编译烧录选型**：采用 Keil 官方 `UV4.exe` 命令行（`-b`/`-r`/`-f`/`-o`），退出码 0=成功、1=成功有警告、2=有错误、≥3=不完整；编译输出经 `-o` 重定向到临时日志文件捕获；`build_and_flash` 在编译成功后自动接烧录，形成闭环；
