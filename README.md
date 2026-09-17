@@ -250,10 +250,10 @@ python run_server.py --transport http --http-port 8300
 | `list_breakpoints` | 列出断点（含对应的 文件:行号 位置） | — |
 | `launch_uvision` | 可见方式拉起 Keil 打开工程，复用已有实例 | `project` |
 | `close_uvision` | 关闭所有 Keil 实例（默认优雅，残留强制） | `force` |
-| `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口） | `project`、`target` |
-| `rebuild_project` | 全量重编译（`UV4 -r`） | `project`、`target` |
-| `flash_download` | 烧录到目标 Flash（`UV4 -f`） | `project`、`target` |
-| `build_and_flash` | 编译成功后才烧录，AI 全流程闭环 | `project`、`target` |
+| `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口；编译后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
+| `rebuild_project` | 全量重编译（`UV4 -r`，编译后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
+| `flash_download` | 烧录到目标 Flash（`UV4 -f`，烧录后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
+| `build_and_flash` | 编译成功后才烧录，AI 全流程闭环（自带通道自愈） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
 | `flash_debug` | 「关旧 Keil→编烧→开新→进调试」一体闭环，规避旧窗口调试旧代码 | `project`、`target` |
 
 | `read_console_output` | 读取命令窗口输出 | clear? |
@@ -372,6 +372,16 @@ python run_server.py --symbol-project myboard:D:/board/out.axf:D:/board/out.map:
   退出调试后误报"执行中"（把错误消息 data 首字节 `0x01` 当运行标志）。
   正确做法（见 `mdkdebug/client.py` 的 `get_status`）：仅当 r_status 为成功时才解析 `data[0]`，
   `status=6`（未处于调试）等错误状态优先正确反映。
+- **编译/烧录自带"前置健康检查 + 自愈"**：`build_project` / `rebuild_project` / `flash_download` /
+  `build_and_flash` 执行前先取一次调试通道健康快照，执行后再取一次；**仅当"编译前通道可用、编译后不可用"**
+  时自动重启 Keil 并重建 UVSOCK 会话（`launch_detached` → 等 4823 监听 → 丢弃旧连接），
+  省掉"编译成功但调试连不上、得再手工 restart_keil 一轮"的往返。结果里始终带 `keil_before` / `keil_after`，
+  发生恢复时附 `keil_recovered` / `keil_wait_ms` / `keil_note`。用户本来就没开 Keil（前后都不可用）时
+  **不会**擅自拉起，避免无谓弹窗打断；`ensure_debug_channel=false` 可整体关闭该行为。
+  > 真机实测：构造"编译完成即关闭 GUI 实例"的故障点后，工具在 **3.7s** 内自动重启 Keil（PID 换新）、
+  > 恢复 4823 监听并重建连接，随后 UVSOCK 命令立即可用。另两次常规验证（`launch_detached` 启动 /
+  > 普通 `Popen` 启动 GUI 实例）下 `UV4 -r` 均**未**带走 GUI 实例——"命令行编译带走实例"的根因是实例
+  > 继承了调用链的 job，批次16 改用 `CREATE_BREAKAWAY_FROM_JOB` 启动已从根上规避，自愈负责兜底。
 - **已用 STM32F4 例程完成 20+ 个工具端到端全功能真机测试**：版本/状态、表达式、内存读写、
   运行控制（run/stop/reset/step/run_timeout/run_to_line）、断点管理（set/clear/list）、进出调试、
   状态快照（`snapshot`）、变量组（`watch`）、结构体字段概览（`read_struct`）、数据断点

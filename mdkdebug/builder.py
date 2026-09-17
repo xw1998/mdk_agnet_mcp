@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import winutil
@@ -158,42 +159,157 @@ def _run_uv4(uv4: str, args: list[str], timeout: int,
             pass
 
 
-def _result(action: str, exit_code: int, output: str) -> dict:
-    return {
+_reset_connection_hook = None
+
+
+def set_reset_connection_hook(fn) -> None:
+    """由 server 层注入"丢弃旧 UVSOCK 连接"的能力。
+
+    builder 不反向依赖 server（避免模块耦合），自愈时经此钩子调用；
+    单测可直接替换钩子打桩。
+    """
+    global _reset_connection_hook
+    _reset_connection_hook = fn
+
+
+def _call_reset_connection(reason: str) -> None:
+    """丢弃当前 UVSOCK 连接（优先用注入钩子，未注入时延迟导入 server 兜底）。"""
+    if _reset_connection_hook is not None:
+        _reset_connection_hook(reason)
+        return
+    from . import server as _server
+    _server._get_client().reset_connection(reason=reason)
+
+
+def _channel_snapshot() -> dict:
+    """调试通道（UVSOCK）健康快照；永不抛异常（探测失败也返回结构化结果）。"""
+    try:
+        return winutil.keil_health()
+    except Exception as e:  # noqa: BLE001
+        return {"code": "error", "keil_alive": None, "port_listening": None,
+                "uvsock_ready": False, "error": str(e)}
+
+
+def _recover_debug_channel(uv4: str, project: str = "", wait: float = 20.0) -> dict:
+    """编译/烧录后调试通道丢失时尝试原地恢复（无需用户手工 restart_keil）。
+
+    步骤：脱离调用方 job 拉起 Keil → 等 4823 进入监听 → 丢弃旧 UVSOCK 连接（下次调用重建）。
+    仅在"编译前通道可用、编译后不可用"时才被调用（见 _result），避免用户本就没开 Keil 时擅自弹窗。
+    """
+    t0 = time.time()
+    out = {"attempted": True, "launched": None, "port_listening": False,
+           "connection_reset": False, "error": None, "wait_ms": 0}
+    try:
+        out["launched"] = winutil.launch_detached(uv4, project or "")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = "拉起 Keil 失败：%s" % e
+    try:
+        out["port_listening"] = bool(winutil.wait_port_listening(
+            winutil.DEFAULT_UVSOCK_PORT, timeout=wait))
+    except Exception as e:  # noqa: BLE001
+        out["error"] = out["error"] or ("等待 UVSOCK 端口失败：%s" % e)
+    if out["port_listening"]:
+        try:
+            _call_reset_connection("编译/烧录后调试通道丢失，自动恢复")
+            out["connection_reset"] = True
+        except Exception as e:  # noqa: BLE001
+            out["error"] = out["error"] or ("重置 UVSOCK 连接失败：%s" % e)
+    out["wait_ms"] = int((time.time() - t0) * 1000)
+    out["keil_after"] = _channel_snapshot()
+    out["recovered"] = bool(out["port_listening"] and out["connection_reset"])
+    return out
+
+
+def _result(action: str, exit_code: int, output: str, keil_before: dict | None = None,
+            uv4: str = "", ensure_debug_channel: bool = True,
+            project: str = "", recover_wait: float = 20.0) -> dict:
+    """统一结果封装。
+
+    编译/烧录（UV4 命令行）与在线调试（UVSOCK）是两条独立通道：前者自己起实例、跑完即退，
+    部分情况下（已有 GUI 实例时）UV4 命令行会把 GUI 实例一并带走，于是出现
+    「编译成功但 4823 无人监听」——调试紧接着就失败。这里在编译前后各取一次健康快照，
+    并**仅当"编译前通道可用、编译后不可用"**时自动恢复（拉起 Keil + 等端口 + 重置连接），
+    避免用户本就没开 Keil 时被擅自弹窗。
+    """
+    keil_after = _channel_snapshot()
+    recovery = None
+    if (ensure_debug_channel and uv4 and isinstance(keil_before, dict)
+            and keil_before.get("uvsock_ready") and not keil_after.get("uvsock_ready")):
+        recovery = _recover_debug_channel(uv4, project, recover_wait)
+        if recovery.get("keil_after"):
+            keil_after = recovery["keil_after"]
+    d = {
         "ok": exit_code in (0, 1),
         "exit_code": exit_code,
         "status_text": _status_text(exit_code),
         "action": action,
         "output": output.strip() or "",
-        # 编译/烧录（UV4 命令行）与在线调试（UVSOCK）是两条独立的通道：
-        # 前者自己起实例、跑完即退，后者依赖一个活着的 Keil + 已开启的 UVSOCK。
-        # 这里顺带附上调试通道的健康快照，避免"烧录成功但调试连不上"时归错因。
-        "keil": winutil.keil_health(),
+        "keil": keil_after,
+        "keil_before": keil_before,
+        "keil_after": keil_after,
+        "ensure_debug_channel": bool(ensure_debug_channel),
     }
+    if not ensure_debug_channel:
+        d["keil_note"] = "本次未启用调试通道自愈（ensure_debug_channel=false）"
+    elif recovery is not None:
+        d["keil_recovered"] = bool(recovery.get("recovered"))
+        d["keil_wait_ms"] = recovery.get("wait_ms")
+        d["keil_recovery"] = recovery
+        if recovery.get("recovered"):
+            d["keil_note"] = ("检测到编译前调试通道可用、编译后丢失，已自动重启 Keil 并重建连接"
+                              "（耗时约 %d ms）" % recovery.get("wait_ms", 0))
+        else:
+            d["keil_note"] = ("检测到编译后调试通道丢失，自动恢复未成功；"
+                              "可调用 restart_keil 或 keil_health 进一步排查")
+    elif not keil_after.get("uvsock_ready"):
+        d["keil_note"] = ("调试通道当前不可用（code=%s）；若需调试请先 restart_keil 或"
+                          "用 keil_health 查看建议" % keil_after.get("code"))
+    return d
 
 
 def build_project(uv4: str, project: str, target: str | None = None,
-                  timeout: int = DEFAULT_BUILD_TIMEOUT) -> dict:
-    """编译工程（UV4 -b）。"""
+                  timeout: int = DEFAULT_BUILD_TIMEOUT,
+                  ensure_debug_channel: bool = True) -> dict:
+    """编译工程（UV4 -b）。
+
+    ensure_debug_channel=True 时：执行前记录调试通道健康快照，执行后若发现
+    "编译前可用、编译后丢失"，则自动拉起 Keil 并重建 UVSOCK 连接。
+    """
+    keil_before = _channel_snapshot()
     args = ["-b", project] + (["-t", target] if target else [])
     code, out = _run_uv4(uv4, args, timeout)
-    return _result("编译", code, out)
+    return _result("编译", code, out, keil_before=keil_before, uv4=uv4,
+                   ensure_debug_channel=ensure_debug_channel, project=project)
 
 
 def rebuild_project(uv4: str, project: str, target: str | None = None,
-                    timeout: int = DEFAULT_BUILD_TIMEOUT) -> dict:
-    """重新编译工程（UV4 -r，全量重编）。"""
+                    timeout: int = DEFAULT_BUILD_TIMEOUT,
+                    ensure_debug_channel: bool = True) -> dict:
+    """重新编译工程（UV4 -r，全量重编）。
+
+    ensure_debug_channel=True 时：执行前记录调试通道健康快照，执行后若发现
+    "编译前可用、编译后丢失"，则自动拉起 Keil 并重建 UVSOCK 连接。
+    """
+    keil_before = _channel_snapshot()
     args = ["-r", project] + (["-t", target] if target else [])
     code, out = _run_uv4(uv4, args, timeout)
-    return _result("重新编译", code, out)
+    return _result("重新编译", code, out, keil_before=keil_before, uv4=uv4,
+                   ensure_debug_channel=ensure_debug_channel, project=project)
 
 
 def flash_download(uv4: str, project: str, target: str | None = None,
-                   timeout: int = DEFAULT_FLASH_TIMEOUT) -> dict:
-    """烧录工程到目标 Flash（UV4 -f，Flash Download）。"""
+                   timeout: int = DEFAULT_FLASH_TIMEOUT,
+                   ensure_debug_channel: bool = True) -> dict:
+    """烧录工程到目标 Flash（UV4 -f，Flash Download）。
+
+    ensure_debug_channel=True 时：执行前记录调试通道健康快照，执行后若发现
+    "烧录前可用、烧录后丢失"，则自动拉起 Keil 并重建 UVSOCK 连接。
+    """
+    keil_before = _channel_snapshot()
     args = ["-f", project] + (["-t", target] if target else [])
     code, out = _run_uv4(uv4, args, timeout)
-    return _result("烧录", code, out)
+    return _result("烧录", code, out, keil_before=keil_before, uv4=uv4,
+                   ensure_debug_channel=ensure_debug_channel, project=project)
 
 
 def launch_uvision(uv4: str, project: str) -> dict:
@@ -314,18 +430,35 @@ def close_uvision(force: bool = False, timeout: int = 10) -> dict:
 
 def build_and_flash(uv4: str, project: str, target: str | None = None,
                     build_timeout: int = DEFAULT_BUILD_TIMEOUT,
-                  flash_timeout: int = DEFAULT_FLASH_TIMEOUT) -> dict:
-    """编译 + 烧录闭环：编译成功后才烧录。"""
-    build = build_project(uv4, project, target, build_timeout)
+                  flash_timeout: int = DEFAULT_FLASH_TIMEOUT,
+                  ensure_debug_channel: bool = True) -> dict:
+    """编译 + 烧录闭环：编译成功后才烧录。
+
+    两个阶段各自带"前置健康快照 + 编译后按需自愈"（见 _result）。
+    顶层汇总 keil_before（进入本调用前的通道状态）与 keil_after（收尾时状态），
+    便于一眼区分「编译成功」与「调试通道是否还活着」。
+    """
+    build = build_project(uv4, project, target, build_timeout,
+                          ensure_debug_channel=ensure_debug_channel)
     if not build["ok"]:
         return {
             "ok": False, "action": "编译并烧录",
             "stage": "编译", "build": build,
+            "keil_before": build.get("keil_before"),
+            "keil_after": build.get("keil_after"),
             "status_text": "编译未通过，未执行烧录",
         }
-    flash = flash_download(uv4, project, target, flash_timeout)
-    return {
+    flash = flash_download(uv4, project, target, flash_timeout,
+                           ensure_debug_channel=ensure_debug_channel)
+    out = {
         "ok": flash["ok"], "action": "编译并烧录",
         "stage": "烧录", "build": build, "flash": flash,
+        "keil_before": build.get("keil_before"),
+        "keil_after": flash.get("keil_after"),
+        "ensure_debug_channel": bool(ensure_debug_channel),
         "status_text": ("烧录成功" if flash["ok"] else "编译成功但烧录失败"),
     }
+    if flash.get("keil_recovered"):
+        out["keil_recovered"] = True
+        out["keil_wait_ms"] = flash.get("keil_wait_ms")
+    return out

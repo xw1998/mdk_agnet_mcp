@@ -16,6 +16,7 @@ import re
 import sys
 import json
 import time
+import inspect
 import asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -113,9 +114,12 @@ async def main():
               builder.DEFAULT_FLASH_TIMEOUT == 600, str(builder.DEFAULT_FLASH_TIMEOUT))
         check("B4 超时状态文本明确可读",
               "超时" in builder._status_text(-1), builder._status_text(-1))
+        # 批次18 起 build_project 末尾多了 ensure_debug_channel 参数，不能再靠
+        # __defaults__[-1] 取超时默认值；改为按参数名取（断言语义不变）。
+        _bp_sig = inspect.signature(builder.build_project)
         check("B5 build_project 默认超时用常量",
-              builder.build_project.__defaults__[-1] == builder.DEFAULT_BUILD_TIMEOUT,
-              str(builder.build_project.__defaults__))
+              _bp_sig.parameters["timeout"].default == builder.DEFAULT_BUILD_TIMEOUT,
+              str(_bp_sig))
         check("B6 描述里说明了 timeout_s 与超时秒数",
               "timeout_s" in (tools["build_and_flash"].description or "")
               and "1800" in (tools["build_and_flash"].description or ""),

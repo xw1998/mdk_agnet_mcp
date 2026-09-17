@@ -460,6 +460,12 @@ def _parse_target(locator, target: str):
         return locator.line_to_addr(file.strip(), ln)
     return None
 
+# 编译/烧录后的调试通道自愈需要丢弃旧 UVSOCK 连接；builder 不反向依赖 server，
+# 在此注入钩子（工具内部先 keil_health 快照，编译后按需自动恢复，省掉一轮 restart_keil 往返）。
+builder.set_reset_connection_hook(
+    lambda reason: _get_client().reset_connection(reason=reason))
+
+
 def _get_client() -> UVClient:
     global _client
     if _client is None:
@@ -2723,15 +2729,17 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "编译 Keil 工程（UV4 -b，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，可省略以用默认工程；"
             "target 为可选目标名。timeout_s 为可选超时秒数（0=默认 1800s）；大型工程/首次全量编译可显式调大，超时会返回 exit_code=-1 并说明。"
-            "返回退出码与编译日志。注意：UV4 -b 会新起独立隐藏进程，构建输出经 -o 捕获返回（不会显示在你已打开的 Keil 窗口）；退出码 0/1=成功,2=有错误,>=3=不完整。Keil 处于调试态时编译可能失败，建议先退出调试。"
+            "返回退出码与编译日志。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。注意：UV4 -b 会新起独立隐藏进程，构建输出经 -o 捕获返回（不会显示在你已打开的 Keil 窗口）；退出码 0/1=成功,2=有错误,>=3=不完整。Keil 处于调试态时编译可能失败，建议先退出调试。"
         ),
     )
     async def build_project(project: str = "", target: str = "",
-                            timeout_s: int = 0) -> str:
+                            timeout_s: int = 0,
+                            ensure_debug_channel: bool = True) -> str:
         try:
             p = _resolve_project(project)
             t = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_BUILD_TIMEOUT
-            return _js(builder.build_project(_builder_cfg["uv4"], p, target.strip() or None, t))
+            return _js(builder.build_project(_builder_cfg["uv4"], p, target.strip() or None, t,
+                                             ensure_debug_channel=ensure_debug_channel))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -2740,15 +2748,17 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "重新编译 Keil 工程（UV4 -r，全量重编，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
             "可省略以用默认工程；target 为可选目标名。timeout_s 为可选超时秒数（0=默认 1800s），全量重编耗时更久，建议按需调大。"
-            "注意：UV4 -r 全量重编，同上——新起隐藏进程、输出经 -o 捕获；退出码语义同 build。Keil 处于调试态时编译可能失败。"
+            "注意：UV4 -r 全量重编，同上——新起隐藏进程、输出经 -o 捕获；退出码语义同 build。Keil 处于调试态时编译可能失败。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。"
         ),
     )
     async def rebuild_project(project: str = "", target: str = "",
-                              timeout_s: int = 0) -> str:
+                              timeout_s: int = 0,
+                              ensure_debug_channel: bool = True) -> str:
         try:
             p = _resolve_project(project)
             t = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_BUILD_TIMEOUT
-            return _js(builder.rebuild_project(_builder_cfg["uv4"], p, target.strip() or None, t))
+            return _js(builder.rebuild_project(_builder_cfg["uv4"], p, target.strip() or None, t,
+                                               ensure_debug_channel=ensure_debug_channel))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -2757,15 +2767,17 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "烧录 Keil 工程到目标 Flash（UV4 -f，后台隐藏窗口，不闪现界面）。project 为 .uvprojx 路径，"
             "可省略以用默认工程；target 为可选目标名。timeout_s 为可选超时秒数（0=默认 600s）。"
-            "注意：UV4 -f 烧录，需目标板与烧录器已连接且工程烧录算法配置正确；Keil 处于调试态时烧录可能失败，建议先退出调试。烧录会覆盖目标 Flash，属有副作用操作。"
+            "注意：UV4 -f 烧录，需目标板与烧录器已连接且工程烧录算法配置正确；Keil 处于调试态时烧录可能失败，建议先退出调试。烧录会覆盖目标 Flash，属有副作用操作。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。"
         ),
     )
     async def flash_download(project: str = "", target: str = "",
-                             timeout_s: int = 0) -> str:
+                             timeout_s: int = 0,
+                             ensure_debug_channel: bool = True) -> str:
         try:
             p = _resolve_project(project)
             t = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_FLASH_TIMEOUT
-            return _js(builder.flash_download(_builder_cfg["uv4"], p, target.strip() or None, t))
+            return _js(builder.flash_download(_builder_cfg["uv4"], p, target.strip() or None, t,
+                                              ensure_debug_channel=ensure_debug_channel))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -2775,17 +2787,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "编译并烧录闭环（后台隐藏窗口，不闪现界面）：先编译，成功后才烧录（UV4 -b 成功后 -f）。"
             "project 为 .uvprojx 路径，可省略以用默认工程；target 为可选目标名。"
             "timeout_s 为可选超时秒数（0=用默认：编译 1800s、烧录 600s）；大型工程或首次全量编译建议显式调大。"
-            "注意：先编译成功才烧录（编译失败不烧录）；编译/烧录均新起隐藏 UV4 进程、输出经 -o 捕获。Keil 处于调试态时建议先退出再执行。"
+            "注意：先编译成功才烧录（编译失败不烧录）；编译/烧录均新起隐藏 UV4 进程、输出经 -o 捕获。Keil 处于调试态时建议先退出再执行。ensure_debug_channel（默认 true）：执行前先取调试通道健康快照，若编译后 4823 由可用变不可用（UV4 命令行把 GUI 实例一起带走），会自动拉起 Keil 并重建 UVSOCK 连接，返回值含 keil_before / keil_after / keil_recovered / keil_note，无需再手工 restart_keil；设为 false 可关闭。"
         ),
     )
     async def build_and_flash(project: str = "", target: str = "",
-                              timeout_s: int = 0) -> str:
+                              timeout_s: int = 0,
+                              ensure_debug_channel: bool = True) -> str:
         try:
             p = _resolve_project(project)
             bt = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_BUILD_TIMEOUT
             ft = int(timeout_s or 0) if int(timeout_s or 0) > 0 else builder.DEFAULT_FLASH_TIMEOUT
             return _js(builder.build_and_flash(_builder_cfg["uv4"], p,
-                                               target.strip() or None, bt, ft))
+                                               target.strip() or None, bt, ft,
+                                               ensure_debug_channel=ensure_debug_channel))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 

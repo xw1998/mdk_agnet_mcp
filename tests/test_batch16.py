@@ -54,6 +54,11 @@ async def main():
         server = create_server(host="127.0.0.1", port=PORT, idle_timeout=30.0)
         client = _get_client()
 
+        # 本机可能正开着 Keil（UV4 进程存活并监听 4823），会让下面几项
+        # “无 UV4 进程”的断言随环境漂移；这里显式把 UV4 进程枚举打桩为空，构造可重复环境。
+        _real_uv4_pids = winutil.uv4_pids
+        winutil.uv4_pids = lambda: []
+
         # ---------- 1. 健康检查 ----------
         h = load(await call(server, "keil_health", {}))
         check("H1 keil_health 在无 Keil 时也能正常返回", h.get("ok") is True, str(h)[:200])
@@ -75,6 +80,7 @@ async def main():
         check("H9 keil_health 对未运行 Keil 给出 keil_not_running",
               winutil.keil_health(14899).get("code") == "keil_not_running",
               str(winutil.keil_health(14899)))
+        winutil.uv4_pids = _real_uv4_pids
 
         # ---------- 2. 连接失败带诊断 ----------
         bad = UVClient(host="127.0.0.1", port=14899, idle_timeout=1.0)
@@ -159,7 +165,9 @@ async def main():
         check("R6 复位后命令可正常执行", d.get("ok") is True, str(d)[:200])
 
         # ---------- 5. restart_keil ----------
-        # mock 环境不能真的开关 Keil：把「关」和「起」两步打桩，只验证流程与返回结构
+        # mock 环境不能真的开关 Keil：把「关」和「起」两步打桩，只验证流程与返回结构；
+        # 同时把 UV4 进程枚举打桩为空，否则本机开着 Keil 时会判成 keil_alive=true。
+        winutil.uv4_pids = lambda: []
         real_launch2, real_close = builder.launch_uvision, builder.close_uvision
         builder.launch_uvision = lambda uv4, project="": {
             "ok": True, "pid": 999, "breakaway": True, "creationflags": "0x1020208"}
@@ -169,6 +177,7 @@ async def main():
                                 {"project": r"C:\fake\x.uvprojx", "wait_ready": 3.0}))
         finally:
             builder.launch_uvision, builder.close_uvision = real_launch2, real_close
+            winutil.uv4_pids = _real_uv4_pids
         check("K1 restart_keil 返回完整流程结构",
               all(k in r for k in ("action", "close", "launch", "port_wait",
                                    "reset", "health", "ok")), str(r)[:240])
