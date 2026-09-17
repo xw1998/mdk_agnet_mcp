@@ -144,21 +144,15 @@ mdk_agent/
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
 │   ├── client.py             # UVClient：调试能力封装 + 连接缓存
 │   ├── builder.py            # UV4 命令行：编译 / 重编译 / 烧录 / 编译烧录闭环
-│   ├── locator.py             # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
+│   ├── locator.py            # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
 │   ├── periph.py             # 内置 STM32F4 常用外设寄存器表（RCC/GPIO/USART/SPI/I2C/TIM/...）+ 内存区域地图
 │   ├── mapfile.py            # .map 链接映射文件解析（Program Size/sections/symbols/栈使用/未用段）
-│   └── server.py             # MCP Server 与 83 个工具定义
+│   └── server.py             # MCP Server 与 85 个工具定义
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
-│   ├── test_e2e.py           # UVClient 协议闭环测试
-│   ├── test_batch1.py        # 批次1：find_symbol/set_register/dwt
-│   ├── test_batch2.py        # 批次2：fault_report/条件断点
-│   ├── test_batch3.py        # 批次3：read_peripheral/list_peripherals/itm_trace
-│   ├── test_batch4.py        # 批次4：query_memory_map/search_mem/fill_mem/snapshot_diff/profile_function/write_peripheral/wait_fault/parse_build_errors/parse_map
-│   ├── test_batch5.py        # 批次5：read_mem_multi/batch/project_targets/set_debug_target/read_project_config
-│   ├── test_batch6.py        # 批次6：target_info/profile_sampling/mdk_guide
-│   ├── test_mcp.py           # MCP Server 工具注册与调用测试
-│   └── test_stdio.py         # stdio 全链路客户端握手测试
+│   ├── test_batch*.py        # 各批次 mock 回归（批次 8 拆为 8a/8b/8cd；逐批覆盖该批新增工具）
+│   └── test_e2e / test_mcp / test_stdio / test_enhanced / test_unhardcode / test_diag.py
+│                             # 协议闭环 / MCP 工具注册 / stdio 握手 / 增强功能 / 去硬编码 / 诊断
 └── example_mdk_project/      # 随附 STM32F4 HAL 例程（真机调试验证目标，随项目一并开源）
 ```
 
