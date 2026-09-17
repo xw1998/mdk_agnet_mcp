@@ -119,16 +119,15 @@ async def main():
         # ---------- 3b. Keil 中途死掉：连接中断要快速失败并带诊断 ----------
         client.phy.open()
         srv.drop_connection_after = 1      # 下一个请求回完响应就 RST 断开
-        try:
-            client.get_status()            # 这条能拿到响应（RST 紧随其后）
-        except Exception:  # noqa: BLE001
-            pass
         t0 = time.time()
         tip2 = ""
-        try:
-            client.get_status()
-        except Exception as e:  # noqa: BLE001
-            tip2 = str(e)
+        # RST 具体落在哪一次调用上取决于收发时序，故连续尝试直到出现异常
+        for _ in range(4):
+            try:
+                client.get_status()
+            except Exception as e:  # noqa: BLE001
+                tip2 = str(e)
+                break
         dt = time.time() - t0
         check("S1 连接被重置时抛错并带诊断",
               ("中断" in tip2 or "超时" in tip2) and ("诊断" in tip2 or "Keil" in tip2),
@@ -224,7 +223,7 @@ async def main():
         check("D-keil_health 描述提到模态框", "模态" in (tools["keil_health"].description or ""), "")
         check("D-restart_keil 描述提示会关闭所有实例",
               "关闭所有 Keil 实例" in (tools["restart_keil"].description or ""), "")
-        check("D1 工具数 68→71", len(tools) == 71, str(len(tools)))
+        check("D1 工具数 68→73", len(tools) == 73, str(len(tools)))
 
         await call(server, "exit_debug", {})
     finally:

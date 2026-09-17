@@ -1071,6 +1071,22 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         try:
             r = _get_client().enter_debug()
             out = dict(r)
+            # 遗留断点预警：.uvoptx 里的持久化断点会在进调试时被 Keil 自动恢复
+            # （BK 清不掉），是「目标行为诡异」的隐蔽干扰源，这里主动报出来。
+            try:
+                info = _read_uvoptx_persistent("")
+                items = info.get("breakpoints") or info.get("bps") or []
+                out["uvoptx_breakpoints"] = {
+                    "count": int(info.get("count", len(items)) or 0),
+                    "items": items[:5]}
+                if out["uvoptx_breakpoints"]["count"]:
+                    out["uvoptx_warning"] = (
+                        "工程 .uvoptx 里有 %d 个持久化断点，会随本次进调试被 Keil 自动恢复"
+                        "（软件断点命令清不掉）。若目标行为不符合预期，先用 "
+                        "list_uvoptx_breakpoints 确认、必要时 clear_uvoptx_breakpoints 清理。"
+                        % out["uvoptx_breakpoints"]["count"])
+            except Exception:  # noqa: BLE001
+                pass
             if not r.get("ok"):
                 out["diagnosis"] = (
                     "进入调试失败，请依次排查：① 目标板是否已连接且调试器驱动正常；"
@@ -1088,9 +1104,40 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def exit_debug() -> str:
         try:
-            return _js(_get_client().exit_debug())
+            r = _get_client().exit_debug()
+            if r.get("ok"):
+                return _js(r)
+            out = dict(r)
+            try:
+                health = winutil.keil_health()
+            except Exception:  # noqa: BLE001
+                health = {}
+            out["keil"] = health
+            code = health.get("code")
+            if code in ("keil_not_running", "port_not_listening"):
+                out["diagnosis"] = (
+                    "Keil 已经不在（%s）——本次调试会话实际已丢失，退出调试自然失败。"
+                    "可用 restart_keil 一步恢复（关闭残留 Keil → 脱离父进程重启 → 等 UVSOCK "
+                    "就绪 → 重建连接）；注意重启会丢失当前会话（断点/观察变量需重新设置），"
+                    "但 .uvoptx 里的持久化断点会被 Keil 自动恢复。" % code)
+            elif health.get("modal_dialogs"):
+                out["diagnosis"] = (
+                    "退出调试被拒，且检测到 Keil 有模态对话框（%s）——命令会被阻塞，"
+                    "请在 Keil 界面处理该窗口后重试。"
+                    % "；".join(str(d) for d in health["modal_dialogs"][:3]))
+            else:
+                out["diagnosis"] = (
+                    "退出调试失败：目标在运行态时会被拒（status=11），请先 stop 再 exit_debug；"
+                    "若反复失败，可用 keil_health 看进程/端口/模态框状态，"
+                    "或用 reset_connection / restart_keil 恢复会话。")
+            return _js(out)
         except Exception as e:  # noqa: BLE001
-            return _js({"ok": False, "error": str(e)})
+            try:
+                health = winutil.keil_health()
+            except Exception:  # noqa: BLE001
+                health = {}
+            return _js({"ok": False, "error": str(e), "keil": health,
+                        "diagnosis": "退出调试过程出错；若 Keil 已退出，用 restart_keil 一步恢复。"})
 
     # ---------------- 断点管理 ----------------
     @server.tool(
@@ -1850,6 +1897,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if "pc" in core:
                 aapcs["program_counter"] = core["pc"]
             out["aapcs"] = aapcs
+            # 标注 PC 可信度：真机反馈「读到的 PC 可能是上一次 halt 的残留值」，
+            # 仅凭 ok=True 就采信会把排查带偏（报出 HAL_Init / 反复同一地址）。
+            # 这里复用寄存器稳定性收敛 + 复查是否真的停住的判定。
+            try:
+                anchor = {"pc": core.get("pc"), "lr": core.get("lr"), "sp": core.get("sp"),
+                          "ok": True, "stable": True}
+                anchor = client._annotate_stop(anchor, verify_halt=True)
+                for k in ("pc_confidence", "halt_verified", "warning", "repeat_count",
+                          "repeat_warning", "target_running", "halt_check", "stable"):
+                    if k in anchor:
+                        out[k] = anchor[k]
+            except Exception:  # noqa: BLE001
+                pass
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -2334,6 +2394,87 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="wait_breakpoint",
+        title="等待断点命中（带超时）",
+        description=(
+            "带超时地等待目标停在断点上：轮询目标状态，一旦停止就读取 PC（含收敛判定与"
+            "「是否真的停住」复查），回落到源码位置，返回 hit / hit_address / hit_count / "
+            "waited_ms。用来确证「App 是否真的调用到内核某函数」，不必再靠读 PC 猜、"
+            "也不必手工循环 get_status。"
+            "symbol 传符号名（如 svcrt_ptable_lookup，自动解析为地址）；address 传 0x 地址；"
+            "两者都不传时用工程 .uvoptx 里的持久化断点作候选（use_project_breakpoints 控制）。"
+            "命中后返回里直接带 file/line/callstack，并累计该地址命中次数（breakpoint_stats 可查全部）。"
+            "注意：命中判定为「目标已停止 且 PC 等于候选地址」（自动兼容 Thumb 位）；"
+            "若本该命中却一直不停，先用 list_breakpoints / list_uvoptx_breakpoints 确认断点存在且启用"
+            "（App 侧重定位后运行时地址与符号地址不同，应传实际运行地址）。需已进入调试。"
+        ),
+    )
+    async def wait_breakpoint(symbol: str = "", address: str = "",
+                              timeout_s: float = 10.0, poll_ms: int = 100,
+                              use_project_breakpoints: bool = True,
+                              project: str = "") -> str:
+        try:
+            client = _get_client()
+            candidates: list = []
+            notes: list = []
+            if symbol:
+                loc = _get_locator()
+                hit = loc.symbol_addr(symbol) if loc is not None else None
+                if not hit:
+                    return _js({"ok": False, "symbol": symbol,
+                                "error": "找不到符号（检查拼写，或先用 find_symbol 检索）"})
+                candidates.append(int(hit["addr"]))
+                notes.append("symbol %s -> %s" % (symbol, hex(hit["addr"])))
+            if address:
+                a, an = _resolve_addr_arg(address, client)
+                candidates.append(int(a))
+                if an:
+                    notes.append(an)
+            if not candidates and use_project_breakpoints:
+                info = _read_uvoptx_persistent(project)
+                items = info.get("breakpoints") or info.get("bps") or []
+                for bp in items:
+                    try:
+                        candidates.append(int(bp.get("address") or bp.get("addr") or 0))
+                    except Exception:  # noqa: BLE001
+                        continue
+                candidates = [c for c in candidates if c]
+                if candidates:
+                    notes.append("候选来自 .uvoptx 持久化断点 %d 个" % len(candidates))
+            r = client.wait_breakpoint(candidates, timeout_s=float(timeout_s),
+                                      poll=max(0.01, int(poll_ms) / 1000.0))
+            out = dict(r)
+            if notes:
+                out["candidates_note"] = "；".join(notes)
+            if r.get("hit") and r.get("stopped"):
+                info = _build_location(client)
+                if info and info.get("ok"):
+                    for k in ("file", "line", "source", "address", "display_path", "callstack"):
+                        if k in info:
+                            out[k] = info[k]
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="breakpoint_stats",
+        title="断点命中统计",
+        description=(
+            "查看本进程内各断点的命中次数（由 wait_breakpoint 累计），用来回答"
+            "「这个断点到底命中过几次」「App 有没有走到过某函数」。"
+            "注意：只统计经 wait_breakpoint 观察到的命中，服务重启即清零；"
+            "在此之前发生的历史命中无法回溯——需要历史请用数据断点(watch)或自行埋点。"
+        ),
+    )
+    async def breakpoint_stats() -> str:
+        try:
+            hits = _get_client().breakpoint_hits()
+            return _js({"ok": True, "count": len(hits), "hits": hits,
+                        "note": "计数自本进程启动起累计，仅含 wait_breakpoint 观察到的命中"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="run_timeout",
         title="运行一段时间后自动暂停",
         description=(
@@ -2344,7 +2485,12 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "避免把陈旧 PC（常量落复位附近 0x0800024c 之类）误当成停靠点。"
             "另外真机实测：halt 后**首次**读到的 PC 常是上一次 halt 的残留值（LR/SP 已是新值），"
             "故读取按'连续采样收敛'判定（连续两次 PC/LR/SP 一致才采纳），"
-            "返回 pc_confidence=high/low；low 表示采样未收敛，PC 不可信，请重试。"
+            "返回 pc_confidence=high/low；low 表示采样未收敛或复查发现目标其实仍在运行，"
+            "PC 不可信，请重试。返回里始终带 pc_confidence 与 stop_verified："
+            "stop_verified=false 表示「没能确证目标已停」，此时绝不要把任何地址当停靠点"
+            "（真机踩过：报出 HAL_Init / 连续同一个地址，而目标其实在跑）。"
+            "若你怀疑目标没停或反复复位，请改用 wait_breakpoint（等断点命中）"
+            "或 read_variable / 串口输出交叉确认。"
             "到点常停在 SysTick 等中断上下文，此时局部变量与调用栈层数可能受限/为空，"
             "AAPCS 寄存器解读不适用。需已进入调试且配置 .axf。"
         ),
@@ -2373,6 +2519,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             info = _build_location(client)
             if info:
                 out.update(info)
+            # 无论定位成败都显式给出 PC 可信度（真机反馈：把陈旧 PC 当停靠点会把排查
+            # 带偏，报出 HAL_Init / 连续同一地址，而目标其实在跑）。
+            if "pc_confidence" not in out:
+                out["pc_confidence"] = "low"
+                out["pc_warning"] = (
+                    "本次未取得可信的 PC（未能确认目标已停止，或符号未就绪）："
+                    "不要把任何地址当作停靠点。需要定位时先 stop 再用 get_current_location，"
+                    "或改用 wait_breakpoint 等断点命中。")
+            regs = out.get("registers") or {}
+            out["stop_verified"] = bool(ws.get("stopped")) and bool(regs.get("halt_verified"))
+            if regs.get("target_running"):
+                out["ok"] = False
+                out["pc_warning"] = regs.get("warning")
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -2728,7 +2887,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 if val is None:
                     regs.append({"reg": name, "addr": f"0x{addr:X}", "value": None})
                     continue
-                entry = {"reg": name, "addr": f"0x{addr:X}", "value": f"0x{val:08X}", "raw": val}
+                # 同时给「裸名」（去掉外设前缀，如 GPIOC_MODER -> MODER），
+                # 便于脚本直接 regs["MODER"]，不用再手工 strip 前缀
+                _bare = name.split("_", 1)[1] if "_" in name else name
+                entry = {"reg": name, "name": _bare,
+                         "addr": f"0x{addr:X}", "value": f"0x{val:08X}", "raw": val}
                 # 关键位域解读
                 bits = []
                 for fname, lsb, width, enum in rdef.get("fields", []):
@@ -2795,18 +2958,29 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="search_mem",
         title="在内存范围内搜索字节序列",
         description=(
-            "在 [start,end) 地址范围内扫描十六进制字节序列（pattern_hex，如 'DEADBEEF'），"
+            "在 [start,end) 地址范围内扫描字节序列。两种给法：pattern_hex 为十六进制"
+            "（如 'DEADBEEF'），pattern_text 为文本（如 'appstat'，默认 ascii 编码，"
+            "不用自己转十六进制）——两者只用一个，同时给时以 pattern_text 为准。"
             "返回所有命中地址（分块读、块间重叠防跨块漏匹配）。用于找魔数、定位被越界写坏的缓冲、"
             "搜索特定数据结构。需已进入调试。start/end 用 0x 十六进制。注意：需目标暂停；大范围扫描较慢（分块读）；请勿搜索外设保留区或未映射地址（可能读取失败）。块间重叠处理了跨块匹配。"
         ),
     )
-    async def search_mem(start: str, end: str, pattern_hex: str, max_results: int = 20) -> str:
+    async def search_mem(start: str, end: str, pattern_hex: str = "",
+                         max_results: int = 20, pattern_text: str = "",
+                         encoding: str = "ascii") -> str:
         try:
             client = _get_client()
-            try:
-                pattern = bytes.fromhex((pattern_hex or "").replace(" ", "").replace("0x", ""))
-            except ValueError:
-                return _js({"ok": False, "error": "pattern_hex 非法，须为偶数个十六进制字符"})
+            if pattern_text:
+                try:
+                    pattern = pattern_text.encode(encoding or "ascii")
+                except Exception as e:  # noqa: BLE001
+                    return _js({"ok": False, "error": "pattern_text 编码失败: %s" % e})
+            else:
+                try:
+                    pattern = bytes.fromhex((pattern_hex or "").replace(" ", "").replace("0x", ""))
+                except ValueError:
+                    return _js({"ok": False, "error": "pattern_hex 非法，须为偶数个十六进制字符；"
+                                                      "搜字符串请用 pattern_text"})
             if not pattern:
                 return _js({"ok": False, "error": "pattern_hex 不能为空"})
             s, sn = _resolve_addr_arg(start, client)

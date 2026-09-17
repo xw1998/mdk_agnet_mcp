@@ -65,6 +65,8 @@ class UVClient:
         self._lock = threading.RLock()
         self._last_used = 0.0
         self.phy = UVInterface(host=host, port=port)
+        self._stop_pc_hist = []   # 最近几次停止点 PC，用于识别「同一地址反复出现」
+        self._bp_hits = {}        # 断点命中计数 {addr: count}（本进程内累计）
 
     # ------------------------------------------------------------------
     # 连接生命周期
@@ -581,7 +583,8 @@ class UVClient:
 
     def read_cpu_registers_stable(self, retries: int = 20, delay: float = 0.05,
                                   require_stopped: bool = False,
-                                  need_stable: int = 2) -> dict:
+                                  need_stable: int = 2,
+                                  verify_halt: bool = True) -> dict:
         """读取 CPU 寄存器，并规避 halt 瞬间的滞后（陈旧）值。
 
         真机实测（F401）：run_timeout/stop 之后**首次**读到的 PC 往往还是上一次 halt 的
@@ -599,6 +602,10 @@ class UVClient:
         返回值在寄存器字段外附加：
         - stable: 是否读到收敛值；False 时附 warning（PC 可能滞后，建议重试）
         - samples: 实际采样次数
+        - halt_verified: 读完寄存器后复查确认目标确实停着；False 表示目标其实在运行，
+          此时 PC 是上一次 halt 的残留值，绝不可用于定位
+        - pc_confidence: high/low 的显式标注（低置信度时同时给 warning）
+        - repeat_count/repeat_warning: 同一 PC 连续出现的次数（疑似陈旧值时的提示）
         """
         if require_stopped:
             try:
@@ -632,7 +639,7 @@ class UVClient:
                 if same >= need_stable - 1:
                     r["stable"] = True
                     r["samples"] = samples
-                    return r
+                    return self._annotate_stop(r, verify_halt)
             else:
                 same = 0
                 prev_sig = sig
@@ -641,7 +648,152 @@ class UVClient:
         last["samples"] = samples
         last["warning"] = ("连续 %d 次采样未收敛（PC/LR/SP 仍在变化），读到的 PC 可能是 halt "
                            "瞬间的滞后值，不可信；请重试，或先 get_status 确认已停止" % samples)
-        return last
+        return self._annotate_stop(last, verify_halt)
+
+    def _annotate_stop(self, r: dict, verify_halt: bool = True) -> dict:
+        """给一次寄存器读取补上「这个 PC 到底可不可信」的判定与交叉验证。
+
+        来自真机反馈：run_timeout 报出的停靠点会把排查带偏——报 main.c:107 HAL_Init、
+        或连续多次报同一个地址，而目标其实一直在跑（串口实时响应）。所以这里做两件事：
+
+        1) 复查目标是否真的停着。停止判定本身可能滞后（stop/复位都是异步生效），
+           读完寄存器后再采样状态；若发现目标在跑，直接降级为「PC 不可信」，
+           而不是把陈旧地址当成停靠点报出去。
+        2) 记录最近的停止点 PC，同一地址连续出现多次时给出 repeat 计数与提示。
+           正常循环也可能反复停在同一处，但结合「目标在跑」的迹象时，
+           应当优先怀疑这是上次 halt 的残留值。
+        """
+        pc = r.get("pc")
+        if isinstance(pc, int) and pc not in (0, 1):
+            hist = self._stop_pc_hist
+            hist.append(pc)
+            del hist[:-5]
+            repeat = 0
+            for v in reversed(hist):
+                if v == pc:
+                    repeat += 1
+                else:
+                    break
+            r["repeat_count"] = repeat
+            if repeat >= 3:
+                r["repeat_warning"] = (
+                    "同一停止地址已连续出现 %d 次（%s）：若怀疑目标其实一直在运行，"
+                    "这个 PC 很可能是上一次 halt 的残留值，请勿据此判断「卡死/反复复位」，"
+                    "可用 get_status、read_variable 或串口输出交叉确认"
+                    % (repeat, hex(pc)))
+        if not verify_halt:
+            r["pc_confidence"] = "high" if r.get("stable") else "low"
+            return r
+        running = None
+        samples = 0
+        last_err = ""
+        for _ in range(2):
+            try:
+                st = self.get_status()
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                break
+            samples += 1
+            if st.get("ok") and st.get("running"):
+                running = True
+                break
+            time.sleep(0.05)
+        r["halt_verified"] = bool(samples >= 2 and not running)   # running=None 表示两次复查都没看到在跑
+        if not r["halt_verified"]:
+            r["halt_check"] = {"samples": samples, "target_running": bool(running),
+                               "error": last_err}
+        if running:
+            r["stable"] = False
+            r["target_running"] = True
+            r["read_ok_before_verify"] = r.get("ok")
+            r["pc_confidence"] = "low"
+            r["warning"] = (
+                "读完寄存器后复查发现目标其实仍在运行：此时读到的 PC 是上一次 halt 的残留值"
+                "（实测会稳定返回同一地址，极易被误判成「停在某处」或「反复复位」），"
+                "不可用于定位。请先 stop 并确认停止（wait_until_stopped），或改用 "
+                "read_variable / 串口输出确认程序实际行为。")
+        else:
+            r["pc_confidence"] = "high" if r.get("stable") else "low"
+        return r
+
+    def note_breakpoint_hit(self, addr: int) -> int:
+        """记录一次断点命中，返回该地址在本进程内的累计命中次数。"""
+        key = int(addr)
+        self._bp_hits[key] = self._bp_hits.get(key, 0) + 1
+        return self._bp_hits[key]
+
+    def breakpoint_hits(self) -> dict:
+        """返回断点命中计数 {hex(addr): count}。"""
+        return {hex(k): v for k, v in self._bp_hits.items()}
+
+    def wait_breakpoint(self, addresses=None, timeout_s: float = 10.0,
+                        poll: float = 0.1) -> dict:
+        """带超时地等待目标停在（给定）断点上。
+
+        addresses: 候选断点地址列表（int）。传空表示「不限定地址」——目标停下即算命中，
+        用于只想等一个停止事件的场景。地址匹配自动兼容 Thumb 位（pc 与 addr 差 1）。
+
+        判定链路刻意保守：先确认目标已停止，再用 read_cpu_registers_stable 读取
+        （含收敛判定 + 复查仍在运行），因此返回的 pc_confidence 可信度可直接采信；
+        若读到的是陈旧 PC 会带 warning，不会被当成命中。
+
+        返回 {ok, hit, hit_address, hit_count, waited_ms, polls, candidates, registers,
+        pc_confidence, warning, repeat_warning}；超时返回 ok=False 且给出候选清单与原因。
+        """
+        adrs = []
+        for a in (addresses or []):
+            try:
+                adrs.append(int(a))
+            except Exception:  # noqa: BLE001
+                continue
+        t0 = time.time()
+        deadline = t0 + max(0.0, float(timeout_s))
+        polls = 0
+        last: dict = {}
+        while True:
+            polls += 1
+            try:
+                last = self.get_status()
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "hit": False, "error": str(e),
+                        "waited_ms": int((time.time() - t0) * 1000), "polls": polls,
+                        "candidates": [hex(a) for a in adrs]}
+            if last.get("ok") and last.get("running") is False:
+                regs = self.read_cpu_registers_stable(retries=20, delay=0.03)
+                pc = regs.get("pc") if isinstance(regs.get("pc"), int) else None
+                matched = None
+                if pc is not None and adrs:
+                    for a in adrs:
+                        if pc == a or (pc | 1) == a or pc == (a | 1):
+                            matched = a
+                            break
+                elif pc is not None:
+                    matched = pc      # 未给候选断点：停下即视为命中
+                waited = int((time.time() - t0) * 1000)
+                out = {"ok": True, "hit": matched is not None, "stopped": True,
+                       "pc": hex(pc) if pc is not None else None,
+                       "waited_ms": waited, "polls": polls, "registers": regs,
+                       "candidates": [hex(a) for a in adrs],
+                       "pc_confidence": regs.get("pc_confidence")}
+                if matched is not None:
+                    out["hit_address"] = hex(matched)
+                    out["hit_count"] = self.note_breakpoint_hit(matched)
+                for k in ("warning", "repeat_warning"):
+                    if regs.get(k):
+                        out[k] = regs[k]
+                return out
+            if time.time() >= deadline:
+                return {"ok": False, "hit": False,
+                        "waited_ms": int((time.time() - t0) * 1000), "polls": polls,
+                        "target_running": bool(last.get("running")),
+                        "candidates": [hex(a) for a in adrs], "status": last,
+                        "error": ("等待断点命中超时（%dms）：目标未停在候选断点上。"
+                                  "排查建议：① 用 list_breakpoints / list_uvoptx_breakpoints "
+                                  "确认断点确实存在且已启用（.uvoptx 遗留断点会干扰）；"
+                                  "② App 侧若做了重定位，运行时地址与符号地址不同，"
+                                  "应传实际运行地址；③ 目标可能一直没执行到该路径。"
+                                  % int((time.time() - t0) * 1000))}
+            time.sleep(poll)
 
     # ------------------------------------------------------------------
     # 运行控制
