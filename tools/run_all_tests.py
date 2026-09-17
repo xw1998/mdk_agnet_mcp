@@ -1,0 +1,183 @@
+# -*- coding: utf-8 -*-
+"""仓库统一测试闸门：先做一致性检查，再跑各批次 mock 测试并汇总。
+
+用法：
+    python tools/run_all_tests.py            # 一致性检查 + 跑闸门内全部测试
+    python tools/run_all_tests.py --no-run    # 只做一致性检查（秒级）
+    python tools/run_all_tests.py --list      # 只列清单
+
+一致性检查（防止"加了工具忘了改断言"这类静默腐烂）：
+  1. 以 mdkdebug.server.create_server() 实际注册的工具数为唯一事实来源
+  2. 扫描 tests/test_*.py 里写死的工具总数断言，必须都等于实际值
+  3. 扫描 README.md 里对工具数的描述，必须等于实际值
+  4. 列出 tests/ 下存在但未纳入闸门的模块（信息提示，不判失败）
+"""
+import asyncio
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 闸门内的测试模块（顺序即执行顺序；新增批次后请加到这里）
+BATCHES = [
+    "test_e2e", "test_mcp", "test_stdio", "test_unhardcode",
+    "test_batch9", "test_batch10", "test_batch13", "test_batch14",
+    "test_batch15", "test_batch16", "test_batch18", "test_batch25",
+    "test_batch26", "test_batch28", "test_batch29", "test_batch30",
+    "test_batch31", "test_batch32", "test_batch33", "test_batch35",
+]
+
+PATTERNS = [
+    re.compile(r"通过\s*(\d+)\s*失败\s*(\d+)"),
+    re.compile(r"(\d+)\s*通过\s*/\s*(\d+)\s*失败"),
+    re.compile(r"通过\s*[:：]\s*(\d+).{0,20}?失败\s*[:：]\s*(\d+)", re.S),
+    re.compile(r"(\d+)\s*(?:passed|pass)\D{0,20}?(\d+)\s*(?:failed|fail)", re.I),
+]
+
+README_COUNT_PATTERNS = [
+    re.compile(r"与\s*(\d+)\s*个工具定义"),
+    re.compile(r"共\s*\*\*(\d+)\*\*\s*个"),
+]
+
+
+def dec(b):
+    for enc in ("utf-8", "gbk", "cp936"):
+        try:
+            return b.decode(enc)
+        except (UnicodeDecodeError, AttributeError):
+            continue
+    return (b or b"").decode("utf-8", "replace")
+
+
+def actual_tool_count():
+    """唯一事实来源：真起一个 server 数注册了多少个工具。"""
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    from mdkdebug import server as srv  # noqa: E402
+    server = srv.create_server()
+    return len(asyncio.run(server.list_tools()))
+
+
+def scan_test_counts(n):
+    """返回 [(文件, 行号, 行文本, 断言值)]。只认同时含『工具数(总)』与 `==` 的行。"""
+    hits = []
+    tdir = os.path.join(ROOT, "tests")
+    for fn in sorted(os.listdir(tdir)):
+        if not (fn.startswith("test_") and fn.endswith(".py")):
+            continue
+        path = os.path.join(tdir, fn)
+        text = dec(open(path, "rb").read())
+        for i, line in enumerate(text.splitlines(), 1):
+            if "==" not in line or not re.search(r"工具(?:总|个)?数", line):
+                continue
+            if line.lstrip().startswith("#"):
+                continue
+            for v in re.findall(r"==\s*(\d+)\b", line):
+                hits.append((fn, i, line.strip(), int(v)))
+    return hits
+
+
+def scan_readme_counts(n=None):
+    hits = []
+    path = os.path.join(ROOT, "README.md")
+    if not os.path.exists(path):
+        return hits
+    text = dec(open(path, "rb").read())
+    for i, line in enumerate(text.splitlines(), 1):
+        for pat in README_COUNT_PATTERNS:
+            for v in pat.findall(line):
+                hits.append(("README.md", i, line.strip(), int(v)))
+    return hits
+
+
+def discover_ungated():
+    tdir = os.path.join(ROOT, "tests")
+    gated = set(BATCHES)
+    out = []
+    for fn in sorted(os.listdir(tdir)):
+        if fn.startswith("test_") and fn.endswith(".py"):
+            mod = fn[:-3]
+            if mod not in gated:
+                out.append(mod)
+    return out
+
+
+def consistency():
+    print("== 一致性检查 ==")
+    n = actual_tool_count()
+    print("实际注册工具数：%d（来源：create_server().list_tools()）" % n)
+    bad = 0
+
+    hits = scan_test_counts(n)
+    wrong = [h for h in hits if h[3] != n]
+    print("tests 里写死的工具数断言：%d 处，%s" % (len(hits), "全部一致" if not wrong else "有不一致"))
+    for fn, i, line, v in wrong:
+        bad += 1
+        print("  [不一致] tests/%s:%d 断言 %d  != 实际 %d\n            %s" % (fn, i, v, n, line))
+    if not hits:
+        bad += 1
+        print("  [不一致] 没扫到任何工具数断言，检查扫描规则是否失效")
+
+    rhits = scan_readme_counts()
+    rwrong = [h for h in rhits if h[3] != n]
+    print("README 里的工具数描述：%d 处，%s" % (len(rhits), "全部一致" if not rwrong else "有不一致"))
+    for fn, i, line, v in rwrong:
+        bad += 1
+        print("  [不一致] %s:%d 写的是 %d  != 实际 %d\n            %s" % (fn, i, v, n, line))
+    if not rhits:
+        bad += 1
+        print("  [不一致] README 没扫到工具数描述，检查扫描规则是否失效")
+
+    ungated = discover_ungated()
+    if ungated:
+        print("存在但未纳入闸门的测试模块（信息提示）：%s" % ", ".join(ungated))
+
+    print("一致性检查：%s" % ("通过" if not bad else "发现 %d 处问题" % bad))
+    return bad
+
+
+def run_gate():
+    print("\n== 闸门测试 ==")
+    bad = []
+    for name in BATCHES:
+        p = subprocess.run([sys.executable, "-m", "tests." + name],
+                           cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out = dec(p.stdout)
+        ok = ng = None
+        for pat in PATTERNS:
+            m = pat.findall(out)
+            if m:
+                ok, ng = m[-1]
+                break
+        if ok is None:
+            ok = str(len(re.findall(r"\[PASS\]|\bPASS\b", out)))
+            ng = str(len(re.findall(r"\[FAIL\]|\bFAIL\b", out)))
+        print("%-16s 通过 %-4s 失败 %-4s rc=%d" % (name, ok, ng, p.returncode), flush=True)
+        if p.returncode != 0 or ng not in ("0",):
+            bad.append(name)
+    print("----")
+    print("总计 %d 个测试文件，异常/失败 %d 个" % (len(BATCHES), len(bad)))
+    if bad:
+        print("问题文件：" + ", ".join(bad))
+    return bad
+
+
+def main():
+    argv = sys.argv[1:]
+    if "--list" in argv:
+        for name in BATCHES:
+            print(name)
+        print("未纳入闸门：" + ", ".join(discover_ungated()))
+        return 0
+    bad = consistency()
+    if "--no-run" in argv:
+        return 1 if bad else 0
+    bad += len(run_gate())
+    print("\n结论：%s" % ("全部通过" if not bad else "存在问题，见上"))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

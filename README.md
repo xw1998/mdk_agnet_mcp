@@ -430,6 +430,15 @@ AI 修改代码后，可按如下顺序实现"自己编译、自己烧录、自�
 
 无需真实 Keil，使用 `tests/mock_uvsock_server.py` 模拟调试器：
 
+**跑全部**（推荐，先做一致性检查再跑 20 个测试模块）：
+
+```bash
+python tools/run_all_tests.py          # 实际工具数 vs tests/README 里写死的断言 + 跑全部测试
+python tools/run_all_tests.py --no-run # 只做一致性检查（秒级，改工具后先跑这个）
+```
+
+单个模块：
+
 ```bash
 python tests/test_e2e.py     # UVClient 协议闭环（25 项）
 python tests/test_mcp.py     # MCP Server 工具注册与调用（19 项）
