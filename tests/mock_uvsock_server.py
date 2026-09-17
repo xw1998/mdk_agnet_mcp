@@ -107,6 +107,8 @@ class MockUVSOCKServer:
         # 首次读到上一轮 halt 的旧值、随后收敛）；队列空则沿用 reg_map 当前值
         self.pc_queue = []
         self.breakpoints = []  # 断点符号/地址列表
+        # 命令窗口额外输出行（复现真机「UVSOCK 回成功、窗口里却是 *** error N」）
+        self.exec_console_extra = []
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
@@ -358,6 +360,9 @@ class MockUVSOCKServer:
         op, rest = parts[0].upper(), parts[1:]
         # 模拟真实 Keil：任何 EXEC_CMD 先回显命令名（0x5020 第一帧）
         self._push_console(cmd)
+        for t in self.exec_console_extra:
+            self._push_console(t)      # 窗口报错行（如 *** error 72: invalid item number）
+            self._push_async(uvsock.UV_DBG_EXEC_CMD, uvsock.UV_STATUS_FAILED, t)
         if op == 'BS' and rest:
             if rest[0] not in self.breakpoints:
                 self.breakpoints.append(rest[0])

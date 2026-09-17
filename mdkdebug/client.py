@@ -15,6 +15,7 @@ UVClient：高层封装 Keil UVSOCK 调试能力，并内置“连接缓存 + �
 from __future__ import annotations
 
 import logging
+import re
 import struct
 import threading
 import time
@@ -27,6 +28,18 @@ from .uvsock import (
 )
 
 logger = logging.getLogger("mdkdebug.client")
+
+# 命令窗口报错行。真机 BK/BS 失败时 UVSOCK 仍回 status=0，错误只出现在命令窗口文本里，
+# 形如 `*** error 72: invalid item number`；只看 status 会把失败当成功。
+_CMD_ERROR_RE = re.compile(r"\*\*\*\s*error\s+(\d+)\s*:\s*(.*)", re.IGNORECASE)
+
+# Keil 命令窗口 BL 输出行，真机实测形如：
+#   0: (E 0x08000DB4) '\\mdk_test\../Core/Src/main.c\77', CNT=1, enabled
+#   3: (A WR 0x20000000 len=1) '0x20000000', CNT=1, enabled
+# E=代码断点(E execution)，A=地址型断点(access，即数据观察点)，WR/RD 为访问类型。
+_BP_LINE_RE = re.compile(
+    r"^\s*(\d+):\s*\(\s*([A-Za-z]+)\s*([A-Za-z]{2})?\s*(0x[0-9A-Fa-f]+)"
+    r"([^)]*)\)\s*'(.*?)'(?:\s*,\s*CNT=(\d+))?(?:\s*,\s*(\w+))?")
 
 # 允许单次读内存的最大分块（Keil 协议限制）
 MAX_CHUNK = 16384
@@ -67,6 +80,10 @@ class UVClient:
         self.phy = UVInterface(host=host, port=port)
         self._stop_pc_hist = []   # 最近几次停止点 PC，用于识别「同一地址反复出现」
         self._bp_hits = {}        # 断点命中计数 {addr: count}（本进程内累计）
+        # 命令窗口/异步消息缓冲的读取游标：内部命令（BS/BK/BL）只取「新增」部分做窗口级
+        # 校验，绝不 clear——否则 read_console_output 随后就读不到命令窗口输出了。
+        self._cons_seen = 0
+        self._msg_seen = 0
 
     # ------------------------------------------------------------------
     # 连接生命周期
@@ -136,6 +153,8 @@ class UVClient:
                 buf = getattr(self.phy, attr, None)
                 if isinstance(buf, list):
                     buf.clear()
+            self._cons_seen = 0
+            self._msg_seen = 0
             self._last_used = 0.0
         try:
             health = winutil.keil_health(self.port)
@@ -516,22 +535,178 @@ class UVClient:
                 out["output_note"] = "响应携带二进制数据（非命令文本），已给 output_hex 原始字节"
         return out
 
+    def _drain_channels(self) -> tuple:
+        """取出「自上次读取以来新增」的命令窗口输出(0x5020)与异步消息(0x4000)。
+
+        用**游标推进**而不是 `clear=True`：内部命令（BS/BK/BL）既要读自己的窗口输出来
+        判断窗口级报错，又不能把缓冲吃光——否则 read_console_output 随后就读不到命令
+        窗口输出了（把批次9 建立的能力吃掉）。故这里只返回新增部分、缓冲保持完整。
+        缓冲被外部 clear（read_console_output(clear=True) / reset_connection）后，
+        游标会因超出长度自动回退到 0，不会把旧行误算成新行。
+        """
+        def _read(fn) -> list:
+            try:
+                return [str(it.get("text") or "").strip() for it in fn(clear=False)]
+            except Exception:  # noqa: BLE001
+                return []
+        allc = _read(self.phy.get_console_output)
+        allm = _read(self.phy.get_async_messages)
+        if self._cons_seen > len(allc):
+            self._cons_seen = 0
+        if self._msg_seen > len(allm):
+            self._msg_seen = 0
+        cons = allc[self._cons_seen:]
+        msgs = allm[self._msg_seen:]
+        self._cons_seen = len(allc)
+        self._msg_seen = len(allm)
+        return [c for c in cons if c], [m for m in msgs if m]
+
+    def exec_command_checked(self, command: str, settle: float = 0.12) -> dict:
+        """执行命令窗口命令，并把窗口里的 `*** error N: ...` 一并判为失败。
+
+        真机实测（批次20 全功能回归）：数据观察点的 `BK 0x20000000` 在 UVSOCK 层回
+        status=0「成功」，而 Keil 命令窗口实际报 `*** error 72: invalid item number`，
+        断点并未清除。只看 status 会把「没清掉」当成功上报，调用方据此继续调试会莫名
+        停在旧断点上，故这里统一做一次窗口级校验：返回额外带 console/errors。
+        """
+        self._drain_channels()          # 先清缓存，避免历史输出被算到本次命令
+        r = self.exec_command(command)
+        if settle:
+            time.sleep(settle)
+        cons, msgs = self._drain_channels()
+        if cons:
+            r["console"] = cons
+        errs = []
+        for t in list(cons) + list(msgs):
+            m = _CMD_ERROR_RE.search(t)
+            if m:
+                errs.append({"code": int(m.group(1)), "message": m.group(2).strip(),
+                             "text": t})
+        if errs:
+            r["errors"] = errs
+            r["ok"] = False
+            r["error"] = "命令窗口报错：" + "；".join(
+                "error %d: %s" % (e["code"], e["message"]) for e in errs)
+        return r
+
+    @staticmethod
+    def parse_breakpoint_table(lines) -> list:
+        """把 Keil 命令窗口 BL 输出解析成结构化断点表。
+
+        真机实测：BL 输出**会**经命令输出通道(0x5020)回传，形如
+        `0: (E 0x08000DB4) '(源码路径)\77', CNT=1, enabled`；
+        `3: (A WR 0x20000000 len=1) '0x20000000', CNT=1, enabled` 为数据观察点。
+        """
+        out = []
+        for t in lines or []:
+            m = _BP_LINE_RE.match(str(t))
+            if not m:
+                continue
+            num, kind, access, addr, extra, expr, cnt, state = m.groups()
+            lm = re.search(r"len=(\d+)", extra or "")
+            out.append({
+                "number": int(num),
+                "kind": "access" if (kind or "").upper().startswith("A") else "exec",
+                "access": (access or "").upper() or None,
+                "address": addr,
+                "length": int(lm.group(1)) if lm else None,
+                "expr": expr,
+                "count": int(cnt) if cnt else None,
+                "enabled": (state or "").lower() != "disabled",
+                "raw": str(t).strip(),
+            })
+        return out
+
+    def list_breakpoints_real(self, settle: float = 0.18) -> dict:
+        """列出本会话中 Keil 的**真实**断点（解析命令窗口 BL 输出）。
+
+        与内部 id 记录不同，这是板上/Keil 侧实际生效的断点表，包含 Keil 断点编号
+        （清除数据观察点必须按编号）；.uvoptx 持久化断点也会出现在这里。
+        """
+        r = self.exec_command_checked("BL", settle=settle)
+        lines = [t for t in (r.get("console") or []) if ":" in t and "(" in t]
+        bps = self.parse_breakpoint_table(lines)
+        return {"ok": bool(r.get("ok")), "count": len(bps), "breakpoints": bps,
+                "console": r.get("console") or [],
+                "errors": r.get("errors") or [],
+                "note": "解析自 Keil 命令窗口 BL 输出（0x5020 通道）；number 为 Keil 断点编号，"
+                        "清除数据观察点必须按编号 BK <number>（按地址会报 error 72）"}
+
+    def resolve_breakpoint_number(self, target: str) -> tuple:
+        """把断点编号/地址/符号解析成 Keil 断点编号；返回 (编号或 None, 说明)。"""
+        t = (target or "").strip()
+        if not t:
+            return None, "空目标"
+        try:
+            real = self.list_breakpoints_real()
+        except Exception as e:  # noqa: BLE001
+            return None, "无法读取真实断点表：%s" % e
+        bps = real.get("breakpoints") or []
+        if not bps:
+            return None, "Keil 当前无断点（或 BL 输出为空）"
+        if t.isdigit():
+            for b in bps:
+                if b["number"] == int(t):
+                    return int(t), "按编号命中"
+            return None, "无编号为 %s 的断点" % t
+        if re.match(r"^0x[0-9A-Fa-f]+$", t):
+            want = int(t, 16)
+            for b in bps:
+                try:
+                    have = int(b["address"], 16)
+                except Exception:  # noqa: BLE001
+                    continue
+                if have == want or (have | 1) == want or have == (want | 1):
+                    return b["number"], "按地址 %s 命中编号 %s" % (t, b["number"])
+            return None, "无地址为 %s 的断点" % t
+        for b in bps:
+            if t in (b.get("expr") or "") or (b.get("expr") or "") == t:
+                return b["number"], "按表达式命中编号 %s" % b["number"]
+        return None, "无匹配断点"
+
     def set_breakpoint(self, expr: str) -> dict:
         """在符号/地址处设置软件断点（命令窗口 BS）。
 
         真机 BS 成功时可能返回 UV_STATUS_BP_CREATED(22) 而非 SUCCESS(0)
         （断点已创建/已启用等断点类返回码），需归一化为成功，
         否则会被误判为失败、导致断点 id 丢失。
+        真机实测：对已存在的断点，BS 会报 `*** error 145: Redefinition: item already
+        exists`——对「设置」语义应视为成功（断点确实在），只附 note 提醒。
         """
-        return self._norm_bp_result(self.exec_command(f"BS {expr}"))
+        r = self._norm_bp_result(self.exec_command_checked(f"BS {expr}"))
+        for e in (r.get("errors") or []):
+            if e.get("code") == 145:
+                r["ok"] = True
+                r["already_exists"] = True
+                r["note"] = ("该断点已存在（Keil 报 error 145 Redefinition），本次未重复创建；"
+                             "可用 list_breakpoints 的 real 字段查看真实断点表。")
+                break
+        return r
 
     def clear_breakpoint(self, expr: str) -> dict:
-        """清除断点（命令窗口 BK，可传符号名或断点编号）。
+        """清除断点（命令窗口 BK）。
 
-        同 set_breakpoint：BK 成功可能返回 BP_DELETED(23) 等断点类返回码，
-        归一化为成功；BP_NOTFOUND(24) 表示断点本就不存在，对"清除"语义同样视为成功。
+        真机实测（批次20）：**数据观察点按地址清不掉**——`BK 0x20000000` 时 UVSOCK 回
+        status=0，命令窗口却报 `*** error 72: invalid item number`，断点依旧生效。
+        故这里先用 BL 解析真实断点编号，按编号 `BK <number>` 清除；解析不出编号时才回退
+        到原有的按地址/符号清除。
+        另外：BK 成功可能返回 BP_DELETED(23) 等断点类返回码，归一化为成功；
+        BP_NOTFOUND(24) 表示断点本就不存在，对"清除"语义同样视为成功。
         """
-        return self._norm_bp_result(self.exec_command(f"BK {expr}"), extra_ok=(24,))
+        num, why = self.resolve_breakpoint_number(expr)
+        if num is not None:
+            r = self._norm_bp_result(self.exec_command_checked(f"BK {num}"),
+                                     extra_ok=(24,))
+            r["cleared_by"] = "number"
+            r["bp_number"] = num
+            r["resolve_note"] = why
+            if r.get("ok"):
+                r["note"] = "已按 Keil 断点编号 %d 清除（%s）" % (num, why)
+            return r
+        r = self._norm_bp_result(self.exec_command_checked(f"BK {expr}"), extra_ok=(24,))
+        r["cleared_by"] = "expr"
+        r["resolve_note"] = why
+        return r
 
     @staticmethod
     def _norm_bp_result(r: dict, extra_ok: tuple = ()) -> dict:
@@ -775,6 +950,15 @@ class UVClient:
                        "waited_ms": waited, "polls": polls, "registers": regs,
                        "candidates": [hex(a) for a in adrs],
                        "pc_confidence": regs.get("pc_confidence")}
+                if matched is None:
+                    # 目标已停止但 PC 不在候选地址：静默返回 hit=false 会让调用方无从下手，
+                    # 这里直接说明「为什么会没命中」以及下一步该做什么。
+                    out["note"] = (
+                        "目标当前已停止，但 PC(%s) 不在候选断点地址（%s）——本次未等到命中。"
+                        "若期望目标跑到断点，请先 run（或 reset 后 run）再 wait_breakpoint；"
+                        "若它本应停在断点处，请用 list_breakpoints 确认断点是否还在、"
+                        ".axf 与板上固件是否一致（符号漂移会导致地址对不上）。"
+                        % (out.get("pc"), "、".join(out.get("candidates") or []) or "未指定"))
                 if matched is not None:
                     out["hit_address"] = hex(matched)
                     out["hit_count"] = self.note_breakpoint_hit(matched)

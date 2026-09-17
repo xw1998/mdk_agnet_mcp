@@ -119,6 +119,8 @@ def _parse_uvprojx_config(uvprojx_path: str | None, target_name: str | None = No
     优化级别：AC5 在 <Cads><Optim>（0-4 映射 _OPTIM_TEXT），AC6 尝试同一节点文本；
     编译宏：<Cads><VariousControls><Define>（逗号分隔）；包含路径同节点 <IncludePath>（分号分隔）。
     用于排查“不同 target 行为不同”——宏/优化差异一目了然。
+    另解析 <Utilities><Flash1><UpdateFlashBeforeDebugging>：=1 表示 Keil 在进入调试前会自动把
+    最新 .axf 下载进 Flash（等价一次烧录），据此可省掉显式的 UV4 -f 烧录。
     """
     import xml.etree.ElementTree as ET
     if not uvprojx_path or not os.path.isfile(uvprojx_path):
@@ -143,6 +145,8 @@ def _parse_uvprojx_config(uvprojx_path: str | None, target_name: str | None = No
             cdefs = [x.strip() for x in cdef_el.text.split(",") if x.strip()]
         inc_el = t.find(".//Cads/VariousControls/IncludePath")
         inc = [x.strip() for x in (inc_el.text or "").split(";") if x.strip()] if inc_el is not None else []
+        # 「调试前更新目标」：Keil 的 Utilities 页选项，勾选时进入调试会自动下载程序到 Flash
+        ufbd = (t.findtext(".//Utilities/Flash1/UpdateFlashBeforeDebugging") or "").strip()
         info = {
             "name": name,
             "compiler": "ARMCLANG(AC6)" if uac6 == "1" else "ARMCC(AC5)",
@@ -151,6 +155,7 @@ def _parse_uvprojx_config(uvprojx_path: str | None, target_name: str | None = No
             "optimization_level": _OPTIM_TEXT.get(optim, f"-O{optim}" if optim.isdigit() else ""),
             "defines": cdefs,
             "include_paths": inc,
+            "update_flash_before_debugging": (ufbd == "1") if ufbd in ("0", "1") else None,
         }
         targets.append(info)
         if chosen is None and (target_name is None or name == target_name):
@@ -1065,7 +1070,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="进入调试模式",
         description=(
             "自动进入 Keil 调试模式（UV_DBG_ENTER）。"
-            "受工程 Load/Flash Download/Run-to-main 设置影响，属于有副作用的操作；"
+            "若目标本来就在调试态（status=10 正在调试），不会报失败，而是返回 "
+            "ok=true + already_in_debug=true + note，可省掉一轮 exit/enter；"
+            "返回 ready/ready_waited_ms 表示已确认就绪。"
+            "受工程 Load/Flash Download/Run-to-main 设置影响，属于有副作用的操作：若工程 Utilities 勾选了 "
+            "Update Target before Debugging（.uvprojx 的 Utilities/Flash1/UpdateFlashBeforeDebugging=1），"
+            "Keil 会在进入调试前**自动把最新 .axf 下载进 Flash**（等价一次烧录）——此时编译完直接 "
+            "enter_debug 即可，不必先 flash_download；该选项为 0 时 Keil 不下载，板上可能仍是旧固件"
+            "（可用 read_project_config 查该字段）。"
             "进入后即可设断点、读变量、运行控制。注意：若当前 Keil 是旧窗口、加载旧固件，进入后调试的是旧代码符号；建议改用 flash_debug 闭环（关旧Keil→编烧→重开→进调试）。受工程 Load/Flash Download/Run-to-main 设置影响，属有副作用操作。需 UVSOCK 已开启。"
             "真机实测：进入调试是异步的——命令返回成功时目标尚未挂载完成，约 0.6~0.7s 后才真正就绪，"
             "期间紧接的读内存/表达式/断点命令会返回 status=6（Target is not in debug mode）。"
@@ -1094,11 +1106,33 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             except Exception:  # noqa: BLE001
                 pass
             if not r.get("ok"):
-                out["diagnosis"] = (
-                    "进入调试失败，请依次排查：① 目标板是否已连接且调试器驱动正常；"
-                    "② 工程是否已编译出 .axf（缺失/过旧时 Keil 无法加载符号，可先 build_project 或 flash_debug）；"
-                    "③ 是否已在调试态（重复 enter 会被拒）。若 Keil 弹出需人工确认的窗口，请在界面处理。"
-                )
+                # status=10「正在调试」不是失败：目标本来就在调试态（上一次 exit_debug 尚未生效、
+                # 或人工/其他工具已进入）。确认一下就绪并返回成功，避免 AI 误判后反复重试或重启 Keil。
+                already = False
+                try:
+                    from .uvsock import UV_STATUS_DEBUGGING as _DEBUGGING
+                except Exception:  # noqa: BLE001
+                    _DEBUGGING = 10
+                if r.get("status") == _DEBUGGING:
+                    try:
+                        already = bool(_get_client().get_status().get("debugging"))
+                    except Exception:  # noqa: BLE001
+                        already = False
+                if already:
+                    out["ok"] = True
+                    out["ready"] = True
+                    out["already_in_debug"] = True
+                    out["status_text"] = "已在调试态"
+                    out["note"] = (
+                        "目标已处于调试态（status=10 正在调试），本次无需重新进入；"
+                        "如需重新开始，可先 exit_debug 再 enter_debug。"
+                    )
+                else:
+                    out["diagnosis"] = (
+                        "进入调试失败，请依次排查：① 目标板是否已连接且调试器驱动正常；"
+                        "② 工程是否已编译出 .axf（缺失/过旧时 Keil 无法加载符号，可先 build_project 或 flash_debug）；"
+                        "③ 是否已在调试态（重复 enter 会被拒）。若 Keil 弹出需人工确认的窗口，请在界面处理。"
+                    )
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -1312,7 +1346,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="clear_watchpoint",
         title="清除数据断点",
-        description="清除指定地址/变量的数据断点（命令窗口 BK）。expr 为变量名或 0x 地址。注意：清除不存在的地址返回 ok 但无副作用；需与 set_watchpoint 配合在调试会话内使用。",
+        description=("清除指定数据断点。expr 传变量名/0x 地址，或直接用 bp_id。实现上先解析 Keil 真实断点编号再"
+                     "`BK <number>`（真机实测：数据观察点按地址清除会报 error 72 invalid item number，看似成功其实没清掉）。"
+                     "返回 cleared_by 表示实际用的方式；若真实断点表里找不到会明确报 ok=false 并给出原因。"),
     )
     async def clear_watchpoint(expr: str = "", bp_id: int | None = None) -> str:
         try:
@@ -1332,16 +1368,26 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                            if w.get("expr") == e or w.get("address") == e]
             if not target:
                 return _js({"ok": False, "error": "需提供 expr 或 bp_id 指定要清除的数据断点"})
-            r = client.exec_command(f"BK {target}")
+            r = client.clear_breakpoint(target)
             ids = {w.get("id") for w in removed}
-            _watchpoints[:] = [w for w in _watchpoints if w.get("id") not in ids]
-            out = {"ok": r.get("ok"), "cleared_target": target,
+            success = bool(r.get("ok"))
+            if success:
+                _watchpoints[:] = [w for w in _watchpoints if w.get("id") not in ids]
+            out = {"ok": success, "cleared_target": target,
                    "status_text": r.get("status_text"), "removed": removed,
+                   "cleared_by": r.get("cleared_by"),
                    "remaining": len(_watchpoints)}
-            if not r.get("ok"):
-                out["error"] = f"Keil 清除命令未确认成功: {r}"
-            # 数据断点依赖硬件 DWT，清除后相关槽位应已释放
-            out["note"] = "数据断点依赖硬件 DWT（可同时生效 2-4 个），清除后相关触发槽位应已释放"
+            if not success:
+                out["error"] = ("Keil 清除未确认成功：%s" % (r.get("error") or r))
+                out["diagnosis"] = (
+                    "数据观察点清不掉时的排查：① 用 list_breakpoints 看 real 字段确认真实断点编号，"
+                    "再 BK <编号>（按地址会报 error 72）；② 目标需处于停止状态；"
+                    "③ 顽固残留可用 clear_all_watchpoints(hard=true) 以 BK * 一次性清空 Keil 侧断点。")
+                if r.get("console"):
+                    out["console"] = r["console"]
+            else:
+                out["note"] = ("数据断点依赖硬件 DWT（可同时生效 2-4 个），清除后相关触发槽位应已释放；"
+                               "本次%s。" % (r.get("note") or "已清除"))
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "expr": expr, "bp_id": bp_id, "error": str(e)})
@@ -1459,14 +1505,31 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="list_breakpoints",
         title="列出断点",
-        description="列出当前调试会话中的断点：返回本服务内部记录（ok=true），并附加解析工程 .uvoptx 中 Keil 持久化的断点（uvoptx 字段）。说明：真实 Keil 的 EXEC_CMD(BL) 不回传命令输出（协议固有限制），故无法枚举真实断点；.uvoptx 字段用于暴露 BK 清不掉、下次进调试会自动恢复的残留断点。",
+        description=("列出断点。返回两部分：① 本服务内部记录（breakpoints/内部 id，用于按 bp_id 清除）；"
+                     "② real 字段——本会话 Keil 的**真实断点表**（解析命令窗口 BL 输出获得，含 Keil 断点编号、"
+                     "类型 exec/access、地址、CNT、enabled）。real 才是板上实际生效的断点：.uvoptx 持久化断点、"
+                     "数据观察点都会出现在这里。注意清除数据观察点必须按 Keil 编号（按地址会报 error 72）。"
+                     "另附 uvoptx 字段暴露工程里 BK 清不掉、下次进调试会自动恢复的持久化断点。"),
     )
     async def list_breakpoints() -> str:
         try:
             out = {"ok": True, "breakpoints": list(_breakpoints),
                    "total": len(_breakpoints),
-                   "note": "Keil 命令窗口 BL 的输出不经 socket 回传（协议限制），无法枚举真实断点；"
-                           "本列表为本服务内部 id 记录，用于按 bp_id 可靠清除。"}
+                   "note": "breakpoints 是本服务内部 id 记录（用于按 bp_id 清除）；"
+                           "真实生效的断点见 real 字段（解析 Keil 命令窗口 BL 输出，含 Keil 断点编号）。"}
+            # 真实断点表：解析 BL 输出（真机实测 BL 会经 0x5020 命令输出通道回传）
+            try:
+                real = _get_client().list_breakpoints_real()
+                out["real"] = real
+                out["real_total"] = real.get("count", 0)
+                acc = [b for b in (real.get("breakpoints") or [])
+                       if b.get("kind") == "access"]
+                if acc:
+                    out["note"] += (" 其中 %d 个是数据观察点，清除请用 clear_watchpoint / "
+                                    "clear_all_watchpoints（内部按 Keil 编号 BK，按地址会报 error 72）。"
+                                    % len(acc))
+            except Exception as e:  # noqa: BLE001
+                out["real"] = {"ok": False, "error": str(e)}
             # 附加：工程 .uvoptx 中 Keil 持久化的断点（BK 清不掉，下次进调试自动恢复）
             uv = _read_uvoptx_persistent()
             out["uvoptx"] = uv
@@ -1490,10 +1553,17 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "清理 .uvoptx 需 Keil 已关闭（否则被内存断点回写覆盖）。"
         ),
     )
-    async def clear_all_breakpoints(include_uvoptx: bool = False) -> str:
+    async def clear_all_breakpoints(include_uvoptx: bool = False,
+                                    hard: bool = False) -> str:
         try:
             client = _get_client()
             cleared = []
+            hard_result = None
+            if hard:
+                # BK * 一次性清空 Keil 侧全部断点（含 .uvoptx 恢复出来的持久断点与数据观察点），
+                # 比逐个按地址清除可靠；代价是会连带清掉非本服务设置的断点。
+                hard_result = client.exec_command_checked("BK *", settle=0.2)
+                _breakpoints[:] = []
             for b in list(_breakpoints):
                 target = b.get("address") or b.get("expr")
                 try:
@@ -1506,6 +1576,21 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             _breakpoints[:] = []
             out = {"ok": True, "cleared": len(cleared), "items": cleared,
                    "note": _bp_clear_note(len(cleared))}
+            if hard:
+                out["hard"] = True
+                out["hard_result"] = hard_result
+                real = {}
+                try:
+                    real = _get_client().list_breakpoints_real()
+                    out["real_after"] = {"count": real.get("count", 0)}
+                except Exception as e:  # noqa: BLE001
+                    out["real_after"] = {"error": str(e)}
+                if not hard_result or not hard_result.get("ok"):
+                    out["ok"] = False
+                    out["error"] = ("BK * 未确认成功：%s" % (hard_result or {}))
+                else:
+                    out["note"] += (" 已用 BK * 清空 Keil 侧全部断点（含 .uvoptx 持久断点与数据观察点）；"
+                                    "当前真实断点数 %s。" % out["real_after"].get("count"))
             # 可选：一并清除 .uvoptx 持久化断点（BK 清不掉的残留）
             if include_uvoptx:
                 path = _uvoptx_project_path("")
@@ -1528,27 +1613,57 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="clear_all_watchpoints",
         title="清除全部数据断点",
         description=(
-            "清除本服务内部记录的全部数据断点（逐个发 BK），并清空内部数据断点表。"
-            "用于一次释放所有 DWT 数据断点槽位。注意：数据断点依赖硬件 DWT，全清后槽位应全部释放。"
+            "清除全部数据断点（逐个发 BK），并清空内部数据断点表，用于一次释放所有 DWT 数据断点槽位。"
+            "实现上按 Keil 真实断点编号清除（真机实测：数据观察点按地址 BK 会报 error 72，看似成功实则没清掉）。"
+            "hard=true 时用 `BK *` 一次性清空 Keil 侧全部断点（含 .uvoptx 持久断点），"
+            "代价是也会清掉非本服务设置的代码断点；用于顽固残留。"
+            "返回 real_after 给出清理后 Keil 真实断点数，便于确认是否真的清干净。"
         ),
     )
-    async def clear_all_watchpoints() -> str:
+    async def clear_all_watchpoints(hard: bool = False) -> str:
         try:
             client = _get_client()
-            if not _watchpoints:
-                return _js({"ok": True, "cleared": 0, "message": "内部数据断点表已为空"})
             cleared = []
-            for w in list(_watchpoints):
-                target = w.get("address") or w.get("expr")
-                try:
-                    r = client.exec_command(f"BK {target}")
-                    cleared.append({"id": w.get("id"), "expr": w.get("expr"),
-                                    "address": w.get("address"), "ok": r.get("ok")})
-                except Exception as e:  # noqa: BLE001
-                    cleared.append({"id": w.get("id"), "expr": w.get("expr"),
-                                    "address": w.get("address"), "ok": False, "error": str(e)})
-            _watchpoints[:] = []
-            return _js({"ok": True, "cleared": len(cleared), "items": cleared})
+            hard_result = None
+            if hard:
+                hard_result = client.exec_command_checked("BK *", settle=0.2)
+                _watchpoints[:] = []
+            else:
+                for w in list(_watchpoints):
+                    target = w.get("address") or w.get("expr")
+                    try:
+                        r = client.clear_breakpoint(target)
+                        item = {"id": w.get("id"), "expr": w.get("expr"),
+                                "address": w.get("address"), "ok": r.get("ok"),
+                                "cleared_by": r.get("cleared_by")}
+                        if not r.get("ok"):
+                            item["error"] = r.get("error")
+                        cleared.append(item)
+                    except Exception as e:  # noqa: BLE001
+                        cleared.append({"id": w.get("id"), "expr": w.get("expr"),
+                                        "address": w.get("address"), "ok": False,
+                                        "error": str(e)})
+                if all(i.get("ok") for i in cleared):
+                    _watchpoints[:] = []
+            out = {"ok": True, "cleared": len(cleared), "items": cleared,
+                   "hard": bool(hard), "hard_result": hard_result}
+            failed = [i for i in cleared if not i.get("ok")]
+            if failed:
+                out["ok"] = False
+                out["error"] = "有 %d 个数据断点未确认清除" % len(failed)
+                out["diagnosis"] = ("可按 Keil 真实编号清除：先用 list_breakpoints 看 real 字段拿到编号，"
+                                    "再 BK <编号>；顽固残留用 hard=true（BK * 一次性清空 Keil 侧断点）。")
+            # 复查 Keil 真实断点数，避免「说清了其实没清」
+            try:
+                real = client.list_breakpoints_real()
+                out["real_after"] = {"count": real.get("count", 0),
+                                     "breakpoints": real.get("breakpoints") or []}
+                if not hard and real.get("count"):
+                    out["note"] = ("清除后 Keil 仍有 %d 个断点（含代码断点/持久化断点，见 real_after）；"
+                                   "数据断点消失即表示槽位已释放。" % real["count"])
+            except Exception as e:  # noqa: BLE001
+                out["real_after"] = {"error": str(e)}
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -2807,7 +2922,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="flash_debug",
         description=(
             "「关旧 Keil→编烧→开新→进调试」一体闭环：先关闭所有 Keil 实例（避免残留旧工程窗口导致调试到旧代码），"
-            "再编译并烧录新固件，成功后重新以可见方式打开本工程并自动进入调试模式。"
+            "再让新固件上板，成功后重新以可见方式打开本工程并自动进入调试模式。"
+            "上板方式自动选择：若工程勾选了 Update Target before Debugging（.uvprojx 的 "
+            "UpdateFlashBeforeDebugging=1，Keil 默认），进调试时 Keil 会自己把最新程序下载进 Flash，"
+            "此时只需编译、不必再显式烧录（省掉一次全片擦写与往返），返回 flash_plan=\"debug_download\"；"
+            "未勾选时才走显式 UV4 -f 烧录（flash_plan=\"explicit_flash\"）。"
             "适用于 AI 修改代码后需上板验证新代码的完整流程，规避「旧窗口调试旧代码」问题。"
             "project 为 .uvprojx 路径，可省略用默认工程；target 为可选目标名。注意：会关闭所有 Keil 实例→编烧→重开→进调试，全程约数秒到数十秒；请先确认 project 路径正确。若板子未连接/烧录失败，不会重开工程也不进调试。输出经 -o 捕获。"
         ),
@@ -2820,13 +2939,26 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定")
             # 1) 关闭所有 Keil 实例，确保后续用干净实例加载新固件
             close = builder.close_uvision(force=False)
-            # 2) 编译 + 烧录新固件
-            bf = builder.build_and_flash(uv4, p, target.strip() or None)
+            # 2) 让新固件上板：
+            #    UpdateFlashBeforeDebugging=1 时 Keil 进入调试会自动下载（用户实测 + .uvprojx 可查），
+            #    故这里只编译，省掉一次显式烧录（全片擦写 + 一次 UV4 -f 往返）；
+            #    未勾选时才退回「编译 + 显式烧录」，保证板上固件一定是新的。
+            auto_dl = ((_parse_uvprojx_config(p, target.strip() or None).get("current") or {})
+                       .get("update_flash_before_debugging"))
+            if auto_dl:
+                bf = builder.build_project(uv4, p, target.strip() or None)
+                flash_plan = "debug_download"
+            else:
+                bf = builder.build_and_flash(uv4, p, target.strip() or None)
+                flash_plan = "explicit_flash"
             if not bf.get("ok"):
                 return _js({
-                    "ok": False, "action": "flash_debug", "stage": "编译烧录",
+                    "ok": False, "action": "flash_debug",
+                    "stage": "编译" if auto_dl else "编译烧录",
+                    "flash_plan": flash_plan,
                     "close_uvision": close, "build_flash": bf,
-                    "status_text": "编译/烧录未通过，未重开工程进入调试",
+                    "status_text": ("编译未通过，未重开工程进入调试" if auto_dl
+                                    else "编译/烧录未通过，未重开工程进入调试"),
                 })
             # 3) 重新打开本工程（干净实例，加载新固件符号）
             launch = builder.launch_uvision(uv4, p)
@@ -2850,7 +2982,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 "ok": enter.get("ok", False),
                 "action": "flash_debug", "stage": "调试",
                 "close_uvision": close,
-                "build": bf.get("build"), "flash": bf.get("flash"),
+                "flash_plan": flash_plan,
+                "flash_note": ("工程已勾选 Update Target before Debugging，进调试时由 Keil 自动下载"
+                               "最新程序，本次未显式烧录（省掉一次全片擦写）"
+                               if auto_dl else
+                               "工程未勾选 Update Target before Debugging，已显式 UV4 -f 烧录新固件"),
+                "build": bf if auto_dl else bf.get("build"),
+                "flash": None if auto_dl else bf.get("flash"),
                 "launch_uvision": launch, "enter_debug": enter,
                 "status_text": ("已重新打开工程并进入调试" if enter.get("ok")
                                 else "已重新打开工程，但进入调试失败，请检查 UVSOCK 是否开启"),
@@ -3428,7 +3566,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="读取工程配置（编译宏/优化级别）",
         description=(
             "解析 .uvprojx 各 target 的编译器（AC5/AC6）、优化级别（-O0..-Otime）、编译宏 Define、"
-            "包含路径。project 传 .uvprojx 路径（省略用默认工程），target 指定某 target（省略用第一个）。"
+            "包含路径，以及 update_flash_before_debugging（Keil 的 Update Target before Debugging："
+            "为 true 时进入调试会自动把最新程序下载进 Flash，可省掉显式烧录）。"
+            "project 传 .uvprojx 路径（省略用默认工程），target 指定某 target（省略用第一个）。"
             "排查“不同 target 行为不同”时对比宏/优化差异。注意：基于 .uvprojx 静态解析各 target 配置，需工程文件在且格式为 Keil 标准 uvprojx；不含运行时状态（优化级别/宏为工程设置值）。"
         ),
     )
