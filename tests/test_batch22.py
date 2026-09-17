@@ -11,7 +11,7 @@
 
 运行：python -m tests.test_batch22
 """
-import sys, os, json, time, asyncio
+import sys, os, json, time, asyncio, threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -24,6 +24,21 @@ from mdkdebug.server import (create_server, _get_client, _watchpoints,
 PORT = 14894
 PASS, FAIL = [], []
 
+
+
+def arm_stop_after(srv, pc, delay=0.05):
+    """模拟「目标正在运行，稍后停在该 PC」——覆盖 wait_breakpoint 的新判定。
+
+    批次23 起 wait_breakpoint 只把「等待期间新发生的停止」算命中：调用时若目标已停着，
+    那是一次旧停止（真机反馈：run_timeout 停在某行后立刻调本工具会错报命中），
+    故这些用例先让目标处于运行态，再由定时器转停。
+    """
+    set_pc(srv, pc)
+    srv.running = True
+    # 确定性钩子：下一次 STATUS 查询仍报运行态，再下一次转停在该 PC —— 保证
+    # wait_breakpoint 进来时目标处于运行态（不依赖 sleep 计时，避免慢机器上抖动）
+    srv.auto_stop_reads = 1
+    srv.auto_stop_pc = pc
 
 def check(name, ok, detail=""):
     (PASS if ok else FAIL).append(name)
@@ -64,7 +79,7 @@ async def main():
     srv.bl_table = [dict(EXEC_BP), dict(WATCH_BP)]
 
     # A1: PC 落在执行断点上 + CNT 也增加 → code
-    set_pc(srv, 0x08000DB4)
+    arm_stop_after(srv, 0x08000DB4)
     # 第 1 次读 BL 是基线，第 2 次（停止后复查）之前让执行断点 CNT 自增 → 模拟等待期间命中
     srv.bl_reads = 0
     srv.bl_bump_after_reads = [(2, 0, 1)]
@@ -77,7 +92,7 @@ async def main():
           json.dumps(r.get("hit_entry"), ensure_ascii=False)[:200])
 
     # A2: PC 不在任何执行断点上，但数据观察点 CNT 增加 → watch（旧实现必然漏判）
-    set_pc(srv, 0x0800AAAA)
+    arm_stop_after(srv, 0x0800AAAA)
     srv.bl_reads = 0
     srv.bl_bump_after_reads = [(2, 3, 1)]
     r = await call(server, "wait_breakpoint", {"timeout_s": 1.0, "address": "0x08000DB4"})
@@ -96,7 +111,7 @@ async def main():
     _watchpoints.clear()
     _watchpoints.append({"id": 91, "expr": "0x20000000", "address": "0x20000000",
                          "access": "write", "count": 1, "file": None, "line": None})
-    set_pc(srv, 0x0800AAAA)
+    arm_stop_after(srv, 0x0800AAAA)
     r = await call(server, "wait_breakpoint", {"timeout_s": 1.0, "address": "0x08000DB4"})
     check("A3 CNT 不可得时退化推断 hit_kind=watch",
           r.get("hit") is True and r.get("hit_kind") == "watch", json.dumps(r, ensure_ascii=False)[:260])
@@ -108,7 +123,7 @@ async def main():
     # A4: 都没命中 → hit=false（不能因为「有观察点」就瞎报命中）
     srv.bl_table = [dict(EXEC_BP), dict(WATCH_BP)]
     _watchpoints.clear()
-    set_pc(srv, 0x0800AAAA)
+    arm_stop_after(srv, 0x0800AAAA)
     r = await call(server, "wait_breakpoint", {"timeout_s": 0.3, "address": "0x08000DB4"})
     check("A4 无 CNT 增量且 PC 不匹配 → hit=false",
           r.get("hit") is False, json.dumps(r, ensure_ascii=False)[:200])
@@ -131,7 +146,7 @@ async def main():
     srv.bl_bump_after_reads = []
     _watchpoints.append({"id": 92, "expr": "0x20000000", "address": "0x20000000",
                          "access": "read", "count": 1, "file": None, "line": None})
-    set_pc(srv, 0x0800AAAA)
+    arm_stop_after(srv, 0x0800AAAA)
     r = await call(server, "wait_breakpoint", {"timeout_s": 1.0})
     check("A6 无代码候选 + 观察点 + CNT 无增量 → hit=true/hit_kind=watch",
           r.get("hit") is True and r.get("hit_kind") == "watch",
@@ -145,7 +160,7 @@ async def main():
     # A7: 既无代码候选、也无观察点 → 保持「停下即视为命中」的旧行为
     _watchpoints.clear()
     srv.bl_table = None
-    set_pc(srv, 0x0800BBBB)
+    arm_stop_after(srv, 0x0800BBBB)
     r = await call(server, "wait_breakpoint", {"timeout_s": 1.0})
     check("A7 无任何候选时停下即命中（hit_kind=code，旧行为不丢）",
           r.get("hit") is True and r.get("hit_kind") == "code",
@@ -156,7 +171,7 @@ async def main():
     srv.bl_table = [dict(EXEC_BP)]
     srv.bl_reads = 0
     srv.bl_bump_after_reads = []
-    set_pc(srv, 0x08000DB4)
+    arm_stop_after(srv, 0x08000DB4)
     r = await call(server, "wait_breakpoint", {"timeout_s": 1.0, "address": "0x08000DB4"})
     check("A8 PC 命中 + CNT 无增量 → hit_entry 来源标 pc",
           r.get("hit") is True and (r.get("hit_entry") or {}).get("source") == "pc"

@@ -33,6 +33,11 @@ logger = logging.getLogger("mdkdebug.client")
 # 形如 `*** error 72: invalid item number`；只看 status 会把失败当成功。
 _CMD_ERROR_RE = re.compile(r"\*\*\*\s*error\s+(\d+)\s*:\s*(.*)", re.IGNORECASE)
 
+# wait_breakpoint：调用时目标已处于停止态时，观察「它是否真的跑起来过」的宽限窗口（秒）。
+# run/step 是异步命令（实测响应滞后），刚开始轮询时读到的可能仍是上一帧的停止态，
+# 故不能一进来就凭「已停止 + PC 匹配」下命中结论。
+_WAIT_RUN_GRACE_S = 0.4
+
 # Keil 命令窗口 BL 输出行，真机实测形如：
 #   0: (E 0x08000DB4) '\\mdk_test\../Core/Src/main.c\77', CNT=1, enabled
 #   3: (A WR 0x20000000 len=1) '0x20000000', CNT=1, enabled
@@ -76,6 +81,11 @@ class UVClient:
         self.port = port
         self.idle_timeout = idle_timeout  # 秒，空闲超过则断开
         self._lock = threading.RLock()
+        # 批次23：「本次停止是不是等待期间新发生的」判定用的两条时间线。
+        # _exec_ts: 最近一次 run/step 命令生效的时间；_last_stop_obs_ts: 最近一次
+        # 「观察到目标处于停止态」的时间。前者晚于后者 → 当前停止是那次运行的结果。
+        self._exec_ts = 0.0
+        self._last_stop_obs_ts = 0.0
         self._last_used = 0.0
         self.phy = UVInterface(host=host, port=port)
         self._stop_pc_hist = []   # 最近几次停止点 PC，用于识别「同一地址反复出现」
@@ -216,11 +226,15 @@ class UVClient:
         因此优先从 data 解析，data 为空时回退到 r_status。
         """
         status, m_data = self._request(uvsock.UV_DBG_STATUS)
+        # 每次读到「已停止」都记一次时间：这是判断后续停止是否为「新发生」的基线
+        _now = time.time()
         # 仅当 r_status 为成功时，data 低字节才表示运行状态（真实 Keil）
         if status == uvsock.UV_STATUS_SUCCESS:
             state = m_data[0] if len(m_data) >= 1 else None
             if state is not None:
                 running = (state == 1)
+                if not running:
+                    self._last_stop_obs_ts = _now
                 if state == 0:
                     st = "已停止"
                 elif state == 1:
@@ -240,6 +254,8 @@ class UVClient:
         running = status in (uvsock.DBG_EXECUTING,
                              uvsock.UV_STATUS_TARGET_EXECUTING,
                              uvsock.UV_STATUS_DEBUGGING)
+        if not running and status in (uvsock.DBG_STOPPED, uvsock.UV_STATUS_TARGET_STOPPED):
+            self._last_stop_obs_ts = _now
         if status == uvsock.DBG_EXECUTING:
             text, debugging = "执行中", True
         elif status in (uvsock.DBG_STOPPED, uvsock.UV_STATUS_TARGET_STOPPED):
@@ -949,8 +965,24 @@ class UVClient:
         （含收敛判定 + 复查仍在运行），因此返回的 pc_confidence 可信度可直接采信；
         若读到的是陈旧 PC 会带 warning，不会被当成命中。
 
+        「只认新发生的停止」：调用时目标若已处于停止态（典型场景——刚被 run_timeout
+        停在某行、紧接着调本工具），那次停止不是本次等待的产物，绝不算命中，否则会把
+        「进来时已停」误报成「等到了命中」。判为「新停止」的三条证据（满足其一即可，
+        结果里用 new_stop_basis 标明用的是哪条）：
+
+        ① ran_observed：等待期间亲眼见到目标在运行（最可靠）；
+        ② run_issued：最近一次 run/step 命令晚于最近一次「观察到目标停止」——真机上
+           run 后目标可能在一次 UVSOCK 往返内就命中断点，来不及看到运行态；
+        ③ pc_moved：停止时的 PC 与调用时不同（手工在 Keil 界面点 Run 也属这种情况）。
+
+        三条都不成立时直接返回 hit=False（stop_is_new=False、ran_during_wait=False），
+        note 说明「目标在等待期间未曾运行」。另外起始就处于停止态时，先给
+        _WAIT_RUN_GRACE_S 的宽限窗口只查状态（run/step 命令是异步的，响应会滞后），
+        窗口内没见运行再读 PC 比对。
+
         返回 {ok, hit, hit_address, hit_count, waited_ms, polls, candidates, registers,
-        pc_confidence, warning, repeat_warning}；超时返回 ok=False 且给出候选清单与原因。
+        pc_confidence, hit_kind, hit_entry, ran_during_wait, stop_is_new, new_stop_basis,
+        warning, repeat_warning}；超时返回 ok=False 且给出候选清单与原因。
         """
         adrs = []
         for a in (addresses or []):
@@ -965,6 +997,30 @@ class UVClient:
             except Exception:  # noqa: BLE001
                 continue
         t0 = time.time()
+        # 起始运行态（用户反馈，第 8 轮）：目标本来就停着时，wait_breakpoint 会立刻返回
+        # hit=true 且 PC 与上一次停止完全相同——把「进来时已停」当成了「等到了断点命中」。
+        # 目标在现场刚被 run_timeout/stop 停下后再调本工具是常见动作，必须区分开。
+        # 判断「新停止」的三条证据（满足其一即算新）：
+        #   ① 等待期间亲眼见到目标在运行（seen_running）
+        #   ② 最近一次 run/step 命令晚于最近一次「观察到目标停止」（exec_pending）——
+        #      真机上 run 后目标可能在一次 UVSOCK 往返内就命中断点，来不及看到运行态
+        #   ③ 停止时的 PC 与调用时的 PC 不同（pc_moved）——手工在 Keil 里点过 Run 也算
+        prev_stop_obs = self._last_stop_obs_ts
+        try:
+            st0 = self.get_status()
+        except Exception:  # noqa: BLE001
+            st0 = {}
+        started_stopped = st0.get("running") is False
+        seen_running = st0.get("running") is True
+        exec_pending = self._exec_ts > prev_stop_obs
+        pc_entry = None
+        if started_stopped and not exec_pending:
+            # 基线 PC：目标若压根没跑起来，PC 不会变——这是「这次停止是旧的」的直接证据
+            _r0 = self.read_cpu_registers()
+            if isinstance(_r0.get("pc"), int):
+                pc_entry = _r0["pc"]
+        # 宽限窗口不超过调用方给的超时，避免 wait_breakpoint(timeout_s=0.2) 反而等更久
+        grace_deadline = t0 + min(_WAIT_RUN_GRACE_S, max(0.0, float(timeout_s)))
         # 命中计数基线：等待期间目标可能在运行，读失败也只是降级，不影响主流程
         cnt_base = self.bp_count_snapshot() if use_cnt else None
         deadline = t0 + max(0.0, float(timeout_s))
@@ -978,9 +1034,30 @@ class UVClient:
                 return {"ok": False, "hit": False, "error": str(e),
                         "waited_ms": int((time.time() - t0) * 1000), "polls": polls,
                         "candidates": [hex(a) for a in adrs]}
+            if last.get("running") is True:
+                seen_running = True
             if last.get("ok") and last.get("running") is False:
+                stop_is_new_unknown = started_stopped and not seen_running and not exec_pending
+                if stop_is_new_unknown and time.time() < grace_deadline:
+                    # 宽限窗口内只查状态、不读寄存器：先确认 run/step 是否真生效
+                    time.sleep(min(max(0.01, float(poll)),
+                                   max(0.0, grace_deadline - time.time())))
+                    continue
                 regs = self.read_cpu_registers_stable(retries=20, delay=0.03)
                 pc = regs.get("pc") if isinstance(regs.get("pc"), int) else None
+                pc_moved = pc_entry is not None and pc is not None and pc != pc_entry
+                if stop_is_new_unknown and not pc_moved:
+                    # 没见它跑过、也没发过 run、PC 更原地未动 → 这是「进来时就已经停着」的旧停止
+                    return self._wait_preexisting_stop(
+                        t0, polls, pc, regs, adrs, watch_addrs)
+                if seen_running:
+                    new_stop_basis = "ran_observed"
+                elif exec_pending:
+                    new_stop_basis = "run_issued"
+                elif pc_moved:
+                    new_stop_basis = "pc_moved"
+                else:
+                    new_stop_basis = "not_new"
                 matched = None
                 if pc is not None and adrs:
                     for a in adrs:
@@ -1048,7 +1125,9 @@ class UVClient:
                        "pc": hex(pc) if pc is not None else None,
                        "waited_ms": waited, "polls": polls, "registers": regs,
                        "candidates": [hex(a) for a in adrs],
-                       "pc_confidence": regs.get("pc_confidence")}
+                       "pc_confidence": regs.get("pc_confidence"),
+                       "ran_during_wait": bool(seen_running), "stop_is_new": True,
+                       "new_stop_basis": new_stop_basis}
                 if hit_kind:
                     out["hit_kind"] = hit_kind
                 if hit_entry:
@@ -1093,6 +1172,38 @@ class UVClient:
                                   "应传实际运行地址；③ 目标可能一直没执行到该路径。"
                                   % int((time.time() - t0) * 1000))}
             time.sleep(poll)
+
+    def _wait_preexisting_stop(self, t0, polls, pc, regs, adrs, watch_addrs) -> dict:
+        """目标「进来时就已经停着」且等待期间没跑起来：那次停止不计为命中。
+
+        用户反馈（第 8 轮）：run_timeout(250) 把目标停在 svcrt_loader.c:156 后紧接着
+        调 wait_breakpoint，立刻返回 hit=true 且 PC 与上一次完全相同（repeat_count=2）
+        ——把「进来时已停」当成了「等到了断点命中」。只在等待期间观察到目标运行过
+        （或 PC 相对调用时移动过）才认这次停止，否则落到这里如实报 hit=False。
+        """
+        pc_s = hex(pc) if pc is not None else None
+        cands = [hex(a) for a in adrs]
+        note = ("目标在等待期间未曾运行：调用 wait_breakpoint 时它已停止（PC=%s），"
+                "这次停止不是本次等待期间新发生的，故不计为命中（stop_is_new=false）。"
+                "若期望等到断点命中，请先 run（或 reset 后 run）再调用本工具。"
+                % pc_s)
+        if pc is not None and pc not in adrs:
+            note += ("当前 PC(%s) 也不在候选断点地址（%s）——可用 list_breakpoints 确认"
+                     "断点是否还在、.axf 与板上固件是否一致（符号漂移会导致地址对不上）。"
+                     % (pc_s, "、".join(cands) or "未指定"))
+        if watch_addrs:
+            note += ("本次另有 %d 个数据观察点候选，同样只有等待期间新发生的停止才算命中。"
+                     % len(watch_addrs))
+        out = {"ok": True, "hit": False, "stopped": True, "pc": pc_s,
+               "waited_ms": int((time.time() - t0) * 1000), "polls": polls,
+               "registers": regs, "candidates": cands,
+               "pc_confidence": regs.get("pc_confidence"),
+               "ran_during_wait": False, "stop_is_new": False,
+               "new_stop_basis": "not_new", "note": note}
+        for k in ("warning", "repeat_warning"):
+            if regs.get(k):
+                out[k] = regs[k]
+        return out
 
     # ------------------------------------------------------------------
     # 运行控制
@@ -1212,6 +1323,16 @@ class UVClient:
         """
         status, m_data = self._request(cmd_code)
         ok = status == UV_STATUS_SUCCESS or status in accept
+        if ok:
+            _now = time.time()
+            if cmd_code in (uvsock.UV_DBG_START_EXECUTION, uvsock.UV_DBG_STEP_INTO,
+                            uvsock.UV_DBG_STEP_HLL, uvsock.UV_DBG_STEP_INSTRUCTION,
+                            uvsock.UV_DBG_STEP_OUT):
+                # 发出过 run/step：后续观察到的停止可能是它跑出来的结果（即使没抓到运行态）
+                self._exec_ts = _now
+            elif cmd_code == uvsock.UV_DBG_STOP_EXECUTION:
+                # 我们主动暂停：这次停止算「已消化」，之后的停止需再有 run/step 才算新
+                self._last_stop_obs_ts = _now
         out = {"status": status, "ok": ok,
                "status_text": status_text(status), "action": label}
         if extra:

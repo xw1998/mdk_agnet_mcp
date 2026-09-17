@@ -128,6 +128,13 @@ flash_debug(project=".../mdk_test.uvprojx")     # 编译 → 新固件上板 →
   → exit_debug
 ```
 
+> **为什么要「先 run 再 wait」**：`wait_breakpoint` 只把**等待期间新发生的停止**算命中。
+> 目标进来时若已经停着（例如刚 `run_timeout` 停在某行），那次停止不算命中，会返回
+> `hit=false` / `stop_is_new=false` / `new_stop_basis=not_new`，`note` 写明「目标在等待期间
+> 未曾运行」。想确认「它现在是否就停在某断点上」，请直接看 `get_status` + `read_registers`
+> 的 PC，或用 `list_breakpoints` 对照，别用 `wait_breakpoint`。
+> 另：`read_peripheral` 的 `regs` 可以传数组（`["MODER","ODR"]`），也接受逗号/空格分隔的字符串。
+
 ### 5.2 只想让板子跑起来看现象
 
 ```

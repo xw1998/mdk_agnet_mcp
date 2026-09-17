@@ -9,7 +9,7 @@
   F read_peripheral 同时给裸寄存器名
 运行：python -m tests.test_batch17
 """
-import sys, os, json, time, asyncio, struct
+import sys, os, json, time, asyncio, struct, threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -21,6 +21,25 @@ from mdkdebug import uvsock
 PORT = 14871
 PASS, FAIL = [], []
 
+
+def set_pc(srv, pc):
+    srv.reg_map["__currentPC()"] = pc
+    srv.reg_map["PC"] = pc
+    srv.reg_map["R15"] = pc
+
+def arm_stop_after(srv, pc, delay=0.05):
+    """模拟「目标正在运行，稍后停在该 PC」——覆盖 wait_breakpoint 的新判定。
+
+    批次23 起 wait_breakpoint 只把「等待期间新发生的停止」算命中：调用时若目标已停着，
+    那是一次旧停止，不再算命中（真机反馈：run_timeout 停在某行后立刻调本工具会误报命中）。
+    故测试需先让目标处于运行态，再由定时器转停。
+    """
+    set_pc(srv, pc)
+    srv.running = True
+    # 确定性钩子：下一次 STATUS 查询仍报运行态，再下一次转停在该 PC —— 保证
+    # wait_breakpoint 进来时目标处于运行态（不依赖 sleep 计时，避免慢机器上抖动）
+    srv.auto_stop_reads = 1
+    srv.auto_stop_pc = pc
 
 def check(name, ok, detail=""):
     (PASS if ok else FAIL).append(name)
@@ -105,11 +124,12 @@ async def main():
     # ---------- B. 等待断点命中 ----------
     hit_addr = client.read_cpu_registers_stable(retries=6, delay=0.01).get("pc")
     client._bp_hits = {}
-    srv.running = False
+    arm_stop_after(srv, hit_addr)
     wb = client.wait_breakpoint([hit_addr], timeout_s=1.0, poll=0.02)
     check("B1 目标停在与候选断点相同的 PC 上 -> 命中",
           wb.get("hit") is True and wb.get("hit_address") == hex(hit_addr), str(wb)[:220])
     check("B2 命中计数从 1 开始累计", wb.get("hit_count") == 1, str(wb)[:160])
+    arm_stop_after(srv, hit_addr)
     wb2 = client.wait_breakpoint([hit_addr], timeout_s=1.0, poll=0.02)
     check("B3 再次命中同一地址计数递增到 2", wb2.get("hit_count") == 2, str(wb2)[:160])
 
@@ -124,6 +144,7 @@ async def main():
           "0x8001234" in str(wb3.get("candidates")) and "list_breakpoints" in (wb3.get("error") or ""),
           str(wb3)[:260])
     srv.running = False
+    arm_stop_after(srv, hit_addr)
 
     # 服务器侧工具
     tw = await call(server, "wait_breakpoint", {"address": hex(hit_addr), "timeout_s": 1.0})

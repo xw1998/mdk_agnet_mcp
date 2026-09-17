@@ -88,6 +88,11 @@ class MockUVSOCKServer:
             struct.pack_into('<I', self.mem, fbase + i * 4, v)
         self.running = False
         self.debugging = False
+        # 批次23：「目标运行中、随后自动停在该 PC」钩子——供 wait_breakpoint 的
+        # 「只认等待期间新发生的停止」测试用（确定性，不依赖 sleep 计时）。
+        # auto_stop_reads 为还剩几次 STATUS 查询仍报运行态，之后转为停止并落到 auto_stop_pc。
+        self.auto_stop_reads = None
+        self.auto_stop_pc = None
         # --- 真机行为模拟钩子（供批次14 测试 A/B 修复）---
         # >0 时：每个请求的响应前先发 N 个 r_cmd 不匹配的陈旧响应帧（模拟真机响应队列残留）
         self.stale_frames = 0
@@ -282,6 +287,15 @@ class MockUVSOCKServer:
                     self.debugging = True
                 body = b"Target is not in debug mode\x00"
                 return uvsock.UV_STATUS_NOT_DEBUGGING, struct.pack('<i', len(body)) + body
+            if self.running and self.auto_stop_reads is not None:
+                if self.auto_stop_reads > 0:
+                    self.auto_stop_reads -= 1
+                else:
+                    self.running = False
+                    if self.auto_stop_pc is not None:
+                        for _k in ("__currentPC()", "PC", "R15"):
+                            self.reg_map[_k] = self.auto_stop_pc
+                    self.auto_stop_reads = None
             # 模拟真实 Keil：r_status 恒为成功，运行状态在响应 data 低字节（0=停止,1=执行中）
             data = b"\x01" if self.running else b"\x00"
             return uvsock.UV_STATUS_SUCCESS, data

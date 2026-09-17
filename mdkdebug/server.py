@@ -35,6 +35,32 @@ from .periph import (list_peripherals as _periph_list, get_peripheral as _periph
 
 logger = logging.getLogger("mdkdebug.server")
 
+
+def _csv_tokens(value, sep_extra=";|"):
+    """把「逗号分隔字符串」参数归一化为 token 列表，兼容调用方直接传数组。
+
+    用户反馈（第 8 轮）：read_peripheral 的 regs 传 ["MODER","ODR"] 会崩——内部直接对
+    参数调 .replace，报 'list' object has no attribute 'replace'。AI 的直觉写法就是给
+    列表，故这里统一兼容 str / list / tuple / set（数组元素再按分隔符拆一遍），
+    其余类型转字符串；同时兼容分号/竖线/空格分隔。返回保持原样大小写，由调用方决定大小写策略。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = []
+        for x in value:
+            items.extend(str(x).split(","))
+        raw = ",".join(items)
+    elif isinstance(value, str):
+        raw = value
+    else:
+        raw = str(value)
+    for ch in sep_extra:
+        raw = raw.replace(ch, ",")
+    # 兼容「用空格分隔」的写法（regs="MODER ODR"）
+    raw = raw.replace(" ", ",")
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
 # 全局共享一个带连接缓存的客户端（线程安全）
 _client: UVClient | None = None
 # 编译/烧录配置（UV4.exe 路径与默认工程）
@@ -1527,6 +1553,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             e = (expr or "").strip()
             removed = []
             target = e
+            swap_from = None
             if bp_id is not None:
                 match = [w for w in _watchpoints if w.get("id") == bp_id]
                 if not match:
@@ -1537,6 +1564,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             elif e:
                 removed = [w for w in _watchpoints
                            if w.get("expr") == e or w.get("address") == e]
+                if removed and removed[0].get("address") and removed[0]["address"] != target:
+                    # 真机实测（批次23 全量回归）：数据断点在命令窗口 BL 里的 expr 就是地址
+                    # （形如 '0x20000000'），传符号名发 `BK test_array` 解析不出编号、清不掉。
+                    # 故命中内部记录时优先用记录里的确切地址——BK 由地址能映射到 Keil 编号。
+                    swap_from, target = target, removed[0]["address"]
             if not target:
                 return _js({"ok": False, "error": "需提供 expr 或 bp_id 指定要清除的数据断点"})
             r = client.clear_breakpoint(target)
@@ -1548,6 +1580,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                    "status_text": r.get("status_text"), "removed": removed,
                    "cleared_by": r.get("cleared_by"),
                    "remaining": len(_watchpoints)}
+            if swap_from:
+                out["resolve_note"] = ("数据断点按符号名清不掉（BL 里记的是地址），"
+                                       "已改用记录地址 %s 清除（原 expr：%s）"
+                                       % (target, swap_from))
             if not success:
                 out["error"] = ("Keil 清除未确认成功：%s" % (r.get("error") or r))
                 out["diagnosis"] = (
@@ -1626,9 +1662,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 if sync:
                     out["internal_sync"] = sync
                 return _js(out)
+            cb_swap = None
             if target:
                 removed = [b for b in _breakpoints
                            if b.get("address") == target or b.get("expr") == target]
+                if removed and removed[0].get("address") and removed[0]["address"] != target:
+                    # 同上：符号名换成内部记录里的确切地址，BK 才能解析到真实编号
+                    # （数据观察点在 BL 里的 expr 就是地址，按符号名发 BK 会报 error 72）
+                    cb_swap, target = target, removed[0]["address"]
             if not target:
                 return _js({"ok": False, "error": "需提供 expr（符号/地址）或 bp_id 指定要清除的断点"})
             r = _get_client().clear_breakpoint(target)  # BK target：用确切地址更可靠
@@ -1638,6 +1679,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                    "status_text": r.get("status_text"),
                    "removed": removed, "remaining": len(_breakpoints),
                    "command": r.get("command")}
+            if cb_swap:
+                out["resolve_note"] = ("已改用内部记录的确切地址 %s 清除（原 expr：%s），"
+                                       "避免按符号名发 BK 解析不到编号" % (target, cb_swap))
             if not r.get("ok"):
                 out["error"] = f"Keil 清除命令未确认成功: {r}"
             out["note"] = ("Cortex-M 目标经 SWD/JTAG 调试时代码断点默认用硬件断点(FPB)，"
@@ -2805,6 +2849,12 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "symbol 传符号名（如 svcrt_ptable_lookup，自动解析为地址）；address 传 0x 地址；"
             "两者都不传时用工程 .uvoptx 里的持久化断点作候选（use_project_breakpoints 控制）。"
             "命中后返回里直接带 file/line/callstack，并累计该地址命中次数（breakpoint_stats 可查全部）。"
+            "**只认「本次等待期间新发生的停止」**：若调用时目标已停着（典型——刚被 run_timeout "
+            "停在某行再调本工具），那次停止不计为命中，会返回 hit=false、stop_is_new=false、"
+            "ran_during_wait=false 且 note 说明「目标在等待期间未曾运行」，避免把「进来时已停」"
+            "误报成「等到了断点命中」。故正确用法是先 run（或 reset 后 run）再调本工具；"
+            "调用时先给一个很短的宽限窗口确认目标是真想跑（run 是异步命令，响应会滞后），"
+            "若窗口内没见运行且 PC 相对调用时没有移动，才判为旧停止。"
             "注意：命中判定为「目标已停止 且 PC 等于候选地址」（自动兼容 Thumb 位），"
             "并额外支持数据观察点命中——数据断点触发时 PC 不等于观察地址，工具会在等待前后"
             "各读一次 Keil 断点表的 CNT：若某条 CNT 增加即为命中项；"
@@ -3361,7 +3411,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "一键读取指定外设（如 RCC/GPIOA/USART1/SPI1/I2C1/TIM2/ADC1/SCB/SysTick）的寄存器当前值，"
             "并解析关键位域（时钟使能/波特率/GPIO 模式/定时器计数等）。"
             "**强烈建议用 regs 只取需要的寄存器**（逗号分隔，可用全名或去掉外设前缀的裸名，"
-            "如 regs=\"MODER,OTYPER,IDR\" 或 \"GPIOC_MODER\"）：默认输出全部寄存器 + 逐位域，"
+            "如 regs=\"MODER,OTYPER,IDR\" 或 \"GPIOC_MODER\"；也接受字符串数组写法 "
+            "regs=[\"MODER\",\"ODR\"]）：默认输出全部寄存器 + 逐位域，"
             "一个 GPIO 就有十几个寄存器、几十个位域，很容易撑爆上下文；"
             "只看值不看位域时再传 fields=\"off\"。返回里 reg_filter 回显本次筛选，"
             "not_found_regs 列出传了但没匹配上的名字（拼错时能立刻发现）。"
@@ -3369,18 +3420,17 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "需已进入调试状态。periph 为外设名（大小写不敏感）。注意：仅适配 STM32F4 寄存器布局；目标型号非 F4 时寄存器偏移/位域可能不准。需已进入调试且目标暂停。"
         ),
     )
-    async def read_peripheral(periph: str, regs: str = "",
-                              fields: str = "auto") -> str:
+    async def read_peripheral(periph: str, regs: str | list = "",
+                              fields: str | list = "auto") -> str:
         try:
             client = _get_client()
             p = _periph_get(periph)
             if not p:
                 avail = ", ".join(x["name"] for x in _periph_list())
                 return _js({"ok": False, "error": f"未知外设 {periph}，可用: {avail}"})
-            # regs：按名筛选（全名或裸名，大小写不敏感），留空 = 全部
-            want = [x.strip().upper() for x in
-                    (regs or "").replace(";", ",").replace("|", ",").split(",")
-                    if x.strip()]
+            # regs：按名筛选（全名或裸名，大小写不敏感），留空 = 全部。
+            # 兼容数组写法（regs=["MODER","ODR"]）——用户反馈直接传列表会崩。
+            want = [x.upper() for x in _csv_tokens(regs)]
             # 允许两种写法：裸名（MODER）或带外设前缀（GPIOC_MODER）——寄存器表里存的是
             # 裸名，用户按 Keil 手册习惯写全名时也要能匹配上。
             pfx = ((p.get("name") or "").strip().upper() + "_")
@@ -3389,7 +3439,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 want_norm.add(w)
                 if pfx != "_" and w.startswith(pfx):
                     want_norm.add(w[len(pfx):])
-            with_fields = str(fields or "auto").strip().lower() not in (
+            # fields 同样兼容数组（fields=["off"] 之类），取第一个元素判定
+            fields_v = fields
+            if isinstance(fields_v, (list, tuple, set, frozenset)):
+                fields_v = list(fields_v)[0] if fields_v else "auto"
+            with_fields = str(fields_v or "auto").strip().lower() not in (
                 "off", "none", "no", "false", "0")
             out_regs: list = []
             hit_names: set = set()

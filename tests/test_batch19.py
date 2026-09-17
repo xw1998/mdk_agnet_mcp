@@ -10,7 +10,7 @@
 
 运行：python -m tests.test_batch19
 """
-import sys, os, json, time, asyncio
+import sys, os, json, time, asyncio, threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -21,6 +21,27 @@ from mdkdebug import uvsock
 
 PORT = 14891
 PASS, FAIL = [], []
+
+
+def set_pc(srv, pc):
+    srv.reg_map["__currentPC()"] = pc
+    srv.reg_map["PC"] = pc
+    srv.reg_map["R15"] = pc
+
+def arm_stop_after(srv, pc, delay=0.05):
+    """模拟「目标正在运行，稍后停在该 PC」——覆盖 wait_breakpoint 的新判定。
+
+    批次23 起 wait_breakpoint 只把「等待期间新发生的停止」算命中：调用时若目标已停着，
+    那是一次旧停止，不再算命中（真机反馈：run_timeout 停在某行后立刻调本工具会误报命中）。
+    故测试需先让目标处于运行态，再由定时器转停。
+    """
+    set_pc(srv, pc)
+    srv.running = True
+    # 确定性钩子：下一次 STATUS 查询仍报运行态，再下一次转停在该 PC —— 保证
+    # wait_breakpoint 进来时目标处于运行态（不依赖 sleep 计时，避免慢机器上抖动）
+    srv.auto_stop_reads = 1
+    srv.auto_stop_pc = pc
+
 
 
 def check(name, ok, detail=""):
@@ -75,12 +96,14 @@ async def main():
 
     # 命中时不应带 note（避免噪声）
     client._bp_hits = {}
+    arm_stop_after(srv, pc)
     wb_hit = client.wait_breakpoint([pc], timeout_s=1.0, poll=0.02)
     check("A9 命中时正常返回 hit_address/hit_count 且不带 note",
           wb_hit.get("hit") is True and wb_hit.get("hit_address") == hex(pc)
           and not wb_hit.get("note"), str(wb_hit)[:220])
 
     # 未给候选断点时「停下即命中」的既有语义不受影响
+    arm_stop_after(srv, pc)
     wb_none = client.wait_breakpoint([], timeout_s=1.0, poll=0.02)
     check("A10 未给候选断点时仍是「停下即命中」（既有语义不变）",
           wb_none.get("hit") is True and wb_none.get("hit_address") == hex(pc)
