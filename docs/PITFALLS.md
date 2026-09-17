@@ -10,7 +10,8 @@
 - [三、读到的东西到底算不算数（脏读防护 / 停止确证 / 粘滞位）](#三读到的东西到底算不算数脏读防护--停止确证--粘滞位)
 - [四、串口占用与释放（用完就还 / 一边收一边发）](#四串口占用与释放用完就还--一边收一边发)
 - [五、断点地址 / 看门狗 / Cache（批次32 真机实测）](#五断点地址--看门狗--cache批次32-真机实测)
-- [六、历次改进留档（按批次）](#六历次改进留档按批次)
+- [六、串口等待与统一信封（批次33 真机实测）](#六串口等待与统一信封批次33-真机实测)
+- [七、历次改进留档（按批次）](#七历次改进留档按批次)
 
 ## 一、真实 Keil 实测要点
 
@@ -365,7 +366,51 @@ serial_read(since=上次 next_seq)                  # 长响应可继续增量�
 > 教训：**「读到的值」和「写下去的值」都要标注可信度**。D-Cache 场景下调试器只能保证「访问了内存」，
 > 不能保证「这就是 CPU 视角的值」——必须显式告诉调用方，而不是让它在不知情的情况下据此下结论。
 
-## 六、历次改进留档（按批次）
+## 六、串口等待与统一信封（批次33 真机实测）
+
+### 6.1 `serial_expect` 只认「调用之后新增」的输出
+
+目标一直在刷日志时（本示例每秒一行 `hb <tick>`），"等某句话出现"最容易踩的坑是
+**把缓冲区里早就在刷的老内容当成这次请求的响应**——那样任何请求都会"秒回成功"。
+`serial_expect` 的基线取调用瞬间的 `next_seq`，只有显式传 `since=0` 才允许回看历史。
+
+真机实测（COM9 / 115200，示例工程 USART2）：
+- 纯等待心跳：`serial_expect(pattern="hb")` → 254ms 命中 `hb 7000`；
+- 原子请求-响应：`serial_expect(pattern="pong", send="ping")` → 51ms 命中 `pong`，
+  返回 `sent_hex=70696e670d0a` / `eol_applied=crlf`（到底发出去什么摆在明面上）；
+- 命令侧：`info` → `devid=0x10016433 sysclk=16000000Hz`、`help`、`echo <带空格文本>`、
+  未知命令回 `ERR unknown cmd`，全部按预期命中；
+- 半行（不带 `\n` 的输出）靠 `include_partial` 兜住，命中时 `matched_source=partial`。
+
+### 6.2 超时不是「失败」，两种超时必须分开（真机踩到）
+
+`serial_expect` 超时**曾经**落进 `unknown-error`，`next_actions` 让调用方「调 keil_health /
+读 Keil 异步消息」——而真实原因是串口没等到内容，方向完全不对。现在超时带机器可读标识：
+
+| 场景 | `timeout_kind` | `error_code` | 下一步该做什么 |
+|---|---|---|---|
+| 一个字节都没新增 | `no-data` | `serial-expect-timeout-no-data` | 查下发是否成功（`sent`/`sent_hex`）、波特率与接线、目标是否在输出 |
+| 有新增但对不上 pattern | `no-match` | `serial-expect-timeout-no-match` | 放宽 pattern（`regex=false` / `case_sensitive=false`）、读返回的 `lines` 当线索 |
+
+配套的一条通用约定：**归类优先用工具给出的结构化标识，其次才按文本猜**。
+只靠中文文本匹配时，"正则编译失败"会被"编译失败"规则抓成 `build-failed`——这类误判
+加规则时极易引入；凡是有结构化字段（`timeout_kind`、退出码…）就不要再靠猜。
+
+### 6.3 示例工程的地址不要写进测试常量
+
+给示例工程加一个 `usart.c` 就会让 `main` 的链接地址移位，于是「断言 `main == 0x8000db4`」
+这类测试会集体失效（本轮 2 个历史用例就是这么挂的）。正确做法是**从当前 `.axf` 现算**
+（`Locator.symbol_addr("main")`）再断言，让测试跟着工程走。
+
+### 6.4 真机验证记录（STM32F401RCTx / COM9 DAPLink VCP）
+
+- `build_project` → `flash_download` 新固件上板：UV4 退出码 0；
+- `serial_list_ports`：列出 COM9 + `likely_chip="mbed / DAPLink VCP"`（VID 0D28:PID 0204）；
+- `clean_project`（`-c`）：`.axf/.hex/.o` 清空，`.map` 由 Keil 保留；
+  `rebuild_project(clean_first=true)`（`-cr`）：产物恢复，0 错误 0 警告；
+- 串口监听持口期间 `serial_list_ports` 标 `monitoring=true`，与其它工具共存无冲突。
+
+## 七、历次改进留档（按批次）
 
 > 以下条目是早期批次直接追加在 README 尾部的改进说明（原先错落在「参考与致谢」之后），
 > 保留在此作为留档。其中大部分能力已并入上方章节与 README 工具表。
