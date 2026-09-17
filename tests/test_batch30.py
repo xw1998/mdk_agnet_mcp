@@ -438,7 +438,7 @@ async def group_g_tools(server):
     for nm in ("clear_faults", "serial_write"):
         check("G1 工具已注册：%s" % nm, nm in tools)
     check("G2 工具总数 81→99（批次33 再 +3，批次35 +10，批次34 +1）",
-          len(tools) == 145, len(tools))
+          len(tools) == 150, len(tools))
     d = tools["serial_write"].description or ""
     check("G3 serial_write 描述点明「一边收一边发」与依赖监听持口",
           "一边收一边发" in d and "serial_monitor_start" in d, d[:160])

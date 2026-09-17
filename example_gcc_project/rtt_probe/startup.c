@@ -12,6 +12,7 @@ int main(void);
 
 void Reset_Handler(void);
 void Default_Handler(void);
+void SysTick_Handler(void);
 
 __attribute__((section(".isr_vector"), used))
 void (*const g_vectors[])(void) = {
@@ -27,7 +28,13 @@ void (*const g_vectors[])(void) = {
     Default_Handler,   /* DebugMonitor */
     0,                 /* 保留 */
     Default_Handler,   /* PendSV */
-    Default_Handler,   /* SysTick */
+    /* SysTick 必须接 main.c 里的 SysTick_Handler：
+     * 这里原本写成 Default_Handler，结果 SysTick 一使能（main 里 systick_init_16mhz）
+     * 第一个 1ms 中断就把 CPU 甩进 Default_Handler 的死循环，main 再也不往前走。
+     * 真机上表现为「RTT 只出来开机那两条、g_state.ms 恒为 0、PC 采样值恒定」。
+     * 这个 bug 就是靠 trace_pcsample 报“采样值几乎不变”+ trace_profile 显示
+     * Default_Handler 100% 才定位到的，不是猜的。 */
+    SysTick_Handler,
 };
 
 void Default_Handler(void)

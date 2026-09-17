@@ -180,7 +180,7 @@ mdk_agent/
 │   ├── ocd.py                # 非 MDK：OpenOCD telnet 会话与内存/寄存器/断点/烧录操作
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署
-│   └── server.py             # MCP Server 与 145 个工具定义
+│   └── server.py             # MCP Server 与 150 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -229,10 +229,10 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **145** 个，分两大块：
+共 **150** 个，分两大块：
 
 - **MDK 族（99 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
-- **非 MDK 族（46 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案**（接口·速度·SWO·RTT 参数档案与自动识别，4 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace**（SWO·RTT·采样剖析·DWT·插桩组件部署，16 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **非 MDK 族（51 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案**（接口·速度·SWO·RTT 参数档案与自动识别 + 工程现场配置发现，4 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署，20 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 
 下表为 MDK 族工具：
 
@@ -261,7 +261,7 @@ python run_server.py --transport http --http-port 8300
 | `set_watchpoint` | 数据断点：在变量/地址处设 读/写/读写 访问断点，命中即暂停（`BS READ/WRITE/READWRITE`） | `expr`、`access`、`count` |
 | `clear_watchpoint` | 清除数据断点：先解析 Keil 真实断点编号再 `BK <编号>`（按地址会报 `error 72` 清不掉），返回 `cleared_by` | `expr` |
 | `list_watchpoints` | 列出当前数据断点（含地址、访问类型、位置） | — |
-| `read_registers` | 批量读取 CPU 核心寄存器 R0-R12/SP/LR/PC/xPSR 及当前值，并按 AAPCS 解读 R0-R3 入参、R0 返回值、LR 返回地址，排查参数/返回值/寄存器被踩 | — |
+| `read_registers` | 批量读取 CPU 核心寄存器 R0-R12/SP/LR/PC/xPSR 及当前值，并按 AAPCS 解读 R0-R3 入参、R0 返回值、LR 返回地址，排查参数/返回值/寄存器被踩 | `names`（只读指定寄存器，如 `pc` / `pc,sp,lr`；不认识的名单进 `unknown_names`） |
 | `disassemble` | capstone 反汇编目标代码：地址 `0x…` / 符号名 / 文件:行 / 缺省当前 PC，排查死循环、跑飞、启动流程、优化行为 | `addr`、`count`（默认 8） |
 | `diagnose` | 一键诊断：聚合寄存器组(含 AAPCS) + PC 处反汇编 + 源码上下文 + 完整调用栈 + 局部变量 + 指定全局变量，一次调用看清现场 | `globals`、`disasm_count`、`source_context` |
 | `find_symbol` | 符号检索：从 .axf ELF 符号表模糊检索函数/全局变量（返回名字/类型/地址/大小），AI 读符号不再靠猜名字；`query` 可写作别名 `name`，配 `reloc_delta` 时附 `run_addr` | `query`、`kind`（all/func/object/global/local）、`limit`、`reloc_delta?` |
@@ -341,6 +341,10 @@ python run_server.py --transport http --http-port 8300
 > 编译烧录工具均以**隐藏窗口**后台执行，不闪现 Keil 界面；`launch_uvision` 则以**可见**方式打开 Keil 供调试查看。
 
 > 编译烧录 / Keil 启动工具的 `project` 均可省略：省略时使用启动参数 `--default-project` 指定的默认工程。
+>
+> 符号（`.axf`）**按需惰性装载**：启动时没配 `--default-project` / `--axf` 也不会让符号族工具作废——
+> 首次用到符号时按「本次会话用过的工程 → 服务默认工程 → 符号工程注册表唯一可用的 `.axf` → 附近唯一可推断的工程」
+> 依次尝试，实际来源在 `get_status.symbol_source` 里如实披露；多候选时不替调用方决定（宁可报错）。
 
 ## 非 MDK 芯片与 trace（不依赖 Keil）
 
@@ -363,7 +367,7 @@ python run_server.py --transport http --http-port 8300
 | `toolchain_objcopy` | 生成 bin/hex/ihex/srec 等镜像格式 | `elf`、`fmt?`、`out?`、`family?`、`extra?` |
 | `toolchain_errors` | **把编译器日志变成结构化错误**：逐条给出 `file`/`line`/`col`/`severity`/`message`/`hint`，警告单独放 `warnings` 不混进 `errors`，便于 AI 直接改代码 | `text`、`limit?` |
 
-### 目标档案（`target_*`，3 个）
+### 目标档案（`target_*`，3 个 + 工程配置发现 1 个）
 
 把「这颗芯片用哪种接口、多快、SWO 主频与速率、RTT 控制块地址、DWT 是否可用」固化成 **20 份档案**（STM32F401/F411/F429/F407/F446/F103/F7/H7/L4、GD32F303、Cortex-M 通用、RISC-V 通用、ESP32/C3/C6/S2/S3、nRF52、RP2040、AIR001），避免每次调试都手写一长串 OpenOCD 参数。
 
@@ -372,6 +376,7 @@ python run_server.py --transport http --http-port 8300
 | `target_list` | 列出全部档案（可按 `arch` / `keyword` 过滤），一眼看清有哪些现成配置 | `arch?`、`keyword?` |
 | `target_show` | 出一份档案的完整参数，并直接给出可用的 **OpenOCD 参数串**（`openocd_args`），可原样喂给 `ocd_start` | `profile`、`interface?`、`target?`、`transport?`、`speed?`、`extra_cfg?` |
 | `target_guess` | **不认识芯片名/`.elf` 时先猜档案**：按型号名正则（`STM32F407ZGT6`→`stm32f407`）或 ELF 的 `e_machine` 推断，**多候选时全列出来不挑一个像样的** | `elf?`、`name?` |
+| `debug_config` | **从工程现场发现调试配置**：解析 `.vscode/launch.json`（cortex-debug，支持 JSONC 注释），把 `device`/`interface`/`configFiles`/`executable`/`svdFile` 直接翻成可喂给 `ocd_start` 的 `profile`/`interface`/`target`，省掉「猜 cfg 名→猜错→再猜」。返回值里的 **`config_source` 一定看**：逐字段说明参数出处；`servertype` 不是 openocd 时会明确说只能借型号与可执行文件。`ocd_start` 在**一个连接参数都没给**时也会自动查一次（`MDKDEBUG_NO_LAUNCH_DISCOVERY=1` 可关） | `path?`、`name?`、`start_dir?`、`list_only?` |
 
 ### OpenOCD（`ocd_*`，17 个）
 
@@ -397,7 +402,7 @@ python run_server.py --transport http --http-port 8300
 | `ocd_gdb` | 借 GDB 批处理做一件 OpenOCD 原生不好做的事（可指定 `elf` 与 `gdb` 路径） | `commands`、`elf?`、`gdb?` 等 |
 | `ocd_log` | 读 OpenOCD 日志尾巴（可按 `keyword` 过滤），排查启动失败用 | `lines?`、`keyword?` |
 
-### trace（`trace_*`，16 个）
+### trace（`trace_*`，20 个）
 
 三条通路：**SWO/ITM**（经 TPIU 单线输出）、**RTT**（目标内存环形缓冲，主机侧自研读写，不依赖 SEGGER 上位机）、**SWD 采样**（`halt` 采 PC，明确标注侵入式）。三条通路解码出的事件（含 MTF 帧）汇入同一缓冲区，由 `trace_events` 统一取。
 
@@ -418,6 +423,10 @@ python run_server.py --transport http --http-port 8300
 | `trace_rtt_detach` | 解除挂接并回本次统计 | — |
 | `trace_profile` | **采样剖析**：周期性 `halt` 采 PC 再 `resume`，按函数聚合出热点；返回 `intrusive: true` 与 `warning`，明说会扰动时序 | `samples?`、`elf?`、`interval_ms?`、`top?`、`timeout?` |
 | `trace_dwt_counters` | 读 DWT 六个计数器（CYCCNT/CPICNT/EXCCNT/SLEEPCNT/LSUCNT/FOLDCNT）与 CYCCNT 使能位 | — |
+| `trace_scope_start` | **变量 scope（只用 SWD 两线、不 halt 目标）**：主机侧按周期用 DAP 读 RAM，把变量连成时间线。`vars` 写法 `g_cnt@0x20000000:4` / `0x20000010:4` / `name`（靠 ELF 查地址与大小，解析不了的条目会列出来而不是静默跳过）。**做不到什么也说清楚**：轮询有间隔、两次采样之间的跳变看不到；目标在跑时若 OpenOCD 拒绝读内存会置 `require_halt=true` 并让你改用 RTT/ITM | `vars`、`elf?`、`period_ms?`、`max_samples?`、`duration_s?`、`timeout?` |
+| `trace_scope_read` | 看 scope 现状：每变量 min/max/最后值/变化次数、真实生效采样率、丢点次数；只回最近 `limit` 条样本，不把上万条塞回上下文 | `limit?` |
+| `trace_scope_stop` | 停掉后台轮询线程并汇总（忘了停会一直占 SWD 带宽） | — |
+| `trace_pcsample` | **DWT 硬件 PC 采样（同样不 halt 目标）**：开 `DEMCR.TRCENA`+`DWT_CTRL.PCSAMPLENA`，主机只轮询 `DWT_PCSR`，按函数聚合。与 `trace_profile` 的本质区别是**不停核、不扰动实时性**。采样器不工作（部分芯片 errata）或采样值几乎不变时会**明确报错**，不给一份看着像样的分布；默认结束恢复 `DEMCR`/`DWT_CTRL` 原值 | `samples?`、`interval_ms?`、`elf?`、`top?`、`enable_dwt?`、`restore?`、`timeout?` |
 | `trace_instrument` | **把目标侧插桩组件部署进你的工程**（见下）：按 `backend` 生成配置、拷贝组件源码与 `.mk`，已有文件默认 SKIP 不覆盖 | `target_dir`、`backend?`、`itm_port?`、`rtt_up?`、`rtt_down?`、`rtt_buf?`、`coreclk?`、`overwrite?`、`swo_baud?`、`dbgmcu_cr?` |
 
 ### 目标侧插桩组件（`components/trace/`）
@@ -461,9 +470,9 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 | `serial` | 宿主机串口监听与命令应答（7 个） |
 | `advanced` | 诊断 / 剖析 / SVD / 工程编辑等进阶能力（25 个） |
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
-| `target` | 非 MDK：目标档案查询与自动识别（3 个） |
+| `target` | 非 MDK：目标档案查询与自动识别、工程现场调试配置发现（4 个） |
 | `ocd` | 非 MDK：OpenOCD 会话 / 内存 / 寄存器 / 断点 / 烧录（17 个） |
-| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 插桩组件部署（16 个） |
+| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 插桩组件部署（20 个） |
 
 三条防翻车约定：**不设环境变量时行为完全不变**（默认全开）；**未归类的工具一律保留**（宁可少裁不错杀，组名写错时也不裁剪只给告警）；`list_tools` / `get_version` / `capabilities` 三个元工具**永不被裁**（否则 AI 连工具清单都问不出来）。裁剪结果会记入 `capabilities.tool_surface`，随时可核对。
 

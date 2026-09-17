@@ -33,6 +33,7 @@ from .locator import Locator
 from . import builder, mapfile, winutil, uvoptx as _uvoptx, __version__
 from . import serialmon
 from . import aliases as _aliases
+from . import annotate as _annotate
 from . import errors as _errors
 from . import keilkb as _keilkb
 from . import cmdscript as _cmdscript
@@ -44,6 +45,7 @@ from . import toolchain as _toolchain
 from . import targets as _targets
 from . import ocd as _ocd
 from . import trace as _trace
+from . import workspace as _workspace
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -341,6 +343,7 @@ def _symbol_projects_from_env() -> list:
 
 
 _SYMBOL_PROJECTS: list = _builtin_symbol_projects()
+_last_project: str = ""  # 本次会话最近一次通过工具参数指定的 .uvprojx（惰性符号定位优先用它）
 _breakpoints: list = []  # 内部断点记录（id/expr/address/file/line），因 BL 输出不经 socket 回传
 _bp_counter: int = 0  # 断点/数据断点 id 自增
 _watchpoints: list = []  # 内部数据断点（watchpoint）记录
@@ -557,7 +560,72 @@ def _probe_rtos():
 
 
 def _get_locator() -> Locator | None:
-    return _symbol_cfg.get("locator")
+    """取符号定位器；没装过就按需惰性解析一次（见 _ensure_locator）。"""
+    return _ensure_locator()
+
+
+def _attach_locator(axf: str, source: str, project_dir: str | None = None):
+    """装载 .axf 并记下来源（axf_source），供 get_status 等如实披露。"""
+    try:
+        loc = Locator(axf, project_dir=project_dir)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("装载符号失败 axf=%s: %s", axf, e)
+        return None
+    _symbol_cfg.update({"locator": loc, "axf": axf, "source_type": "axf",
+                        "axf_source": source})
+    logger.info("符号定位（惰性装载）：axf=%s 来源=%s 条目=%d", axf, source, loc.total_entries())
+    return loc
+
+
+def _ensure_locator() -> Locator | None:
+    """按需惰性解析符号定位器——真机踩坑：启动时没配工程，一整族工具全废。
+
+    MCP 服务启动时若既没给 --axf 也没给 --default-project，locator 就是 None；
+    之后就算 AI 已经用 launch_uvision / build_project 明确指定过工程，
+    find_symbol / snapshot / read_locals / get_current_location 这一族依然全报
+    「符号定位未就绪」，只能重启服务才能用——信息明明拿得到却不用。
+
+    这里在每次真正需要符号时按可信度依次尝试，并记录实际来源（axf_source）：
+      1. 本次会话用过的工程（工具参数里出现过的 .uvprojx，最可信）
+      2. 服务配置的默认工程
+      3. 符号工程注册表（内置/环境/启动参数注入）里**唯一**存在 .axf 的那项
+      4. 附近自动发现的 .uvprojx，且能**唯一**推断出 .axf
+    多候选时**不替调用方决定**：保持 None 并记日志，由调用方报错（宁可报错也不给
+    可能张冠李戴的符号）。
+    """
+    if _symbol_cfg.get("locator") is not None:
+        return _symbol_cfg["locator"]
+    cands = []
+    if _last_project:
+        cands.append(("本次会话使用的工程", _last_project))
+    if (_builder_cfg or {}).get("default_project"):
+        cands.append(("服务默认工程", _builder_cfg["default_project"]))
+    for src, proj in cands:
+        axf = _resolve_axf(proj)
+        if axf:
+            return _attach_locator(axf, "%s：%s" % (src, proj),
+                                   os.path.dirname(os.path.abspath(proj)))
+    regs = [r for r in (_SYMBOL_PROJECTS or [])
+            if r.get("axf") and os.path.isfile(r["axf"])]
+    if len(regs) == 1:
+        return _attach_locator(regs[0]["axf"],
+                               "符号工程注册表：%s" % (regs[0].get("name") or regs[0]["axf"]))
+    if not regs:
+        found = []
+        for proj in _find_project_candidates():
+            axf = _resolve_axf(proj)
+            if axf:
+                found.append((axf, proj))
+        if len(found) == 1:
+            return _attach_locator(found[0][0], "附近唯一可推断的工程：%s" % found[0][1],
+                                   os.path.dirname(os.path.abspath(found[0][1])))
+        if len(found) > 1:
+            logger.warning("符号自动定位：附近有多个候选 .axf，不替调用方决定：%s",
+                           [f[0] for f in found])
+    else:
+        logger.warning("符号自动定位：注册表里有多个可用 .axf，不替调用方决定：%s",
+                       [r.get("name") for r in regs])
+    return None
 
 
 
@@ -798,12 +866,33 @@ def _is_debugging(client=None, ttl: float = 1.0):
     return val
 
 
+def _hex_bytes(text: str):
+    """把用户写的十六进制字节串转成 bytes，容忍常见写法（真机踩坑）。
+
+    真机实测：`write_mem(addr="0x20001000", data="0x11223344")` 直接报
+    `non-hexadecimal number found ... at position 1`——地址能写 0x 前缀、值不能，
+    属于用户/模型都会踩的不一致。这里统一容忍 `0x/0X` 前缀、空格、逗号、下划线、
+    分号、冒号（`0x11,0x22` 也能拼对）。返回 (bytes | None, 错误说明)。
+    """
+    s = "".join((text or "").split())
+    for sep in (",", "_", ";", "|", ":"):
+        s = s.replace(sep, "")
+    if "0x" in s.lower():
+        s = "".join(p for p in s.lower().split("0x") if p)
+    try:
+        return bytes.fromhex(s), ""
+    except ValueError as e:
+        return None, ("非法十六进制字节串：%s；期望形如 deadbeef、de ad be ef 或 "
+                      "0x11223344（长度需为偶数）" % e)
+
+
 def _symbol_state(debugging=None) -> dict:
     """符号文件（.axf/.map）路径 + 时间戳 + 是否已与当前调试会话不一致。"""
     cfg = _symbol_cfg or {}
     axf = cfg.get("axf") or ""
     out = {"symbol_file": axf or None,
            "symbol_source_type": cfg.get("source_type"),
+           "symbol_source": cfg.get("axf_source"),
            "symbol_entries": None,
            "symbol_stale": False}
     try:
@@ -1454,6 +1543,22 @@ def _param_hint_block(tool) -> str:
             % (_param_signature(tool), json.dumps(example, ensure_ascii=False)))
 
 
+def _apply_annotations(info) -> None:
+    """给工具挂 MCP 官方注解（readOnlyHint / destructiveHint / idempotentHint /
+    openWorldHint）。吸收自 MCP 规范的 tool annotations：注解不是安全边界，
+    而是给客户端与 AI 的**风险词汇表**——决定要不要弹确认、能不能自动放行。
+
+    做在 list_tools 这一层而不是逐个改注册代码：契约要"所有工具都有"，
+    逐个补一定会漏，新增工具又会退回原样（与批次33 统一信封同一理由）。
+    """
+    try:
+        from mcp.types import ToolAnnotations
+        a = _annotate.annotations_for(info.name)
+        info.annotations = ToolAnnotations(**a)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("未能写入工具注解：%s（%s）", getattr(info, "name", "?"), e)
+
+
 # ---------------- 符号重定位偏移（App 侧变量按符号名直读） ----------------
 # 背景：App 运行期重定位后，运行地址 = .axf 里的链接地址 + delta（SVCrtOS 里是 0xF000）。
 # 此前读 App 变量必须手工算偏移，这里做成全局设置 + 按调用覆盖。
@@ -1647,7 +1752,7 @@ _TOOLSETS = {
         "toolchain_errors",
     },
     "target": {
-        "target_list", "target_show", "target_guess",
+        "target_list", "target_show", "target_guess", "debug_config",
     },
     "ocd": {
         "ocd_start", "ocd_stop", "ocd_status", "ocd_cmd", "ocd_cfg_list",
@@ -1660,7 +1765,8 @@ _TOOLSETS = {
         "trace_swo_stop", "trace_decode", "trace_events", "trace_clear",
         "trace_rtt_find", "trace_rtt_attach", "trace_rtt_read", "trace_rtt_write",
         "trace_rtt_detach", "trace_profile", "trace_dwt_counters",
-        "trace_instrument",
+        "trace_instrument", "trace_scope_start", "trace_scope_read",
+        "trace_scope_stop", "trace_pcsample",
     },
 }
 
@@ -1918,6 +2024,7 @@ class AliasMCPServer(MCPServer):
                         desc = info.description
                     except Exception:  # noqa: BLE001
                         logger.debug("未能写入风险说明：%s", info.name, exc_info=True)
+            _apply_annotations(info)
             note = _aliases.alias_note(info.name, self._real_params(info.name))
             if not note:
                 continue
@@ -1960,7 +2067,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     elif not axf:
         logger.warning("未定位到 .axf，位置定位工具(get_current_location/run_to_line)不可用")
     _symbol_cfg = {"locator": locator, "axf": axf,
-                   "source_type": ("axf" if locator is not None else None)}
+                   "source_type": ("axf" if locator is not None else None),
+                   "axf_source": (("--axf 启动参数：%s" % axf) if (axf_path and axf)
+                                  else ("从默认工程推断：%s" % default_project) if axf
+                                  else None)}
     logger.info("Mdkdebug 已就绪：UVSOCK@%s:%d  idle_timeout=%ss", host, port, idle_timeout)
     logger.info("构建配置：UV4=%s  默认工程=%s", uv4, default_project)
 
@@ -2242,11 +2352,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         try:
             client = _get_client()
             a, note = _resolve_addr_arg(addr, client)
-            hex_str = "".join((data_hex or "").split())
-            try:
-                payload = bytes.fromhex(hex_str)
-            except ValueError as e:
-                return _js({"ok": False, "addr": str(addr), "error": f"data_hex 非法: {e}"})
+            payload, herr = _hex_bytes(data_hex)
+            if payload is None:
+                return _js({"ok": False, "addr": str(addr),
+                            "error": "data_hex 非法: %s" % herr,
+                            "hint": "传十六进制字节串：deadbeef / de ad be ef / 0x11223344"})
             out = dict(client.write_mem(a, payload))
             ca = _cache_advisory(client, a, "write")
             if ca:
@@ -3390,9 +3500,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "排查函数参数传错、返回值不对、寄存器被踩等问题时使用。需已进入调试状态。注意：需目标暂停。真机实测 halt 后首次读到的 PC 可能是上一次 halt 的残留值（LR/SP 已更新），"
             "本工具因此按'连续采样收敛'判定（连续两次 PC/LR/SP 一致才采纳），返回 stable 标记；"
             "stable=false 表示未收敛、PC 不可信，请重试。SP/LR 在中断上下文为现场脏值，AAPCS 解读仅对普通函数调用点成立。"
+            "names 可选：只要指定寄存器（如 'pc' 或 'pc,sp,lr'，也接受 r13/r14/r15 写法），"
+            "不传则整组读；不认识的名单会放进 unknown_names 并列出 supported_names（不静默忽略）。"
         ),
     )
-    async def read_registers() -> str:
+    async def read_registers(names: str = "") -> str:
         try:
             client = _get_client()
             # 寄存器名候选（大小写兼容不同 Keil 版本）
@@ -3401,9 +3513,23 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             aliases = {"SP": ("__currentSP()", "SP", "R13"),
                        "LR": ("__currentLR()", "LR", "R14"),
                        "PC": ("__currentPC()", "PC", "R15")}
+            # names：只读指定寄存器（真机反馈：想单看 pc 却只能整组读，返回里再自己翻）
+            want: list = []
+            unknown: list = []
+            toks = ((names or "").replace(",", " ").replace(";", " ")
+                    .replace("|", " ").split())
+            for tok in toks:
+                up = tok.strip().upper()
+                up = {"R13": "SP", "R14": "LR", "R15": "PC"}.get(up, up)
+                if up in order:
+                    if up not in want:
+                        want.append(up)
+                elif tok.strip():
+                    unknown.append(tok.strip())
+            use = want or order
             core: dict = {}
             failed: list = []
-            for name in order:
+            for name in use:
                 cands = aliases.get(name, (name,))
                 val = None
                 for c in cands:
@@ -3419,8 +3545,18 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 else:
                     core[name.lower()] = val
             if not core:
-                return _js({"ok": False, "error": "无法读取 CPU 寄存器（请先进入调试）", "failed": failed})
+                msg = "无法读取 CPU 寄存器（请先进入调试）"
+                if unknown and not want:
+                    msg = "指定的寄存器名都不被支持：%s" % ", ".join(unknown)
+                return _js({"ok": False, "error": msg, "failed": failed,
+                            "unknown_names": unknown or None,
+                            "supported_names": [n.lower() for n in order]})
             out = {"ok": True, "registers": core, "count": len(core)}
+            if want:
+                out["filter"] = [n.lower() for n in want]
+            if unknown:
+                out["unknown_names"] = unknown
+                out["supported_names"] = [n.lower() for n in order]
             if failed:
                 out["unavailable"] = failed
             # AAPCS 解读：R0-R3 前4入参（当帧为函数入口时才有意义），R0 返回值，LR 返回地址
@@ -4499,6 +4635,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                         p,
                         ("；本机找到的候选工程：%s" % "、".join(cands)) if cands else
                         "（未在附近找到任何 .uvprojx）"))
+            global _last_project
+            _last_project = p      # 记下来，供惰性符号定位复用
             return p
         if _builder_cfg["default_project"]:
             dp = _builder_cfg["default_project"]
@@ -6984,7 +7122,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     # 新加的组才有东西可裁。任一族注册失败都只记日志，不让整个 server 起不来。
     _extra_counts = {}
     for _mod_name, _mod in (("toolchain", _toolchain), ("targets", _targets),
-                            ("ocd", _ocd), ("trace", _trace)):
+                            ("ocd", _ocd), ("trace", _trace),
+                            ("workspace", _workspace)):
         try:
             _extra_counts[_mod_name] = _mod.register(server, _js)
         except Exception as _e:  # noqa: BLE001

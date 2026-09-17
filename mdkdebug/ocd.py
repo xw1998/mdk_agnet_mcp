@@ -134,6 +134,40 @@ class OCDTelnet:
             idle_deadline = time.time() + 0.6
         return _strip_prompt(_clean_telnet(buf).decode("utf-8", "replace"))
 
+    def _drain(self, settle: float = 0.04, limit: float = 0.25) -> bytes:
+        """发送前清空套接字里滞留的字节（上一条命令迟到的回包 / 异步帧）。
+
+        真机取证：连续发命令时，上一条命令的回包偶尔晚到，和下一条命令的回显挤在
+        同一个 recv 里；`_has_prompt` 一见提示符就提前返回，于是下一条命令只拿到
+        回显残片（`reg xpsr` -> `rg xpsr`），真实结果被算到再下一条命令头上。
+        发前清空是唯一能保证「响应必属于本命令」的办法；清掉的字节数如实披露。
+        """
+        if not self.sock:
+            return b""
+        dropped = b""
+        try:
+            self.sock.settimeout(max(0.01, float(settle)))
+        except OSError:
+            return b""
+        deadline = time.time() + max(0.05, float(limit))
+        try:
+            while time.time() < deadline:
+                try:
+                    chunk = self.sock.recv(65536)
+                except socket.timeout:
+                    break
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                dropped += chunk
+        finally:
+            try:
+                self.sock.settimeout(0.3)
+            except OSError:
+                pass
+        return dropped
+
     def cmd(self, command: str, timeout: float | None = None) -> dict:
         """发一条命令，返回 {ok, command, output, lines, error, raw}。"""
         command = (command or "").strip()
@@ -144,6 +178,7 @@ class OCDTelnet:
             if not r.get("ok"):
                 return {"ok": False, "command": command, "error": r.get("error")}
         t = float(timeout if timeout is not None else self.timeout)
+        dropped = self._drain()
         try:
             self.sock.sendall((command + "\n").encode("utf-8"))
         except OSError as e:
@@ -151,7 +186,20 @@ class OCDTelnet:
             return {"ok": False, "command": command,
                     "error": "发送失败（连接已断？）：%s" % e}
         raw = self._read_until_prompt(t)
-        return _shape(command, raw)
+        res = _shape(command, raw)
+        if dropped:
+            res["stale_bytes"] = len(dropped)
+        # 只收到回显（残片）没收到真实结果：极可能是迟到的提示符让读提前返回，
+        # 再读一轮补齐；拿到内容就用它，仍为空则如实返回空（不给假结果）。
+        if res.pop("_echo_only", False):
+            extra = self._read_until_prompt(min(t, 1.5))
+            if extra.strip():
+                res = _shape(command, raw + "\n" + extra)
+                res["echo_retry"] = True
+                res.pop("_echo_only", None)
+                if dropped:
+                    res["stale_bytes"] = len(dropped)
+        return res
 
     def cmd_many(self, commands, timeout: float | None = None) -> dict:
         """多条命令逐条发，聚合结果（任一条报错则整体 ok=false）。"""
@@ -188,8 +236,21 @@ def _clean_telnet(buf: bytes) -> bytes:
     i, n = 0, len(buf)
     while i < n:
         b = buf[i]
-        if b == 0xFF and i + 1 < n:
-            i += 3 if 0xFB <= buf[i + 1] <= 0xFE else 2
+        if b == 0xFF:
+            if i + 1 >= n:
+                i += 1                       # 行尾孤立 IAC，只丢它自己
+                continue
+            nxt = buf[i + 1]
+            if 0xFB <= nxt <= 0xFE:          # WILL/WONT/DO/DONT + option
+                i += 3
+            elif 0xF0 <= nxt <= 0xFA:        # 其它 telnet 命令（GA/SB…）
+                i += 2
+            else:
+                # **孤立 IAC 只能丢它自己**。旧实现无条件 `i += 2`，会把紧跟在
+                # IAC 后面的那个数据字节一起吞掉——真机取证：`reg pc` 的回显被
+                # 吃成 `eg pc`、`reg xpsr` 被吃成 `rg xpsr`，症状是「回显残片 +
+                # 真实结果丢失」，解析出来像目标没回话，属于静默错答案。
+                i += 1
             continue
         if b == 0x00:
             i += 1
@@ -230,15 +291,41 @@ def _strip_prompt(text: str) -> str:
     return "\n".join(lines)
 
 
+def _echo_fragment(line: str, command: str) -> bool:
+    """这一行是不是命令回显（含被 telnet 协商吃掉开头字符的残片）。
+
+    整行相等的情况一直有处理；残片是真心机才暴露的：`_clean_telnet` 早期把孤立
+    IAC 后面的数据字节一起吞了，于是 `reg pc` 的回显变成 `eg pc`、`reg xpsr`
+    变成 `rg xpsr`。判定放宽成「非空且是命令串的子串（长度 >= 2）」，两种都覆盖。
+    误伤风险极低：命令回显外的正常输出不会恰好是命令串的子串。
+    """
+    c = (command or "").strip()
+    s = (line or "").strip()
+    if not c or not s:
+        return False
+    if s == c or (len(s) >= 2 and s in c):
+        return True
+    # 残片兜底：telnet 协商字节可能插进回显中间吃掉若干字符（真机 `reg xpsr`
+    # -> `rg xpsr`），这种既不相等也不是连续子串。判定放宽成「s 是 c 的子序列
+    # 且长度不少于命令的一半」——回显以外的正常输出不会是这种形状。
+    if len(s) < max(2, len(c) // 2):
+        return False
+    it = iter(c)
+    return all(ch in it for ch in s)
+
+
 def _shape(command: str, raw: str) -> dict:
     """把原始回包整理成结构化结果：剔回显、折叠 Tcl 栈、提取错误。"""
     lines = raw.split("\n")
-    # 1) 剔掉回显行（OpenOCD telnet 会把命令行原样回显）
+    # 1) 剔掉回显行（OpenOCD telnet 会把命令行原样回显，可能是残片）
     out = []
+    echo_only = True
     for i, ln in enumerate(lines):
-        if i == 0 and ln.strip() == command.strip():
+        if i < 3 and _echo_fragment(ln, command):
             continue
         out.append(ln)
+        if ln.strip():
+            echo_only = False
     # 2) 折叠 Jim-Tcl 调用栈（它跟随在 Error 行后面，对新错误没信息量）
     kept, in_stack = [], False
     for ln in out:
@@ -259,6 +346,9 @@ def _shape(command: str, raw: str) -> dict:
     res = {"ok": not errs, "command": command, "output": text,
            "lines": [ln for ln in kept if ln.strip()],
            "error": errs[0] if errs else None}
+    # 只在「确实收到了东西、但全是回显」时才置位（用来触发一次重读补数据）。
+    # 回包完全为空说明该命令本来就不输出（halt 之类），不必白等重读。
+    res["_echo_only"] = bool(echo_only and raw.strip())
     if len(errs) > 1:
         res["errors"] = errs
     if warns:
@@ -669,12 +759,45 @@ def register(server, js=None) -> int:
             if s.running() and restart:
                 s.stop()
             extra = [x for x in re.split(r"[;,|]", extra_cfg or "") if x.strip()]
+            # 参数优先级链：显式参数 > 环境变量 > 工程现场(launch.json) > 档案默认值。
+            # 只有当**一个连接参数都没给**时才去看工程现场，绝不覆盖显式参数；
+            # 命中/未命中都记在 config_source 里，便于回溯参数到底哪来的。
+            config_source = None
+            if not (profile or interface or target):
+                if not os.environ.get("MDKDEBUG_NO_LAUNCH_DISCOVERY"):
+                    from . import workspace as _ws
+                    g = _ws.guess_from_workspace(start_dir=cwd or os.getcwd())
+                    if g.get("ok"):
+                        profile = g.get("profile") or ""
+                        interface = g.get("interface") or ""
+                        target = g.get("target") or ""
+                        transport = transport or g.get("transport") or ""
+                        extra = list(extra) + list(g.get("extra_cfg") or [])
+                        config_source = g.get("config_source")
+                    elif g.get("found"):
+                        config_source = {"tried": g.get("path"),
+                                         "skipped": g.get("error")}
             ag = _targets.openocd_args(profile=profile, interface=interface,
                                        target=target, transport=transport,
                                        speed=speed, extra_cfg=extra)
             if not ag.get("ok"):
-                return _js(ag)
+                out = dict(ag)
+                if config_source:
+                    out["config_source"] = config_source
+                return _js(out)
             args = list(ag["args"])
+            # 显式把 scripts 目录传给 openocd（-s）：不同发行版的自带默认路径
+            # 与实际安装布局常常对不上（xPack 就是 bin/ + openocd/scripts），
+            # 不传 -s 时 openocd 会因找不到 interface/target cfg 直接退出，
+            # 而报错只有一句“exit code 1”。找不到目录就如实说明，不硬编一个路径。
+            sd = ""
+            if not cwd:
+                try:
+                    sd = _targets.scripts_dir(exe or "")
+                except Exception:  # noqa: BLE001
+                    sd = ""
+                if sd:
+                    args = ["-s", sd] + args
             # 端口显式指定，避免与已占用的 4444 撞车（同时开第二个 OpenOCD 时）
             args += ["-c", "telnet_port %d" % int(telnet_port),
                      "-c", "gdb_port %d" % int(gdb_port),
@@ -689,7 +812,16 @@ def register(server, js=None) -> int:
             s.profile = profile or ""
             out = dict(r)
             out["profile"] = profile or None
+            if config_source:
+                out["config_source"] = config_source
             out["openocd_args"] = ag
+            if sd:
+                out["scripts_dir"] = sd
+            elif not cwd:
+                out["scripts_dir_warning"] = (
+                    "没定位到 OpenOCD 的 scripts 目录，未传 -s；若启动失败报 "
+                    "can't find interface/target cfg，用 ocd_start(cwd=...) 或 "
+                    "工具链目录里 openocd/scripts 的绝对路径。")
             out["toolchain_hint"] = ag.get("toolchain_hint")
             out["log_tail"] = s.tail(25)
             if r.get("ok"):
@@ -1006,12 +1138,34 @@ def register(server, js=None) -> int:
         try:
             tgt = ("%s " % target.strip()) if target.strip() else ""
             s = get_session()
+            # 目标在跑时 openocd 只在输出里写 `Could not read register 'pc'`，
+            # status 依旧是“成功”，解析出来就是一个空字典。若只回 ok:false + raw，
+            # 调用方得自己从一长串文本里找原因（真机就是在这个坑上卡住的）。
+            # 这里直接把“要 halt”说出来，并把当前状态一起给出来。
+            def _empty(tag_raw):
+                running = False
+                try:
+                    st = s.cmd("targets", timeout=5)
+                    running = "running" in (st.get("output") or "").lower()
+                except Exception:  # noqa: BLE001
+                    pass
+                d = {"ok": False,
+                     "error": ("OpenOCD 没返回寄存器内容" if "could not read register" not in tag_raw.lower()
+                               else "目标正在运行，寄存器只有 halt 时才能读"),
+                     "target_running": running,
+                     "raw": tag_raw,
+                     "hint": "先 ocd_control(action=\"halt\") 停核再读寄存器；"
+                             "读 RAM 不需要停核（变量 scope 就用这条）"}
+                return _js(d)
+
             if not name:
                 r = s.cmd(tgt + "reg", timeout=float(timeout))
                 if not r.get("ok"):
                     return _js(r)
                 regs = _parse_regs(r.get("output") or "")
-                return _js({"ok": bool(regs), "count": len(regs),
+                if not regs:
+                    return _empty(r.get("output") or "")
+                return _js({"ok": True, "count": len(regs),
                             "registers": regs,
                             "registers_hex": {k: "0x%X" % v for k, v in regs.items()},
                             "raw": r.get("output")})
@@ -1021,8 +1175,15 @@ def register(server, js=None) -> int:
                     return _js(r)
                 regs = _parse_regs(r.get("output") or "")
                 v = regs.get(name)
-                return _js({"ok": v is not None, "name": name, "value": v,
-                            "value_hex": ("0x%X" % v) if v is not None else None,
+                if v is None:
+                    d = json.loads(_empty(r.get("output") or ""))
+                    d["name"] = name
+                    d["value"] = None
+                    d["available"] = sorted(regs) if regs else []
+                    d["error_extra"] = ("目标里没有叫 %r 的寄存器（或本次没读到）" % name)
+                    return _js(d)
+                return _js({"ok": True, "name": name, "value": v,
+                            "value_hex": "0x%X" % v,
                             "raw": r.get("output")})
             vv = _parse_int(value)
             if vv is None:
@@ -1142,8 +1303,24 @@ def register(server, js=None) -> int:
                 r = s.cmd("%srwp 0x%X" % (tgt, a2), timeout=float(timeout))
                 book[:] = [b for b in book if _parse_addr(b["addr"]) != a2]
                 return _js(r)
+            if a in ("clear_all", "del_all", "remove_all"):
+                # 没有 addr 也得能拆掉观察点：DWT 的观察点是硬件资源，忘在目标上
+                # 会一直触发 halt/影响时序，而调用方未必记得住地址。
+                if not book:
+                    return _js({"ok": True, "action": a, "removed": [],
+                                "note": "本会话没记下任何观察点，未对目标发命令"})
+                removed, failed = [], []
+                for b in list(book):
+                    ba = _parse_addr(b["addr"])
+                    if ba is None:
+                        continue
+                    rr = s.cmd("%srwp 0x%X" % (tgt, ba), timeout=float(timeout))
+                    (removed if rr.get("ok") else failed).append(b["addr"])
+                book[:] = [] if not failed else [b for b in book if b["addr"] in failed]
+                return _js({"ok": not failed, "action": a, "removed": removed,
+                            "failed": failed or None})
             return _js({"ok": False, "action": action,
-                        "available": ["set", "clear", "list"]})
+                        "available": ["set", "clear", "clear_all", "list"]})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "action": action, "error": str(e)})
     n += 1

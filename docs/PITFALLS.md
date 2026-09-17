@@ -15,6 +15,7 @@
 - [八、SVD 解码与工程文件编辑（批次35 真机实测）](#八svd-解码与工程文件编辑批次35-真机实测)
 - [九、历次改进留档（按批次）](#九历次改进留档按批次)
 - [十一、非 MDK 链路（工具链 / OpenOCD / trace）](#十一非-mdk-链路工具链--openocd--trace)
+- [十二、Keil 窗口复用 / 惰性符号 / 写入与回显（本轮真机实测）](#十二keil-窗口复用--惰性符号--写入与回显本轮真机实测)
 
 ## 一、真实 Keil 实测要点
 
@@ -824,6 +825,62 @@ RTT 通路闭环时 `trace_rtt_read` 明明读回了 `boot: mdkdebug rtt probe` 
 别用 shell 包装器（`timeout`、管道、`env`）跑出来的结果下判断；两者不一致时，先怀疑包装器。
 代码里仍保留了一道运行期失败特征判定（`_BROKEN_RE`，命中「起得来、退出码 0、其实没跑」的 exe
 就判不可用），但注释只描述事实，不挂具体包的结论。
+
+## 十二、Keil 窗口复用 / 惰性符号 / 写入与回显（本轮真机实测）
+
+本轮的坑都属同一类：**工具手里明明有信息却不拿去用，于是给出一份看起来很确定、实际是错的答案**。
+
+### 1. `launch_uvision(reuse=True)` 仍然开新窗口：相对路径 vs 绝对路径
+
+真机现象：同工程 Keil 窗口累积到 2 个（红线是「只保留一个窗口」）。根因在复用的同一性判定：
+调用方传的是**相对路径**（`example_mdk_project/.../mdk_test.uvprojx`），而实例枚举从命令行
+拿到的是**绝对路径**，旧 `_same_project` 只归一大小写与分隔符，相对/绝对不等 → 判不出同一工程
+→ 又拉起一个。修法：比较前先 `abspath`。
+
+验证：收敛后传相对路径、绝对路径调 `launch_uvision(reuse=True)`，两次都 `reused=true`、
+`pid` 不变、`list_uvision_instances.count` 始终为 1。
+
+### 2. 启动时没配工程 → 符号相关工具整族不可用
+
+真机现象：MCP 服务启动只给了 UVSOCK 端口，没给 `--default-project` / `--axf`，于是
+`find_symbol` / `snapshot` / `read_locals` / `get_current_location`（文件行号）全报「符号定位未就绪」，
+而工程路径其实就在工具参数里（`launch_uvision(project=...)`）。
+
+修法：符号定位改为**按需惰性解析**，优先序固定并记录来源（`get_status.symbol_source` 披露）：
+本次会话用过的工程 > 服务默认工程 > 符号工程注册表里唯一存在 `.axf` 的那项 > 附近唯一可推断的工程。
+**多候选就不替调用方决定**（保持未装载并记日志），宁可报错也不猜一个可能张冠李戴的符号。
+
+### 3. `write_mem` 地址收 `0x` 前缀、值不收
+
+`write_mem(addr="0x20001000", data="0x11223344")` 直接报 `non-hexadecimal ... at position 1`：
+地址能写 `0x`、值不能，是人和模型都会踩的不一致。修法：统一容忍 `0x/0X` 前缀、空格、逗号、
+下划线、分号、冒号（`0x11,0x22` 也拼得对），失败时给出期望写法，并归类到 `invalid-argument`
+（原来落 `unknown-error`，`next_actions` 指去查 Keil 健康，方向完全错）。
+
+### 4. OpenOCD telnet：孤立 IAC 吞掉数据字节 → 回显残片 + 结果串台
+
+真机现象：`ocd_reg(pc)` 的 `raw` 是 `"eg pc\npc (/32): 0x080000f4"`，`ocd_reg(xpsr)` 的 `raw`
+只有 `"rg xpsr"`（真实结果没到），看起来像目标没回话。两个独立根因：
+
+- `_clean_telnet` 对孤立 IAC（`0xFF`）无条件 `i += 2`，把紧跟其后的**数据字节一起吞了**
+  （`reg` 的首字符被吃）。修法：只有 `WILL/WONT/DO/DONT`+option 吃 3 字节、其它 telnet 命令吃 2 字节，
+  **孤立 IAC 只吃它自己**。
+- 上一条命令迟到的提示符让 `_read_until_prompt` 一见提示符就提前返回，下一条命令只拿到回显残片。
+  修法：发命令前 `_drain()` 清空滞留字节（清掉的字节数记进 `stale_bytes`）；若整理后只剩回显，
+  自动补读一轮，仍为空就如实返回空；回显判定放宽到「子序列且长度 ≥ 命令一半」以覆盖 `rg xpsr` 形态。
+
+### 5. SWO 零字节不该只说「没数据」
+
+`trace_swo_start` 回 ok、`trace_swo_read` 永远 0 字节——用户根本分不清是「引脚没接」「目标没使能 ITM」
+还是「波特率不对」。修法：零字节时 DAP 直读 `DEMCR.TRCENA / ITM_TCR.ITMENA / ITM_TER / TPIU_ACPR`，
+用 `coreclk/(ACPR+1)` 算实际 SWO 速率并和本次配置比，读不到的寄存器进 `unreadable`，
+再给「引脚 / 插桩 / 端口」可查清单。**结论必须来自目标寄存器实读，不替设备编原因。**
+
+### 6. `read_registers` 只能整组读
+
+真机顺手试 `read_registers(regs=["pc"])` 直接被拒（参数名不被接受）。修法：加 `names`
+（`"pc"` / `"pc,sp,lr"`，也接受 `r13/r14/r15`），并把 `regs/reg/registers/only/filter` 纳入别名层；
+不认识的名单放进 `unknown_names` + 回 `supported_names`，**不静默忽略**。
 
 ## 九、历次改进留档（按批次）
 

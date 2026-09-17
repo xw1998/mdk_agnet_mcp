@@ -29,6 +29,7 @@ _PROJECT = ["proj", "project_path", "uvprojx", "path", "project_file"]
 _SPEC = {
     # ---- 表达式 / 变量 ----
     "calc_expression": {"expr": _LOCATE},
+    "read_registers": {"names": ["regs", "reg", "registers", "only", "filter"]},
     "read_variable": {"name": _LOCATE + ["arr", "varname"],
                       "count": ["n", "num", "items", "length"]},
     "read_struct": {"name": _LOCATE + ["struct", "type"],

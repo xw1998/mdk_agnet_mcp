@@ -1213,10 +1213,39 @@ def register(server, js=None) -> int:
         try:
             if show_only:
                 return _js({"ok": True, "state": env_state()})
-            fams = "" if families in ("", "all") else families
+            # 真机撞到的坑：旧代码把 "" / "all" 都折成 fams="" ，再 fams or None
+            # 传给 apply_env → families=None → **什么都不注入，却回 ok:true**。
+            # 调用方看到「成功」就去跑 arm-none-eabi-gcc，然后在别处莫名失败。
+            # 现在 "all" 原样透传（resolve_paths 本来就会展开 all/*），
+            # 当真有家族没装时把"注入了什么 / 没注入什么"写在 note 里。
+            raw = (families or "").strip() or "all"
             extra = [p for p in re.split(r"[;|]", path_extra or "") if p.strip()]
-            r = apply_env(fams or None, path_extra=extra or None, reset=bool(reset))
+            r = apply_env(raw, path_extra=extra or None, reset=bool(reset))
+            r["families_requested"] = raw
+            # 家族名写错时不静默：跟实际探测到的家族对一遍，把不认识的名字报出来。
+            # （旧行为是「照单注入 0 个目录」+ ok:true，调用方无从发现拼写错。）
+            try:
+                known = set((discover().get("families") or {}).keys())
+                known |= {"all", "*"} | set(_FAMILY_PROBE_ORDER) | \
+                    {"make", "cmake", "ninja", "openocd", "gdb"}
+                asked = [x.strip() for x in re.split(r"[,;|]", raw) if x.strip()]
+                unknown = [x for x in asked if x not in known]
+                if unknown:
+                    r["unknown_families"] = unknown
+                    r["warning"] = ("这些家族名没有出现在探测结果里：%s；"
+                                    "它们没带来任何 PATH 项，先确认名字拼写" % unknown)
+            except Exception:  # noqa: BLE001
+                pass
             r["state"] = env_state()
+            if not r.get("added_now"):
+                r["note"] = ("本次没有新增 PATH 项：要么之前已经铺过（applied 非空），"
+                              "要么请求的家族在本机没有探测到 bin 目录")
+                if not r.get("applied"):
+                    r["ok"] = False
+                    r["error"] = ("请求的家族 %r 在本机一个 bin 目录都没解析到，"
+                                  "PATH 未发生变化" % raw)
+                    r["hint"] = ("先 toolchain_list(refresh=true) 看哪些家族可用，"
+                                  "或用 path_extra 直接给 bin 目录")
             return _js(r)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})

@@ -355,13 +355,20 @@ def openocd_args(profile: str = "", interface: str = "", target: str = "",
 
 
 def _fmt_speed(speed) -> str:
+    """把速度格式化成 OpenOCD `adapter speed` 要的**裸 kHz 数字**。
+
+    这里曾经输出 "1k" / "4k" 这种带单位的紧凑写法，看着更友好，实际 openocd
+    直接拒：`Error: Invalid command argument / khz option value ('1k') is not valid`
+    （真机撞到：ocd_start(speed=1000) 一起手就退出码 1）。单位是多余的——
+    这个命令的参数本来就是 kHz，带上反而变成非法值。
+    """
     try:
         v = float(speed)
     except (TypeError, ValueError):
         return str(speed)
-    if v >= 1000000:
-        return "%gk" % (v / 1000.0)
-    return "%gk" % (v / 1000.0) if v >= 1000 else "%d" % int(v)
+    if abs(v - int(v)) < 1e-9:
+        return str(int(v))
+    return ("%.3f" % v).rstrip("0").rstrip(".")
 
 
 def _toolchain_hint(spec: dict) -> dict:
@@ -389,20 +396,25 @@ def scripts_dir(openocd_path: str = "") -> str:
     if not exe:
         return ""
     base = os.path.dirname(os.path.abspath(exe))
-    cands = [
-        os.path.join(base, "..", "share", "openocd", "scripts"),
-        os.path.join(base, "..", "scripts"),
-        os.path.join(base, "scripts"),
-        os.path.join(base, "..", "..", "share", "openocd", "scripts"),
-        # xPack 版：bin/openocd.exe + share/openocd/scripts
-        os.path.join(base, "..", "share", "openocd", "scripts"),
+    # 各发行版布局不一样，硬编码几种组合一定会漏（真机撞过：xPack 的
+    # 0.12.0-4 是 bin/openocd.exe + openocd/scripts，两种写法都没覆盖到，
+    # 于是 ocd_cfg_list 报“找不到 scripts 目录”）。改成
+    # 「先枚举已知组合，再从 exe 目录往上逐层扫 → 扫不到就如实返回空」。
+    rel = [
+        ("..", "openocd", "scripts"),          # xPack: bin/ + ../openocd/scripts
+        ("..", "share", "openocd", "scripts"),  # 发行版包: bin/ + ../share/...
+        ("..", "scripts"),
+        ("scripts",),
+        ("..", "..", "share", "openocd", "scripts"),
+        ("..", "..", "openocd", "scripts"),
     ]
-    # 再宽一点：往上一层找 share/openocd/scripts
-    for up in ("..", "../.."):
-        p = os.path.normpath(os.path.join(base, up))
-        cands.append(os.path.join(p, "share", "openocd", "scripts"))
+    cands = [os.path.normpath(os.path.join(base, *r)) for r in rel]
+    for up in ("..", "../..", "../../.."):
+        root = os.path.normpath(os.path.join(base, *up.split("/")))
+        cands.append(os.path.join(root, "share", "openocd", "scripts"))
+        cands.append(os.path.join(root, "openocd", "scripts"))
+        cands.append(os.path.join(root, "scripts"))
     for c in cands:
-        c = os.path.normpath(c)
         if os.path.isdir(os.path.join(c, "target")) and os.path.isdir(os.path.join(c, "interface")):
             return c
     return ""

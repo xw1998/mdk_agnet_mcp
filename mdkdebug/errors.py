@@ -28,25 +28,20 @@ from __future__ import annotations
 import logging
 import re
 
+from . import annotate as _annotate
+
 logger = logging.getLogger("mdkdebug.errors")
 
 # ----------------------------------------------------------------------
 # 风险分级（吸收 embeddedskills 的 operation_mode：低/中/高）
 # ----------------------------------------------------------------------
-RISK_HIGH = {
-    "flash_download", "flash_debug", "build_and_flash", "clean_project",
-    "fill_mem", "write_peripheral", "close_uvision", "restart_keil",
-    "reset", "set_breakpoint", "clear_all_breakpoints", "write_mem",
-    # UV4 -d 批处理会真正进调试并下载程序（Erase/Program/Verify）
-    "batch_debug_script",
-}
-RISK_MEDIUM = {
-    "build_project", "rebuild_project", "launch_uvision", "run", "stop",
-    "step", "reset_connection", "dismiss_dialog", "serial_write", "serial_expect",
-    "set_reloc_delta", "serial_monitor_start", "serial_monitor_stop",
-    # 会真实修改用户的 .uvprojx（写前自动备份，但仍是不可逆的文件改动）
-    "uvprojx_edit",
-}
+# 风险分级的数据源统一放在 annotate（批次37）：那里是**按整个工具面**归类过的，
+# 含非 MDK 工具族（ocd_/toolchain_/trace_/target_）。
+# 在此之前，这批工具因为不在下面两张表里，风险字段是空的——
+# 于是 ocd_flash / ocd_write_mem 这种真写 Flash 的工具**没有风险提示**，
+# 而 readOnlyHint 一旦也沿用同一套数据，就会被误标成"只读"：这是本轮修掉的缺口。
+RISK_HIGH = set(_annotate.DESTRUCTIVE)
+RISK_MEDIUM = set(_annotate.MUTATING) - RISK_HIGH
 
 # ----------------------------------------------------------------------
 # 字符串错误码字典
@@ -110,9 +105,21 @@ ERROR_CODES = {
         "text": "调试会话的符号已过期（编译/烧录后 .axf 已重生成，旧会话求值会报解析错误）",
         "next_actions": ["exit_debug 后重新 enter_debug 刷新符号", "或按返回值里的 symbol_stale_warning 提示处理"],
     },
+    "debug-info-missing": {
+        "text": "当前 PC 所在函数没有可用的局部变量调试信息（不是『调试通道坏了』）",
+        "next_actions": [
+            "多为编译优化把局部变量优化掉了（read_project_config 看 optimization，-Otime/-O3 常见）：调低优化级别重新编译再试",
+            "先 get_current_location 确认停在函数体内（停在库函数/启动代码里通常本就没有局部信息）",
+            "看全局变量用 read_variable，看固定地址的值用 read_mem（不依赖调试信息）",
+        ],
+    },
     "symbol-missing": {
         "text": "缺少调试符号（未定位到 .axf 或符号表为空）",
-        "next_actions": ["先编译一次生成 .axf，再用 set_symbol_file 指定", "确认工程构建输出目录里确实有 .axf"],
+        "next_actions": [
+            "先编译一次生成 .axf（build_project 或 toolchain_build），再用 set_symbol_file 指定",
+            "传过工程就会有符号：任何带 project 参数的工具（如 launch_uvision/build_project）都会顺带把符号挂上，可先用 read_project_config 确认工程路径",
+            "用 list_symbol_projects 看内置/注入的符号工程，核对构建输出目录里确实有 .axf",
+        ],
     },
     "breakpoint-address-unresolved": {
         "text": "断点地址不在已加载镜像内（Keil 报 error 57）",
@@ -254,6 +261,24 @@ ERROR_CODES = {
             "用 toolchain_list 看本服务认到的 openocd 根目录是不是你期望的那个",
         ],
     },
+    "ocd-start-failed": {
+        "text": "OpenOCD 没起来就退了（退出码非 0）——真正的失败原因在 openocd 的日志里",
+        "next_actions": [
+            "读返回里的 log_tail（或 ocd_log）：openocd 会把 Invalid argument / "
+            "can't find xxx.cfg 这类真因写在最后几行",
+            "看 scripts_dir_warning：没传 -s scripts 目录时 cfg 找不到，报错只有一句 exit code 1",
+            "调低速度或换接口 cfg：adapter speed 的参是**裸 kHz 数字**（写 1000 不写 1k）",
+            "确认探针没被 Keil / 另一个 OpenOCD 占着（ocd_status 看是否有残留会话）",
+        ],
+    },
+    "ocd-target-running": {
+        "text": "目标正在运行，这个操作要求先停核（Cortex-M 的 core 寄存器只在 halted 时可见）",
+        "next_actions": [
+            "ocd_control(action=\"halt\") 停核后重试；读寄存器/设断点/单步都要求 halt",
+            "读内存**不需要** halt（DAP 直读 RAM）：变量 scope 这类观测别去停核",
+            "只想看运行中的函数分布用 trace_pcsample（不 halt）",
+        ],
+    },
     "toolchain-missing": {
         "text": "没找到要用的工具链可执行文件",
         "next_actions": [
@@ -326,6 +351,13 @@ _RULES = (
     (r"写后读不一致", "ocd-write-verify-mismatch"),
     (r"没有 Flash bank|没有可用的 Flash bank", "ocd-no-flash-bank"),
     (r"找不到 OpenOCD scripts 目录", "ocd-script-missing"),
+    (r"openocd 进程已退出|openocd.*退出码|failed to open|can't find .*\.cfg|Invalid command argument",
+     "ocd-start-failed"),
+    # 真机撞到：目标在跑时读寄存器，openocd 只在输出里写
+    # `Could not read register 'pc'`（status 仍为 0/成功），旧规则全不命中，
+    # 落到 unknown-error，next_actions 指到“读 output 自己看”——方向完全不对。
+    (r"Could not read register|Could not read register|Target not halted|target .{0,12}not halted|must be halted",
+     "ocd-target-running"),
     (r"不支持的 transport|未知档案|既没给 profile 也没给 interface", "target-unknown"),
     (r"找不到工具\s|本机没找到|找不到\s*\S*\s*的\s*(gcc|objcopy)|该工具不在放行白名单",
      "toolchain-missing"),
@@ -345,7 +377,10 @@ _RULES = (
     (r"不在本机串口列表中", "serial-port-not-found"),
     (r"WinError\s*=?\s*5\b|拒绝访问|被别的程序占用|已被占用|端口被占用|被占用", "serial-port-busy"),
     (r"symbol_stale|符号.*过期|status\s*13", "symbol-stale"),
-    (r"未定位到 \.axf|符号文件不可用|符号表为空", "symbol-missing"),
+    (r"未从 \.axf 定位到当前函数或变量信息|无局部变量调试信息|未定位到当前函数",
+     "debug-info-missing"),
+    (r"未定位到 \.axf|符号文件不可用|符号表为空|符号定位未就绪|缺少 \.axf 调试符号", "symbol-missing"),
+    (r"data_hex 非法|非法十六进制字节串", "invalid-argument"),
     (r"error\s*57", "breakpoint-address-unresolved"),
     (r"error\s*65", "breakpoint-limit"),
     (r"error\s*72", "breakpoint-not-found"),
@@ -366,6 +401,11 @@ _RULES = (
     (r"超时|timeout", "timeout"),
     (r"未检测到 Keil|Keil 未运行|未运行|UVSOCK|4823|无法连接|连接失败|Connection refused",
      "uvsock-unavailable"),
+    # 「至少要给一个/至少给一个/二者传其一」是真机踩到的漏网：target_guess 无参时报
+    # 「elf 与 name 至少要给一个」，旧规则里没有「至少」这一支，落进 unknown-error 后
+    # next_actions 指向「读 OpenOCD output」，把一个纯参数问题指去了非 MDK 方向。
+    (r"至少要给|至少给\S{0,4}一个|至少\S{0,4}(其一|选一|传一)|二者\S{0,4}(其一|选一|传一)|二选一",
+     "invalid-argument"),
     (r"参数|Field required|缺少|不能为空|参数不足", "invalid-argument"),
 )
 

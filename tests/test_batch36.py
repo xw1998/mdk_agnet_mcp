@@ -11,7 +11,7 @@
     烧录 / 日志 / 多命令聚合 / 错误路径）
   D trace 族：SWO 采集与 ITM+MTF 解码 / RTT（主机侧读写控制块并推进 RdOff）/
     采样剖析 / DWT / 组件部署
-  E 工具面：注册总数 145、四族齐全、capabilities.non_mdk
+  E 工具面：注册总数 150、四族齐全、capabilities.non_mdk
   F gdb 解析：只挑**真能跑**的 gdb、绝不到别的架构去凑（ESP 工具链复核）
 
 真机（F401 + DAPLink）验证单独做，见 docs/PITFALLS.md。
@@ -431,6 +431,23 @@ def test_ocd(server, mock):
     check("C44 ocd_load 同样走 ASCII 暂存",
           r.get("ok") is True and r.get("staged_from") == cn_elf, r)
 
+    # ---- telnet 噪声与回显残片（真机 `reg xpsr` -> `rg xpsr` 踩出来的） ----
+    check("C45 孤立 IAC 后面那个数据字节不被吞掉",
+          _ocd._clean_telnet(b"\xffreg pc\r\n> ").startswith(b"reg pc"),
+          _ocd._clean_telnet(b"\xffreg pc\r\n> "))
+    shp = _ocd._shape("reg xpsr", "rg xpsr\nxPSR = 0x61000000")
+    check("C46 回显残片被剔掉、真实结果保留",
+          shp.get("lines") == ["xPSR = 0x61000000"], shp)
+    shp = _ocd._shape("reg xpsr", "rg xpsr")
+    check("C47 只收到回显残片时标记 _echo_only（触发补读）",
+          shp.get("_echo_only") is True, shp)
+    shp = _ocd._shape("halt", "")
+    check("C48 本来就不输出的命令不误触补读（不白等）",
+          shp.get("_echo_only") is False, shp)
+    shp = _ocd._shape("mdw 0x08000000 1", "mdw 0x08000000 1\n0x08000000: 20000728")
+    check("C49 正常回包不因残片规则被误删",
+          shp.get("lines") == ["0x08000000: 20000728"], shp)
+
 
 # ======================================================================
 # D trace 族
@@ -468,6 +485,25 @@ def test_trace(server, mock):
     r2 = asyncio.run(call(server, "trace_swo_read", {"max_events": 50}))
     check("D7 增量语义：第二次不再重复给同一批",
           len(r2.get("new_events") or r2.get("events") or []) == 0, r2)
+
+    # ---- 零字节时必须上目标取证，而不是笼统说「没数据」（真机踩坑） ----
+    for off, val in ((0xE000EDFC, 0x00000000),   # DEMCR.TRCENA=0
+                     (0xE0000E80, 0x00000003),   # ITM_TCR
+                     (0xE0000E00, 0x00000002),   # ITM_TER：只使能了 port1
+                     (0xE0040010, 0x0000000F),   # TPIU_ACPR
+                     (0xE00400F0, 0x00000002)):  # TPIU_SPPR
+        mock.target.poke(off, struct.pack("<I", val))
+    (_tr._T.get("swo") or {}).pop("_diag", None)      # 绕开 5s 缓存
+    r = asyncio.run(call(server, "trace_swo_read", {"max_events": 10}))
+    vs = r.get("verdict") or []
+    check("D7b 零字节时点出『目标没使能 trace』（TRCENA=0）",
+          any("TRCENA" in v for v in vs), r)
+    diag = r.get("diagnostics") or {}
+    check("D7c 诊断如实带出读到的寄存器值",
+          (diag.get("registers") or {}).get("DEMCR") == "0x00000000"
+          and (diag.get("registers") or {}).get("ITM_TER") == "0x00000002", diag)
+    check("D7d 给不出结论时也有可查清单（引脚/插桩/端口）",
+          len(diag.get("checks") or []) >= 3 and bool(r.get("hint")), r)
 
     # 造一个坏帧（CRC 错）与一个 ITM Overflow，验证"如实上报不完整"
     with open(cap, "ab") as f:
@@ -630,11 +666,12 @@ def test_surface(server):
     r = asyncio.run(call(server, "list_tools", {}))
     tools = r.get("tools") or []
     names = [t.get("tool") if isinstance(t, dict) else t for t in tools]
-    check("E1 工具总数 145", len(names) == 145, len(names))
+    check("E1 工具总数 150", len(names) == 150, len(names))
+    check("E1b 工程配置发现工具在册", "debug_config" in names)
     # target_ 前缀共 4 个：本批新增 target_list/show/guess 3 个，
     # 另有历史工具 target_info（MDK 侧调试目标信息），故计 4。
     for pre, cnt in (("toolchain_", 10), ("target_", 4), ("ocd_", 17),
-                     ("trace_", 16)):
+                     ("trace_", 20)):
         got = [n for n in names if n.startswith(pre)]
         check("E2 %s* 共 %d 个" % (pre, cnt), len(got) == cnt, len(got))
 

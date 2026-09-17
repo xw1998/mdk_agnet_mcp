@@ -324,6 +324,97 @@ def _swo_state() -> dict:
     return st
 
 
+def _rd32(s, addr: int, timeout: float = 5.0):
+    """DAP 直读一个 32 位寄存器；读不到就返回 (None, 原因)，不猜值。"""
+    from . import ocd as _ocd
+    r = s.cmd("mdw 0x%X 1" % int(addr), timeout=timeout)
+    if not r.get("ok"):
+        return None, (r.get("error") or "读寄存器失败")
+    p = _ocd._parse_mem(r.get("output") or "", int(addr), 1, 32)
+    if not p.get("complete"):
+        return None, "没有解析到数据（目标没响应？）"
+    return p["words"][0] & 0xFFFFFFFF, None
+
+
+# SWO 零字节时要去目标上看的那几个寄存器（Cortex-M4 固定地址）
+_DEMCR = 0xE000EDFC        # bit24 TRCENA：trace 全局使能
+_ITM_TCR = 0xE0000E80      # bit0 ITMENA：ITM 使能
+_ITM_TER = 0xE0000E00      # 端口使能位图（目标侧）
+_TPIU_SPPR = 0xE00400F0    # 输出协议选择
+_TPIU_ACPR = 0xE0040010    # 异步时钟预分频：SWO 速率 = coreclk/(ACPR+1)
+_DIAG_REFRESH = 5.0        # 诊断结果缓存秒数（避免反复轮询时反复读寄存器）
+
+
+def _swo_diag(sw: dict) -> dict:
+    """SWO 收不到数据时上目标取证，而不是在主机侧猜原因。
+
+    真机当初的处境：`trace_swo_start` 回 ok、`trace_swo_read` 永远 0 字节，没有任何
+    提示——用户无法区分「引脚没接」「目标没使能 ITM」「波特率不对」。这里直接用
+    DAP 读 ITM/DEMCR/TPIU 寄存器，把能用事实回答的三件事回答掉：
+      1. 目标侧到底有没有使能 trace（DEMCR.TRCENA / ITM_TCR.ITMENA / ITM_TER）；
+      2. 目标使能的 ITM 端口位图，和主机侧 `itm port N on` 是否一致；
+      3. TPIU 分频算出的实际 SWO 速率（coreclk/(ACPR+1)），和本次配置差多少。
+    读不到的寄存器如实列进 `unreadable`，绝不用猜测补齐。
+    """
+    from . import ocd as _ocd
+    now = time.time()
+    cached = sw.get("_diag")
+    if cached and now - float(cached.get("at") or 0) < _DIAG_REFRESH:
+        return dict(cached)
+    out = {"at": now, "registers": {}, "unreadable": {}, "verdict": [],
+           "checks": []}
+    s = _ocd.get_session()
+    if not s.running():
+        out["verdict"].append("OpenOCD 会话已不在：先 ocd_status 确认，再看 SWO")
+        sw["_diag"] = out
+        return dict(out)
+    vals = {}
+    for name, addr in (("DEMCR", _DEMCR), ("ITM_TCR", _ITM_TCR),
+                       ("ITM_TER", _ITM_TER), ("TPIU_SPPR", _TPIU_SPPR),
+                       ("TPIU_ACPR", _TPIU_ACPR)):
+        v, err = _rd32(s, addr)
+        if v is None:
+            out["unreadable"][name] = err
+        else:
+            vals[name] = v
+    out["registers"] = {k: "0x%08X" % v for k, v in vals.items()}
+    ck = int(sw.get("coreclk") or 0)
+    bd = int(sw.get("baud") or 0)
+    if "TPIU_ACPR" in vals and ck:
+        actual = ck // (vals["TPIU_ACPR"] + 1)
+        out["tpiu_baud_actual"] = actual
+        if bd and abs(actual - bd) > max(1000, bd // 20):
+            out["verdict"].append(
+                "TPIU 实际速率 %d != 本次配置 %d（coreclk/(ACPR+1)，ACPR=0x%X）："
+                "目标侧没按这个速率输出，收到的字节会被当噪声丢掉"
+                % (actual, bd, vals["TPIU_ACPR"]))
+    if "DEMCR" in vals and not (vals["DEMCR"] >> 24) & 1:
+        out["verdict"].append("DEMCR.TRCENA=0：目标根本没使能 trace 单元，"
+                              "ITM 写出去的字节一个都到不了引脚")
+    if "ITM_TCR" in vals and not vals["ITM_TCR"] & 1:
+        out["verdict"].append("ITM_TCR.ITMENA=0：ITM 没使能（组件初始化没跑？）")
+    if "ITM_TER" in vals:
+        ter = vals["ITM_TER"]
+        ports = [int(p) for p in (sw.get("ports") or [])]
+        if ter == 0:
+            out["verdict"].append(
+                "ITM_TER=0：没有任何 ITM 端口被使能——端口使能位在**目标侧**，"
+                "OpenOCD 的 `itm port N on` 只是主机侧开关，不能代替它")
+        elif ports and not any((ter >> p) & 1 for p in ports):
+            out["verdict"].append(
+                "ITM_TER=0x%X 不含本次监听的端口 %s：目标写的端口和主机听的端口不一致"
+                % (ter, ports))
+    out["checks"] = [
+        "SWO 引脚有没有真接到探针的 SWO 脚（Cortex-M4 常是 PB3）——"
+        "SWCLK/SWDIO 通了不等于 SWO 也接了，这条只能眼查排线",
+        "目标侧桁桩组件是否已部署并真的被调用：trace_instrument(target_dir=...) "
+        "生成 components/trace，固件要调它的初始化（backend=itm）",
+        "主机侧监听的 ITM 端口要和目标写入的端口一致（trace_swo_start 的 ports）",
+    ]
+    sw["_diag"] = out
+    return dict(out)
+
+
 def swo_read(max_events: int = 300, ports=None) -> dict:
     sw = _T.get("swo")
     if not sw:
@@ -331,14 +422,22 @@ def swo_read(max_events: int = 300, ports=None) -> dict:
                 "hint": "先 trace_swo_start（需要 OpenOCD 会话在跑）"}
     path = sw["file"]
     if not os.path.isfile(path):
+        d = _swo_diag(sw)
         return {"ok": True, "new_bytes": 0, "events": [],
                 "note": "采集文件还没生成（OpenOCD 只在收到数据时才写）",
-                "state": _swo_state()}
+                "diagnostics": d, "verdict": d.get("verdict") or [],
+                "hint": _swo_hint(d), "state": _swo_state()}
     size = os.path.getsize(path)
     off = int(sw.get("offset") or 0)
     if size <= off:
+        d = _swo_diag(sw)
+        elapsed = round(time.time() - float(sw.get("started_at") or time.time()), 1)
         return {"ok": True, "new_bytes": 0, "events": [], "state": _swo_state(),
-                "note": "没有新数据；确认目标在跑、且组件已经把事件写出"}
+                "note": "已采集 %.1fs 仍是 0 字节（不是「暂时没数据」）" % elapsed,
+                "diagnostics": d, "verdict": d.get("verdict") or [],
+                "hint": _swo_hint(d)}
+
+
     try:
         with open(path, "rb") as f:
             f.seek(off)
@@ -357,6 +456,15 @@ def swo_read(max_events: int = 300, ports=None) -> dict:
             "truncated": len(new) > max_events,
             "state": _swo_state(), "decoder": _T["decoder"].stats()
             if _T["decoder"] else None}
+
+
+def _swo_hint(d: dict) -> str:
+    """把诊断结论整理成一句可执行的提示；没结论时明确说「没查出来」。"""
+    v = d.get("verdict") or []
+    if v:
+        return "零字节原因（来自目标寄存器实读）：" + "；".join(v)
+    return ("目标和 TPIU 使能位都正常，但主机侧一个字节也没收到：优先排查 SWO 物理接线"
+            "（SWD 通了不代表 SWO 接了），其次用 ocd_log 看探针是否报告 SWO 溢出")
 
 
 def swo_stop(itm_off: bool = True) -> dict:
@@ -787,6 +895,391 @@ def dwt_counters() -> dict:
                     "它们用 mcycle CSR 计时——见 trace_guide"}
 
 
+# ============================== 非侵入式观测（只用 SWD 两线）
+#
+# 先把“做不到什么”说清楚（trace_guide 里也写了）——
+#   * **指令级 CPU 录制（ETM/PTM 那种“每一跳都记下来”）需要并行 trace 口**，
+#     不是 SWD 两线能干的；只接 SWD/SWO 时不要再指望它。
+#   * 下面两条是 SWD 两线**真能做到**的非 halt 观测：
+#     1) 变量 scope：DAP 读 RAM 不需要停核，主机侧轮询成时间线；
+#     2) PC 采样：DWT 硬件采样器 (PCSAMPLENA + DWT_PCSR) 自带采样，主机只读寄存器。
+# 两者都**不 halt 目标**，但都有代价（采样率受 SWD 带宽 / 采样器速率限制，会丢窗口），
+# 所以返回里一定带真实速率、丢点次数与“样本不代表全时域”的披露。
+
+_SCOPE_LOCK_HINT = "先 ocd_start；变量 scope 靠 DAP 读目标 RAM"
+
+
+def _elf_symbol(elf: str, name: str):
+    """在 ELF 里找**任意**符号的 (地址, 字节大小)——数据变量也能找。
+
+    已有的 elf_symbol_addr 只服务 RTT 控制块定位（返回单个 int），
+    变量 scope 还需要符号大小。找不到返回 (None, None)，不猜地址。
+    """
+    if not elf or not os.path.isfile(elf) or not name:
+        return None, None
+    want = name.strip().lower()
+    try:
+        from elftools.elf.elffile import ELFFile
+        with open(elf, "rb") as f:
+            e = ELFFile(f)
+            for sec in e.iter_sections():
+                if sec.name not in (".symtab", ".dynsym"):
+                    continue
+                for sym in sec.iter_symbols():
+                    if sym.name.lower() != want or not sym["st_value"]:
+                        continue
+                    sz = int(sym["st_size"] or 0)
+                    return int(sym["st_value"]) & ~1, (sz or None)
+    except Exception:  # noqa: BLE001
+        return None, None
+    return None, None
+
+
+def _parse_vars(spec: str, elf: str = "") -> dict:
+    """解析变量清单："g_cnt@0x20000000:4, g_flag, 0x20000010:1"。
+
+    每条支持四种写法：`name@addr:size` / `addr:size` / `name@addr` / `name`
+    （只给名字就去 ELF 查地址与大小）。size 缺省 4 字节。
+    **解析不了的条目一律列在 invalid 里报出来**，不静默跳过——
+    少测一个变量比测错一个变量容易被发现。
+    """
+    items, invalid = [], []
+    seen = {}
+    for raw in re.split(r"[,;\n]+", str(spec or "")):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        body, _, szs = s.partition(":")
+        size = 0
+        if szs.strip():
+            try:
+                size = int(szs.strip(), 0)
+            except ValueError:
+                invalid.append({"item": s, "why": "size 不是整数：%r" % szs.strip()})
+                continue
+        name, addr = "", None
+        if "@" in body:
+            name, _, ab = body.partition("@")
+            name, ab = name.strip(), ab.strip()
+        else:
+            ab = body.strip()
+        if ab:
+            try:
+                addr = int(ab, 0)
+            except ValueError:
+                invalid.append({"item": s, "why": "地址不是数字：%r" % ab})
+                continue
+        else:
+            if not name:
+                invalid.append({"item": s, "why": "既没地址也没名字"})
+                continue
+            a, esz = _elf_symbol(elf, name)
+            if a is None:
+                invalid.append({"item": s, "why": "ELF 里没找到符号 %r" % name})
+                continue
+            addr = a
+            if not size and esz:
+                size = int(esz)
+        size = int(size or 4)
+        if size <= 0 or size > 64:
+            invalid.append({"item": s, "why": "size=%d 超范围（1..64）" % size})
+            continue
+        nm = name or "var_%X" % addr
+        if nm in seen:
+            nm = "%s_%X" % (nm, addr)
+        seen[nm] = addr
+        items.append({"name": nm, "addr": int(addr), "size": size})
+    return {"items": items, "invalid": invalid}
+
+
+def _halt_like(err: str) -> bool:
+    """判断 OpenOCD 的报错是不是「目标在跑、不能读内存」。"""
+    t = (err or "").lower()
+    return ("not halted" in t) or ("target not halted" in t) \
+        or ("cannot read memory" in t and "halt" in t)
+
+
+def _read_var(s, addr: int, size: int, timeout: float = 5.0) -> dict:
+    """读一个变量（不 halt 目标）。返回 {ok, value} 或 {ok:False, error}。"""
+    from . import ocd as _ocd
+    n = max(1, (int(size) + 3) // 4)
+    r = s.cmd("mdw 0x%X %d" % (int(addr), n), timeout=timeout)
+    if not r.get("ok"):
+        return {"ok": False,
+                "error": (r.get("error") or r.get("output") or "mdw 失败").strip()[:200]}
+    pq = _ocd._parse_mem(r.get("output") or "", int(addr), n, 32)
+    if not pq["complete"]:
+        return {"ok": False, "error": "读取不完整（%d/%d 字）" % (pq["got"], n)}
+    b = _ocd._mem_to_bytes(pq["words"], 32, int(size))
+    return {"ok": True, "value": int.from_bytes(b[:int(size)], "little")}
+
+
+def scope_start(vars: str, elf: str = "", period_ms: float = 100.0,
+                max_samples: int = 2000, duration_s: float = 0.0,
+                timeout: float = 5.0) -> dict:
+    """启动非 halt 的变量 scope（后台线程轮询 DAP 读 RAM）。"""
+    import threading
+    from . import ocd as _ocd
+    s = _ocd.get_session()
+    if not s.running():
+        return {"ok": False, "error": "OpenOCD 没在运行", "hint": _SCOPE_LOCK_HINT}
+    cur = _T.get("scope")
+    if cur and cur.get("thread") and cur["thread"].is_alive():
+        return {"ok": False, "error": "已有一个变量 scope 在跑",
+                "hint": "先 trace_scope_stop 停下再开新的；同一条 SWD 上不要并发采样"}
+    p = _parse_vars(vars, elf)
+    if not p["items"]:
+        return {"ok": False, "error": "没有可用的变量",
+                "invalid": p["invalid"],
+                "hint": "写法：name@0x20000000:4 / 0x20000000:4 / name（名字靠 elf 查）；"
+                        "按逗号分隔"}
+    st = {"vars": p["items"], "invalid": p["invalid"], "elf": elf or None,
+          "period_ms": float(period_ms), "max_samples": int(max_samples),
+          "duration_s": float(duration_s), "samples": [],
+          "reads": 0, "misses": 0, "last_error": None, "require_halt": False,
+          "halted": False, "started_at": time.time(), "stopped_at": None,
+          "by_var": {it["name"]: {"last": None, "min": None, "max": None,
+                                  "changes": 0, "reads": 0}
+                     for it in p["items"]}}
+    stop_ev = threading.Event()
+
+    def _run():
+        t0 = time.time()
+        while not stop_ev.is_set():
+            if duration_s and time.time() - t0 >= float(duration_s):
+                break
+            if len(st["samples"]) >= int(max_samples):
+                break
+            row = {"t": round(time.time() - t0, 4)}
+            for it in p["items"]:
+                rv = _read_var(s, it["addr"], it["size"], timeout=timeout)
+                if not rv.get("ok"):
+                    st["misses"] += 1
+                    st["last_error"] = rv.get("error")
+                    if not st["require_halt"] and _halt_like(rv.get("error")):
+                        st["require_halt"] = True
+                    continue
+                v = rv["value"]
+                row[it["name"]] = v
+                st["reads"] += 1
+                bv = st["by_var"][it["name"]]
+                bv["reads"] += 1
+                if bv["last"] is None:
+                    bv["min"] = bv["max"] = v
+                else:
+                    bv["min"] = min(bv["min"], v)
+                    bv["max"] = max(bv["max"], v)
+                    if v != bv["last"]:
+                        bv["changes"] += 1
+                bv["last"] = v
+            if len(row) > 1:
+                st["samples"].append(row)
+            if period_ms and float(period_ms) > 0:
+                time.sleep(min(float(period_ms) / 1000.0, 2.0))
+        st["stopped_at"] = time.time()
+
+    st["stop_ev"] = stop_ev
+    th = threading.Thread(target=_run, name="mdkdebug-scope", daemon=True)
+    st["thread"] = th
+    _T["scope"] = st
+    _T["mode"] = _T.get("mode") or "scope"
+    th.start()
+    time.sleep(min(float(period_ms) / 1000.0 * 3, 0.5))  # 先跑两三轮再回，便于看首值
+    out = scope_read(limit=5)
+    out["invalid"] = p["invalid"]
+    out["hint"] = ("用 trace_scope_read 取样本、trace_scope_stop 收尾；"
+                    "采样率是主机侧轮询率，**不代表目标真实执行周期**。"
+                    "需要精确耗时用目标侧计时宏 + trace_dwt_counters")
+    return out
+
+
+def scope_read(limit: int = 200) -> dict:
+    """看变量 scope 当前采样：只返回最近 limit 条 + 每变量统计。"""
+    st = _T.get("scope")
+    if not st:
+        return {"ok": False, "error": "还没启动变量 scope",
+                "hint": "trace_scope_start(vars=\"g_cnt@0x20000000:4\")"}
+    lm = max(1, int(limit))
+    sam = st["samples"]
+    running = bool(st.get("thread") and st["thread"].is_alive())
+    dur = ((st.get("stopped_at") or time.time()) - st["started_at"]) or 1e-9
+    return {"ok": True, "running": running, "vars": st["vars"],
+            "samples": len(sam), "shown": min(lm, len(sam)),
+            "elapsed_s": round(dur, 3),
+            "effective_hz": round(len(sam) / dur, 2),
+            "reads": st["reads"], "misses": st["misses"],
+            "require_halt": bool(st["require_halt"]),
+            "last_error": st["last_error"], "intrusive": False,
+            "by_var": st["by_var"],
+            "recent": sam[-lm:],
+            "warning": ("采样率是主机侧轮询率（%dms 一轮，每变量一次 mdw），"
+                        "受 SWD 带宽/OS 调度影响，**不等于目标执行周期**；"
+                        "轮询窗口之间的取值变化看不到。" % int(st["period_ms"] or 0))
+            if not st["require_halt"] else
+                       ("目标在跑时 OpenOCD 拒绝读内存（需 halt）——这条链路上"
+                        "读到的全是丢点，请改用 RTT/ITM 让目标自己往外推数据")}
+
+
+def scope_stop() -> dict:
+    """停掉变量 scope，返回汇总（每变量 min/max/变化次数 + 真实采样率）。"""
+    st = _T.get("scope")
+    if not st:
+        return {"ok": True, "stopped": False, "note": "没有在跑的变量 scope"}
+    ev = st.get("stop_ev")
+    if ev is not None:
+        ev.set()
+    th = st.get("thread")
+    joined = False
+    if th and th.is_alive():
+        # 线程每轮最多阻塞 2s，join 给足两轮的时间；没退就如实说没退
+        th.join(timeout=min(5.0, max(1.0, float(st["period_ms"]) / 1000.0 * 2 + 2.0)))
+        joined = not th.is_alive()
+    _T["scope"] = None
+    _T["mode"] = None
+    sam = st["samples"]
+    dur = ((st.get("stopped_at") or time.time()) - st["started_at"]) or 1e-9
+    return {"ok": True, "stopped": True, "vars": st["vars"],
+            "samples": len(sam), "elapsed_s": round(dur, 3),
+            "effective_hz": round(len(sam) / dur, 2),
+            "reads": st["reads"], "misses": st["misses"],
+            "require_halt": bool(st["require_halt"]),
+            "last_error": st["last_error"], "by_var": st["by_var"],
+            "intrusive": False, "thread_joined": joined,
+            "warning": "轮询式观测：两次采样之间的变化看不到，"
+                       "丢了几个点看 misses；要无丢点请用 RTT（目标侧缓冲）"}
+
+
+def pc_sample(samples: int = 500, interval_ms: float = 10.0, elf: str = "",
+              top: int = 15, enable_dwt: bool = True, restore: bool = True,
+              timeout: float = 20.0) -> dict:
+    """非 halt 的 PC 采样：开 DWT 硬件 PC 采样器，主机只轮询 DWT_PCSR。
+
+    与 trace_profile（halt→读 PC→resume）的区别：**全程不停核**，
+    因此不扰动实时性；代价是样本来自硬件采样器（速率受 POSTPRESET/POSTCNT 控制），
+    而且部分芯片修订版上 PC 采样器根本不工作——那种情况会明确报
+    `sampler_inactive` 而不是给一份看着像样的分布。
+    """
+    from . import ocd as _ocd
+    s = _ocd.get_session()
+    if not s.running():
+        return {"ok": False, "error": "OpenOCD 没在运行", "hint": "先 ocd_start"}
+    DEMCR, DWT_CTRL, DWT_PCSR = 0xE000EDFC, 0xE0001000, 0xE000101C
+
+    def rd(addr):
+        r = s.cmd("mdw 0x%X 1" % addr, timeout=5)
+        if not r.get("ok"):
+            return None
+        p = _ocd._parse_mem(r.get("output") or "", addr, 1, 32)
+        return p["words"][0] if p["complete"] and p["words"] else None
+
+    def wr(addr, val):
+        r = s.cmd("mww 0x%X 0x%X" % (addr, val), timeout=5)
+        return bool(r.get("ok"))
+
+    demcr0 = rd(DEMCR)
+    ctrl0 = rd(DWT_CTRL)
+    if demcr0 is None or ctrl0 is None:
+        return {"ok": False, "error": "读 DWT/DEMCR 失败（目标没连上或不是 Cortex-M）",
+                "hint": "RISC-V/Xtensa 没有 DWT，它们要用 mcycle CSR；见 trace_guide"}
+    enabled = []
+    if enable_dwt:
+        # TRCENA(bit24) 不置位时 DWT 整个不工作
+        if not (demcr0 & (1 << 24)):
+            if not wr(DEMCR, demcr0 | (1 << 24)):
+                return {"ok": False, "error": "写 DEMCR.TRCENA 失败",
+                        "demcr": "0x%X" % demcr0}
+            enabled.append("DEMCR.TRCENA")
+        # PCSAMPLENA=bit12；POSTPRESET=bits[4:1]（置 0xF 让采样尽量慢下来，
+        # 避免采样器疯狂覆盖而主机读不到变化）
+        want = (ctrl0 | (1 << 12) | (0xF << 1)) & ~(0xF << 5)
+        if wr(DWT_CTRL, want):
+            enabled.append("DWT_CTRL.PCSAMPLENA")
+        else:
+            return {"ok": False, "error": "写 DWT_CTRL.PCSAMPLENA 失败",
+                    "dwt_ctrl": "0x%X" % ctrl0,
+                    "hint": "部分 Cortex-M 修订版不支持 PC 采样（PCSAMPLEENA 恒 0）"}
+    pcs, distinct, fails = [], {}, 0
+    t0 = time.time()
+    n = max(1, int(samples))
+    for _ in range(n):
+        v = rd(DWT_PCSR)
+        if v is None:
+            fails += 1
+        else:
+            v &= ~1
+            pcs.append(v)
+            distinct[v] = distinct.get(v, 0) + 1
+        if interval_ms and float(interval_ms) > 0:
+            time.sleep(min(float(interval_ms) / 1000.0, 1.0))
+        if time.time() - t0 > float(timeout):
+            break
+    ctrl1 = rd(DWT_CTRL)
+    sampler_ok = bool(ctrl1 is not None and (ctrl1 & (1 << 12)))
+    if restore:
+        if ctrl0 is not None:
+            wr(DWT_CTRL, ctrl0)
+        if demcr0 is not None:
+            wr(DEMCR, demcr0)
+    dur = time.time() - t0
+    out = {"ok": bool(pcs) and sampler_ok, "samples": len(pcs), "fails": fails,
+           "requested": n, "duration_s": round(dur, 3),
+           "effective_hz": round(len(pcs) / (dur or 1e-9), 2),
+           "distinct_pcs": len(distinct), "intrusive": False,
+           "sampler_enabled": sampler_ok, "enabled": enabled,
+           "restored": bool(restore),
+           "dwt_pcsr": "0xE000101C", "dwt_ctrl_after": ("0x%X" % ctrl1) if ctrl1 is not None else None}
+    if not pcs:
+        out["error"] = "一次 PC 采样都没读到"
+        return out
+    if not sampler_ok:
+        out["error"] = "PC 采样器没使能上（DWT_CTRL.PCSAMPLENA 读回为 0）"
+        out["hint"] = ("这条芯片/修订版上 DWT PC 采样不可用，**不给分布**；"
+                       "要用非侵入式函数分布只能靠 SWO/ITM 插桩，"
+                       "或在目标侧自己做 PCSAMPLE 计数")
+        out["distinct_raw"] = len(distinct)
+        return out
+    funcs = elf_funcs(elf) if elf else []
+    if len(pcs) >= 8 and len(distinct) <= 2:
+        # 值不变时把“停在哪”说清楚，而不是只报一句“可能 errata”。
+        # 真机上就是这么抓到固件 bug 的：PC 恒定 → 一查符号是 Default_Handler
+        # → 向量表把 SysTick 接到了死循环（拦截不到的错误全是猜的，这里不猜）。
+        out["ok"] = False
+        where = []
+        for pc in sorted(distinct)[:3]:
+            nm = func_of(pc, funcs) if funcs else None
+            where.append({"pc": "0x%X" % pc, "function": nm or "(ELF 里没有对应函数)"})
+        out["stuck_at"] = where
+        known = where[0].get("function") if where else None
+        out["error"] = ("PC 采样值几乎不变（%d 个不同值 / %d 次读）"
+                        "——采样器在跑但没反映执行流") % (len(distinct), len(pcs))
+        if known and "Default_Handler" in str(known):
+            out["diagnosis"] = ("目标停在 Default_Handler：有中断/异常被使能但没写处理函数"
+                                "（最常见是向量表里某个入口填了默认死循环）")
+            out["hint"] = ("对着 ELF 查一下是哪个向量：如果固件自己的中断处理函数存在，"
+                            "就是向量表没指过去；找不到就确认是触发了一类异常"
+                            "（读 0xE000ED28 CFSR / 0xE000ED2C HFSR）")
+        else:
+            out["hint"] = ("两种可能：目标真的全程停在同一循环（比如等标志、空转），"
+                            "或 PC 采样器在该芯片修订版上不可用；"
+                            "用 trace_profile（halt 采样，侵入式）交叉验证再下结论")
+        return out
+    by_func = {}
+    for pc, c in distinct.items():
+        fn = func_of(pc, funcs) if funcs else ("0x%X" % pc)
+        by_func[fn] = by_func.get(fn, 0) + c
+    tl = sorted(by_func.items(), key=lambda kv: -kv[1])[:max(1, int(top))]
+    out["by_function"] = [{"function": k, "samples": v,
+                           "percent": round(100.0 * v / max(1, len(pcs)), 2)}
+                          for k, v in tl]
+    out["top_pcs"] = [{"pc": "0x%X" % k, "samples": v}
+                      for k, v in sorted(distinct.items(), key=lambda kv: -kv[1])[:int(top)]]
+    out["elf"] = os.path.abspath(elf) if elf else None
+    out["warning"] = ("DWT 硬件 PC 采样：不 halt 目标，但样本是「采样器最近一次采到的 PC」，"
+                      "同一值会被重复读到，占比只能当参考；"
+                      "POSTPRESET/POSTCNT 定了采样周期，采样率 ≠ 指令数")
+    return out
+
+
 # ================================================================ 插桩组件部署
 
 def list_components() -> dict:
@@ -912,7 +1405,10 @@ GUIDE = {
         "走 trace_swo_start → 目标跑起来 → trace_swo_read。\n"
         "  RTT（只要 SWD/JTAG）：不要额外引脚，双向通道，主机直读目标 RAM。"
         "走 trace_rtt_attach → trace_rtt_read/write。ESP32 这类没 ITM 的目标首选。\n"
-        "  SWD 采样（什么都不要）：halt+读PC+resume，侵入式，只能看热点分布。走 trace_profile。"
+        "  SWD 采样（什么都不要）：halt+读PC+resume，侵入式，只能看热点分布。走 trace_profile。\n"
+        "  SWD 仅两线也能做的非侵入观测：变量 scope（trace_scope_start，DAP 轮询 RAM，"
+        "不 halt）与 DWT 硬件 PC 采样（trace_pcsample，不 halt）。"
+        "**指令级录制 SWD 两线做不到**，详见 topic=swd_limits。"
     ),
     "swd_wiring": (
         "SWD 最少四根：SWCLK / SWDIO / GND / 3V3(参考电平)。"
@@ -938,6 +1434,25 @@ GUIDE = {
         "连不上/SWO 没数据时的排查顺序：ocd_log 看日志 → ocd_probe 确认目标已识别 → "
         "确认探针是否支持 SWO → 用 RTT 或采样剖析兜底（这两条只要求能读写内存）。"
     ),
+    "swd_limits": (
+        "只接 SWD 两线时，到底能做到什么、做不到什么：\n"
+        "  ✅ **变量 scope（非侵入）**：DAP 读 RAM 不需要停核，主机侧按周期轮询就能把"
+        "变量连成时间线 → trace_scope_start/read/stop。代价：轮询有间隔，"
+        "两次采样之间的跳变看不到；采样率是主机轮询率而非目标周期。\n"
+        "  ✅ **函数分布（非侵入）**：DWT 自带的硬件 PC 采样器（DEMCR.TRCENA + "
+        "DWT_CTRL.PCSAMPLENA，读 DWT_PCSR），主机只读寄存器 → trace_pcsample。"
+        "代价：样本是「采样器最近一次采到的 PC」，同一值会被重复读到，占比仅供参考；"
+        "部分芯片修订版上采样器根本不动（这种会直接报错，不会给假分布）。\n"
+        "  ⚠️ **侵入式 PC 采样**：halt→读PC→resume 的 trace_profile，能拿到更确定的"
+        "热点分布，但每条样本都中断目标，会破坏实时性。\n"
+        "  ❌ **指令级 CPU 录制（每一跳都记下来、事后回放）**：需要 ETM/PTM 并行 trace 口"
+        "（额外 4~5 根线 + 大容量 trace 缓冲）或 SWO 引脚上的指令 trace 流，"
+        "**SWD 两线本身做不到**——不要在这条链路上承诺它。\n"
+        "  ❌ **带时间戳的逐事件时间线**：要么目标侧插桩（RTT/ITM，见 components/trace/），"
+        "要么上硬件 trace 口；纯轮询给不了无丢包的时间线。\n"
+        "结论：SWD 两线能做到「低成本的运行中观测」（变量 + 函数分布），"
+        "做不到「无损录制」。要无损就上 SWO 引脚 + ITM，或目标侧 RTT 插桩。"
+    ),
 }
 
 
@@ -949,8 +1464,10 @@ def register(server, js=None) -> int:
         name="trace_guide",
         title="Trace 方案选型与接线指南（SWO / RTT / SWD 采样）",
         description=(
-            "讲清楚三条 trace 通路各自的硬件要求与代价，以及接线、ITM、RTT 的注意点。"
-            "topic 可取：howto（总览与取舍）/ swd_wiring（接线）/ rtt_notes / itm_notes / "
+            "讲清楚各条 trace 通路的硬件要求与代价，以及接线、ITM、RTT 的注意点。"
+            "topic 可取：howto（总览与取舍）/ swd_limits（**只用 SWD 两线能做到什么、"
+            "做不到什么：变量 scope 与 DWT PC 采样能做，指令级录制做不到**）/ "
+            "swd_wiring（接线）/ rtt_notes / itm_notes / "
             "when_unavailable（没数据时怎么排查）；留空返回全部。\n"
             "**没有 SWO 引脚并不等于不能 trace**：RTT 只要 SWD，采样剖析连缓冲都不要，"
             "只是能拿到的东西不同——这份指南就是帮你按手头硬件选对路子。"
@@ -1233,6 +1750,90 @@ def register(server, js=None) -> int:
     async def trace_rtt_detach() -> str:
         try:
             return _js(rtt_detach())
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_scope_start",
+        title="变量 scope（只用 SWD 两线，不 halt 目标）",
+        description=(
+            "不用改目标代码、也不用 SWO 引脚，直接观测 RAM 里的变量：主机侧按周期"
+            "用 DAP 读内存（**不 halt 目标、不扰动执行**），把变量值连成时间线。\n"
+            "vars 写法（逗号分隔）：`g_cnt@0x20000000:4` / `0x20000010:4` / "
+            "`name@addr` / `name`（只给名字就用 elf 查地址与大小）。\n"
+            "**它做不到什么必须说清楚**：轮询是有间隔的，两次采样之间的跳变看不到；"
+            "采样率是主机轮询率而非目标周期；目标在跑时若 OpenOCD 拒绝读内存"
+            "（require_halt=true），就必须改用 RTT/ITM 让目标自己推数据。\n"
+            "指令级 CPU 录制（每一跳都记下来）需要 ETM 并行 trace 口，**SWD 两线做不到**。"
+        ),
+    )
+    async def trace_scope_start(vars: str = "", elf: str = "",
+                                period_ms: float = 100.0,
+                                max_samples: int = 2000,
+                                duration_s: float = 0.0,
+                                timeout: float = 5.0) -> str:
+        try:
+            return _js(scope_start(vars=vars, elf=elf, period_ms=float(period_ms),
+                                   max_samples=int(max_samples),
+                                   duration_s=float(duration_s),
+                                   timeout=float(timeout)))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_scope_read",
+        title="看变量 scope 的最近采样与统计",
+        description=(
+            "取变量 scope 的最新情况：每变量 min/max/最后值/变化次数、真实生效采样率、"
+            "丢点次数（misses）。recent 只给最近 limit 条，不会把上万条样本塞回上下文。"
+        ),
+    )
+    async def trace_scope_read(limit: int = 200) -> str:
+        try:
+            return _js(scope_read(limit=int(limit)))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_scope_stop",
+        title="停止变量 scope 并汇总",
+        description=("停掉后台轮询线程，返回本次观测汇总（每变量 min/max/变化次数、"
+                     "实际采样率、丢点）。**忘了停会一直占着 SWD 带宽**，"
+                     "影响后面的 halt/断点操作，用完就停。"),
+    )
+    async def trace_scope_stop() -> str:
+        try:
+            return _js(scope_stop())
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_pcsample",
+        title="DWT 硬件 PC 采样（不 halt 目标的函数分布）",
+        description=(
+            "靠 DWT 自带的硬件 PC 采样器（DEMCR.TRCENA + DWT_CTRL.PCSAMPLENA，"
+            "读 DWT_PCSR）看函数分布：**全程不 halt 目标**，实时性不受扰动。\n"
+            "与 trace_profile 的区别：那个是 halt→读 PC→resume（侵入式），"
+            "这个是硬件采样器自己采、主机只读寄存器（非侵入）。\n"
+            "**如果采样器不工作会明确报错**（sampler_inactive / 值不变），"
+            "不会给一份看着像样的分布——部分 Cortex-M 修订版上 PC 采样器确实不可用。\n"
+            "样本是「采样器最近一次采到的 PC」，同一值会被重复读到，占比仅供参考；"
+            "默认采样结束会恢复 DEMCR/DWT_CTRL 原值。"
+        ),
+    )
+    async def trace_pcsample(samples: int = 500, interval_ms: float = 10.0,
+                             elf: str = "", top: int = 15,
+                             enable_dwt: bool = True, restore: bool = True,
+                             timeout: float = 20.0) -> str:
+        try:
+            return _js(pc_sample(samples=int(samples),
+                                 interval_ms=float(interval_ms), elf=elf,
+                                 top=int(top), enable_dwt=bool(enable_dwt),
+                                 restore=bool(restore), timeout=float(timeout)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

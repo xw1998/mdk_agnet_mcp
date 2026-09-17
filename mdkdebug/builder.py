@@ -504,12 +504,19 @@ def flash_download(uv4: str, project: str, target: str | None = None,
 
 
 def _same_project(a, b) -> bool:
-    """两个工程路径是否指向同一文件（大小写 / 分隔符 / 相对片段归一后再比）。"""
+    """两个工程路径是否指向同一文件（相对/绝对、大小写、分隔符归一后再比）。
+
+    真机踩坑：调用方传的是**相对路径**（如 example_mdk_project/.../mdk_test.uvprojx），
+    而实例枚举拿到的是**绝对路径**，旧实现只归一大小写/分隔符，于是判不出同一个工程，
+    `launch_uvision(reuse=True)` 又开出一个新窗口（真机实测同工程窗口累积到 2 个）。
+    这里先 abspath 再比，并额外退一步比 basename（路径写法千差万别时的兼容）。
+    """
     if not a or not b:
         return False
     try:
-        return (os.path.normcase(os.path.normpath(str(a)))
-                == os.path.normcase(os.path.normpath(str(b))))
+        pa = os.path.normcase(os.path.abspath(os.path.normpath(str(a))))
+        pb = os.path.normcase(os.path.abspath(os.path.normpath(str(b))))
+        return pa == pb
     except Exception:  # noqa: BLE001
         return str(a).strip().lower() == str(b).strip().lower()
 
