@@ -141,15 +141,36 @@ _SPEC = {
                                            "build_log"]},
 }
 
-# 毫秒主名的工具：额外接受秒写法（×1000），反之亦然
-_MS_TO_S = {"timeout_ms", "duration_ms", "interval_ms", "max_ms", "poll_ms",
-            "wait_ms"}
-_S_TO_MS = {"timeout_s", "duration_s", "interval_s", "max_s", "poll_s"}
+# 时间参数的等价族。同族内「任意前缀 × 任意写法」都指向该工具的主时间名：
+#   族 A（超时族）timeout / duration / max / wait —— 互相等价；
+#   族 B（间隔族）poll / interval —— 只在主名本身就是间隔参数时互相等价。
+# 刻意不把族 B 并入族 A：把「采样/轮询间隔」映射成「超时」会静默改变行为，宁可报错。
+#
+# 单位后缀是最强的语义线索：带 _s 的一律按秒解释、带 _ms 的一律按毫秒解释，
+# 与主名单位无关（timeout_ms 的工具收到 timeout_s=2 就按 2000 ms 用）。
+# 不带后缀（如 timeout=5）只能按主名单位解释 —— 所以 list_tools 必须把主名单位
+# 标出来，否则 AI 会以为 timeout=5 是 5 秒。
+_TIMEOUT_FAMILY = ("timeout", "duration", "max", "wait")
+_INTERVAL_FAMILY = ("poll", "interval")
+_TIME_UNIT_SUFFIXES = ("", "_ms", "_s")
 
-# 同单位同义词：AI 会按语义写 duration_/max_/wait_ 前缀，同单位（ms↔ms、s↔s）应互相等价。
-# 刻意排除 interval_*/poll_*：那是采样/轮询间隔，映射到超时会静默改变行为（宁可报错）。
-_MS_SYNONYM = ("timeout_ms", "duration_ms", "max_ms", "wait_ms")
-_S_SYNONYM = ("timeout_s", "duration_s", "max_s")
+def _time_family_of(name: str):
+    """名字属于哪个时间族；不是时间参数则返回 None。"""
+    if not name:
+        return None
+    for family in (_TIMEOUT_FAMILY, _INTERVAL_FAMILY):
+        for prefix in family:
+            if name == prefix or name in (prefix + "_ms", prefix + "_s"):
+                return family
+    return None
+
+def _unit_suffix(name: str) -> str:
+    """取名字的单位后缀（"_ms" / "_s" / ""）。"""
+    if name.endswith("_ms"):
+        return "_ms"
+    if name.endswith("_s"):
+        return "_s"
+    return ""
 
 
 def _build():
@@ -161,23 +182,19 @@ def _build():
             for c in cands:
                 if c and c != primary:
                     amap.setdefault(c, primary)
-        # 时间单位换算别名
+        # 时间参数：同族前缀 × 全部写法（无后缀 / _ms / _s）互为别名。
+        # 第 9 轮反馈说「别名层只做了一半，AI 会在时间单位上撞墙」——原来只给
+        # 主名换算同名的另一种单位（timeout_ms↔timeout_s），换个前缀就撞墙，
+        # 例如 run_timeout 收下 duration_ms 却不认 duration_s。这里按族展开成笛卡尔积。
         for primary in primaries:
-            if primary in _MS_TO_S:
-                sec = primary[:-3] + "_s"
-                amap.setdefault(sec, primary)
-            elif primary in _S_TO_MS:
-                ms = primary[:-2] + "_ms"
-                amap.setdefault(ms, primary)
-            # 同单位同义词（不换算）
-            if primary in _MS_SYNONYM:
-                for syn in _MS_SYNONYM:
-                    if syn != primary:
-                        amap.setdefault(syn, primary)
-            elif primary in _S_SYNONYM:
-                for syn in _S_SYNONYM:
-                    if syn != primary:
-                        amap.setdefault(syn, primary)
+            family = _time_family_of(primary)
+            if not family:
+                continue
+            for prefix in family:
+                for suffix in _TIME_UNIT_SUFFIXES:
+                    alias = prefix + suffix
+                    if alias != primary:
+                        amap.setdefault(alias, primary)
         if amap:
             table[tool] = amap
     return table
@@ -192,11 +209,17 @@ def aliases_of(tool: str) -> dict:
 
 
 def is_time_pair(primary: str, alias: str) -> int:
-    """主名/别名是否构成时间单位换算：返回 1000（秒→毫秒）、-1（毫秒→秒）或 0。"""
-    if primary in _MS_TO_S and alias.endswith("_s"):
-        return 1000
-    if primary in _S_TO_MS and alias.endswith("_ms"):
-        return -1
+    """主名/别名是否构成时间单位换算：返回 1000（秒→毫秒）、-1（毫秒→秒）或 0。
+
+    以**别名自带的后缀**为准（这是调用方的真实意图），而不是主名的单位：
+    别名写 _s 而主名是 _ms 就 ×1000，反之 ÷1000；别名不带后缀则不换算（按主名单位）。
+    """
+    fam = _time_family_of(primary)
+    if not fam or _time_family_of(alias) is not fam:
+        return 0        # 非时间参数，或跨族（poll_ms ← timeout_s）→ 不换算
+    p_suf, a_suf = _unit_suffix(primary), _unit_suffix(alias)
+    if a_suf and p_suf and a_suf != p_suf:
+        return 1000 if a_suf == "_s" else -1
     return 0
 
 
@@ -229,11 +252,20 @@ def alias_note(tool: str, allowed=None) -> str:
     if not rev:
         return ""
     parts = []
+    converts = False
     for primary, aliases in rev.items():
         unit = ""
         if primary.endswith("_ms"):
             unit = "（毫秒）"
         elif primary.endswith("_s"):
             unit = "（秒）"
+        p_suf = _unit_suffix(primary)
+        for a in aliases:
+            a_suf = _unit_suffix(a)
+            if a_suf and a_suf != p_suf:
+                converts = True
         parts.append("%s%s ← %s" % (primary, unit, "/".join(sorted(aliases))))
-    return "；".join(parts)
+    note = "；".join(parts)
+    if converts:
+        note += "；带 _s/_ms 的别名按后缀换算（_s=秒、_ms=毫秒）"
+    return note

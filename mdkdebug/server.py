@@ -1199,7 +1199,11 @@ class AliasMCPServer(MCPServer):
             if "参数别名" in desc:
                 continue
             try:
-                info.description = desc + "\n参数别名（同样可用）：" + note
+                # 第 9 轮反馈：「别名层只做了一半」，会让 AI 以为「随便写也行」。故这里
+                # 把口径写死——规范名以【参数】行为准，别名只是兼容写法，未列出的名字会被拒绝。
+                info.description = (desc + "\n【参数别名】" + note
+                                    + "。规范名以上方【参数】行为准；"
+                                      "未列出的参数名会被拒绝，不会静默忽略")
             except Exception:  # noqa: BLE001
                 logger.debug("未能写入别名说明：%s", info.name, exc_info=True)
         return await super().list_tools()
