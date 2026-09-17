@@ -28,4 +28,6 @@ Thumbs.db
 _build_test*.log
 
 # 本地开发经验文档（不上云端仓库）
-docs/
+docs/*
+# 例外：随仓库分发的使用指南
+!docs/build-flash-debug-guide.md
