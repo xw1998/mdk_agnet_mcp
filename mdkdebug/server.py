@@ -1102,7 +1102,7 @@ def _apply_param_hints(server) -> int:
     for tool in tools.values():
         desc = getattr(tool, "description", "") or ""
         block = _param_hint_block(tool)
-        if block and "【参数】" not in desc:
+        if block and "\n【参数】" not in desc:
             tool.description = desc + block
             n += 1
     return n
@@ -1140,6 +1140,12 @@ class AliasMCPServer(MCPServer):
             self._alias_real_params = cache
         return cache.get(tool, set())
 
+    def _real_params_or_none(self, tool: str) -> set | None:
+        """该工具的真实参数集合；**工具不在注册表里**返回 None（与"无参数工具"区分开）。"""
+        self._real_params(tool)                      # 预热缓存
+        cache = getattr(self, "_alias_real_params", None) or {}
+        return cache.get(tool)
+
     def _alias_map(self, tool: str) -> dict:
         amap = _aliases.aliases_of(tool)
         if not amap:
@@ -1157,8 +1163,15 @@ class AliasMCPServer(MCPServer):
         out, applied = dict(arguments), []
         for key in list(arguments.keys()):
             primary = amap.get(key)
-            if not primary or primary in arguments:
-                continue                      # 未知别名 / 主名已给 → 原样交给框架校验
+            if not primary:
+                continue                      # 真正不认识的名字 → 交给 unknown_params 拒绝
+            if primary in arguments:
+                # 主名优先：不覆盖已给的主名，但**别名键必须删掉**——留着它会以
+                # "未知参数"的身份被拒（batch 里 _batch_alias_args 补的 n_bytes 与遗留的
+                # size 撞在一起时就会这样：报错说 size 不被接受，而它分明是 n_bytes 的别名）。
+                out.pop(key, None)
+                applied.append("%s 已忽略（主名 %s 同时给出，取主名）" % (key, primary))
+                continue
             out[primary] = _aliases.convert_time(primary, key, arguments[key])
             out.pop(key, None)
             applied.append("%s→%s" % (key, primary))
@@ -1169,24 +1182,37 @@ class AliasMCPServer(MCPServer):
         排查代价很高。这里显式拒绝，并在报错里列出可用参数与别名。"""
         if not isinstance(arguments, dict):
             return []
-        real = self._real_params(tool)
-        if not real:
-            return []                     # 没读到 schema（工具未注册/读取失败）→ 不拦
+        real = self._real_params_or_none(tool)
+        if real is None:
+            return []                     # 工具未注册 / 读不到 schema → 不拦，交给框架
+        # real 为空集＝该工具确实不需要任何参数：给了参数就是打错了，同样要拒绝
         return [k for k in arguments if k not in real and not k.startswith("_")]
 
-    async def call_tool(self, name, arguments, context=None):
-        arguments, applied = self.normalize_arguments(name, arguments)
-        if applied:
-            logger.info("参数别名归一 %s: %s", name, "、".join(applied))
-        bad = self.unknown_params(name, arguments)
+    def prepare_arguments(self, tool: str, arguments) -> tuple:
+        """别名归一 + 拒绝未知参数——**单工具直调与 batch 共用的唯一入口**。
+
+        第 11 轮反馈（批次28）：batch 原先直接调用注册表里的裸函数
+        `await entry.fn(**args)`，绕过了本层，于是 `run_timeout(timeout_s=0.5)` 直调可用、
+        放进 batch 却报 `got an unexpected keyword argument` —— 整套别名（族展开 + 单位换算）
+        在多步调试最常用的入口上完全不可见。故把归一/拒绝抽成本方法，两条路径都过它。
+        """
+        arguments, applied = self.normalize_arguments(tool, arguments)
+        bad = self.unknown_params(tool, arguments)
         if bad:
-            real = sorted(self._real_params(name))
-            note = _aliases.alias_note(name, set(real))
-            msg = ("参数名不被接受：%s。%s 接受的参数：%s"
-                   % ("、".join(bad), name, "、".join(real)))
+            real = sorted(self._real_params(tool))
+            note = _aliases.alias_note(tool, set(real))
+            msg = ("参数名不被接受：%s。%s %s"
+                   % ("、".join(bad), tool,
+                      ("接受的参数：" + "、".join(real)) if real else "不接受任何参数"))
             if note:
                 msg += "（参数别名：%s）" % note
             raise ToolError(msg)
+        return arguments, applied
+
+    async def call_tool(self, name, arguments, context=None):
+        arguments, applied = self.prepare_arguments(name, arguments)
+        if applied:
+            logger.info("参数别名归一 %s: %s", name, "、".join(applied))
         return await super().call_tool(name, arguments, context)
 
     async def list_tools(self):
@@ -1196,7 +1222,7 @@ class AliasMCPServer(MCPServer):
             if not note:
                 continue
             desc = info.description or ""
-            if "参数别名" in desc:
+            if "\n【参数别名】" in desc:
                 continue
             try:
                 # 第 9 轮反馈：「别名层只做了一半」，会让 AI 以为「随便写也行」。故这里
@@ -1500,7 +1526,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 return _js(r)
             out = dict(r)
             try:
-                health = winutil.keil_health()
+                # with_dialogs：原先 health 里根本没有 modal_dialogs 键，下面那条模态框
+                # 分支永远不会命中（死代码），退出调试被模态框挡住时给不出可用诊断。
+                health = winutil.keil_health(with_dialogs=True)
             except Exception:  # noqa: BLE001
                 health = {}
             out["keil"] = health
@@ -1512,10 +1540,18 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     "就绪 → 重建连接）；注意重启会丢失当前会话（断点/观察变量需重新设置），"
                     "但 .uvoptx 里的持久化断点会被 Keil 自动恢复。" % code)
             elif health.get("modal_dialogs"):
+                shown = []
+                for d in health["modal_dialogs"][:2]:
+                    txt = (d.get("message") or "").strip()
+                    btns = "、".join(d.get("button_texts") or [])
+                    shown.append("%s%s%s" % (d.get("title") or "(无标题)",
+                                             ("：" + txt) if txt else "",
+                                             ("[按钮: %s]" % btns) if btns else ""))
                 out["diagnosis"] = (
-                    "退出调试被拒，且检测到 Keil 有模态对话框（%s）——命令会被阻塞，"
-                    "请在 Keil 界面处理该窗口后重试。"
-                    % "；".join(str(d) for d in health["modal_dialogs"][:3]))
+                    "退出调试被拒，且检测到 Keil 有模态对话框（%s）——命令会被阻塞。"
+                    "可用 dismiss_dialog 读取正文并按按钮关闭（如 dismiss_dialog(button=\"确定\")），"
+                    "或直接在 Keil 界面处理，然后重试。"
+                    % "；".join(shown))
             else:
                 out["diagnosis"] = (
                     "退出调试失败：目标在运行态时会被拒（status=11），请先 stop 再 exit_debug；"
@@ -3311,7 +3347,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "检查 Keil 调试通道的健康状态：UV4 进程是否存在、UVSOCK 端口是否监听、"
             "是否有模态对话框阻塞。返回 keil_alive / uv4_pids / port / port_listening / "
-            "uvsock_ready / code / diagnosis / suggestion，并在检测到 Keil 模态框时列出其标题。"
+            "uvsock_ready / code / diagnosis / suggestion；检测到 Keil 模态框时一并给出"
+            "modal_dialogs[{title, message, button_texts}]——**正文与可点按钮都有**，"
+            "知道框里写了什么、该点哪个（配套 dismiss_dialog 直接关框，不必再去界面手点）。"
             "用途：命令超时或「操作了没反应」时先调它，直接看清断在哪一环（keil_not_running / "
             "port_not_listening / port_occupied），而不是干等到超时；也可作为操作前后的廉价自检"
             "（纯 ctypes + socket 探测，Keil 未运行时也能正常返回）。"
@@ -3320,17 +3358,38 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     async def keil_health() -> str:
         try:
             port = _get_client().port
-            h = winutil.keil_health(port)
-            dialogs = winutil.find_modal_dialogs()
-            h["modal_dialogs"] = dialogs
-            h["modal_blocked_suspected"] = bool(dialogs)
-            if dialogs:
-                titles = "、".join((d.get("title") or "(无标题)") for d in dialogs[:3])
-                h["suggestion"] = (
-                    (h.get("suggestion") or "")
-                    + " 检测到 Keil 模态对话框，很可能阻塞命令执行，请先在 Keil 界面处理："
-                    + titles)
+            # with_dialogs：一并取回模态框的**正文与按钮**——第 11 轮反馈指出"只给标题"
+            # 帮助有限（知道有个 μVision 框，却不知道框里写什么、该点哪个）。
+            h = winutil.keil_health(port, with_dialogs=True)
+            if h.get("modal_blocked_suspected"):
+                h["suggestion"] = ((h.get("suggestion") or "")
+                                   + " 接下来用 dismiss_dialog 查看正文并按按钮关闭"
+                                     "（button 省略则按确定/OK/是/关闭自动挑）。")
+            h["dialog_note"] = ("modal_dialogs[].message 是框内正文、button_texts 是可点按钮；"
+                                "两者为空说明该框不是标准控件（少见），可退回 Keil 界面手动处理。")
             return _js(h)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="dismiss_dialog",
+        title="读取并关闭阻塞 Keil 的模态对话框",
+        description=(
+            "把 Keil「有个模态框在挡路」补成「框里写什么、点哪个按钮」：枚举 UV4 的模态对话框"
+            "（类名 #32770），**读出正文（Static 控件）与全部按钮文字（Button 控件）**并按按钮点击关闭。"
+            "button 传按钮文字（如「确定」「重试」，支持部分匹配）；不传则按 确定/OK/是/关闭/重试 "
+            "的语义顺序自动挑，没有可点按钮时退化为 WM_CLOSE。title 可按标题筛（多个框时），"
+            "index 取第几个（默认 0）。返回 {ok, dismissed, clicked, method, dialog{title,message,buttons}, "
+            "remaining}。"
+            "用法：命令不返回且 keil_health 报 modal_blocked_suspected=true 时调它——"
+            "先看 dialog.message 知道 Keil 报了什么，再决定点哪个按钮，解除阻塞后重试原命令。"
+            "注意：① 关框只解除阻塞，不等于问题已修（如正文说输出文件写不进去，要先解决占用/权限）；"
+            "② 指定 button 却匹配不到时**不会**擅自改点别的按钮，而是返回 button_not_found 并列出可用按钮。"
+        ),
+    )
+    async def dismiss_dialog(button: str = "", title: str = "", index: int = 0) -> str:
+        try:
+            return _js(winutil.dismiss_modal_dialog(button=button, title=title, index=index))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -4122,7 +4181,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "每项 {\"tool\": \"工具名\", \"args\": {\"参数名\": 值}}；"
             "tool 必须是本服务已注册的工具名（**本服务全部工具都支持**，含 disassemble、编译烧录、"
             "断点管理、运行控制等；仅不支持 batch 自身，避免递归），"
-            "args 就是该工具自己的参数名（可先看该工具描述末尾的【参数】/【调用示例】）。"
+            "args 就是该工具自己的参数名（可先看该工具描述末尾的【参数】/【调用示例】）；"
+            "batch 内与单工具直调**完全等价**：别名写法（如 timeout_s / duration_ms）"
+            "同样生效、未知参数同样被拒绝（命中别名时该条结果会带 param_alias）。"
             "例：一次往返下 2 个断点再运行——"
             "commands=[{\"tool\": \"set_breakpoint\", \"args\": {\"expr\": \"main\"}},"
             " {\"tool\": \"set_breakpoint\", \"args\": {\"expr\": \"svcrt_sched_activate\"}},"
@@ -4149,15 +4210,32 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     one["error"] = f"batch 不支持工具: {tool}（不是本服务已注册的工具名）"
                 else:
                     args = _batch_alias_args(tool, args)
-                    try:
-                        raw = await entry.fn(**args)
-                    except TypeError as e:
+                    # 批次28：batch 内的参数与单工具直调**必须走同一层**——别名归一
+                    # （族展开 + 单位换算）与未知参数拒绝都在 prepare_arguments 里，
+                    # 不再直接拿注册表里的裸函数调用。
+                    prep = getattr(server, "prepare_arguments", None)
+                    if prep is None:
+                        pass                                  # 非别名版 server（极简嵌入）→ 原样
+                    else:
+                        try:
+                            args, applied = prep(tool, args)
+                            if applied:
+                                one["param_alias"] = applied
+                        except Exception as e:  # noqa: BLE001
+                            args = None
+                            one["error"] = str(e)
+                    if args is not None:
+                        try:
+                            raw = await entry.fn(**args)
+                        except TypeError as e:
+                            raw = None
+                            one["error"] = (f"参数不匹配: {e}；该工具参数{_param_signature(entry)}"
+                                            "（见该工具描述里的【调用示例】）")
+                        except Exception as e:  # noqa: BLE001
+                            raw = None
+                            one["error"] = str(e)
+                    else:
                         raw = None
-                        one["error"] = (f"参数不匹配: {e}；该工具参数{_param_signature(entry)}"
-                                        "（见该工具描述里的【调用示例】）")
-                    except Exception as e:  # noqa: BLE001
-                        raw = None
-                        one["error"] = str(e)
                     if raw is not None:
                         try:
                             data = json.loads(raw) if isinstance(raw, str) else raw

@@ -199,10 +199,15 @@ def port_listening(port: int = DEFAULT_UVSOCK_PORT, host: str = "127.0.0.1",
         return False
 
 
-def keil_health(port: int = DEFAULT_UVSOCK_PORT) -> dict:
+def keil_health(port: int = DEFAULT_UVSOCK_PORT, with_dialogs: bool = False) -> dict:
     """廉价健康检查：UV4 进程 + UVSOCK 端口，并给出可操作诊断。
 
     返回 keil_alive / uv4_pids / port_listening / uvsock_ready / diagnosis / suggestion。
+
+    with_dialogs=True 时**一并枚举模态对话框**（含正文与按钮），并给出
+    modal_dialogs / modal_blocked_suspected：模态框下的"端口正常、命令不返回"是最难自己
+    看出来的一种故障，提前探测能让调用方直接看到"框里写了什么"。
+
     设计为"永不抛异常"——健康检查本身崩掉就失去意义了。
     """
     try:
@@ -236,7 +241,7 @@ def keil_health(port: int = DEFAULT_UVSOCK_PORT) -> dict:
         suggestion = "可尝试 restart_keil 清场重启；若仍异常，检查是否有其它程序占用该端口。"
         code = "port_occupied"
 
-    return {
+    out = {
         "ok": True,
         "code": code,
         "keil_alive": bool(pids),
@@ -247,13 +252,92 @@ def keil_health(port: int = DEFAULT_UVSOCK_PORT) -> dict:
         "diagnosis": diagnosis,
         "suggestion": suggestion,
     }
+    if with_dialogs:
+        # 字段**始终存在**：没有 UV4 进程时给空列表，调用方才能区分"没探测"与"没有框"
+        try:
+            dialogs = find_modal_dialogs() if pids else []
+        except Exception:  # noqa: BLE001
+            dialogs = []
+        out["modal_dialogs"] = dialogs
+        out["modal_blocked_suspected"] = bool(dialogs)
+        if dialogs:
+            shown = []
+            for d in dialogs[:3]:
+                txt = (d.get("message") or "").strip()
+                btns = "、".join(d.get("button_texts") or [])
+                shown.append("%s%s%s" % (d.get("title") or "(无标题)",
+                                         ("：" + txt) if txt else "（正文未取到）",
+                                         ("[按钮: %s]" % btns) if btns else ""))
+            if code == "ok":
+                out["diagnosis"] = ("Keil 与 UVSOCK 均就绪，但有 %d 个模态对话框在阻塞命令"
+                                    "（端口正常、命令不返回正是模态框的典型症状）" % len(dialogs))
+            out["suggestion"] = ((out.get("suggestion") or "")
+                                 + " 检测到 Keil 模态对话框，很可能阻塞命令执行："
+                                 + "；".join(shown)
+                                 + "。可直接用 dismiss_dialog 读取正文并按按钮关闭，"
+                                   "或在 Keil 界面手动处理。")
+    return out
+
+
+def _child_controls(hwnd) -> list:
+    """枚举窗口的全部子控件（EnumChildWindows，含嵌套）：[{hwnd, class, text}]。
+
+    只靠窗口标题看不到"框里写什么"，必须下钻到子控件：标准对话框（#32770）的正文是
+    Static 控件、按钮是 Button 控件。
+    """
+    if sys.platform != "win32" or not hwnd:
+        return []
+    out = []
+    try:
+        user32 = ctypes.windll.user32
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _cb(ch, _lparam):
+            try:
+                cbuf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(ch, cbuf, 256)
+                tbuf = ctypes.create_unicode_buffer(2048)
+                user32.GetWindowTextW(ch, tbuf, 2048)
+                out.append({"hwnd": int(ch), "class": cbuf.value, "text": tbuf.value})
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        user32.EnumChildWindows(int(hwnd), _cb, 0)
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def dialog_content(hwnd) -> dict:
+    """读一个对话框的正文与按钮：{"message", "buttons":[{hwnd,text}], "button_texts",
+    "statics", "child_count"}。
+
+    Keil 的模态框正文（Static）通常就是唯一有用的一句话，如
+    "Create File -o '…' failed."；按钮（Button）给出可选项（确定/取消/重试）。
+    """
+    kids = _child_controls(hwnd)
+    statics, buttons = [], []
+    for k in kids:
+        cls, txt = (k.get("class") or ""), (k.get("text") or "").strip()
+        if not txt:
+            continue
+        if cls == "Static":
+            if txt not in statics:
+                statics.append(txt)
+        elif cls == "Button":
+            buttons.append({"hwnd": k.get("hwnd"), "text": txt})
+    return {"message": " ".join(statics), "buttons": buttons,
+            "button_texts": [b["text"] for b in buttons],
+            "statics": statics, "child_count": len(kids)}
 
 
 def find_modal_dialogs() -> list:
-    """枚举属于 UV4 进程的可见对话框窗口（类名 #32770）。
+    """枚举属于 UV4 进程的可见对话框窗口（类名 #32770），并读出正文与按钮。
 
     Keil 弹出模态框时 UVSOCK 仍能连上，但命令不执行也不报错——只能靠窗口识别。
-    返回 [{"pid":..., "title":...}, ...]。
+    只给标题帮助有限（"有个 μVision 框"仍不知该点什么），故一并返回：
+      [{pid, hwnd, title, message, buttons:[{hwnd,text}], button_texts, statics}]
     """
     if sys.platform != "win32":
         return []
@@ -279,7 +363,9 @@ def find_modal_dialogs() -> list:
                     return True
                 tbuf = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(hwnd, tbuf, 512)
-                out.append({"pid": int(pid.value), "title": tbuf.value})
+                item = {"pid": int(pid.value), "hwnd": int(hwnd), "title": tbuf.value}
+                item.update(dialog_content(hwnd))  # message / buttons / button_texts
+                out.append(item)
             except Exception:  # noqa: BLE001
                 pass
             return True
@@ -350,3 +436,147 @@ def wait_uv4_exit(timeout: float = 12.0, interval: float = 0.3) -> dict:
             return {"ok": False, "remaining": remain,
                     "waited_ms": int((time.monotonic() - t0) * 1000)}
         time.sleep(interval)
+
+
+# 模态框"默认按钮"偏好顺序：这些是"确认/关闭"语义，点了不会改变构建结果，
+# 只解除阻塞（先精确匹配再包含匹配，见 _pick_button）。
+_OK_BUTTON_HINTS = ("确定", "OK", "是", "Yes", "关闭", "Close", "继续", "Continue",
+                    "重试", "Retry")
+
+def _pick_button(buttons: list, wanted: str = ""):
+    """从 [{hwnd,text}] 里挑按钮。
+
+    wanted 非空时只认它（精确 → 忽略大小写 → 包含），挑不到返回 None——
+    **不替用户改点别的按钮**，否则就成了"以为点了确定、实际点了取消"。
+    wanted 为空时按 _OK_BUTTON_HINTS 的确认语义顺序自动挑。
+    """
+    if not buttons:
+        return None
+    if wanted and wanted.strip():
+        w = wanted.strip().lower()
+        for b in buttons:
+            if (b.get("text") or "").strip().lower() == w:
+                return b
+        for b in buttons:
+            if w in (b.get("text") or "").strip().lower():
+                return b
+        return None
+    for hint in _OK_BUTTON_HINTS:
+        h = hint.lower()
+        for b in buttons:
+            if (b.get("text") or "").strip().lower() == h:
+                return b
+    for hint in _OK_BUTTON_HINTS:
+        h = hint.lower()
+        for b in buttons:
+            if h in (b.get("text") or "").strip().lower():
+                return b
+    return None
+
+def _click_control(hwnd, timeout_ms: int = 2000) -> bool:
+    """点按钮（BM_CLICK）。用 SendMessageTimeout(ABORTIFHUNG) 而非 SendMessage，
+    避免目标线程卡死时把调用方一起挂住。
+
+    注意返回值只表示"消息送出去了"：按钮回调会销毁对话框，SendMessage 可能因此返回 0，
+    所以**判断是否关掉要看窗口是否真的消失**，不能看这个返回值。
+    """
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        BM_CLICK = 0x00F5
+        SMTO_ABORTIFHUNG = 0x0002
+        res = wintypes.DWORD(0)
+        r = ctypes.windll.user32.SendMessageTimeoutW(
+            int(hwnd), BM_CLICK, 0, 0, SMTO_ABORTIFHUNG, int(timeout_ms), ctypes.byref(res))
+        return bool(r)
+    except Exception:  # noqa: BLE001
+        return False
+
+def _post_close(hwnd) -> bool:
+    """退路：给对话框发 WM_CLOSE（没有可点的 Button 时用）。"""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        return bool(ctypes.windll.user32.PostMessageW(int(hwnd), 0x0010, 0, 0))
+    except Exception:  # noqa: BLE001
+        return False
+
+def dialog_brief(d: dict) -> dict:
+    """对话框摘要（去掉 hwnd 细节，便于回传）。"""
+    return {"pid": d.get("pid"), "hwnd": d.get("hwnd"), "title": d.get("title", ""),
+            "message": d.get("message", ""), "buttons": (d.get("button_texts") or [])}
+
+def _wait_dialog_gone(hwnd, timeout: float = 3.0, interval: float = 0.15) -> bool:
+    """等对话框窗口消失（点完按钮后需要一点时间让目标线程处理）。"""
+    t0 = time.monotonic()
+    while True:
+        left = [d for d in find_modal_dialogs() if int(d.get("hwnd") or 0) == int(hwnd)]
+        if not left:
+            return True
+        if time.monotonic() - t0 >= timeout:
+            return False
+        time.sleep(interval)
+
+def dismiss_modal_dialog(button: str = "", title: str = "", index: int = 0,
+                         wait: float = 3.0) -> dict:
+    """读取 Keil 模态对话框的正文/按钮并把它关掉（AI 自愈闭环的最后一步）。
+
+    - button 指定按钮文字（部分匹配亦可，如 "确定"）；给定却找不到 → 直接报
+      button_not_found 并列出可用按钮，**不擅自改点别的**；
+    - 未指定 button 时按确定/OK/是/关闭/重试 的语义顺序自动挑，挑不到退化为 WM_CLOSE；
+    - 关掉与否以"窗口是否真的消失"为准，不看点击调用的返回值。
+    """
+    dialogs = find_modal_dialogs()
+    if not dialogs:
+        return {"ok": False, "code": "no_dialog",
+                "error": ("未发现 Keil(UV4) 模态对话框——命令不返回可能是别的原因，"
+                          "可用 keil_health 看进程/端口/调试态"),
+                "modal_dialogs": []}
+    if title and title.strip():
+        key = title.strip().lower()
+        target = next((d for d in dialogs if key in (d.get("title") or "").lower()), None)
+        if target is None:
+            return {"ok": False, "code": "dialog_not_found",
+                    "error": "未找到标题含 %r 的对话框" % title,
+                    "modal_dialogs": [dialog_brief(d) for d in dialogs]}
+    else:
+        i = max(0, min(int(index or 0), len(dialogs) - 1))
+        target = dialogs[i]
+
+    btns = target.get("buttons") or []
+    hwnd = int(target.get("hwnd") or 0)
+    if button and button.strip():
+        btn = _pick_button(btns, button)
+        if btn is None:
+            return {"ok": False, "code": "button_not_found",
+                    "error": "对话框里没有文字匹配 %r 的按钮" % button,
+                    "dialog": dialog_brief(target),
+                    "hint": "可用 button 传其中之一，或省略 button 走默认（确定/OK/是/关闭）。"}
+        method, clicked = "BM_CLICK", btn.get("text", "")
+        _click_control(btn.get("hwnd"))
+    else:
+        btn = _pick_button(btns, "")
+        if btn is not None:
+            method, clicked = "BM_CLICK", btn.get("text", "")
+            _click_control(btn.get("hwnd"))
+        elif hwnd:
+            method, clicked = "WM_CLOSE", ""
+            _post_close(hwnd)
+        else:
+            return {"ok": False, "code": "no_button",
+                    "error": "该对话框没有可点的按钮，也取不到窗口句柄",
+                    "dialog": dialog_brief(target)}
+
+    dismissed = _wait_dialog_gone(hwnd, wait)
+    remaining = [dialog_brief(d) for d in find_modal_dialogs()]
+    out = {"ok": dismissed, "code": "dismissed" if dismissed else "still_open",
+           "dismissed": dismissed, "method": method, "clicked": clicked,
+           "dialog": dialog_brief(target), "remaining": remaining}
+    if dismissed:
+        out["note"] = ("已关闭模态框，阻塞应已解除，可重试之前的命令。"
+                       "注意：关框只解除阻塞，不代表问题已修——"
+                       "请按对话框正文处置（例如正文说输出文件写不进去，就要先解决写权限/占用）。")
+    else:
+        out["note"] = ("点了 %s 但对话框仍在，可能被别的对话框挡住或 Keil 无响应；"
+                       "可在 Keil 界面手动处理，或 restart_keil 重启。" % (clicked or method))
+    return out

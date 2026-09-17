@@ -167,8 +167,12 @@ async def main():
     # ============ D. 主名优先 / 不静默 ============
     print("D. 主名优先与未知参数")
     a, applied = norm(server, "watch", {"expressions": ["v1"], "exprs": ["NOPE"]})
-    check("D1 主名与别名同时给出时只认主名",
-          a.get("expressions") == ["v1"] and "exprs" in a and applied == [],
+    # 批次28 收紧：主名优先的语义 = 丢弃别名键、取主名值（并在 applied 里如实记录）。
+    # 旧行为把别名键留在参数里，会被 unknown_params 判成"未知参数"直接拒绝——
+    # read_mem(address=…, size=…) 这种"真名+旧别名"混写就因此报错，而 size 分明是 n_bytes 的别名。
+    check("D1 主名与别名同时给出时只认主名（别名键丢弃并记录，不留成未知参数）",
+          a.get("expressions") == ["v1"] and "exprs" not in a
+          and any("exprs" in s for s in applied),
           json.dumps([a, applied], ensure_ascii=False)[:200])
 
     a, applied = norm(server, "get_status", {"expr": "v1"})
