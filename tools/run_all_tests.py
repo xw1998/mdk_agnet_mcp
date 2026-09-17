@@ -2,9 +2,16 @@
 """仓库统一测试闸门：先做一致性检查，再跑各批次 mock 测试并汇总。
 
 用法：
-    python tools/run_all_tests.py            # 一致性检查 + 跑闸门内全部测试
-    python tools/run_all_tests.py --no-run    # 只做一致性检查（秒级）
-    python tools/run_all_tests.py --list      # 只列清单
+    python tools/run_all_tests.py              # 一致性检查 + 全部测试（默认 4 路并发）
+    python tools/run_all_tests.py --fast       # 只跑关键几批（改一两个模块时用，分钟级→十几秒）
+    python tools/run_all_tests.py --only test_batch36,test_batch35
+    python tools/run_all_tests.py --jobs 1     # 退化成串行（排查并发疑似干扰时用）
+    python tools/run_all_tests.py --no-run     # 只做一致性检查（秒级）
+    python tools/run_all_tests.py --list       # 只列清单
+
+为什么能并发：每个测试模块自己起 mock 服务器、端口各不相同、临时目录也各自独立。
+唯一的例外是**共享守卫端口**的模块（见 EXCLUSIVE_GROUPS），它们会被自动排到串行尾巴上，
+免得互相把对方的端口占掉、跑出假失败。
 
 一致性检查（防止"加了工具忘了改断言"这类静默腐烂）：
   1. 以 mdkdebug.server.create_server() 实际注册的工具数为唯一事实来源
@@ -17,6 +24,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,6 +38,15 @@ BATCHES = [
     "test_batch31", "test_batch32", "test_batch33", "test_batch34",
     "test_batch35", "test_batch36",
 ]
+
+# --fast：改一两个模块时先跑这几批（覆盖协议层/统一信封/非 MDK 链路），全绿再跑全量
+FAST_SET = ["test_e2e", "test_mcp", "test_batch33", "test_batch35", "test_batch36"]
+
+# 并发禁区：这些模块共用同一个「守卫端口」，同时跑会互相干扰（真检查过端口占用）：
+#   test_batch29 断言 14999 没在监听，test_batch35 的子进程会去 bind 14999
+EXCLUSIVE_GROUPS = [["test_batch29", "test_batch35"]]
+EXCLUSIVE = {n for g in EXCLUSIVE_GROUPS for n in g}
+DEFAULT_JOBS = 4
 
 PATTERNS = [
     re.compile(r"通过\s*(\d+)\s*失败\s*(\d+)"),
@@ -147,30 +165,80 @@ def consistency():
     return bad
 
 
-def run_gate():
-    print("\n== 闸门测试 ==")
-    bad = []
-    for name in BATCHES:
+def run_one(name, timeout):
+    """跑一个测试模块，返回 (名称, 通过, 失败, rc, 秒, 输出)。"""
+    t0 = time.time()
+    try:
         p = subprocess.run([sys.executable, "-m", "tests." + name],
-                           cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        out = dec(p.stdout)
-        ok = ng = None
-        for pat in PATTERNS:
-            m = pat.findall(out)
-            if m:
-                ok, ng = m[-1]
-                break
-        if ok is None:
-            ok = str(len(re.findall(r"\[PASS\]|\bPASS\b", out)))
-            ng = str(len(re.findall(r"\[FAIL\]|\bFAIL\b", out)))
-        print("%-16s 通过 %-4s 失败 %-4s rc=%d" % (name, ok, ng, p.returncode), flush=True)
-        if p.returncode != 0 or ng not in ("0",):
-            bad.append(name)
+                           cwd=ROOT, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=timeout)
+        out, rc = dec(p.stdout), p.returncode
+    except subprocess.TimeoutExpired as e:
+        out, rc = dec(e.output) + "\n[gate] 超时 %ss" % timeout, 124
+    ok = ng = None
+    for pat in PATTERNS:
+        m = pat.findall(out)
+        if m:
+            ok, ng = m[-1]
+            break
+    if ok is None:
+        ok = str(len(re.findall(r"\[PASS\]|\bPASS\b", out)))
+        ng = str(len(re.findall(r"\[FAIL\]|\bFAIL\b", out)))
+    return name, ok, ng, rc, time.time() - t0, out
+
+
+def run_gate(names=None, jobs=DEFAULT_JOBS, timeout=900):
+    names = list(names or BATCHES)
+    jobs = max(1, int(jobs or 1))
+    # 共享守卫端口的模块抽出来串行跑，其余并发
+    par = [n for n in names if n not in EXCLUSIVE]
+    ser = [n for n in names if n in EXCLUSIVE]
+    how = "串行" if jobs == 1 or len(par) <= 1 else "%d 路并发" % min(jobs, len(par))
+    print("\n== 闸门测试（%s，共 %d 个模块%s）==" % (
+        how, len(names), "，其中 %d 个因共享端口串行" % len(ser) if ser else ""))
+    results = {}
+    t_all = time.time()
+    if jobs == 1 or len(par) <= 1:
+        for n in par:
+            results[n] = run_one(n, timeout)
+            print("  %-16s %5.1fs" % (n, results[n][4]), flush=True)
+    else:
+        with ThreadPoolExecutor(max_workers=min(jobs, len(par))) as ex:
+            for r in ex.map(lambda n: run_one(n, timeout), par):
+                results[r[0]] = r
+                print("  %-16s %5.1fs" % (r[0], r[4]), flush=True)
+    for n in ser:
+        results[n] = run_one(n, timeout)
+        print("  %-16s %5.1fs" % (n, results[n][4]), flush=True)
+
+    bad, slow = [], []
+    for n in names:
+        _, ok, ng, rc, sec, out = results[n]
+        print("%-16s 通过 %-4s 失败 %-4s rc=%-3d %.1fs" % (n, ok, ng, rc, sec))
+        slow.append((sec, n))
+        if rc != 0 or ng not in ("0",):
+            bad.append(n)
+            tail = [ln for ln in out.splitlines() if "FAIL" in ln][:6]
+            for ln in tail:
+                print("     %s" % ln.strip()[:160])
+    slow.sort(reverse=True)
     print("----")
-    print("总计 %d 个测试文件，异常/失败 %d 个" % (len(BATCHES), len(bad)))
+    print("总计 %d 个测试文件，异常/失败 %d 个，总耗时 %.1fs（最慢：%s）" % (
+        len(names), len(bad), time.time() - t_all,
+        "、".join("%s %.1fs" % (n, s) for s, n in slow[:3])))
     if bad:
         print("问题文件：" + ", ".join(bad))
     return bad
+
+
+def _pick(argv, flag, default=""):
+    """取 --flag 的值（支持 --flag=v 与 --flag v 两种写法）。"""
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return default
 
 
 def main():
@@ -180,10 +248,22 @@ def main():
             print(name)
         print("未纳入闸门：" + ", ".join(discover_ungated()))
         return 0
+
+    names = list(BATCHES)
+    if "--fast" in argv:
+        names = list(FAST_SET)
+    names = [n.strip() for n in _pick(argv, "--only").split(",") if n.strip()] or names
+    unknown = [n for n in names if n not in BATCHES]
+    if unknown:
+        print("不认识的测试模块：%s（可用 --list 看清单）" % ", ".join(unknown))
+        return 2
+    jobs = 1 if "--serial" in argv else int(_pick(argv, "--jobs", str(DEFAULT_JOBS)) or 1)
+    timeout = float(_pick(argv, "--timeout", "900") or 900)
+
     bad = consistency()
     if "--no-run" in argv:
         return 1 if bad else 0
-    bad += len(run_gate())
+    bad += len(run_gate(names, jobs=jobs, timeout=timeout))
     print("\n结论：%s" % ("全部通过" if not bad else "存在问题，见上"))
     return 1 if bad else 0
 

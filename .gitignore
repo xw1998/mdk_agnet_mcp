@@ -24,6 +24,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# GCC 示例工程构建产物（make 生成）
+example_gcc_project/**/build/
+
 # 本地测试残留
 _build_test*.log
 

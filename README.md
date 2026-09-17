@@ -194,7 +194,9 @@ mdk_agent/
 │   ├── test_batch*.py        # 各批次 mock 回归（批次 8 拆为 8a/8b/8cd；逐批覆盖该批新增工具）
 │   └── test_e2e / test_mcp / test_stdio / test_enhanced / test_unhardcode / test_diag.py
 │                             # 协议闭环 / MCP 工具注册 / stdio 握手 / 增强功能 / 去硬编码 / 诊断
-└── example_mdk_project/      # 随附 STM32F4 HAL 例程（真机调试验证目标，随项目一并开源）
+├── example_mdk_project/      # 随附 STM32F4 HAL 例程（MDK/UVSOCK 链路的真机验证目标）
+└── example_gcc_project/      # 随附 GCC 例程（非 MDK 链路的真机验证目标）
+    └── rtt_probe/            # STM32F401 自建 RTT 验证固件（引用 components/trace，无需 Keil）
 ```
 
 ## 快速开始
@@ -606,20 +608,25 @@ AI 修改代码后，可按如下顺序实现"自己编译、自己烧录、自�
 
 无需真实 Keil，也无需真实 OpenOCD：MDK 链路用 `tests/mock_uvsock_server.py` 模拟调试器，非 MDK 链路用 `tests/mock_openocd.py` 模拟 OpenOCD（内建假 RAM 与 RTT 控制块，能验证内存读写、寄存器、断点、烧录与 RTT 收发）。
 
-**跑全部**（推荐，先做一致性检查再跑 22 个测试模块）：
+**跑全部**（默认 4 路并发，本机约 72s；串行约 157s，两者结论一致）：
 
 ```bash
-python tools/run_all_tests.py          # 实际工具数 vs tests/README 里写死的断言 + 跑全部测试
-python tools/run_all_tests.py --no-run # 只做一致性检查（秒级，改工具后先跑这个）
+python tools/run_all_tests.py            # 实际工具数 vs tests/README 写死的断言 + 22 个模块
+python tools/run_all_tests.py --fast     # 只跑关键 5 批（改一两个模块时用，约 48s）
+python tools/run_all_tests.py --only test_batch36,test_batch35   # 指定模块
+python tools/run_all_tests.py --jobs 1   # 退化成串行（怀疑并发干扰时用）
+python tools/run_all_tests.py --no-run   # 只做一致性检查（秒级，改工具后先跑这个）
 ```
+
+> 并发的安全前提是「各模块自带 mock、端口互不相同」；共用同一个守卫端口的模块（`EXCLUSIVE_GROUPS`：`test_batch29`/`test_batch35`）会被自动排到串行尾巴，避免互相抢端口跑出假失败。
 
 单个模块：
 
 ```bash
-python tests/test_e2e.py     # UVClient 协议闭环（25 项）
-python tests/test_mcp.py     # MCP Server 工具注册与调用（19 项）
+python tests/test_e2e.py     # UVClient 协议闭环（26 项）
+python tests/test_mcp.py     # MCP Server 工具注册与调用（31 项）
 python tests/test_stdio.py   # stdio 全链路客户端握手（7 项）
-python -m tests.test_batch36 # 非 MDK：工具链 / 档案 / OpenOCD / trace 四组（116 项）
+python -m tests.test_batch36 # 非 MDK：工具链 / 档案 / OpenOCD / trace 四组（137 项）
 ```
 
 单独启动模拟调试器供人工联调：
