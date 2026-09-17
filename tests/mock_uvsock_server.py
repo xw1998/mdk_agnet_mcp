@@ -93,6 +93,16 @@ class MockUVSOCKServer:
         # auto_stop_reads 为还剩几次 STATUS 查询仍报运行态，之后转为停止并落到 auto_stop_pc。
         self.auto_stop_reads = None
         self.auto_stop_pc = None
+        # 停止时置位的 DFSR 位（批次24）：模拟「数据观察点命中 → DWTTRAP(bit2) 置位」。
+        # 例如 auto_stop_dfsr = 0x04 即表示这次停止是 DWT 比较器触发的。
+        self.auto_stop_dfsr = None
+        # 批次24：停止瞬间改写内存，模拟「数据观察点在等待期间被写」（值变化证据链路）。
+        # 形如 [(addr, value_int, size_bytes), ...]
+        self.auto_stop_writes = None
+        # DFSR（0xE000ED30）：真实硬件为 W1C（写 1 清位），这里如实模拟。
+        self.dfsr = 0
+        # DWT 比较器比较地址（COMP0..3 @ 0xE0001020 + 0x10n），供观察点定位测试。
+        self.dwt_comps = [0, 0, 0, 0]
         # --- 真机行为模拟钩子（供批次14 测试 A/B 修复）---
         # >0 时：每个请求的响应前先发 N 个 r_cmd 不匹配的陈旧响应帧（模拟真机响应队列残留）
         self.stale_frames = 0
@@ -295,6 +305,17 @@ class MockUVSOCKServer:
                     if self.auto_stop_pc is not None:
                         for _k in ("__currentPC()", "PC", "R15"):
                             self.reg_map[_k] = self.auto_stop_pc
+                    if self.auto_stop_dfsr:
+                        self.dfsr |= self.auto_stop_dfsr
+                    if self.auto_stop_writes:
+                        for _wa, _wv, _ws in self.auto_stop_writes:
+                            _off = _wa - 0x20000000
+                            if 0 <= _off and _off + _ws <= len(self.mem):
+                                _fmt = {1: '<B', 2: '<H', 4: '<I'}.get(_ws, '<I')
+                                try:
+                                    struct.pack_into(_fmt, self.mem, _off, _wv)
+                                except Exception:
+                                    pass
                     self.auto_stop_reads = None
             # 模拟真实 Keil：r_status 恒为成功，运行状态在响应 data 低字节（0=停止,1=执行中）
             data = b"\x01" if self.running else b"\x00"
@@ -587,6 +608,11 @@ class MockUVSOCKServer:
             key = {0xE000ED04: "icsr", 0xE000ED28: "cfsr", 0xE000ED2C: "hfsr",
                    0xE000ED34: "mmfar", 0xE000ED38: "bfar"}[nAddr]
             payload = struct.pack('<I', self.scb[key] & 0xFFFFFFFF)
+        elif nAddr == 0xE000ED30:  # DFSR（Debug Fault Status Register，W1C）
+            payload = struct.pack('<I', self.dfsr & 0xFFFFFFFF)
+        elif nAddr in (0xE0001020, 0xE0001030, 0xE0001040, 0xE0001050):  # DWT_COMP0..3
+            _i = (nAddr - 0xE0001020) // 0x10
+            payload = struct.pack('<I', self.dwt_comps[_i] & 0xFFFFFFFF)
         elif nAddr == 0xE0042000:  # DBGMCU->IDCODE（供 target_info）
             payload = struct.pack('<I', self.idcode & 0xFFFFFFFF)
         elif 0x40000000 <= nAddr < 0x40000000 + len(self.periph):  # 外设段
@@ -606,6 +632,16 @@ class MockUVSOCKServer:
         if nAddr in (0xE000EDFC, 0xE0001000, 0xE0001004):  # DWT/SCS 调试寄存器
             key = {0xE000EDFC: "demcr", 0xE0001000: "ctrl", 0xE0001004: "cyccnt"}[nAddr]
             self.dwt[key] = struct.unpack('<I', payload[:4])[0]
+            resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
+            return uvsock.UV_STATUS_SUCCESS, resp
+        if nAddr == 0xE000ED30:  # DFSR：W1C，写 1 清位
+            _val = struct.unpack('<I', payload[:4])[0]
+            self.dfsr &= (~_val) & 0xFFFFFFFF
+            resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
+            return uvsock.UV_STATUS_SUCCESS, resp
+        if nAddr in (0xE0001020, 0xE0001030, 0xE0001040, 0xE0001050):  # DWT_COMP0..3
+            _i = (nAddr - 0xE0001020) // 0x10
+            self.dwt_comps[_i] = struct.unpack('<I', payload[:4])[0]
             resp = struct.pack('<QIQI', nAddr, nBytes, 0, 0)
             return uvsock.UV_STATUS_SUCCESS, resp
         if 0x40000000 <= nAddr < 0x40000000 + len(self.periph):

@@ -61,6 +61,37 @@ def _csv_tokens(value, sep_extra=";|"):
     raw = raw.replace(" ", ",")
     return [x.strip() for x in raw.split(",") if x.strip()]
 
+def _items_arg(value):
+    """「结构化列表」参数的类型兼容：数组 / JSON 数组字符串 / 分隔符字符串。
+
+    第 9 轮通则：所有接受「列表」的参数都同时接受数组与分隔符字符串，不要让 AI 靠报错
+    学习签名。用于 read_mem_multi.addresses、batch.commands 这类元素为对象的列表参数：
+    - 数组 / 元组 / 集合：原样返回
+    - JSON 字符串（以 [ 或 { 开头）：json.loads 解析
+    - 其余字符串：按逗号/分号/竖线/空格拆成 token，元素再按各自类型处理
+    解析失败时抛 ValueError，由调用方转成带说明的 error 返回。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        if s[:1] in "[{":
+            try:
+                loaded = json.loads(s)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(
+                    "参数是字符串且看起来像 JSON，但解析失败：%s"
+                    "（请改为规范的 JSON 数组，或直接用数组写法）" % e)
+            if isinstance(loaded, (list, tuple)):
+                return list(loaded)
+            return [loaded]
+        return _csv_tokens(s)
+    return [value]
+
 # 全局共享一个带连接缓存的客户端（线程安全）
 _client: UVClient | None = None
 # 编译/烧录配置（UV4.exe 路径与默认工程）
@@ -1522,6 +1553,21 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if not r.get("ok"):
                 out["error"] = f"设置数据断点失败: {r}"
                 return _js(out)
+            # 批次24：记录观察地址当前值，作为「命中时该地址是否真被改写」的基线。
+            # 真机上观察点往往在 run 后几微秒内就命中、目标随即停住，等待开始时的
+            # 现场读取拿到的已是变动后的值，故基线必须在设点时就留下。
+            try:
+                # 仅在目标停止时记录：运行中读到的值可能是陈旧值，用它当基线会高估
+                # 「本次等待期间被改写」的证据强度，宁可退化为「无基线」。
+                if client.get_status().get("running") is False:
+                    client.watch_remember_values([addr])
+                    out["baseline_ready"] = True
+                else:
+                    out["baseline_ready"] = False
+                    out["baseline_note"] = ("目标当时处于运行态，未记录值变化基线；"
+                                            "命中判定会退化为「无基线」而不冒充证据")
+            except Exception:  # noqa: BLE001
+                pass
             loc = _get_locator()
             l = loc.locate(addr) if loc else None
             if l and l.get("file"):
@@ -2151,13 +2197,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="获取调试状态快照",
         description=(
             "一次返回当前调试位置的全貌：PC、文件:行、源码上下文、完整调用栈、当前函数局部变量，"
-            "以及指定的全局变量（globals 参数传入变量名列表）。AI 排查问题时一次调用即可获得完整画面，"
+            "以及指定的全局变量（globals 传变量名列表，数组或逗号/分号分隔字符串均可）。"
+            "AI 排查问题时一次调用即可获得完整画面，"
             "避免多次 get_current_location/read_locals/read_variable 往返。globals 可选，"
             "如 ['SystemCoreClock','test_array']。需已进入调试且配置 .axf。注意：聚合 read_locals/get_current_location，同样受中断上下文限制——全速运行后手动 stop 或停在 SysTick 中断时，局部变量与完整调用栈可能层数受限/为空。"
         ),
     )
-    async def snapshot(globals: list = None, source_context: int = 4) -> str:
+    async def snapshot(globals: list | str = None, source_context: int = 4) -> str:
         try:
+            globals = _csv_tokens(globals)
             client = _get_client()
             loc = _get_locator()
             if not loc or not loc.is_ready():
@@ -2210,12 +2258,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="批量读取表达式",
         description=(
             "一次求值多个表达式（变量/寄存器/指针解引用等）并返回结果，减少往返调用。"
-            "expressions 为表达式列表，如 ['SystemCoreClock','timer.sec','*(uint32_t*)0x20000000']。"
+            "expressions 为表达式列表，如 ['SystemCoreClock','timer.sec','*(uint32_t*)0x20000000']；"
+            "也接受分隔符字符串（数组写法优先；字符串写法建议用分号分隔，避免表达式内部的逗号被拆开）。"
             "需已进入调试状态。注意：需目标暂停，运行中表达式无法求值；刚停止瞬间个别表达式可能读到脏值。"
         ),
     )
-    async def watch(expressions: list) -> str:
+    async def watch(expressions: list | str) -> str:
         try:
+            expressions = _csv_tokens(expressions)
             client = _get_client()
             if not expressions:
                 return _js({"ok": False, "error": "expressions 不能为空"})
@@ -2475,8 +2525,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     async def dwt() -> str:
         try:
             client = _get_client()
-            _dwt_enable(client)
+            if not _dwt_enable(client):
+                return _js({"ok": False,
+                            "error": ("使能 DWT 失败（无法写 DEMCR.TRCENA 或 DWT_CTRL.CYCCNTENA）："
+                                      "请先 enter_debug 并确认目标已停止")})
             cycles = _dwt_read_u32(client, _DWT_CYCCNT)
+            if cycles is None:
+                return _js({"ok": False,
+                            "error": ("读不到 DWT->CYCCNT（0xE0001004）：常见原因是尚未进入调试态"
+                                      "或目标正在运行（本工具需目标暂停），也可能是目标器件无 DWT。"
+                                      "请先 enter_debug 并 stop 后重试。")})
             freq = None
             try:
                 f = client.calc_expression("SystemCoreClock")
@@ -2687,11 +2745,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "源码上下文 + 完整调用栈 + 当前函数局部变量 + 指定关键全局变量，生成结构化现场报告。"
             "AI 接到 bug 报告后一次调用即可看清程序卡在哪、寄存器状态、正在执行什么指令、谁调进来的，"
             "避免多次 get_current_location/read_registers/disassemble/read_locals 往返。"
-            "globals 可选，传关键全局变量名列表。需已进入调试且配置 .axf。注意：聚合多个只读诊断，同样受中断上下文限制——停在 SysTick 中断/全速运行后手动 stop 时，局部变量与完整调用栈可能受限/为空。需已进入调试且配置 .axf。"
+            "globals 可选，传关键全局变量名列表（数组或逗号/分号分隔字符串均可）。需已进入调试且配置 .axf。注意：聚合多个只读诊断，同样受中断上下文限制——停在 SysTick 中断/全速运行后手动 stop 时，局部变量与完整调用栈可能受限/为空。需已进入调试且配置 .axf。"
         ),
     )
-    async def diagnose(globals: list = None, source_context: int = 4, disasm_count: int = 6) -> str:
+    async def diagnose(globals: list | str = None, source_context: int = 4,
+                       disasm_count: int = 6) -> str:
         try:
+            globals = _csv_tokens(globals)
             client = _get_client()
             loc = _get_locator()
             if not loc or not loc.is_ready():
@@ -2856,12 +2916,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "调用时先给一个很短的宽限窗口确认目标是真想跑（run 是异步命令，响应会滞后），"
             "若窗口内没见运行且 PC 相对调用时没有移动，才判为旧停止。"
             "注意：命中判定为「目标已停止 且 PC 等于候选地址」（自动兼容 Thumb 位），"
-            "并额外支持数据观察点命中——数据断点触发时 PC 不等于观察地址，工具会在等待前后"
-            "各读一次 Keil 断点表的 CNT：若某条 CNT 增加即为命中项；"
+            "并额外支持数据观察点命中——数据断点触发时 PC 不等于观察地址，判定链路按证据强度递减："
+            "① 等待前后各读一次 Keil 断点表的 CNT，某条 CNT 增加即为命中项；"
+            "② 读 DFSR(0xE000ED30)：等待开始前先清零（DFSR 为 W1C），命中后若 DWTTRAP(bit2) "
+            "置位即判为观察点命中，并用 DWT_COMPn 定位命中的是哪个观察点——这是硬件证据；"
             "**真机实测（UVSOCK@4823 + STM32F401）本版 Keil 的 BL CNT 是断点计数条件设置值、"
-            "不随命中递增**，此时退化为「目标已停止 + PC 不在任何代码候选 + 存在观察点」"
-            "推断为观察点命中，返回 hit_kind（code/watch）、hit_entry（来源见 source 字段，"
-            "推断时 source=inferred）与 cnt_note（说明判定依据强度）；"
+            "不随命中递增**，此时由 ② 接手；③ ①② 都取不到时才退化为「目标已停止 + PC 不在"
+            "任何代码候选 + 存在观察点」推断为观察点命中。"
+            "返回 hit_kind（code/watch）、hit_confidence（verified=有 PC/CNT/DFSR 实际证据，"
+            "inferred=纯推断）、hit_entry（source 字段：pc/cnt/dfsr/inferred）、"
+            "dfsr / dfsr_note（DFSR 原始值与解读）与 cnt_note（说明判定依据强度）；"
             "候选来源除 symbol/address/.uvoptx 外，还包含本服务 set_watchpoint 设的数据观察点，"
             "以及在无其他候选时取 Keil 真实断点表（list_breakpoints.real）中的执行断点；"
             "若本该命中却一直不停，先用 list_breakpoints / list_uvoptx_breakpoints 确认断点存在且启用"
@@ -3605,13 +3669,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "记录/对比调试状态的基线：首次调用创建基线（保存指定 globals 与 PC/LR/SP 寄存器），"
             "之后调用对比当前状态，输出 changed/unchanged/unreadable。用于观察程序运行后哪些变量/"
-            "寄存器发生变化，定位被意外改写的状态。globals 传变量名列表（如 ['SystemCoreClock']）。"
+            "寄存器发生变化，定位被意外改写的状态。globals 传变量名列表（如 ['SystemCoreClock']，"
+            "数组或逗号/分号分隔字符串均可）。"
             "需已进入调试且配置 .axf。注意：首次调用创建基线、之后调用做对比；需目标暂停。若两次调用间目标已重启，寄存器基线（PC/SP/LR）对比意义有限。"
         ),
     )
-    async def snapshot_diff(globals: list = None) -> str:
+    async def snapshot_diff(globals: list | str = None) -> str:
         global _snapshot_baseline
         try:
+            globals = _csv_tokens(globals)
             client = _get_client()
             loc = _get_locator()
             if not loc or not loc.is_ready():
@@ -3863,15 +3929,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="read_mem_multi",
         title="一次读取多个地址的内存",
         description=(
-            "批量读内存：addresses 传地址列表，每项为 {addr, n_bytes}（n_bytes 缺省 32）。"
+            "批量读内存：addresses 传地址列表，每项为 {addr, n_bytes}（n_bytes 缺省 32）；也可直接传地址字符串"
+            "（如 \"0x20000000,0x20001000\"）或地址数组，此时每处按 n_bytes=32 读。"
             "一次 MCP 往返读多个地址，减少 AI 连续调用 read_mem 的往返。返回每处 ok/data_hex/ascii。注意：批量读内存，需目标暂停（运行中读取会失败/错位）；仍受异步消息堆积影响，建议先 stop。"
         ),
     )
-    async def read_mem_multi(addresses: list) -> str:
+    async def read_mem_multi(addresses: list | str) -> str:
         try:
             client = _get_client()
             results = []
-            for item in addresses or []:
+            for item in _items_arg(addresses):
                 if isinstance(item, dict):
                     addr = item.get("addr", item.get("address", ""))
                     size = int(item.get("n_bytes", item.get("size", 32)) or 32)
@@ -3892,7 +3959,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="batch",
         title="批量执行多条命令（读类 + 断点 + 运行控制）",
         description=(
-            "一次提交多条命令、聚合返回，减少 AI 往返。commands 为列表，每项 {\"tool\": \"工具名\", \"args\": {\"参数名\": 值}}；"
+            "一次提交多条命令、聚合返回，减少 AI 往返。commands 为列表（也接受 JSON 数组字符串），"
+            "每项 {\"tool\": \"工具名\", \"args\": {\"参数名\": 值}}；"
             "tool 必须是本服务已注册的工具名（**本服务全部工具都支持**，含 disassemble、编译烧录、"
             "断点管理、运行控制等；仅不支持 batch 自身，避免递归），"
             "args 就是该工具自己的参数名（可先看该工具描述末尾的【参数】/【调用示例】）。"
@@ -3906,12 +3974,12 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "会按顺序真实执行，请自行确认顺序与后果。"
         ),
     )
-    async def batch(commands: list, stop_on_error: bool = False) -> str:
+    async def batch(commands: list | str, stop_on_error: bool = False) -> str:
         try:
             _get_client()
             tm = getattr(server, "_tool_manager", None)
             results = []
-            for c in commands or []:
+            for c in _items_arg(commands):
                 tool = str((c or {}).get("tool", "") or "")
                 args = dict((c or {}).get("args", {}) or {})
                 one = {"tool": tool, "ok": False}

@@ -38,6 +38,23 @@ _CMD_ERROR_RE = re.compile(r"\*\*\*\s*error\s+(\d+)\s*:\s*(.*)", re.IGNORECASE)
 # 故不能一进来就凭「已停止 + PC 匹配」下命中结论。
 _WAIT_RUN_GRACE_S = 0.4
 
+# DFSR（Debug Fault Status Register，Cortex-M 系统控制空间 0xE000ED30）——最近一次调试
+# 事件的硬证据。数据观察点（DWT 比较器）命中时 DWTTRAP(bit2) 置位，可把 wait_breakpoint
+# 的观察点判定从「推断」升级为「实测」。
+# 真机实测（STM32F429 + Keil UVSOCK@4823）：read_mem 读 0xE000ED30 可稳定读到（需已进入
+# 调试、目标暂停）；DFSR 是 W1C（写 1 清位），故等待开始前先清一次，等待期间再置位的
+# 就是本次事件——只看结果不区分历史残留会误判（实测刚进调试 DFSR 就可能已带 VCATCH 位）。
+_DFSR_ADDR = 0xE000ED30
+_DFSR_HALTED = 1 << 0     # 调试器挂起
+_DFSR_BKPT = 1 << 1       # BKPT 指令命中（软件断点）
+_DFSR_DWTTRAP = 1 << 2    # DWT 比较器命中（数据观察点）
+_DFSR_VCATCH = 1 << 3     # Vector catch
+_DFSR_EXTERNAL = 1 << 4   # 外部调试请求
+
+# DWT 比较器逐个保持「比较地址 + 掩码 + 功能」三元组，间隔 0x10：COMPn@0xE0001020+0x10n。
+_DWT_COMP_BASE = 0xE0001020
+_DWT_FUNC_BASE = 0xE0001028
+
 # Keil 命令窗口 BL 输出行，真机实测形如：
 #   0: (E 0x08000DB4) '\\mdk_test\../Core/Src/main.c\77', CNT=1, enabled
 #   3: (A WR 0x20000000 len=1) '0x20000000', CNT=1, enabled
@@ -90,6 +107,11 @@ class UVClient:
         self.phy = UVInterface(host=host, port=port)
         self._stop_pc_hist = []   # 最近几次停止点 PC，用于识别「同一地址反复出现」
         self._bp_hits = {}        # 断点命中计数 {addr: count}（本进程内累计）
+        # 批次24：被观察地址的历史值（设点时 / 上一停止点读到的），作为数据观察点
+        # 「本次运行窗口内是否被改写」的基线。真机实测：观察点打在频繁写入的变量上时，
+        # run 后几微秒内变量就被写、目标随即被 Keil 停住，等待开始时的现场读取拿到的
+        # 已是变动后的值，只有历史记录才能构成值变化证据。
+        self._watch_value_cache = {}
         # 命令窗口/异步消息缓冲的读取游标：内部命令（BS/BK/BL）只取「新增」部分做窗口级
         # 校验，绝不 clear——否则 read_console_output 随后就读不到命令窗口输出了。
         self._cons_seen = 0
@@ -944,6 +966,190 @@ class UVClient:
                 continue
         return snap or None
 
+    def read_dfsr(self) -> dict:
+        """读 DFSR（Debug Fault Status Register，0xE000ED30）——最近一次调试事件。
+
+        数据观察点（DWT 比较器）命中时 dwt_trap(bit2) 置位，这是「数据断点真的命中了」
+        的直接硬证据（第 9 轮反馈：希望把观察点命中从 inferred 升级为 verified）。
+        需已进入调试且目标暂停；读不到时返回 ok=False，调用方应降级判定而非报错。
+        注意 DFSR 是 W1C（写 1 清位），要判断「本次等待期间是否发生过」必须先清零。
+        返回 {ok, value, value_hex, halted, bkpt, dwt_trap, vcatch, external}。
+        """
+        try:
+            r = self.read_mem(_DFSR_ADDR, 4)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "value": None, "error": str(e)}
+        if not r.get("ok"):
+            return {"ok": False, "value": None, "status": r.get("status"),
+                    "status_text": r.get("status_text"),
+                    "error": "读取 DFSR 失败：%s" % (r.get("status_text") or r.get("status"))}
+        v = int.from_bytes(bytes.fromhex(r["data_hex"]), "little")
+        return {"ok": True, "value": v, "value_hex": "0x%08X" % v,
+                "halted": bool(v & _DFSR_HALTED), "bkpt": bool(v & _DFSR_BKPT),
+                "dwt_trap": bool(v & _DFSR_DWTTRAP), "vcatch": bool(v & _DFSR_VCATCH),
+                "external": bool(v & _DFSR_EXTERNAL)}
+
+    def clear_dfsr(self, mask: int | None = None) -> dict:
+        """清 DFSR 指定位（W1C：写 1 清除）。默认清 HALTED/BKPT/DWTTRAP/VCATCH。"""
+        if mask is None:
+            mask = _DFSR_HALTED | _DFSR_BKPT | _DFSR_DWTTRAP | _DFSR_VCATCH
+        try:
+            r = self.write_mem(_DFSR_ADDR, struct.pack("<I", mask & 0xFFFFFFFF))
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "mask": "0x%08X" % (mask & 0xFFFFFFFF), "error": str(e)}
+        return {"ok": bool(r.get("ok")), "mask": "0x%08X" % (mask & 0xFFFFFFFF),
+                "status": r.get("status"), "written": r.get("written", 0)}
+
+    def dwt_comp_values(self, count: int = 4) -> list:
+        """读 DWT_COMP0..n 的比较地址，用于把「观察点命中」定位到具体是哪一个比较器。
+
+        读不到的位置返回 None，调用方自行降级。需目标暂停。
+        """
+        out = []
+        for i in range(max(0, int(count))):
+            addr = _DWT_COMP_BASE + 0x10 * i
+            try:
+                r = self.read_mem(addr, 4)
+            except Exception:  # noqa: BLE001
+                r = {"ok": False}
+            if r.get("ok") and r.get("data_hex"):
+                out.append(int.from_bytes(bytes.fromhex(r["data_hex"]), "little"))
+            else:
+                out.append(None)
+        return out
+
+    def dwt_func_values(self, count: int = 4) -> list:
+        """读 DWT_FUNCTION0..n（含 MATCHED 状态位），用于交叉确认数据观察点触发。"""
+        out = []
+        for i in range(max(0, int(count))):
+            addr = _DWT_FUNC_BASE + 0x10 * i
+            try:
+                r = self.read_mem(addr, 4)
+            except Exception:  # noqa: BLE001
+                r = {"ok": False}
+            if r.get("ok") and r.get("data_hex"):
+                out.append(int.from_bytes(bytes.fromhex(r["data_hex"]), "little"))
+            else:
+                out.append(None)
+        return out
+
+    def watch_value_snapshot(self, watch_addrs) -> dict:
+        """读被观察地址的当前值（4 字节），作为「等待期间是否被改写」的基线。
+
+        数据观察点是对某地址的访问触发：若等待期间该地址的值真的变了，那就是「写访问
+        确实发生过」的数据侧证据（第 9 轮建议③的可行替代——真机实测 Keil 在 halt 后
+        会自行读走 DFSR/MATCHED，硬件命中位拿不到）。
+        """
+        snap = {}
+        for a in (watch_addrs or []):
+            try:
+                a = int(a)
+                r = self.read_mem(a, 4)
+            except Exception:  # noqa: BLE001
+                continue
+            if r.get("ok") and r.get("data_hex"):
+                snap[a] = r["data_hex"]
+        return snap
+
+    def watch_remember_values(self, watch_addrs) -> dict:
+        """在目标处于停止态时记录被观察地址的值，作为后续等待的基线。
+
+        调用点：设置数据观察点成功后、以及每次等待结束时（把本次停止点的值留作
+        下一次的基线）。目标运行中读到的值可能是陈旧值，不做记录意义不大，但记录
+        也不会造成误判（值未变就不算证据）。
+        """
+        snap = self.watch_value_snapshot(watch_addrs)
+        if not isinstance(getattr(self, "_watch_value_cache", None), dict):
+            self._watch_value_cache = {}
+        self._watch_value_cache.update(snap)
+        return snap
+
+    def watch_baseline(self, watch_addrs) -> dict:
+        """取「本次等待期间地址是否被改写」的基线：优先历史记录，缺失的再现场读。
+
+        历史记录来自 watch_remember_values（设点 / 上一停止点）；只有从未记录过的
+        地址才回退到现场读取，并在返回值旁记录用了哪些历史值，便于如实措辞。
+        """
+        cache = getattr(self, "_watch_value_cache", None) or {}
+        out, missing, cached = {}, [], []
+        for a in (watch_addrs or []):
+            try:
+                a = int(a)
+            except Exception:  # noqa: BLE001
+                continue
+            if a in cache:
+                out[a] = cache[a]
+                cached.append(hex(a))
+            else:
+                missing.append(a)
+        if missing:
+            out.update(self.watch_value_snapshot(missing))
+        self._watch_baseline_cached = cached
+        return out
+
+    def watch_value_check(self, watch_addrs, before) -> dict:
+        """对比被观察地址的「等待前 / 命中后」值，返回逐地址比对结果。
+
+        命中后顺带把「停止点的值」写入历史记录：本次窗口结束，它就是下一次的基线。
+        """
+        out = {}
+        for a in (watch_addrs or []):
+            try:
+                a = int(a)
+                b = (before or {}).get(a)
+                r = self.read_mem(a, 4)
+            except Exception:  # noqa: BLE001
+                continue
+            after = r.get("data_hex") if r.get("ok") else None
+            out[hex(a)] = {"before": b, "after": after,
+                           "changed": bool(b and after and b != after)}
+            if after and isinstance(getattr(self, "_watch_value_cache", None), dict):
+                self._watch_value_cache[a] = after
+        return out
+
+    def watch_hw_loaded(self, watch_addrs) -> dict:
+        """确认数据观察点是否已装载到 DWT 比较器（读 DWT_COMPn 与候选地址比对）。
+
+        真机实测（UVSOCK@4823 + STM32F429）：Keil 用 DWT 比较器实现数据观察点，
+        设点后 COMPn 会等于观察地址。可据此区分「Keil 没把观察点装进硬件」（此时再等
+        也不可能命中）与「装了但本次未触发」，避免把两种情况一律归为推断。
+        """
+        comps = self.dwt_comp_values()
+        loaded = {}
+        for a in (watch_addrs or []):
+            try:
+                a = int(a)
+            except Exception:  # noqa: BLE001
+                continue
+            loaded[hex(a)] = any(
+                c is not None and (c == a or (c | 1) == a or c == (a | 1)) for c in comps)
+        return {"loaded": loaded, "any_loaded": any(loaded.values()),
+                "dwt_comp": [None if c is None else hex(c) for c in comps],
+                "note": "DWT_COMPn 与观察地址匹配 = 观察点已装到硬件比较器；"
+                        "注意 Keil 在 halt 后会自行读走 DFSR/MATCHED，硬件命中位通常读不到"}
+
+    def _match_watch_candidate(self, watch_addrs) -> tuple:
+        """已有 DFSR.DWTTRAP 硬证据时，用 DWT_COMPn 定位命中的是哪个观察点。
+
+        返回 (matched_addr, note)；比较器读不到或对不上候选时退回候选列表首个地址，
+        并在 note 里说明退回了（不静默改变依据强度）。
+        """
+        comps = self.dwt_comp_values()
+        for c in comps:
+            if c is None or c == 0:
+                continue
+            for a in watch_addrs:
+                try:
+                    a = int(a)
+                except Exception:  # noqa: BLE001
+                    continue
+                if c == a or (c | 1) == a or c == (a | 1):
+                    return a, "DWT_COMP 匹配到观察点地址 %s" % hex(a)
+        known = [hex(c) for c in comps if c]
+        vals = "、".join(known) if known else "无"
+        return int(watch_addrs[0]), ("DWT_COMP 未匹配到候选观察点（读到 %s），"
+                                     "已退回候选列表首个地址" % vals)
+
     def wait_breakpoint(self, addresses=None, timeout_s: float = 10.0,
                         poll: float = 0.1, watch_addresses=None,
                         use_cnt: bool = True) -> dict:
@@ -953,9 +1159,13 @@ class UVClient:
         用于只想等一个停止事件的场景。地址匹配自动兼容 Thumb 位（pc 与 addr 差 1）。
         watch_addresses: 数据观察点地址列表（int）。数据断点命中时 PC 不等于观察地址，
         故不能按 PC 判定。判定顺序：① 等待前后各读一次 Keil 断点表的 CNT，若某条 CNT
-        增加，该条即命中项（代码断点同样适用）；② 取不到有效增量时退化为「目标已停止
-        + PC 不在任何代码候选 + 存在数据观察点」推断为观察点命中，并在 hit_entry.source
-        标注 "inferred"、cnt_note 说明依据强度。
+        增加，该条即命中项（代码断点同样适用）；② 读 DFSR(0xE000ED30)，若 DWTTRAP(bit2)
+        置位（等待开始前已清零，故代表本次事件）则判为观察点命中，hit_entry.source="dfsr"
+        ——这是硬件证据，hit_confidence="verified"，并用 DWT_COMPn 定位是哪个观察点；
+        ③ 两者都取不到时退化为「目标已停止 + PC 不在任何代码候选 + 存在数据观察点」
+        推断为观察点命中，hit_entry.source="inferred"、hit_confidence="inferred"，
+        cnt_note 说明依据强度。结果里附 dfsr / dfsr_note（读到时给出 DWTTRAP/BKPT 位，
+        读不到时说明原因）。
         注意（真机实测 UVSOCK@4823 + STM32F401）：同一断点命中多次，BL 输出的 CNT 恒为 1
         ——该字段是断点的计数条件设置值（.uvoptx 的 break_if_rcount），不是命中次数，
         故②才是常见路径；hit_kind 给 "code"/"watch"，hit_entry 注明来源。
@@ -981,8 +1191,9 @@ class UVClient:
         窗口内没见运行再读 PC 比对。
 
         返回 {ok, hit, hit_address, hit_count, waited_ms, polls, candidates, registers,
-        pc_confidence, hit_kind, hit_entry, ran_during_wait, stop_is_new, new_stop_basis,
-        warning, repeat_warning}；超时返回 ok=False 且给出候选清单与原因。
+        pc_confidence, hit_kind, hit_confidence, hit_entry, dfsr, dfsr_note,
+        ran_during_wait, stop_is_new, new_stop_basis, warning, repeat_warning}；
+        超时返回 ok=False 且给出候选清单与原因。
         """
         adrs = []
         for a in (addresses or []):
@@ -1021,6 +1232,15 @@ class UVClient:
                 pc_entry = _r0["pc"]
         # 宽限窗口不超过调用方给的超时，避免 wait_breakpoint(timeout_s=0.2) 反而等更久
         grace_deadline = t0 + min(_WAIT_RUN_GRACE_S, max(0.0, float(timeout_s)))
+        # DFSR 硬证据基线（第 9 轮建议③）：先读一次前值、再清零（W1C）——等待期间重新置位
+        # 的就是本次事件（只看结果不区分历史残留会误判）。目标当时可能在运行，读不到就降级。
+        dfsr_base = self.read_dfsr()
+        dfsr_cleared = False
+        if dfsr_base.get("ok"):
+            dfsr_cleared = bool(self.clear_dfsr().get("ok"))
+        # 数据观察点：等待开始前记录被观察地址的值，命中后比对（数据侧证据）
+        # 值变化基线：优先「设点时 / 上一停止点」的历史值（现场读可能已是被改写后的值）
+        watch_before = self.watch_baseline(watch_addrs) if watch_addrs else {}
         # 命中计数基线：等待期间目标可能在运行，读失败也只是降级，不影响主流程
         cnt_base = self.bp_count_snapshot() if use_cnt else None
         deadline = t0 + max(0.0, float(timeout_s))
@@ -1044,6 +1264,9 @@ class UVClient:
                                    max(0.0, grace_deadline - time.time())))
                     continue
                 regs = self.read_cpu_registers_stable(retries=20, delay=0.03)
+                # DFSR 当前值（目标已停，可读）：DWTTRAP=数据观察点触发、BKPT=软件断点。
+                dfsr_now = self.read_dfsr()
+                dfsr_used = False
                 pc = regs.get("pc") if isinstance(regs.get("pc"), int) else None
                 pc_moved = pc_entry is not None and pc is not None and pc != pc_entry
                 if stop_is_new_unknown and not pc_moved:
@@ -1072,6 +1295,7 @@ class UVClient:
                 # 等待前各读一次，CNT 增加的那条就是命中项（代码断点与数据观察点都适用）。
                 hit_kind = "code" if matched is not None else None
                 hit_entry = None
+                vcheck = None
                 cnt_delta = {}
                 cnt_after = self.bp_count_snapshot() if use_cnt else None
                 if cnt_base and cnt_after:
@@ -1092,21 +1316,68 @@ class UVClient:
                         except Exception:  # noqa: BLE001
                             matched = None
                 elif matched is None and watch_addrs:
-                    # CNT 增量不可用（或本版 Keil 的 BL CNT 并非命中次数）时的退步判定：
-                    # 目标确实已停、又有数据观察点、PC 又不在任何代码候选上 → 判为观察点触发。
-                    # 实测（UVSOCK@4823 + STM32F401）：同一断点命中 3 次，BL 输出的 CNT 恒为 1，
-                    # 该字段是断点的计数条件设置值（.uvoptx 的 break_if_rcount），不是命中次数，
-                    # 故这里以推断为主，并在 hit_entry/cnt_note 里标明依据强度。
-                    if cnt_base and cnt_after:
-                        why = ("断点表 CNT 未随命中递增（本版 Keil 的 BL CNT 是断点计数条件、"
-                               "不是命中次数），已按「目标已停止且 PC 不在任何代码候选上」推断")
+                    # 判定链路（证据强度递减）：
+                    #   ① DFSR.DWTTRAP 置位 → 硬件命中位（等待前已清零，代表本次事件）；
+                    #   ② 被观察地址的值在等待期间被改写 → 数据侧实证；
+                    #   ③ 都拿不到 → 按「目标已停 + PC 不在代码候选 + 存在观察点」推断。
+                    # 真机实测（UVSOCK@4823 + STM32F429）：Keil 用 DWT 比较器实现数据观察点
+                    # （设点后 DWT_COMPn = 观察地址），但 halt 后 Keil 会自行读走 DFSR 与
+                    # DWT_FUNCTIONn.MATCHED，硬件命中位通常读到恒为 0，故 ② 是真机可行路径。
+                    if dfsr_now.get("ok") and dfsr_now.get("dwt_trap"):
+                        hit_kind = "watch"
+                        matched, _comp_note = self._match_watch_candidate(watch_addrs)
+                        hit_entry = {
+                            "kind": "access", "address": hex(int(matched)),
+                            "source": "dfsr",
+                            "note": ("DFSR.DWTTRAP=1（%s）：DWT 比较器触发，硬件证据"
+                                     % dfsr_now.get("value_hex"))}
+                        if _comp_note:
+                            hit_entry["note"] += "；" + _comp_note
+                        dfsr_used = True
                     else:
-                        why = ("未能取得断点表 CNT（等待开始时目标可能在运行或命令窗口不可用），"
-                               "已按「目标已停止且 PC 不在任何代码候选上」推断")
-                    hit_kind = "watch"
-                    matched = int(watch_addrs[0])
-                    hit_entry = {"kind": "access", "address": hex(int(watch_addrs[0])),
-                                 "source": "inferred", "note": why}
+                        _chg = []
+                        if watch_before:
+                            vcheck = self.watch_value_check(watch_addrs, watch_before)
+                            _chg = [k for k, v in vcheck.items() if v.get("changed")]
+                        if _chg:
+                            matched = int(_chg[0], 16)
+                            hit_kind = "watch"
+                            hit_entry = {
+                                "kind": "access", "address": _chg[0],
+                                "source": "value_changed",
+                                "note": ("被观察地址 %s 的值由 %s 变为 %s：数据侧实证"
+                                         "（该地址确实被写过）；非 DWT 硬件命中位。"
+                                         "基线取自%s"
+                                         % (_chg[0], vcheck[_chg[0]]["before"],
+                                            vcheck[_chg[0]]["after"],
+                                            ("设点/上一停止点的历史记录" if _chg[0] in
+                                             (getattr(self, "_watch_baseline_cached", None) or [])
+                                             else "等待开始时的现场读取")))}
+                        else:
+                            # 退步判定：CNT 增量不可用（或本版 Keil 的 BL CNT 并非命中次数）、
+                            # 也拿不到数据侧证据时，按「目标已停 + PC 不在代码候选 + 有观察点」推断。
+                            # 实测（UVSOCK@4823 + STM32F401）：同一断点命中 3 次，BL 输出的 CNT 恒为 1，
+                            # 该字段是断点的计数条件设置值（.uvoptx 的 break_if_rcount），不是命中次数，
+                            # 故这里以推断为主，并在 hit_entry/cnt_note 里标明依据强度。
+                            if cnt_base and cnt_after:
+                                why = ("断点表 CNT 未随命中递增（本版 Keil 的 BL CNT 是断点计数条件、"
+                                       "不是命中次数），已按「目标已停止且 PC 不在任何代码候选上」推断")
+                            else:
+                                why = ("未能取得断点表 CNT（等待开始时目标可能在运行或命令窗口不可用），"
+                                       "已按「目标已停止且 PC 不在任何代码候选上」推断")
+                            if watch_before:
+                                why += ("；被观察地址的值与基线一致、未观察到改写"
+                                        "（读不到值变化证据）")
+                            else:
+                                why += "；未能取得被观察地址的基线值（等待开始时目标可能在运行）"
+                            if dfsr_now.get("ok"):
+                                why += "；DFSR 已读到但 DWTTRAP=0（%s）" % dfsr_now.get("value_hex")
+                            else:
+                                why += "；DFSR 读取失败（未进入调试或目标不支持）"
+                            hit_kind = "watch"
+                            matched = int(watch_addrs[0])
+                            hit_entry = {"kind": "access", "address": hex(int(watch_addrs[0])),
+                                         "source": "inferred", "note": why}
                 if hit_entry is None and matched is not None and cnt_after:
                     # 真机实测本版 Keil 的 BL CNT 不随命中递增，此时按 PC 命中的代码断点
                     # 在 CNT 快照里找回同地址项，保证 hit=true 时也能说明"命中的是哪条"。
@@ -1134,6 +1405,35 @@ class UVClient:
                     out["hit_entry"] = hit_entry
                 if cnt_delta:
                     out["cnt_delta"] = {str(k): v for k, v in cnt_delta.items()}
+                # 命中依据强度：PC / CNT / DFSR 都是可核对的实际证据 → verified；仅「目标已停 +
+                # PC 不在候选 + 存在观察点」的纯推断 → inferred（第 9 轮反馈明确要求区分两者）。
+                _src = (hit_entry or {}).get("source")
+                if matched is not None and hit_kind:
+                    out["hit_confidence"] = "inferred" if _src == "inferred" else "verified"
+                if vcheck is not None:
+                    out["watch_value_check"] = vcheck
+                if watch_addrs:
+                    try:
+                        out["dwt_watch_loaded"] = self.watch_hw_loaded(watch_addrs)
+                    except Exception as e:  # noqa: BLE001
+                        out["dwt_watch_loaded"] = {"error": str(e)}
+                if dfsr_now.get("ok"):
+                    out["dfsr"] = dfsr_now
+                    if dfsr_now.get("dwt_trap"):
+                        _dfsr_what = "DWT 比较器触发（数据观察点）"
+                    elif dfsr_now.get("bkpt"):
+                        _dfsr_what = "软件断点命中"
+                    elif dfsr_now.get("vcatch"):
+                        _dfsr_what = "Vector catch"
+                    else:
+                        _dfsr_what = "无 DWT/BKPT 事件"
+                    out["dfsr_note"] = ("等待开始前%s清零 DFSR；当前 %s（%s）"
+                                       % ("已" if dfsr_cleared else "未能",
+                                          dfsr_now.get("value_hex"), _dfsr_what))
+                else:
+                    out["dfsr_note"] = ("未能读到 DFSR（%s）：数据观察点命中判定保持推断强度，"
+                                        "如需硬证据请确认已进入调试且目标暂停"
+                                        % (dfsr_now.get("error") or "未知原因"))
                 if use_cnt and not (cnt_base and cnt_after):
                     out["cnt_note"] = ("未能取得断点命中计数(CNT)基线（等待开始时目标可能在运行或"
                                        "命令窗口不可用），本次命中判定已降级；如需精确判定，"
