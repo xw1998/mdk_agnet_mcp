@@ -3390,30 +3390,58 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="launch_uvision",
         description=(
             "可见方式启动 Keil uVision 并打开工程，供人工查看界面 / 调试准备。"
-            "project 为 .uvprojx 路径，可省略以用默认工程；若已运行同工程则复用已有实例。"
-            "用户无需手动打开 Keil，AI 可通过本工具拉起。注意：UV4 是单实例程序，同工程重复 launch 会复用已有实例、不会新开窗口。若需加载新固件，请配合 flash_debug 闭环避免旧窗口调试旧代码。"
+            "project 为 .uvprojx 路径，可省略以用默认工程。"
+            "reuse（默认 true）：已有打开同一工程的 Keil 窗口时**复用**该窗口并前置，不新开——"
+            "真机实测 UV4.exe 并非单实例程序，反复调用本工具会累积出多个同工程窗口（曾达 6 个），"
+            "因此默认复用；确需第二个窗口时才传 reuse=false。"
+            "返回值含 reused / pid / instances（当前同工程窗口数）。"
+            "用户无需手动打开 Keil，AI 可通过本工具拉起；想看当前开了几个窗口用 list_uvision_instances，"
+            '想把多余的收掉用 close_uvision(keep="latest")。'
         ),
     )
-    async def launch_uvision(project: str = "") -> str:
+    async def launch_uvision(project: str = "", reuse: bool = True) -> str:
         try:
             if _builder_cfg["uv4"] is None:
                 raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定")
             p = _resolve_project(project)
-            return _js(builder.launch_uvision(_builder_cfg["uv4"], p))
+            return _js(builder.launch_uvision(_builder_cfg["uv4"], p, reuse=bool(reuse)))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="list_uvision_instances",
+        description=(
+            "列出当前所有 Keil uVision 实例：PID、启动时间、打开的工程、是否有窗口。"
+            "用于确认是否残留了多个同工程窗口——UV4.exe 并非单实例程序，反复 launch_uvision / "
+            "flash_debug 会累积实例而互不回收（真机上曾同时开着 6 个同工程窗口）。"
+            "project 可选：只统计打开该工程的实例。count>1 时返回 note 提示收敛方式。"
+            '收敛为一个窗口：close_uvision(keep="latest")。'
+        ),
+    )
+    async def list_uvision_instances(project: str = "") -> str:
+        try:
+            p = _resolve_project(project) if project else ""
+            return _js(builder.list_uvision_instances(p))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
         name="close_uvision",
         description=(
-            "关闭所有 Keil uVision 实例，配合 launch_uvision 实现 Keil 开关闭环。"
+            "关闭 Keil uVision 实例，配合 launch_uvision 实现 Keil 开关闭环。"
+            'keep="all"（默认）关闭全部实例；keep="latest" / "oldest" 只保留一个实例'
+            "（最新 / 最早启动的那个），其余关闭——用于把累积的多个同工程窗口收敛成一个，"
+            "只开一个窗口调试。project 非空时只处理打开该工程的实例。"
             "force 默认 False：先优雅关闭（发送关闭消息），残留则自动强制终止；"
-            "force=True 直接强制结束所有 UV4.exe。注意：会关闭所有 Keil 实例（含人工查看中的窗口），调用前确认无需保留。强制终止后立即重取进程列表可能短暂误报残留（本工具已轮询等待）。沙箱环境受权限/跨会话限制可能无法关闭，需在真实运行环境使用。"
+            "force=True 直接强制结束。返回 closed / kept / total_before / remaining。"
+            "注意：会关闭 Keil 窗口（含人工查看中的），调用前确认无需保留。强制终止后立即重取进程列表可能短暂误报残留（本工具已轮询等待）。沙箱环境受权限/跨会话限制可能无法关闭，需在真实运行环境使用。"
         ),
     )
-    async def close_uvision(force: bool = False) -> str:
+    async def close_uvision(force: bool = False, keep: str = "all",
+                            project: str = "") -> str:
         try:
-            return _js(builder.close_uvision(force=force))
+            p = _resolve_project(project) if project else ""
+            return _js(builder.close_uvision(force=force, keep=keep, project=p))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 

@@ -200,7 +200,12 @@ def _recover_debug_channel(uv4: str, project: str = "", wait: float = 20.0) -> d
     out = {"attempted": True, "launched": None, "port_listening": False,
            "connection_reset": False, "error": None, "wait_ms": 0}
     try:
-        out["launched"] = winutil.launch_detached(uv4, project or "")
+        # 与 launch_uvision 同一条路径：已有同工程窗口则复用，避免每次自愈都多开一个窗口
+        lr = launch_uvision(uv4, project or "")
+        out["launched"] = lr
+        out["reused_window"] = bool(lr.get("reused"))
+        if not lr.get("ok"):
+            out["error"] = "拉起 Keil 失败：%s" % lr.get("error")
     except Exception as e:  # noqa: BLE001
         out["error"] = "拉起 Keil 失败：%s" % e
     try:
@@ -312,23 +317,84 @@ def flash_download(uv4: str, project: str, target: str | None = None,
                    ensure_debug_channel=ensure_debug_channel, project=project)
 
 
-def launch_uvision(uv4: str, project: str) -> dict:
+def _same_project(a, b) -> bool:
+    """两个工程路径是否指向同一文件（大小写 / 分隔符 / 相对片段归一后再比）。"""
+    if not a or not b:
+        return False
+    try:
+        return (os.path.normcase(os.path.normpath(str(a)))
+                == os.path.normcase(os.path.normpath(str(b))))
+    except Exception:  # noqa: BLE001
+        return str(a).strip().lower() == str(b).strip().lower()
+
+
+def list_uvision_instances(project: str = "") -> dict:
+    """列出当前 Keil uVision 实例（PID / 启动时间 / 打开的工程 / 是否有窗口）。
+
+    存在的理由（真机实测）：UV4.exe **不是**单实例程序，同一工程可以被反复打开成多个
+    窗口且互不回收——每调用一次可见方式启动就可能多一个窗口。先把"现在开了几个"摆出来，
+    再决定要不要收敛。project 非空时只统计该工程的实例。
+    """
+    items = winutil.uv4_instances()
+    matched = [i for i in items if _same_project(i.get("project"), project)] if project else items
+    out = {
+        "ok": True,
+        "action": "列出Keil实例",
+        "count": len(matched),
+        "total": len(items),
+        "instances": [{
+            "pid": i.get("pid"),
+            "created": i.get("created"),
+            "created_str": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(i["created"]))
+                            if i.get("created") else None),
+            "project": i.get("project", ""),
+            "has_window": bool(i.get("has_window")),
+        } for i in matched],
+    }
+    if project:
+        out["project_filter"] = project
+    if len(matched) > 1:
+        out["note"] = ("同一工程已开 %d 个窗口（UV4 并非单实例程序）。"
+                       '如需收敛为一个：close_uvision(keep="latest")。' % len(matched))
+    return out
+
+
+def launch_uvision(uv4: str, project: str, reuse: bool = True) -> dict:
     """可见方式启动 Keil uVision 并打开指定工程（供调试查看界面）。
 
     以**脱离调用方 job** 的方式启动（CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS |
     CREATE_NEW_PROCESS_GROUP），并把标准流接到 DEVNULL。否则由 MCP 服务拉起的 UV4 会
     随调用链所在的 job 一起被回收（现象："刚拉起就没了"），标准流也会继承被污染的环境。
-    UV4.exe 是单实例程序：若已有实例打开相同工程，本次启动会复用（新进程随即退出）。
+
+    真机实测修正：UV4.exe **不是**单实例程序——同一工程可以被反复打开成多个窗口且互不
+    回收（曾累积 6 个同工程实例）。因此这里先枚举已有实例：
+    - reuse=True（默认）：已有同工程窗口则**复用**（前置该窗口）并如实返回 reused=true，
+      不再新开窗口；
+    - reuse=False：无条件新开一个窗口（仅在确实需要第二个窗口时使用）。
     """
+    if reuse and project:
+        same = [i for i in winutil.uv4_instances()
+                if _same_project(i.get("project"), project)]
+        if same:
+            cur = same[-1]                      # 列表按创建时间升序 → 末位为最新
+            focused = winutil.focus_window(cur.get("hwnd"))
+            return {
+                "ok": True, "reused": True, "pid": cur.get("pid"),
+                "instances": len(same), "focused": focused,
+                "msg": "已有同工程 Keil 实例，复用该窗口（未新开；当前同工程窗口 %d 个）"
+                       % len(same),
+                "hint": ('如需收敛到单窗口：close_uvision(keep="latest")；'
+                         "如需看全部实例：list_uvision_instances。"),
+            }
     r = winutil.launch_detached(uv4, project)
     if not r.get("ok"):
         return {"ok": False, "error": r.get("error", "启动 Keil 失败")}
     return {
-        "ok": True,
+        "ok": True, "reused": False,
         "pid": r.get("pid"),
         "creationflags": r.get("creationflags"),
         "breakaway": r.get("breakaway"),
-        "msg": "已脱离父进程启动 Keil uVision 并打开工程（若已运行同工程则复用已有实例）",
+        "msg": "已脱离父进程启动 Keil uVision 并打开工程",
         "hint": "UVSOCK 需数秒才监听；可用 keil_health 确认 port_listening，"
                 "或用 restart_keil 一步完成关闭→重启→等待→重连。",
     }
@@ -390,40 +456,67 @@ def _wait_pids_settle(wait: float = 2.0) -> list[int]:
         _time.sleep(0.1)
     return _uv4_pids()
 
-def close_uvision(force: bool = False, timeout: int = 10) -> dict:
-    """关闭所有 Keil uVision 实例（AI 管理 Keil 开关的闭环，纯 ctypes 不依赖 taskkill）。
+def close_uvision(force: bool = False, timeout: int = 10, keep: str = "all",
+                  project: str = "") -> dict:
+    """关闭 Keil uVision 实例（AI 管理 Keil 开关的闭环，纯 ctypes 不依赖 taskkill）。
 
+    - keep="all"（默认）：关闭全部实例；
+    - keep="latest" / "oldest"：**只保留一个**实例（最新 / 最早启动的那个），其余关闭——
+      用于把"反复打开累积的多个同工程窗口"收敛成一个，只开一个窗口调试；
+    - project 非空：只处理打开该工程的实例（默认处理所有实例）。
     force=False：先对每个实例的可见主窗口发 WM_CLOSE 优雅关闭，等待退出；
-    超时后残留实例强制终止。force=True：直接强制终止所有 UV4.exe。
-    注意：会关闭所有 Keil 实例；未保存的调试会话/源码改动可能丢失，调用前请确保已保存。
+    超时后残留实例强制终止。force=True：直接强制终止。
+    注意：未保存的调试会话/源码改动可能丢失，调用前请确保已保存。
     """
     import time as _time
-    before = _uv4_pids()
+    inst = winutil.uv4_instances()
+    if project:
+        inst = [i for i in inst if _same_project(i.get("project"), project)]
+    before = [i["pid"] for i in inst] if inst else _uv4_pids()
     if not before:
-        return {"ok": True, "action": "关闭Keil", "closed": 0, "msg": "当前无 Keil uVision 实例"}
+        return {"ok": True, "action": "关闭Keil", "closed": 0, "kept": [],
+                "msg": "当前无 Keil uVision 实例"}
+    keep = str(keep or "all").lower()
+    keep_pid = None
+    if keep in ("latest", "oldest"):
+        if len(before) == 1:
+            keep_pid = before[0]
+        else:
+            ordered = sorted(inst, key=lambda x: (x.get("created") is None,
+                                                  x.get("created") or 0.0, x["pid"]))
+            keep_pid = ordered[-1]["pid"] if keep == "latest" else ordered[0]["pid"]
+    targets = [p for p in before if p != keep_pid]
+    kept = [keep_pid] if keep_pid else []
+    if not targets:
+        return {"ok": True, "action": "关闭Keil", "closed": 0, "kept": kept, "keep": keep,
+                "total_before": len(before), "msg": "已是单个实例，无需关闭"}
     try:
         if not force:
-            for pid in before:
+            for pid in targets:
                 _close_uvision_graceful(pid)
-            # 等待优雅退出
+            # 等待优雅退出（只看本次目标，保留的实例不算残留）
             deadline = _time.time() + timeout
             while _time.time() < deadline:
-                if not _uv4_pids():
+                if not [p for p in _uv4_pids() if p in targets]:
                     break
                 _time.sleep(0.3)
-            remain = _uv4_pids()
+            remain = [p for p in _uv4_pids() if p in targets]
             if remain:
                 for pid in remain:
                     _terminate_uvision(pid)
-                remain = _wait_pids_settle()
-                return {"ok": len(remain) == 0, "action": "关闭Keil",
-                        "closed": len(before), "force_fallback": True, "remaining": remain}
-            return {"ok": True, "action": "关闭Keil", "closed": len(before), "force": False}
-        for pid in before:
+                remain = [p for p in _wait_pids_settle() if p in targets]
+                return {"ok": len(remain) == 0, "action": "关闭Keil", "keep": keep,
+                        "closed": len(targets), "kept": kept, "total_before": len(before),
+                        "force_fallback": True, "remaining": remain}
+            return {"ok": True, "action": "关闭Keil", "keep": keep,
+                    "closed": len(targets), "kept": kept, "total_before": len(before),
+                    "force": False}
+        for pid in targets:
             _terminate_uvision(pid)
-        remain = _wait_pids_settle()
-        return {"ok": len(remain) == 0, "action": "关闭Keil",
-                "closed": len(before), "force": True, "remaining": remain}
+        remain = [p for p in _wait_pids_settle() if p in targets]
+        return {"ok": len(remain) == 0, "action": "关闭Keil", "keep": keep,
+                "closed": len(targets), "kept": kept, "total_before": len(before),
+                "force": True, "remaining": remain}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"关闭 Keil 失败：{e}"}
 

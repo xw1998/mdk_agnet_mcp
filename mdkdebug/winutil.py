@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import ctypes
+import re
 import socket
 import subprocess
 import sys
@@ -69,6 +70,123 @@ def uv4_pids() -> list:
         return pids
     except Exception:  # noqa: BLE001
         return []
+
+
+_UV_PROJ_RE = re.compile(r"([A-Za-z]:\\[^<>|?*\"]*?\.uv(?:projx|proj|mpw))", re.IGNORECASE)
+
+
+def uv4_windows() -> list:
+    """枚举属于 UV4 进程的可见顶层窗口：[{pid, hwnd, title}]。
+
+    Keil 主窗口标题形如 "<工程全路径>.uvprojx - µVision"，是判断"同一工程被开了几个窗口"
+    最可靠的本地信号（不需要 wmic / PowerShell 之类的命令行探测）。
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        pids = set(uv4_pids())
+        if not pids:
+            return []
+        user32 = ctypes.windll.user32
+        out = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                pid = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if int(pid.value) not in pids:
+                    return True
+                buf = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, buf, 512)
+                out.append({"pid": int(pid.value), "hwnd": int(hwnd), "title": buf.value})
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def uv4_process_created(pid: int):
+    """UV4 进程创建时间（epoch 秒）；取不到返回 None。用于判定"最新 / 最早"实例。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                        ("dwHighDateTime", wintypes.DWORD)]
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return None
+        try:
+            c, e, k, u = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+            if not kernel32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e),
+                                            ctypes.byref(k), ctypes.byref(u)):
+                return None
+            ticks = (int(c.dwHighDateTime) << 32) | int(c.dwLowDateTime)
+            return ticks / 1e7 - 11644473600.0        # 1601-01-01 → Unix epoch
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def parse_project_from_title(title: str) -> str:
+    """从 Keil 主窗口标题解析工程路径（标题形如 "<完整路径>.uvprojx - µVision"）。"""
+    if not title:
+        return ""
+    m = _UV_PROJ_RE.search(title)
+    return m.group(1) if m else ""
+
+
+def uv4_instances() -> list:
+    """列出所有 UV4.exe 实例，按创建时间升序：
+
+    [{pid, created, project, title, hwnd, has_window}]
+
+    真机实测：UV4.exe **不是**单实例程序——同一工程可以被反复打开成多个窗口且互不回收
+    （曾累积 6 个同工程实例）。所以需要能"看见"当前到底开了几个。
+    """
+    pids = uv4_pids()
+    if not pids:
+        return []
+    by_pid = {}
+    for w in uv4_windows():
+        by_pid.setdefault(w["pid"], []).append(w)
+    out = []
+    for pid in pids:
+        ws = by_pid.get(int(pid)) or []
+        title, hwnd = "", 0
+        for w in ws:
+            if w.get("title"):
+                title, hwnd = w["title"], w["hwnd"]
+                break
+        out.append({"pid": int(pid), "created": uv4_process_created(pid),
+                    "project": parse_project_from_title(title), "title": title,
+                    "hwnd": hwnd, "has_window": bool(ws)})
+    out.sort(key=lambda x: (x["created"] is None, x["created"] or 0.0, x["pid"]))
+    return out
+
+
+def focus_window(hwnd) -> bool:
+    """把窗口恢复并前置（复用已有实例时让用户看到"就是这一个窗口"）。"""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(int(hwnd), 9)          # SW_RESTORE
+        return bool(user32.SetForegroundWindow(int(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def port_listening(port: int = DEFAULT_UVSOCK_PORT, host: str = "127.0.0.1",
