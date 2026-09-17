@@ -1299,7 +1299,9 @@ def register(server, js=None) -> int:
             "`info threads`（RTOS 多任务）、`thread apply all bt`（各任务调用栈）、"
             "`monitor` 透传 OpenOCD 命令、`load` 走 GDB 通道烧录。\n"
             "gdb 省略时按 elf 的架构自动挑（arm-none-eabi-gdb / riscv32-esp-elf-gdb "
-            "等）；commands 用分号或换行分隔，会自动展开成多个 -ex。"
+            "等），只在同架构里挑、并只挑**真能跑**的（探测输出命中运行期失败特征的会被 "
+            "跳过并记进 gdb_broken）；commands 用分号或换行分隔，"
+            "会自动展开成多个 -ex。"
             "`-batch` 下不会进交互，别发需要人工确认的命令。"
         ),
     )
@@ -1309,21 +1311,16 @@ def register(server, js=None) -> int:
             from . import toolchain as _tc
             _tc.apply_env(["all"])
             exe = gdb
+            pick = {"gdb_select": "explicit"}
             if not exe:
-                fam = ""
-                if elf:
-                    g = _targets.guess_from_elf(elf)
-                    if g.get("ok"):
-                        fam = g.get("family") or ""
-                for f in ([fam] if fam else []) + ["arm-none-eabi", "riscv-none-elf",
-                                                   "riscv32-esp-elf", "xtensa-esp-elf"]:
-                    exe = _tc.find_tool(f, "gdb") or ""
-                    if exe:
-                        break
-            if not exe:
-                return _js({"ok": False, "error": "本机没找到 gdb",
-                            "hint": "装 xPack gcc（自带 gdb）或 esp-elf-gdb，"
-                                    "再用 toolchain_env(families=\"all\") 注入"})
+                g = _targets.guess_from_elf(elf) if elf else {"ok": False}
+                fam = (g.get("family") or "") if g.get("ok") else ""
+                # 给了 elf 就知道架构，只在**同架构**里挑（arm 的 ELF 拿到 riscv/xtensa
+                # 的 gdb 只会得到莫名其妙的报错）；没给 elf 才退化成「全找一遍」并如实标注。
+                pick = _tc.find_gdb(family=fam)
+                if not pick.get("ok"):
+                    return _js(pick)
+                exe = pick["path"]
             cmds = _split_commands(commands)
             if not cmds:
                 return _js({"ok": False, "error": "commands 不能为空"})
@@ -1336,6 +1333,15 @@ def register(server, js=None) -> int:
             r = _tc.run_tool(exe, argv, timeout=float(timeout))
             r["gdb"] = exe
             r["commands"] = cmds
+            r["gdb_select"] = pick.get("gdb_select")
+            if pick.get("family"):
+                r["gdb_family"] = pick.get("family")
+            if pick.get("via"):
+                r["gdb_via"] = pick.get("via")
+            if pick.get("note"):
+                r["gdb_note"] = pick.get("note")
+            if [t for t in (pick.get("tried") or []) if not t.get("ok")]:
+                r["gdb_broken"] = [t for t in pick["tried"] if not t.get("ok")]
             if not r.get("ok"):
                 r["hint"] = ("连不上 gdb_port：确认 ocd_start 起着的会话的 gdb_port，"
                              "以及目标已 halt；OpenOCD 的日志里会有 gdb 连接记录")

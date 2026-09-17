@@ -793,6 +793,38 @@ RTT 通路闭环时 `trace_rtt_read` 明明读回了 `boot: mdkdebug rtt probe` 
   已改为解引用宏 `(*(volatile uint32_t *)0xE000EDFCu)`；
 - 顺手消掉 RTT 后端下 `_raw_out()` 的 unused variable 告警（循环变量下沉到各分支）。
 
+
+### 11.14 「找工具」不能只认名字最短的那个，更不能跨架构凑（ESP 工具链复核踩出）
+
+装完 ESP 的 crosstool-NG 包（`xtensa-esp-elf` / `riscv32-esp-elf`）做家族复核，发现两处：
+
+- **认死短名会说「没有」**：`find_tool(fam, "gdb")` 只按 `gdb` 这个键查，而 ESP 的 gdb 包里
+  根本没有无后缀的 `xtensa-esp-elf-gdb.exe`（只有 `-no-python` 和 `-3.x` 两种名字），于是
+  「明明装了 gdb 却回 None」。新增 `find_gdb()`：按 `gdb → gdb-no-python → gdb-<版本(高优先)>`
+  依次挑，并且**逐个真跑一次 `--version`**，坏候选记进 `tried` 跳过、在 `via` / `note` 里说清
+  到底用了哪一个。
+- **缺 gdb 时会掉到别的架构**：`ocd_gdb` 原来是「[ELF 家族] + 固定四个家族」顺次找，某个家族
+  没有 gdb 就继续往下，arm 的 ELF 最终可能拿到 riscv/xtensa 的 gdb——一个**看起来像样的错答案**。
+  现在改成：给了 `elf` 就只在**同架构**家族里找（`find_gdb` 内部限制），找不到就如实报错并附
+  `tried` 与 `hint`；没给 `elf`（架构未知）才全找一遍，且回包标 `gdb_select: first-available`
+  明说「这是碰上的，不是按架构挑的」。
+- **自家挑出来的工具，自家白名单得放行**：`find_gdb` 选中的是 `xtensa-esp-elf-gdb-no-python.exe`，
+  而 `run_tool` 的放行白名单是按「标准后缀」（`-gdb` / `-gcc` …）比对的，带变体或版本尾巴的
+  名字一律判成「不在白名单」拒跑——**两层自相矛盾**：能找到、却跑不了。现在白名单补了一条正则，
+  认得 `-no-python` / `-py3` / `-3.12` 这类尾巴，无关 exe（`calc.exe`）仍然拒。
+
+### 11.15 复核工具可用性，别拿 shell 包装器的结果当结论
+
+同一件事上面还有个小插曲：用 `bash` 里的 `timeout <exe> --version` 探 ESP 的 gdb，
+输出是 `Python path configuration:`（像是启动器坏了）；换 `subprocess` 直接调（**也就是工具
+真正会走的调用路径**）却一切正常。差异来自启动方式（`timeout` 包装改变了环境），不是工具本身
+的问题——差点据此写出一条错误的「缺陷结论」写进代码注释。
+
+教训：**验证「这个工具能不能用」必须走真实调用路径**（Python `subprocess` / MCP 工具本身），
+别用 shell 包装器（`timeout`、管道、`env`）跑出来的结果下判断；两者不一致时，先怀疑包装器。
+代码里仍保留了一道运行期失败特征判定（`_BROKEN_RE`，命中「起得来、退出码 0、其实没跑」的 exe
+就判不可用），但注释只描述事实，不挂具体包的结论。
+
 ## 九、历次改进留档（按批次）
 
 > 以下条目是早期批次直接追加在 README 尾部的改进说明（原先错落在「参考与致谢」之后），

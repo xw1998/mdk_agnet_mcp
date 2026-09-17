@@ -12,6 +12,7 @@
   D trace 族：SWO 采集与 ITM+MTF 解码 / RTT（主机侧读写控制块并推进 RdOff）/
     采样剖析 / DWT / 组件部署
   E 工具面：注册总数 145、四族齐全、capabilities.non_mdk
+  F gdb 解析：只挑**真能跑**的 gdb、绝不到别的架构去凑（ESP 工具链复核）
 
 真机（F401 + DAPLink）验证单独做，见 docs/PITFALLS.md。
 
@@ -658,6 +659,119 @@ def test_surface(server):
           str(getattr(mdkdebug, "__version__", "")).startswith("0.0.6"),
           getattr(mdkdebug, "__version__", None))
 
+def test_gdb_pick(server):
+    """F gdb 解析：只挑真能跑的、且不跨架构。
+
+    来源：ESP 工具链装完复核时发现的缺陷——
+      * find_tool(fam, "gdb") 认死短名，xtensa-esp-elf 家族里根本没有无后缀 gdb 键，
+        于是「有 gdb 却说没有」；
+      * ocd_gdb 按 [elf 家族] + [固定四个家族] 顺序找，某个家族缺 gdb 时会**掉到别的
+        架构**上（arm 的 ELF 拿 riscv/xtensa 的 gdb），拿到的是个看起来像样的错答案。
+    """
+    real_scan, real_probe, real_sub, real_find = (
+        _tc.scan, _tc.probe_version, _tc.subprocess, _tc.find_gdb)
+    try:
+        fake_idx = {
+            "riscv32-esp-elf": {
+                "gcc": [r"C:\fake\riscv32-esp-elf-gcc.exe"],
+                "gdb": [r"C:\fake\riscv32-esp-elf-gdb.exe"],
+                "gdb-no-python": [r"C:\fake\riscv32-esp-elf-gdb-no-python.exe"],
+            },
+            "riscv-none-elf": {"gcc": [r"C:\fake\riscv-none-elf-gcc.exe"]},
+            "arm-none-eabi": {
+                "gcc": [r"C:\fake\arm-none-eabi-gcc.exe"],
+                "gdb": [r"C:\fake\arm-none-eabi-gdb.exe"],
+            },
+        }
+        _tc.scan = lambda refresh=False, max_age=20.0: fake_idx
+
+        def fake_probe(path, refresh=False):
+            bad = "no-python" not in path
+            return {"tool": os.path.basename(path), "path": path, "ok": not bad,
+                    "version": None if bad else "14.2",
+                    "first_line": None,
+                    "error": "起不来" if bad else None}
+
+        _tc.probe_version = fake_probe
+
+        g = _tc.find_gdb(family="riscv32-esp-elf")
+        check("F1 无后缀 gdb 起不来时自动改用能跑的那个",
+              g.get("ok") is True and g.get("via") == "gdb-no-python"
+              and "no-python" in (g.get("path") or ""), g)
+        # 两层必须自洽：find_gdb 挑出来的，run_tool 的白名单也得放行
+        check("F1b find_gdb 选中的能被 run_tool 白名单放行",
+              _tc.is_runnable(g.get("path") or ""), g.get("path"))
+        check("F2 选中的不是坏候选，且坏候选留在 tried 里可追溯",
+              [t for t in (g.get("tried") or []) if not t.get("ok")]
+              and g.get("note"), g)
+
+        g2 = _tc.find_gdb(family="arm-none-eabi")
+        check("F3 本家族 gdb 全起不来时如实报错，不跨架构去凑",
+              g2.get("ok") is False and g2.get("path") is None
+              and bool(g2.get("tried"))
+              and all(t.get("family") == "arm-none-eabi" for t in (g2.get("tried") or [])),
+              g2)
+        check("F4 报错里带 tried 与 hint（能自己往下查）",
+              bool(g2.get("tried")) and bool(g2.get("hint")), g2)
+
+        g3 = _tc.find_gdb(family="no-such-family-xyz")
+        check("F5 家族名写错时明确报未知家族",
+              g3.get("ok") is False and g3.get("gdb_select") == "bad-family", g3)
+
+        # ocd_gdb：给了 elf 就必须按 elf 的家族去找
+        seen = []
+
+        def recorder(family="", probe=True):
+            seen.append(family)
+            return {"ok": False, "path": None, "family": family or None,
+                    "error": "本机没找到 %s 能跑的 gdb" % (family or "任何家族"),
+                    "hint": "装 xPack gcc 或 esp-elf-gdb", "tried": [],
+                    "gdb_select": "elf-family" if family else "first-available"}
+
+        _tc.find_gdb = recorder
+        r = asyncio.run(call(server, "ocd_gdb", {"commands": "info registers"}))
+        check("F6 没给 elf 时如实标注架构未知（first-available）",
+              seen and seen[-1] == "" and r.get("gdb_select") == "first-available"
+              and r.get("ok") is False, {"seen": seen, "r": r})
+        if os.path.isfile(REAL_AXF):
+            r2 = asyncio.run(call(server, "ocd_gdb",
+                                  {"commands": "info registers", "elf": REAL_AXF}))
+            check("F7 给了 arm 的 elf 就只在 arm-none-eabi 里找 gdb",
+                  seen and seen[-1] == "arm-none-eabi" and r2.get("ok") is False, seen)
+
+        # 放行白名单：ESP 的 gdb 名字带变体/版本尾巴（-no-python / -3.12）
+        check("F9 带变体/版本尾巴的 gdb 名能过白名单，无关 exe 仍被拒",
+              _tc.is_runnable("xtensa-esp-elf-gdb-no-python.exe")
+              and _tc.is_runnable("xtensa-esp-elf-gdb-3.12.exe")
+              and _tc.is_runnable("arm-none-eabi-gdb-py3.exe")
+              and not _tc.is_runnable("calc.exe")
+              and not _tc.is_runnable("mystery-tool.exe"), None)
+        # 这一段要查本机真实安装情况，先把前面几段装上去的假件全部换回真的
+        _tc.find_gdb = real_find
+        _tc.scan, _tc.probe_version = real_scan, real_probe
+        esp_gdb = _tc.find_gdb(family="xtensa-esp-elf")   # 本机没装则 ok=False，跳过
+        if esp_gdb.get("ok"):
+            rr = _tc.run_tool(esp_gdb["path"], args="--version", timeout=30)
+            check("F10 find_gdb 选出的 gdb 真能被 run_tool 跑起来（不是白名单误伤）",
+                  rr.get("ok") is True and "gdb" in (rr.get("stdout") or "").lower(),
+                  {k: rr.get(k) for k in ("ok", "error", "path", "stdout")})
+
+        # probe_version：退出码 0 但根本没跑起来，必须判成不可用
+        _tc.probe_version = real_probe   # 先换回真探针，再假掉它的 subprocess
+        class _P(object):
+            stdout = b"Python path configuration:\n"
+            stderr = b""
+
+        _tc.subprocess = type("S", (), {"run": staticmethod(lambda *a, **k: _P())})
+        _tc._VER_CACHE.clear()
+        pv = _tc.probe_version(r"C:\fake\xxx-gdb.exe", refresh=True)
+        check("F11 退出码 0 但输出命中运行期失败特征 → 判不可用",
+              pv.get("ok") is False and pv.get("broken") is True, pv)
+    finally:
+        _tc.scan, _tc.probe_version = real_scan, real_probe
+        _tc.subprocess, _tc.find_gdb = real_sub, real_find
+
+
 
 # ======================================================================
 def main():
@@ -680,6 +794,8 @@ def main():
         test_trace(server, mock)
         print("\n-- E 工具面 --")
         test_surface(server)
+        print("\n-- F gdb 解析（ESP 复核）--")
+        test_gdb_pick(server)
     finally:
         MOC.detach(sess, mock)
         shutil.rmtree(TMPROOT, ignore_errors=True)

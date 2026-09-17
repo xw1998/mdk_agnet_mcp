@@ -30,7 +30,7 @@ import subprocess
 import time
 
 __all__ = [
-    "FAMILIES", "discover", "find_tool", "apply_env", "env_state",
+    "FAMILIES", "discover", "find_tool", "find_gdb", "apply_env", "env_state",
     "run_tool", "detect_project", "build", "parse_gcc_output",
     "elf_info", "size_report", "objcopy", "register",
 ]
@@ -129,11 +129,45 @@ _RUNNABLE_SUFFIXES = (
 )
 _RUNNABLE_EXACT = ("make", "mingw32-make", "cmake", "ctest", "ninja", "python",
                    "python3", "bash", "sh", "elf2bin")
+# 上面那串后缀只覆盖「标准名」。ESP 官方包里的 gdb 叫 xtensa-esp-elf-gdb-no-python /
+# -gdb-3.12 这类**带变体或版本尾巴**的名字（find_gdb 挑出来的就是它们），光按后缀
+# 比对会把自家选出来的工具判成「不在白名单」（曾真踩：find_gdb 给了 -no-python，
+# run_tool 当场拒跑）。这里补一条正则把尾巴也认了。
+_RUNNABLE_RE = re.compile(
+    r"-(?:gcc|g\+\+|cpp|c\+\+|clang|objcopy|objdump|size|nm|readelf|ar|ranlib|"
+    r"strip|ld|as|gdb|gcov)(?:-no-python|-py\d?|-\d+(?:\.\d+)*)?$", re.I)
 
 _VERSION_ARGS = {
     "make": ["--version"],
     "mingw32-make": ["--version"],
 }
+# 运行期失败特征：这些 exe「起得来、退出码 0」但根本没正常跑（只在 stdout 上露馅）。
+# 用途：探测可用性别只看退出码。本机见过 exe 只打一行运行时错误就退出、rc 仍为 0，
+# 这种必须按输出特征判掉，否则 toolchain_list 会把它当可用工具报出去。
+_BROKEN_RE = re.compile(
+    r"(Python path configuration|Fatal Python error|"
+    r"could not find (?:the )?interpreter|"
+    r"not a valid Win32 application|"
+    r"unable to start correctly|"
+    r"is not recognized as an internal or external command)",
+    re.I)
+
+# gdb 键的挑选顺序：gdb → gdb-no-python → gdb-<版本>（高版本优先）
+_GDB_KEY_RE = re.compile(r"^gdb(-no-python|-\d+(?:\.\d+)*)?$")
+
+
+def _gdb_sort_key(tk: str):
+    """本家族内 gdb 候选的排序键：先无后缀，再 -no-python，最后按版本从高到低。"""
+    if tk == "gdb":
+        return (0, (), 0)
+    if tk == "gdb-no-python":
+        return (1, (), 0)
+    m = re.match(r"^gdb-(\d+(?:\.\d+)*)$", tk or "")
+    if m:
+        return (2, tuple(-int(x) for x in m.group(1).split(".")), 0)
+    return (3, (), 0)
+
+
 _FAMILY_PROBE_ORDER = ("arm-none-eabi", "riscv-none-elf", "riscv32-esp-elf",
                        "xtensa-esp-elf", "xtensa-esp32-elf")
 _PROBE_TOOLS = ("gcc", "g++", "objcopy", "size", "nm", "readelf", "gdb", "ar")
@@ -339,6 +373,72 @@ def find_tool(family: str, tool: str) -> str | None:
     return None
 
 
+def _gdb_paths(family: str) -> list:
+    """某家族里所有 gdb 候选（按 _gdb_sort_key 排好序）。"""
+    idx = scan().get(family) or {}
+    keys = [k for k in idx if _GDB_KEY_RE.match(k or "")]
+    keys.sort(key=_gdb_sort_key)
+    return [(k, idx[k][0]) for k in keys]
+
+
+def find_gdb(family: str = "", probe: bool = True) -> dict:
+    """挑一个**真能跑**的 gdb（不是「名字最像」的那个）。
+
+    为什么会挑到不能跑的：ESP 官方 gdb 包把无后缀名留给 python 启动器，
+    它需要 PYTHONHOME 才能跑；真正的 gdb 叫 -no-python 或 -3.x。
+    另外 xtensa-esp-elf 家族里压根没有无后缀的 gdb 键。
+
+    规则：
+      - family 给了 → 只在该家族与其**同架构**兄弟家族里找（arm 的 ELF 绝不
+        会拿到 riscv/xtensa 的 gdb）；family 空 → 按 _FAMILY_PROBE_ORDER 全找，
+        但会标 is_arch_known=False 提示调用方「架构未知，是碰上的」。
+      - 候选逐个真跑一次 --version（走 probe_version 缓存），坏的记进 tried 跳过。
+    """
+    family = (family or "").strip()
+    if family and family not in FAMILIES:
+        return {"ok": False, "gdb_select": "bad-family", "path": None,
+                "error": "未知的工具链家族：%s" % family,
+                "known_families": [f for f in FAMILIES if "gdb" in f or f in _FAMILY_PROBE_ORDER]}
+    arch = (FAMILIES.get(family) or {}).get("arch") if family else None
+    if family:
+        same_arch = [f for f in FAMILIES
+                     if f != family and FAMILIES[f].get("arch") == arch
+                     and (FAMILIES[f].get("prefix") or f in ("gdb",))]
+        fams = [family] + sorted(same_arch)
+    else:
+        fams = list(_FAMILY_PROBE_ORDER)
+    tried = []
+    for f in fams:
+        for key, path in _gdb_paths(f):
+            info = probe_version(path) if probe else {"ok": True}
+            good = bool(info.get("ok"))
+            tried.append({"family": f, "key": key, "path": path, "ok": good,
+                          "reason": info.get("error") or None})
+            if not good:
+                continue
+            same = (f == family) or not family
+            note = None
+            if key != "gdb":
+                bad = [t for t in tried if t["key"] == "gdb" and not t["ok"]]
+                note = ("本家族的无后缀 gdb 起不来（%s），改用 %s"
+                        % (bad[0]["reason"], key)) if bad else ("选用 %s（无无后缀 gdb）" % key)
+            if family and not same:
+                note = ("%s家族里没有能跑的 gdb，用了同架构的 %s（%s）"
+                        % (family, f, key))
+            return {"ok": True, "path": path, "family": f, "via": key,
+                    "arch": FAMILIES.get(f, {}).get("arch"),
+                    "is_arch_known": bool(family),
+                    "gdb_select": "elf-family" if family else "first-available",
+                    "note": note, "tried": tried}
+    return {"ok": False, "path": None, "family": family or None, "arch": arch,
+            "is_arch_known": bool(family),
+            "gdb_select": "elf-family" if family else "first-available",
+            "error": ("本机没找到 %s 能跑的 gdb" % family) if family else "本机没找到能跑的 gdb",
+            "tried": tried,
+            "hint": "装 xPack gcc（自带 gdb）或 esp-elf-gdb 后 toolchain_env(families=\"all\") 注入；"
+                    "也可以用 gdb= 直接给绝对路径"}
+
+
 def probe_version(path: str, refresh: bool = False) -> dict:
     """跑 --version 拿版本字符串（按路径+mtime 缓存）。"""
     try:
@@ -365,6 +465,9 @@ def probe_version(path: str, refresh: bool = False) -> dict:
         info["first_line"] = first
         info["ok"] = bool(first)
         info["version"] = _extract_version(first)
+        if first and _BROKEN_RE.search(text):
+            info.update(ok=False, version=None, broken=True,
+                        error="这个 exe 起不来（命中运行期失败特征）：%s" % first[:120])
     except Exception as e:  # noqa: BLE001
         info["error"] = str(e)
     _VER_CACHE[sig] = info
@@ -500,6 +603,14 @@ def resolve_command(tool: str, family: str = "") -> dict:
         if os.path.isfile(tool):
             return {"ok": True, "path": os.path.normpath(tool), "family": family}
         return {"ok": False, "error": "文件不存在：%s" % tool}
+    if _strip_ext(tool).lower() == "gdb":
+        g = find_gdb(family=family)
+        if g.get("ok"):
+            return {"ok": True, "path": g["path"], "family": g["family"],
+                    "via": g.get("via"), "note": g.get("note"),
+                    "gdb_select": g.get("gdb_select")}
+        return {"ok": False, "error": g.get("error"), "hint": g.get("hint"),
+                "tried": g.get("tried")}
     fams = [family] if family else list(FAMILIES)
     for f in fams:
         p = find_tool(f, tool)
@@ -520,7 +631,7 @@ def is_runnable(tool: str) -> bool:
     for sfx in _RUNNABLE_SUFFIXES:
         if base.endswith(sfx):
             return True
-    return False
+    return bool(_RUNNABLE_RE.search(base))
 
 
 def run_tool(tool: str, args=None, cwd: str = "", timeout: float = 300,
