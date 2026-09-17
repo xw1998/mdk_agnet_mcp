@@ -276,6 +276,27 @@ python run_server.py --transport http --http-port 8300
 
 > 编译烧录 / Keil 启动工具的 `project` 均可省略：省略时使用启动参数 `--default-project` 指定的默认工程。
 
+### 参数约定（别名 / 类型宽容 / 单位换算）
+
+工具签名面向「AI 直接写」设计，参数名与类型都做了容忍，不必靠报错反推签名：
+
+- **名称列表参数**（`globals`、`regs`、`fields`、`expressions`、`addresses`、`commands`…）
+  同时接受数组、JSON 数组字符串、以及逗号 / 分号 / 竖线 / 空格分隔的字符串，
+  例如 `regs: ["MODER","ODR"]` 与 `regs: "MODER,ODR"` 等价；
+- **地址类参数**（`addr`/`address`/`start`/`end`/`expr`/`target`…）
+  同时接受整数（`0x20000000`）、`"0x…"`、十进制串与符号名，
+  `read_mem(addr=0x20000000, n_bytes=8)` 可直接写；
+- **参数别名**：主名保持不变（不破坏已有调用与文档），但每个工具额外接受一组统一别名
+  （如 `expr ← expression/var/variable`、`addr ← address/location`、`query ← keyword/name`）。
+  `list_tools` 的描述里会附一行「参数别名（同样可用）：主名 ← 别名…」，AI 一次调用即可对齐；
+- **时间参数单位换算**：主名带 `_ms` 的（如 `timeout_ms`）接受 `_s` 写法并自动 ×1000，反之 ÷1000；
+  `duration_` / `max_` / `wait_` 与 `timeout_` 在同单位下视为等价（不换算），
+  但 `interval_` / `poll_` 语义是采样间隔，刻意不参与等价换算，避免静默改变行为；
+- **未知参数显式拒绝**：框架默认静默忽略未知参数，打错键名会悄悄拿到默认值。本服务改为直接报错，
+  并在消息里列出该工具接受的参数与可用别名（`_` 前缀的元参数除外）；
+- **别名不遮蔽真实参数，且主名优先**：与某工具真实参数同名的别名会被剔除（如 `read_mem` 真有
+  `length` 就不再拿它当 `n_bytes` 的别名）；主名与别名同时出现时只认主名。
+
 ## 接入 AI 工具客户端
 
 以支持 MCP 的客户端为例，在 MCP 配置中加入该服务：

@@ -26,10 +26,12 @@ import time
 import xml.etree.ElementTree as ET
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from .client import UVClient, UVSOCKConnectError
 from .locator import Locator
 from . import builder, mapfile, winutil, uvoptx as _uvoptx, __version__
+from . import aliases as _aliases
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -91,6 +93,28 @@ def _items_arg(value):
             return [loaded]
         return _csv_tokens(s)
     return [value]
+
+def _addr_arg(value):
+    """地址/表达式类参数的类型兼容：整数地址也能直接用。
+
+    真机实测（批次25）：AI 的直觉写法是 read_mem(addr=0x20000000)，而工具签名声明为
+    字符串，会被框架直接判为类型错误（Input should be a valid string）。内部
+    _parse_addr / _resolve_addr_arg 本来就接受 int，这里把入口也放开：
+    - int / float：转为 "0xXXXX" 字符串（下游按十六进制解析，语义等价）
+    - 字符串：原样 strip（"0x.."、十进制串、符号名、表达式都照旧）
+    - None：空串
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(int(value))
+    if isinstance(value, int):
+        return "0x%X" % value
+    if isinstance(value, float):
+        return "0x%X" % int(value)
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", "ignore")
+    return str(value).strip()
 
 # 全局共享一个带连接缓存的客户端（线程安全）
 _client: UVClient | None = None
@@ -1088,6 +1112,99 @@ def _js(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
+class AliasMCPServer(MCPServer):
+    """在工具调用入口做参数名归一（第 9 轮建议②「参数名收敛」）。
+
+    主名保持不变（不改名＝不破坏已有调用与文档），但每个工具额外接受一组统一别名：
+    AI 按直觉写 query / name / expression / address / timeout_ms 都能落地。
+    list_tools 会把「主名 ← 别名」写进描述，AI 不必靠报错反推签名。
+
+    两条安全约束：
+    - **别名不得遮蔽真实参数**：与某工具真实参数同名的别名会被剔除（如 read_mem 真有
+      length 参数，就不再拿 length 当 n_bytes 的别名）；
+    - **主名优先**：主名与别名同时出现时只认主名，不静默改写用户给的参数。
+    """
+
+    def _real_params(self, tool: str) -> set:
+        """该工具的真实参数名集合（用于剔除会遮蔽真实参数的别名）。"""
+        cache = getattr(self, "_alias_real_params", None)
+        if cache is None:
+            cache = {}
+            try:
+                for info in self._tool_manager.list_tools():
+                    params = getattr(info, "parameters", None) or {}
+                    props = params.get("properties") if isinstance(params, dict) else None
+                    cache[info.name] = set((props or {}).keys())
+            except Exception:  # noqa: BLE001
+                logger.debug("构建别名白名单失败，按无别名处理", exc_info=True)
+            self._alias_real_params = cache
+        return cache.get(tool, set())
+
+    def _alias_map(self, tool: str) -> dict:
+        amap = _aliases.aliases_of(tool)
+        if not amap:
+            return {}
+        real = self._real_params(tool)
+        return {k: v for k, v in amap.items() if k not in real}
+
+    def normalize_arguments(self, tool: str, arguments) -> tuple:
+        """把别名键换成主名；返回 (参数, 生效的别名说明列表)。"""
+        if not isinstance(arguments, dict) or not arguments:
+            return arguments, []
+        amap = self._alias_map(tool)
+        if not amap:
+            return arguments, []
+        out, applied = dict(arguments), []
+        for key in list(arguments.keys()):
+            primary = amap.get(key)
+            if not primary or primary in arguments:
+                continue                      # 未知别名 / 主名已给 → 原样交给框架校验
+            out[primary] = _aliases.convert_time(primary, key, arguments[key])
+            out.pop(key, None)
+            applied.append("%s→%s" % (key, primary))
+        return out, applied
+
+    def unknown_params(self, tool: str, arguments) -> list:
+        """框架默认会**静默忽略**未知参数——AI 打错键名（如 timeouts_s）会悄悄拿到默认值，
+        排查代价很高。这里显式拒绝，并在报错里列出可用参数与别名。"""
+        if not isinstance(arguments, dict):
+            return []
+        real = self._real_params(tool)
+        if not real:
+            return []                     # 没读到 schema（工具未注册/读取失败）→ 不拦
+        return [k for k in arguments if k not in real and not k.startswith("_")]
+
+    async def call_tool(self, name, arguments, context=None):
+        arguments, applied = self.normalize_arguments(name, arguments)
+        if applied:
+            logger.info("参数别名归一 %s: %s", name, "、".join(applied))
+        bad = self.unknown_params(name, arguments)
+        if bad:
+            real = sorted(self._real_params(name))
+            note = _aliases.alias_note(name, set(real))
+            msg = ("参数名不被接受：%s。%s 接受的参数：%s"
+                   % ("、".join(bad), name, "、".join(real)))
+            if note:
+                msg += "（参数别名：%s）" % note
+            raise ToolError(msg)
+        return await super().call_tool(name, arguments, context)
+
+    async def list_tools(self):
+        # 描述里补「主名 ← 别名」，只补一次（重复调用不会叠加）
+        for info in self._tool_manager.list_tools():
+            note = _aliases.alias_note(info.name, self._real_params(info.name))
+            if not note:
+                continue
+            desc = info.description or ""
+            if "参数别名" in desc:
+                continue
+            try:
+                info.description = desc + "\n参数别名（同样可用）：" + note
+            except Exception:  # noqa: BLE001
+                logger.debug("未能写入别名说明：%s", info.name, exc_info=True)
+        return await super().list_tools()
+
+
 def create_server(host: str = "127.0.0.1", port: int = 4823,
                   idle_timeout: float = 30.0,
                   uv4_path: str | None = None,
@@ -1117,7 +1234,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     logger.info("Mdkdebug 已就绪：UVSOCK@%s:%d  idle_timeout=%ss", host, port, idle_timeout)
     logger.info("构建配置：UV4=%s  默认工程=%s", uv4, default_project)
 
-    server = MCPServer(
+    server = AliasMCPServer(
         name="mdkdebug",
         title="Keil uVision Debug (Mdkdebug)",
         version=__version__,
@@ -1252,8 +1369,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "返回十六进制字节串及 ASCII 视图。注意：需目标暂停——目标运行期间 UVSOCK 推送异步消息会堆积，导致读取响应错位（典型报错 AMEM 响应数据过短），务必先 stop 再读。勿越界读外设保留区，可先 query_memory_map 确认范围。"
         ),
     )
-    async def read_mem(addr: str, n_bytes: int = 0, length: int = 0,
+    async def read_mem(addr: str | int, n_bytes: int = 0, length: int = 0,
                        reloc_delta: str = "") -> str:
+        addr = _addr_arg(addr)
         try:
             client = _get_client()
             n = int(n_bytes or 0) or int(length or 0)
@@ -1279,7 +1397,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "如 'de ad be ef' 或 'deadbeef'（自动去空格）。返回实际写入长度。注意：需目标暂停，运行中写入会失败/错位。写外设寄存器/关键内存有副作用，写入前确认地址与值正确（可先 read_mem 备份）。"
         ),
     )
-    async def write_mem(addr: str, data_hex: str) -> str:
+    async def write_mem(addr: str | int, data_hex: str) -> str:
+        addr = _addr_arg(addr)
         try:
             client = _get_client()
             a, _note = _resolve_addr_arg(addr, client)
@@ -1416,8 +1535,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "（如 'main'）或地址（如 '0x08001034'）。返回是否成功。注意：设断点走命令窗口 BS，会触发 Keil 异步推送断点消息，紧随其后的命令响应可能被污染（本工具已改为先 calc_expression 取地址再 BS 0xaddr）；设断点后立即 run/step 前需稍等异步消息落地。需已进入调试且配置 .axf。"
         ),
     )
-    async def set_breakpoint(expr: str) -> str:
+    async def set_breakpoint(expr: str | int) -> str:
         global _bp_counter
+        expr = _addr_arg(expr)
         try:
             client = _get_client()
             e = (expr or "").strip()
@@ -1520,8 +1640,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "返回设断地址与 文件:行。命中后可用 get_current_location/snapshot 看是谁改的。需已进入调试。注意：数据/访问断点依赖硬件 DWT 支持，可同时生效个数有限（通常2-4个），设多了会失败；命中后目标暂停，用 get_current_location/snapshot 看现场。需已进入调试。"
         ),
     )
-    async def set_watchpoint(expr: str, access: str = "write", count: int = 1) -> str:
+    async def set_watchpoint(expr: str | int, access: str = "write", count: int = 1) -> str:
         global _bp_counter
+        expr = _addr_arg(expr)
         try:
             client = _get_client()
             e = (expr or "").strip()
@@ -1593,7 +1714,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                      "`BK <number>`（真机实测：数据观察点按地址清除会报 error 72 invalid item number，看似成功其实没清掉）。"
                      "返回 cleared_by 表示实际用的方式；若真实断点表里找不到会明确报 ok=false 并给出原因。"),
     )
-    async def clear_watchpoint(expr: str = "", bp_id: int | None = None) -> str:
+    async def clear_watchpoint(expr: str | int = "", bp_id: int | None = None) -> str:
+        expr = _addr_arg(expr)
         try:
             client = _get_client()
             e = (expr or "").strip()
@@ -1672,8 +1794,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "注意：清除断点同样走命令窗口并触发异步消息，清除后立即 run/step 前建议稍等。需已进入调试。"
         ),
     )
-    async def clear_breakpoint(expr: str = "", bp_id: int | None = None,
+    async def clear_breakpoint(expr: str | int = "", bp_id: int | None = None,
                                keil_number: int | None = None) -> str:
+        expr = _addr_arg(expr)
         try:
             # 定位清除目标：优先内部断点 id，其次按地址/符号名；用确切地址发 BK 更可靠
             target = (expr or "").strip()
@@ -2677,7 +2800,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "排查死循环 / 跑飞 / 启动流程 / 优化后行为时，查看 PC 处指令在做什么。需已进入调试且配置 .axf。注意：依赖 .axf 符号表与配置；Thumb/ARM 指令模式按符号/地址推断，个别地址可能模式误判。需目标暂停。"
         ),
     )
-    async def disassemble(addr: str = "", count: int = 8) -> str:
+    async def disassemble(addr: str | int = "", count: int = 8) -> str:
+        addr = _addr_arg(addr)
         try:
             client = _get_client()
             loc = _get_locator()
@@ -2843,7 +2967,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "需已进入调试状态且配置了 .axf 调试符号。注意：实现为临时断点→run→清除。run 到断点停止时返回的 status 是 22(断点已创建) 而非 0；刚停止瞬间读 PC 可能为脏值（本工具已用稳定读取修复）。需已进入调试且配置 .axf。"
         ),
     )
-    async def run_to_line(target: str) -> str:
+    async def run_to_line(target: str | int) -> str:
+        target = _addr_arg(target)
         try:
             loc = _get_locator()
             if not loc or not loc.is_ready():
@@ -2932,7 +3057,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "（App 侧重定位后运行时地址与符号地址不同，应传实际运行地址）。需已进入调试。"
         ),
     )
-    async def wait_breakpoint(symbol: str = "", address: str = "",
+    async def wait_breakpoint(symbol: str = "", address: str | int = "",
                               timeout_s: float = 10.0, poll_ms: int = 100,
                               use_project_breakpoints: bool = True,
                               project: str = "", reloc_delta: str = "") -> str:
@@ -3599,7 +3724,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "避免把外设区当 RAM 读或把越界地址当合法地址。addr 为空返回全部区域。注意：返回的是 STM32F4 的典型内存布局；其他内核/系列（如 M0/M7、G/L 系列）地址范围可能不同，请勿对非 F4 目标直接套用。"
         ),
     )
-    async def query_memory_map(addr: str = "") -> str:
+    async def query_memory_map(addr: str | int = "") -> str:
+        addr = _addr_arg(addr)
         try:
             a = _parse_addr(addr) if addr else None
             return _js(_query_memory_map(a))
@@ -3617,7 +3743,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "搜索特定数据结构。需已进入调试。start/end 用 0x 十六进制。注意：需目标暂停；大范围扫描较慢（分块读）；请勿搜索外设保留区或未映射地址（可能读取失败）。块间重叠处理了跨块匹配。"
         ),
     )
-    async def search_mem(start: str, end: str, pattern_hex: str = "",
+    async def search_mem(start: str | int, end: str | int, pattern_hex: str = "",
                          max_results: int = 20, pattern_text: str = "",
                          encoding: str = "ascii") -> str:
         try:
@@ -3654,7 +3780,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "SRAM 初始化、批量回填等。需已进入调试。addr 用 0x 十六进制。注意：需目标暂停；批量写内存/清零有副作用，误写关键区（栈、外设、Flash）可能导致程序异常，写入前确认范围。"
         ),
     )
-    async def fill_mem(addr: str, byte: int, count: int) -> str:
+    async def fill_mem(addr: str | int, byte: int, count: int) -> str:
+        addr = _addr_arg(addr)
         try:
             client = _get_client()
             a, _note = _resolve_addr_arg(addr, client)
