@@ -27,7 +27,7 @@ BATCHES = [
     "test_batch15", "test_batch16", "test_batch18", "test_batch25",
     "test_batch26", "test_batch28", "test_batch29", "test_batch30",
     "test_batch31", "test_batch32", "test_batch33", "test_batch34",
-    "test_batch35",
+    "test_batch35", "test_batch36",
 ]
 
 PATTERNS = [

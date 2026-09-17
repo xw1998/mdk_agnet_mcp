@@ -14,6 +14,7 @@
 - [七、UV4 命令行批处理调试（`-d` + 初始化文件，真机实测）](#七uv4-命令行批处理调试-d--初始化文件真机实测)
 - [八、SVD 解码与工程文件编辑（批次35 真机实测）](#八svd-解码与工程文件编辑批次35-真机实测)
 - [九、历次改进留档（按批次）](#九历次改进留档按批次)
+- [十一、非 MDK 链路（工具链 / OpenOCD / trace）](#十一非-mdk-链路工具链--openocd--trace)
 
 ## 一、真实 Keil 实测要点
 
@@ -597,6 +598,200 @@ AI 会真的去 0 号地址下断点。现在 `line_to_addr` 跳过 `a<=0` 的�
   save/show/load/apply → `batch` 子命令 → 非受控工具未被注入 → 收尾 `exit_debug`）；
 - 收尾原则：**只退出脚本自己进入的调试态**，Keil 进程保持运行（不 `taskkill`，
   也不用 `close_uvision`——用户可能正开着窗口）。
+
+## 十一、非 MDK 链路（工具链 / OpenOCD / trace）
+
+本节记录批次36（非 MDK 扩展 + SWD/SWO trace）在写 mock 时提前逼出来的五类真机级缺陷——
+它们有一个共同点：**不是靠猜，而是靠 mock 严格照抄真实 OpenOCD 的输出格式才暴露的**。
+
+### 11.1 写后校验不能拿写命令去读
+
+`ocd_write_mem` 原本用同一条写命令（`mww`）回读校验，结果 `verified` 恒为 `False`——
+写命令的回显里根本没有读到的值。修法是按位宽换成对应的读命令：`mdb`(8) / `mdh`(16) / `mdw`(32)。
+
+> 教训：**校验必须用独立的读路径**。同一命令既写又读，看起来"闭环了"，实际是自证。
+
+### 11.2 裸地址带 Thumb 位必被拒（OpenOCD 与 Keil 同病）
+
+`ocd_bp(0x08000401)` 会被 OpenOCD 判为非法地址——Cortex-M 的地址 bit0 是 Thumb 状态位，不是地址的一部分。
+符号式断点没事，因为调试器求值回传的是偶数地址；裸地址则原样送下去。
+修法：**仅对代码区（≥ `0x08000000` 或 < `0x00100000`）的奇数地址清 bit0**，并在返回里给 `note` 说明做过归一；
+RISC-V 不受影响，不能无脑全局清。
+
+这与批次32 在 Keil 侧踩到的是**同一个坑的两个面**（那时是 `error 57 illegal address`）。
+
+### 11.3 不校验魔数，全 0 的 RAM 会被当成合法 RTT 控制块
+
+RTT 控制块靠字符串 `SEGGER RTT\0` 标识。若 `rtt_parse_cb` 直接按结构体偏移解释一片全 0 的 RAM，
+会"成功地"读出上下行通道，返回一个看似合法、实则纯属幻觉的结果——
+这正是「宁可报错也不给看似权威的错答案」要杜绝的情形。
+修法：解析前先校验 id 字符串以 `SEGGER RTT` 开头，不匹配就明确报「不是 RTT 控制块」并给排查提示。
+
+### 11.4 三处解析正则与真实输出格式不符
+
+| 解析点 | 原先要求 | 真实 OpenOCD 输出 |
+|---|---|---|
+| `probe()` 的 targets 列表 | `name: type`（带冒号） | 列对齐、无冒号，且含 `--` 分隔行 |
+| `flash banks` | 多要求一个字段 | `#0 : name (driver) at 0x08000000, size 0x100000`（size 可选） |
+| `reg` | 只认 `r0 = 0x...` | `(0) r0 (/32): 0x00000000 (dirty)`，RISC-V 为 `x0/zero` |
+
+三处都改成按真实格式解析（`_FLASH_BANK_RE` 提到模块级，probe 与 `ocd_flash_info` 共用一份）。
+
+### 11.5 提示符带尾空格，匹配不到就白等
+
+`_has_prompt` 原先是 `text.endswith(">")`，而 OpenOCD 的提示符是 `"> "`（**带尾空格**）。
+于是每次都匹配不上，只能等满 0.6s 空闲超时才返回——不影响正确性，但把每条命令都拖慢一个量级。
+修法：**先 rstrip 尾部空白再判 `>`**。
+
+### 11.6 元教训：这五条为什么能在 mock 阶段就被抓住
+
+写 `tests/mock_openocd.py` 时只做了一个决定——**应答格式照抄真机，不做美化**：
+`targets` 用列对齐、`flash banks` 带 `(driver) at ...` 与 `size`、`reg` 带 `(0) (/32) (dirty)`、
+提示符带尾空格、未映射地址回 `Error: Failed to read memory at 0x...`、未知命令回
+`Error: invalid command name "xxx"` 并附一段 Jim-Tcl 栈。
+
+如果 mock 用"自己觉得合理"的格式应答，这五条一个也暴露不出来，会全部留到真机——
+而真机只给一句报错，定位成本比改 mock 高出几个量级。
+**mock 的价值不在"能跑通"，而在"照抄外部系统的怪癖"。**
+
+### 11.7 telnet 通道里的两个行首噪声：IAC 与 NUL（真机取证）
+
+首批 ocd_* 工具在 mock 上全绿，到真机（F401 + DAPLink，xPack OpenOCD 0.12.0）上却出现
+三个“看着像工具坏了”的症状：`cpuid/partno/core` 全是 None、读内存只拿到 0/16 字节、
+`ocd_reg(name="pc")` 失败。用 `_rt_dump.py` 抓原始字节才看到根因（**不猜，取证**）：
+
+```
+banner    b'\xff\xfb\x03\xff\xfb\x01\xff\xfd\x03\xff\xfe\x01Open On-Chip Debugger\r\n\r> '
+命令回包  b'reg\r\n\x00===== arm v7m registers\r\n(0) r0 (/32): 0x000001b8\r\n...'
+读内存    b'mdw 0x08000000 2\r\n\x000x08000000: 20000728 080002e1 \r\n\r> '
+```
+
+两段噪声都插在**行首**：`\xff`+`\xfb~\xfe`+option 是 telnet 的 WILL/WONT/DO/DONT 协商，
+`\x00` 是 OpenOCD 给每条命令输出加的固定 NUL 前缀。而解析全部是行首锚定的正则
+（`^\s*(0x...)` / `^\s*\(\d+\)\s*name` / `^#(\d+)\s*:`）——`\s` 不吃 NUL，
+于是整行被丢弃，**raw 里明明有数据，解析出来是 0 条**。这是典型的静默错答案：
+不报错、不抛异常，只是把「读不到」当成「没有」。
+
+处置（三处，缺一不可）：
+
+1. `_clean_telnet()`：字节层剥 IAC 序列（`\xff` 后跟 `\xfb~\xfe` 多吃一个 option 字节）
+   与所有 NUL，`_read_until_prompt` 回包前统一过一遍；
+2. 三个解析正则的 `^\s*` 换成 `^[\x00\s]*`，做二层防御——清洗漏一处也只丢一行，
+   不会让整个解析静默变空；
+3. **mock 也照抄这两段噪声**（默认开，`--no-telnet-noise` 可关）：
+   不复现噪声，剥噪声的代码就永远没人测。加上之后 mock 阶段就能覆盖这条路径。
+
+### 11.8 「读不回来」不是「写没生效」
+
+真机测试里往 `0x2001FFF0`（F401 只有 96KB RAM，该地址越界）写 4 字节：
+**写命令 `mww` 不报错**，只有读回时报 target 错误。若写工具的校验逻辑把
+「读回结果为空」直接判成 mismatch，就会报出「写后读不一致：目标可能在跑 / 该地址只读 /
+D-Cache 未回写」——三条全是猜的，真相是地址越界。
+
+改法：校验前先分两条路——
+
+- 读回命令本身失败或没解析出任何字 → `verified: null` + `verify_error`，错误码
+  `ocd-write-verify-read-failed`，下一步指向「核对地址是否在可读区间」；
+- 读回成功但值不同 → 才是 `ocd-write-verify-mismatch`。
+
+同一条原则：**报错必须来自设备真实返回，不许替设备猜原因。**
+
+### 11.9 错误码要分链路，通用码不能跨链路复用
+
+统一信封的 `error_code` 是给 AI 看下一步用的。Keil 侧的通用码
+（`timeout` / `unknown-error` / `invalid-argument`）的 `next_actions` 全都指向
+`keil_health` / `read_async_messages` —— 用在 OpenOCD 链路就是**方向性错误**：
+
+| 真机实测失败 | 修前归类 | next_actions 指向 | 修后归类 |
+|---|---|---|---|
+| `ocd_read_mem` 只读到 0/16 字节 | `output-write-failed` | Objects/Listings 目录权限 | `ocd-read-short` |
+| `ocd_write_mem` 写后读不一致 | `unknown-error` | keil_health | `ocd-write-verify-mismatch` |
+| `ocd_reg` 单读失败 | `unknown-error` | keil_health | （NUL 修好后自然恢复） |
+
+两个具体修正：
+
+1. 去掉 `output-write-failed` 规则里**裸的“只读”**——它把「只读**到** 0/16 字节」
+   当成了输出目录只读；改成语境化的「输出目录.*只读 / 磁盘空间」；
+2. 非 MDK 族（工具名前缀 `ocd_` / `toolchain_` / `trace_` / `target_`）在
+   **通用码**上替换 `next_actions`（`_NON_MDK_ACTIONS`），并新增 14 个链路专用码
+   （`ocd-not-running` / `ocd-probe-busy` / `ocd-telnet-unreachable` / `ocd-read-short` /
+   `ocd-write-verify-*` / `ocd-no-flash-bank` / `toolchain-missing` / `trace-rtt-*` 等），
+   规则**排在 Keil 通用规则之前**——否则「OpenOCD 不在运行」会被 `uvsock-unavailable`
+   抢走（后者带“UVSOCK/4823”字样，对 OpenOCD 完全指错）。
+
+### 11.10 telnet 只认行首 `Error:` 会漏掉「假成功」回包（RTT 端到端验证踩出）
+
+真机烧一个自建固件时 `ocd_flash` 回了 `ok: true`，可 Flash 里的内容还是上一次的程序。
+抓原始回包才看清 OpenOCD 打的是：
+
+```
+** Programming Started **
+couldn't open D://git_project/mdk_agent/_rtt_proj/build/rtt_probe.elf
+embedded:startup.tcl:1813: Error: ** Programming Failed **
+```
+
+三条都不是 `ok` 的依据——第一条像进度，第二条无前缀，第三条虽然写了 `Error:` 但**带位置前缀**
+（`embedded:startup.tcl:1813: `），而 `_shape()` 当时用的是 `^\s*Error\s*:` 的 `match`。
+
+修法（两层）：
+
+1. `_ERR_RE` 从「行首」放宽为「词边界后」：`(?:^|[\s\[(\"'])(?:Error|error)\s*:`，改用 `search`；
+2. 新增 `_FAIL_RE` 收编不带 `Error:` 的失败白话：`couldn't open` / `cannot open` /
+   `unable to open` / `no flash bank` / `not enough space` / `** ...Failed... **`。
+
+回归要同时守住**反向**：`** Programming Finished **` / `** Verified OK **` 不能被误判成失败
+（mock 用例 C39–C41）。
+
+### 11.11 OpenOCD 的 telnet 是 7-bit：路径里的中文传不过去
+
+同一个坑的第二层：上一条里 `couldn't open` 的路径是 `D://git_project/...`，
+而工具发出去的是 `D:/工作/git_project/...` —— **`工作` 这 6 个 UTF-8 字节在传输路上就没了**。
+telnet（RFC 854）默认是 7-bit NVT，OpenOCD 并不协商 BINARY 选项，所以非 ASCII 字节到不了它。
+把固件放到纯 ASCII 路径（`C:/Users/.../Temp/mdk_rtt_test/rtt_probe.elf`）后，
+同一条命令立刻 `** Verified OK **`，RTT 控制块也读到 `SEGGER RTT`。
+
+Windows 上中文工程目录太常见（本仓库就在 `D:\工作\...`），所以不是报错了事：
+
+- `stage_ascii_path()`：路径含非 ASCII 时，把文件拷到 `%TEMP%/mdkdebug_stage/<sha1前8>_<安全名>`，
+  用 ASCII 副本喂给 OpenOCD；`ocd_flash` / `ocd_load` 返回值里带 `staged_from` / `staged_path` /
+  `path_note` 如实披露，绝不悄悄换文件；
+- 拷不动（临时目录也非 ASCII 且无权限）才报错，并给「把固件放到纯英文路径」的 hint。
+
+mock 侧同步保真：`_serve_line` 在 `telnet_noise` 打开时按 7-bit 语义丢掉非 ASCII 字符，
+`program` 对打不开的路径回上面那三行——不这么做，剥噪声/暂存的代码永远没人测。
+
+### 11.12 RTT 通道里是裸 MTF，别再找 ITM 报文头
+
+RTT 通路闭环时 `trace_rtt_read` 明明读回了 `boot: mdkdebug rtt probe` 这类可读文本，
+`trace_decode` 却给 `frames: []`——因为 `decode()` 只会先把字节当成 ITM 报文流
+（`decode_itm`）再从 instrumentation 包里抽 MTF。RTT 上传的**就是 MTF 帧本体**，
+外面没有 ITM 封装，于是「有数据、0 事件」这种静默错答案就出现了。
+
+修法：
+
+- `decode(..., fmt="auto"|"itm"|"mtf")`：`auto` 先按 ITM 找 instrumentation 包，
+  一个都没有且流首立着 MTF 魔数 `0xA5`，就退回**裸 MTF** 再解一次，并在返回值里
+  写明 `mode_used` 与 note；`fmt` 非法值直接报错，不猜格式；
+- `rtt_read` 读到字节后顺手喂给**独立的** `rtt_decoder`（和 SWO 的 decoder 分开，
+  避免两条通路的半帧状态互串），事件带 `source: "mtf-rtt"` 进缓冲，
+  `trace_events` 立刻能看到内容。
+
+真机闭环结果（STM32F401 + CMSIS-DAP，`toolchain_build` → `ocd_flash` → `trace_rtt_find`
+→ `trace_rtt_attach` → `trace_rtt_read`）：9/9 通过，解出
+`reset(init)` / `text("boot: ...")` / `event(0x1001 enter/exit, ts 8730/10403)` 等真实帧。
+
+### 11.13 组件自身两个编译期缺陷（真机固件编出来的）
+
+写一个最小 F401 固件把 trace 组件真正编一遍，才发现组件里有问题——这类缺陷在 mock
+和语法检查里都看不见：
+
+- `trace_instrument` 生成的配置把后端写成 `#define MDK_TRACE_BACKEND_RTT`（**没有值**），
+  于是组件里所有 `#if MDK_TRACE_BACKEND_RTT` 都变成 `#if 与空` → `error: #if with no
+  expression`；已改为 `#define MDK_TRACE_BACKEND_RTT 1`；
+- `mdk_trace.c` 里 `MDK_TRACE_DEMCR` 定义成了裸常量 `0xE000EDFCu`，却按左值用
+  （`MDK_TRACE_DEMCR |= ...`）→ `error: lvalue required as left operand of assignment`；
+  已改为解引用宏 `(*(volatile uint32_t *)0xE000EDFCu)`；
+- 顺手消掉 RTT 后端下 `_raw_out()` 的 unused variable 告警（循环变量下沉到各分支）。
 
 ## 九、历次改进留档（按批次）
 

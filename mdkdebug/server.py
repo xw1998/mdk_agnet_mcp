@@ -40,6 +40,10 @@ from . import svd as _svd
 from . import uvprojx as _uvprojx
 from . import session as _session
 from . import outctl as _outctl
+from . import toolchain as _toolchain
+from . import targets as _targets
+from . import ocd as _ocd
+from . import trace as _trace
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -1631,6 +1635,32 @@ _TOOLSETS = {
         "clear_all_watchpoints", "list_watchpoints", "breakpoint_stats",
         "set_conditional_breakpoint", "clear_uvoptx_breakpoints",
         "list_uvoptx_breakpoints", "batch", "set_reloc_delta",
+    },
+    # ---- 非 MDK 能力族（批次36）----
+    # 这四个组的存在意义：调 RISC-V / ESP32 这类不用 Keil 的目标时，
+    # MDKDEBUG_TOOLSETS=toolchain,target,ocd,trace 即可把上下文压到只剩
+    # 这一条链路，不必让近百个 Keil 工具的描述挤占窗口。
+    "toolchain": {
+        "toolchain_list", "toolchain_env", "toolchain_run",
+        "toolchain_detect_project", "toolchain_build", "toolchain_compile",
+        "toolchain_elf_info", "toolchain_size", "toolchain_objcopy",
+        "toolchain_errors",
+    },
+    "target": {
+        "target_list", "target_show", "target_guess",
+    },
+    "ocd": {
+        "ocd_start", "ocd_stop", "ocd_status", "ocd_cmd", "ocd_cfg_list",
+        "ocd_probe", "ocd_control", "ocd_read_mem", "ocd_write_mem", "ocd_reg",
+        "ocd_bp", "ocd_wp", "ocd_flash", "ocd_flash_info", "ocd_load",
+        "ocd_gdb", "ocd_log",
+    },
+    "trace": {
+        "trace_guide", "trace_status", "trace_swo_start", "trace_swo_read",
+        "trace_swo_stop", "trace_decode", "trace_events", "trace_clear",
+        "trace_rtt_find", "trace_rtt_attach", "trace_rtt_read", "trace_rtt_write",
+        "trace_rtt_detach", "trace_profile", "trace_dwt_counters",
+        "trace_instrument",
     },
 }
 
@@ -6649,6 +6679,48 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                        if k in ("ok", "exists", "saved_at", "size", "error")}),
                 "output_control": dict({"available": True}, **_outctl.summary()),
             }
+            # 非 MDK 链路（批次36）：不用 Keil 的芯片走这一套。
+            # 这里刻意只做**廉价探测**（listdir 级），不跑 --version 也不启动
+            # OpenOCD：capabilities 是冷启动就会调的工具，慢一秒都是浪费。
+            non_mdk = {}
+            try:
+                tc = _toolchain.discover(with_version=False)
+                fams_have = sorted(f for f, e in (tc.get("families") or {}).items()
+                                   if e.get("tools"))
+                non_mdk["toolchain"] = {
+                    "available": bool(fams_have),
+                    "families_found": fams_have,
+                    "families_missing": sorted(tc.get("missing") or []),
+                    "roots": tc.get("roots"),
+                    "detail": "交叉编译器 / make / cmake / ninja / openocd / gdb "
+                              "的探测结果（详细版本用 toolchain_list）",
+                }
+            except Exception as e:  # noqa: BLE001
+                non_mdk["toolchain"] = {"available": False, "error": str(e)}
+            try:
+                non_mdk["targets"] = {
+                    "available": True,
+                    "profiles": len(_targets.PROFILES),
+                    "detail": "内置目标档案（连接方式 + 工具链 + trace 参数），"
+                              "详见 target_list",
+                }
+            except Exception as e:  # noqa: BLE001
+                non_mdk["targets"] = {"available": False, "error": str(e)}
+            try:
+                non_mdk["openocd"] = _ocd.session_info()
+            except Exception as e:  # noqa: BLE001
+                non_mdk["openocd"] = {"available": False, "error": str(e)}
+            try:
+                non_mdk["trace"] = _trace.summary()
+            except Exception as e:  # noqa: BLE001
+                non_mdk["trace"] = {"available": False, "error": str(e)}
+            non_mdk["when_to_use"] = (
+                "目标不用 Keil 时（RISC-V / ESP32 / 裸 GCC 工程）："
+                "target_list 挑档案 → toolchain_env 铺 PATH → toolchain_build 构建 → "
+                "ocd_start 起 OpenOCD → ocd_control/ocd_read_mem 调试 → "
+                "trace_instrument + trace_swo_start / trace_rtt_attach 做 trace。"
+                "MDKDEBUG_TOOLSETS=toolchain,target,ocd,trace 可只暴露这一条链路。"
+            )
             env = {"uv4_path": uv4,
                    "default_project": _builder_cfg.get("default_project"),
                    "symbol_source": _symbol_cfg.get("source_type"),
@@ -6664,10 +6736,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             except Exception:  # noqa: BLE001
                 pass
             return _js({"ok": True, "channels": ch, "modules": mods, "env": env,
-                        "tool_surface": surface,
+                        "non_mdk": non_mdk, "tool_surface": surface,
                         "recommended": ["capabilities 看能做什么", "keil_health 看现在通不通",
                                         "list_tools 查准确参数名",
-                                        "mdk_guide 看典型工作流"]})
+                                        "mdk_guide 看典型工作流",
+                                        "target_list / toolchain_list 看非 MDK 链路"]})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -6905,6 +6978,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                 "每个工具的完整说明见其 description 末尾的【参数】/【调用示例】"})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "keyword": keyword, "error": str(e)})
+
+    # 非 MDK 能力族（工具链 / 目标档案 / OpenOCD / trace）。
+    # 这些模块各自把工具注册进来，放在工具面裁剪之前，这样 _TOOLSETS 里
+    # 新加的组才有东西可裁。任一族注册失败都只记日志，不让整个 server 起不来。
+    _extra_counts = {}
+    for _mod_name, _mod in (("toolchain", _toolchain), ("targets", _targets),
+                            ("ocd", _ocd), ("trace", _trace)):
+        try:
+            _extra_counts[_mod_name] = _mod.register(server, _js)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("注册 %s 工具族失败（该族不可用，其余功能不受影响）：%s",
+                           _mod_name, _e)
+    logger.info("非 MDK 工具族注册：%s", _extra_counts)
 
     # 工具面裁剪：MDKDEBUG_TOOLSETS=core,serial 之类只暴露相关工具，
     # 避免近百个工具的描述挤占上下文。默认不设 = 全开，行为与以前完全一致。

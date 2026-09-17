@@ -169,6 +169,142 @@ ERROR_CODES = {
         "text": "刚停止时读到的是脏值（PC 未收敛）",
         "next_actions": ["稍等片刻重读一次（工具已默认做读数收敛判定）", "确认看门狗冻结位已置位，避免 halt 期间被复位"],
     },
+    # ------------------------------------------------------------------
+    # 非 MDK 链路（OpenOCD / 交叉工具链 / trace）
+    #
+    # 为什么要单独立码：Keil 侧的通用码（timeout / unknown-error）的
+    # next_actions 全都指向 keil_health / read_async_messages，对 OpenOCD 链路是
+    # **方向性错误**——真机实测：ocd_read_mem 读不全被归成 output-write-failed
+    # （next_actions 指向 Objects/Listings 目录权限），ocd_write_mem / ocd_reg 失败
+    # 归成 unknown-error（指向 keil_health）。错误的下一步比没有下一步更坑。
+    # ------------------------------------------------------------------
+    "ocd-not-running": {
+        "text": "OpenOCD 会话没在运行（非 MDK 侧没有调试通道）",
+        "next_actions": [
+            "先 ocd_start(profile=\"stm32f401\" 之类) 把会话起起来；不确定档案用 target_list",
+            "若刚被 ocd_stop / 进程自己退了，读 ocd_log 看退出原因（探针被占、cfg 路径错）",
+        ],
+    },
+    "ocd-session-exists": {
+        "text": "本服务已有一个 OpenOCD 会话在跑（同一根探针同时只能一个实例）",
+        "next_actions": [
+            "继续用现有会话（ocd_status 看它跑的是哪个档案），或 ocd_stop 后再起",
+            "需要换配置直接用 ocd_start(restart=true)",
+        ],
+    },
+    "ocd-probe-busy": {
+        "text": "调试探针被占用（另一个进程持着 DAP，常见是 Keil 正在调试）",
+        "next_actions": [
+            "先退出 Keil 的调试会话（或 close_uvision），再 ocd_start",
+            "确认没有其它 OpenOCD / pyOCD / 厂商 IDE 在后台占着同一根探针",
+        ],
+    },
+    "ocd-telnet-unreachable": {
+        "text": "连不上 OpenOCD 的 telnet 命令口（进程没起来 / 端口不对 / 已退出）",
+        "next_actions": [
+            "读 ocd_log 看 openocd 自己的报错（cfg 找不到、探针未被识别最常在这）",
+            "用 ocd_status 看进程与端口；端口被占就在 ocd_start 里换 telnet_port",
+            "探针插口/驱动问题不属于本链路：先确认 DAP 在设备管理器里能看到",
+        ],
+    },
+    "ocd-command-failed": {
+        "text": "OpenOCD 拒绝了这条命令（目标配置或目标当前状态不允许）",
+        "next_actions": [
+            "读返回里的 output：OpenOCD 把 `Error: ...` 原文留在那里（本工具不替它编原因）",
+            "地址类命令先 ocd_control(action=\"halt\")；目标没停住时读内存/下断点会失败",
+            "批量发命令时用 ocd_cmd_many 一条条看，定位是哪一条开始不对",
+        ],
+    },
+    "ocd-read-short": {
+        "text": "内存没读全（实际读到的字节数少于请求）",
+        "next_actions": [
+            "先 ocd_control(action=\"halt\") 再读：目标在跑时 DAP 直读会失败或读到半截",
+            "核对地址在有效区间（ocd_map / ocd_flash_info 看布局），外设区可能不可读",
+            "Cortex-M7/H7 开着 D-Cache 时直读 RAM 可能拿不到最新值，必要时先清 Cache",
+        ],
+    },
+    "ocd-write-verify-read-failed": {
+        "text": "写后回读校验本身失败（读不回来，不代表写入失败）",
+        "next_actions": [
+            "核对地址是否在可读区间：RAM 越界 / 未映射区域上 OpenOCD 的**写命令不报错**，只有读回才报",
+            "用 ocd_map（或 target_show 的布局信息）确认这颗芯片的 RAM/Flash 区间后再选地址",
+            "目标没停住时也读不回来：先 ocd_control(action=\"halt\")",
+        ],
+    },
+    "ocd-write-verify-mismatch": {
+        "text": "写后读不一致（写入未生效或回读被缓存干扰）",
+        "next_actions": [
+            "目标可能在跑：先 halt 再写；写 Flash 前要先擦除对应扇区",
+            "该地址可能只读（外设寄存器中锁定的域、未解锁的 Flash 区域）",
+            "H7 这类带 D-Cache 的目标，直写 RAM 可能被脏行回写覆盖，先清 Cache",
+        ],
+    },
+    "ocd-no-flash-bank": {
+        "text": "没有可用的 Flash bank（target cfg 不匹配或该芯片需要额外 cfg）",
+        "next_actions": [
+            "用 target_show / target_list 看档案选的 interface/target cfg 是否对应这颗芯片",
+            "部分 ESP32 / RISC-V 目标要专门的 cfg（如 esp32.cfg）才会注册 Flash driver",
+            "确认目标已上电且已被识别：ocd_probe 看 targets 列表里有没有 CPU",
+        ],
+    },
+    "ocd-script-missing": {
+        "text": "找不到 OpenOCD 的 scripts 目录（interface/target cfg 都在里面）",
+        "next_actions": [
+            "确认解压出来的 xpack-openocd 目录完整（share/openocd/scripts 要在）",
+            "用 toolchain_list 看本服务认到的 openocd 根目录是不是你期望的那个",
+        ],
+    },
+    "toolchain-missing": {
+        "text": "没找到要用的工具链可执行文件",
+        "next_actions": [
+            "用 toolchain_list 看本机已装了什么（本服务会扫描 D:/Tools/mdk_agent_toolchains）",
+            "按架构选对家族：arm-none-eabi / riscv-none-elf / riscv32-esp-elf / xtensa-esp-elf",
+            "也可能命令名字不对：看看 toolchain_where 能不能定位",
+        ],
+    },
+    "target-unknown": {
+        "text": "目标档案没命中（profile 不是已知档案）",
+        "next_actions": [
+            "先 target_list 看档案清单（含各档案的接口/目标 cfg 与默认 transport）",
+            "没有合适的就手给 interface/target cfg：ocd_start(interface=..., target=...)",
+        ],
+    },
+    "file-not-found": {
+        "text": "文件不存在或路径不对",
+        "next_actions": [
+            "核对路径（Windows 路径带空格要引号；本工具参数直接传字符串即可）",
+            "若是构建产物：先构建一次（toolchain_build / build_project），再引用产物",
+        ],
+    },
+    "trace-not-attached": {
+        "text": "还没 attach RTT（没有可用的上行/下行通道）",
+        "next_actions": [
+            "先 trace_rtt_attach：目标里必须已经跑着 RTT 组件（trace_instrument 可复制到工程）",
+            "不确定控制块地址用 trace_rtt_find 在 RAM 里扫（它认 `SEGGER RTT` 魔数）",
+        ],
+    },
+    "trace-rtt-not-found": {
+        "text": "RAM 里没扫到 RTT 控制块",
+        "next_actions": [
+            "确认固件真的带了 RTT 组件并已初始化（_SEGGER_RTT 符号在 ELF 里）",
+            "优先用 elf 定位（trace_rtt_find(elf=...)），比盲扫快且准",
+            "目标停在复位前/没跑起来时控制块还没建，先 resume 让它跑一会儿再扫",
+        ],
+    },
+    "trace-rtt-invalid": {
+        "text": "这个地址不是合法的 RTT 控制块（魔数/字段不匹配）",
+        "next_actions": [
+            "换成 trace_rtt_find 用 elf 的 _SEGGER_RTT 符号定位，不要手工猜地址",
+            "若地址是别人给的：确认它指向的是控制块开头（不是通道缓冲）",
+        ],
+    },
+    "trace-swo-not-running": {
+        "text": "当前没有正在进行的 SWO 采集",
+        "next_actions": [
+            "先 trace_swo_start（要 coreclk 与 baud；TPIU 上 SWO 要接线正确）",
+            "读已落盘的采集用 trace_swo_read(file=...)（采集结束后仍可回看）",
+        ],
+    },
     "unknown-error": {
         "text": "未归类的失败",
         "next_actions": ["调 keil_health 看 Keil 侧状态", "用 read_async_messages 读 Keil 的异步报错原文"],
@@ -177,6 +313,28 @@ ERROR_CODES = {
 
 # 分类规则：按顺序匹配，先具体后笼统
 _RULES = (
+    # ---- 非 MDK 链路（OpenOCD / 工具链 / trace）----
+    # 必须排在 Keil 通用规则之前：后面的 `未运行|无法连接|连接失败` 是给 UVSOCK 写的，
+    # 会把「OpenOCD 没在运行」「连接 telnet 失败」抢走，指向完全错的下一步。
+    (r"OpenOCD\s*(没在|未|不)运行|openocd.*not\s*running", "ocd-not-running"),
+    (r"已有 OpenOCD 在运行", "ocd-session-exists"),
+    (r"探针.*(被占用|被占|被另一个)|Failed to open.*(CMSIS|dap)|no device found",
+     "ocd-probe-busy"),
+    (r"连接 OpenOCD telnet|等待 telnet 端口超时|telnet.*(连接|connect).*(失败|refused)",
+     "ocd-telnet-unreachable"),
+    (r"只读到\s*\d+\s*/\s*\d+\s*字节", "ocd-read-short"),
+    (r"写后读不一致", "ocd-write-verify-mismatch"),
+    (r"没有 Flash bank|没有可用的 Flash bank", "ocd-no-flash-bank"),
+    (r"找不到 OpenOCD scripts 目录", "ocd-script-missing"),
+    (r"不支持的 transport|未知档案|既没给 profile 也没给 interface", "target-unknown"),
+    (r"找不到工具\s|本机没找到|找不到\s*\S*\s*的\s*(gcc|objcopy)|该工具不在放行白名单",
+     "toolchain-missing"),
+    (r"还没 attach RTT", "trace-not-attached"),
+    (r"没找到 RTT 控制块", "trace-rtt-not-found"),
+    (r"不是 RTT 控制块|控制块字段不合理|控制块太短|控制块数据不足", "trace-rtt-invalid"),
+    (r"没有正在进行的 SWO 采集", "trace-swo-not-running"),
+    (r"OpenOCD 拒绝了|^\s*Error\s*:", "ocd-command-failed"),
+    # ---- MDK / Keil 链路 ----
     (r"未定位到 UV4|UV4\.exe.*(不存在|找不到)|找不到 UV4", "uv4-not-found"),
     # 「正则编译失败」含「编译失败」子串，必须先于 build-failed 规则，否则会被误判成编译挂了
     (r"正则编译失败|正则.*(无效|不合法)|pattern.*(无效|不合法)", "invalid-argument"),
@@ -194,9 +352,14 @@ _RULES = (
     (r"error\s*145", "breakpoint-exists"),
     (r"未指定工程路径|未指定工程|没有可用的默认工程", "project-required"),
     (r"工程.*(不存在|找不到|打不开)|无法打开工程", "project-not-found"),
+    # 文件类出错统一码：放在 project-not-found 之后，避免把「工程文件不存在」抢走
+    (r"不存在：|文件不存在|找不到文件|no such file", "file-not-found"),
     (r"编译未通过|编译失败|构建失败|build\s*(failed|error)", "build-failed"),
     (r"设备数据库|器件库|Device Family Pack", "toolchain-not-ready"),
-    (r"写入错误|只读|磁盘空间", "output-write-failed"),
+    # 删掉裸的「只读」：它会把 ocd_read_mem 的「只读**到** 0/16 字节」误判成
+    # 输出目录只读（真机实测踩到）。Keil 侧的原文是「写入错误（输出目录只读 / 磁盘空间不足）」，
+    # 下面这两条已经能盖住。
+    (r"写入错误|磁盘空间|输出目录.*只读|只读.*(目录|文件系统|属性)", "output-write-failed"),
     (r"UV4 访问错误|已有实例占用", "keil-busy"),
     (r"已处于调试|已在调试态|调试会话已存在", "already-debugging"),
     (r"未进入调试|不在调试|需要调试态|not in debug", "not-debugging"),
@@ -230,11 +393,54 @@ def _classify_structured(obj: dict) -> str:
 
     没有这一步时，serial_expect 超时的结果（只有 timeout/timeout_kind，没有 error 文本）
     会落进 unknown-error，next_actions 指向 keil_health，方向完全不对（真机实测踩到）。
+    非 MDK 链路同理：ocd_read_mem 用 complete/expected_bytes 自述“没读全”，
+    ocd_write_mem 用 verified/mismatch 自述“写后不一致”，都比去猜中文措辞靠谱。
     """
     if obj.get("timeout") is True and "timeout_kind" in obj:
         return ("serial-expect-timeout-no-data" if obj.get("timeout_kind") == "no-data"
                 else "serial-expect-timeout-no-match")
+    # 非 MDK：工具自带的结构化结论优先
+    if obj.get("complete") is False and "expected_bytes" in obj:
+        return "ocd-read-short"
+    if obj.get("verified") is False and "mismatch" in obj:
+        return "ocd-write-verify-mismatch"
+    if obj.get("verify_error") and obj.get("verified") is None:
+        return "ocd-write-verify-read-failed"
+    if isinstance(obj.get("parsed_banks"), list) and not obj.get("parsed_banks"):
+        return "ocd-no-flash-bank"
     return ""
+
+# 非 MDK 工具名前缀：这些工具用不到 Keil 侧的下一步动作（keil_health / UVSOCK 那套）
+_NON_MDK_PREFIXES = ("ocd_", "toolchain_", "trace_", "target_")
+
+# 通用码在非 MDK 链路上的替代动作（同码不同链路，下一步完全不一样）
+_NON_MDK_ACTIONS = {
+    "timeout": [
+        "调 ocd_log 看 OpenOCD 侧最后在干什么（卡在擦除/编程很常见）",
+        "擦除/烧录/大批量读取本就慢：把 timeout 参数调大后重试",
+        "确认会话还在：ocd_status；探针被拔或目标掉电会让命令一直挂住",
+    ],
+    "unknown-error": [
+        "读返回里的 output / raw：OpenOCD 与工具链的原始输出在那里，不要猜原因",
+        "用 ocd_status / toolchain_list 确认会话与工具链状态后重试",
+    ],
+    "invalid-argument": [
+        "用 list_tools(keyword=...) 查该工具的参数签名与 example_args 示例",
+        "地址类参数支持 0x 前缀；宽度只接受 8/16/32；target 只在多目标时需要",
+    ],
+}
+
+def is_non_mdk_tool(tool_name: str) -> bool:
+    return str(tool_name or "").startswith(_NON_MDK_PREFIXES)
+
+def code_actions(tool_name: str, code: str) -> list:
+    """取某个错误码在该链路下的下一步动作（非 MDK 族对通用码做替换）。"""
+    if not code:
+        return []
+    if is_non_mdk_tool(tool_name) and code in _NON_MDK_ACTIONS:
+        return list(_NON_MDK_ACTIONS[code])
+    info = ERROR_CODES.get(code)
+    return list(info["next_actions"]) if info else []
 
 def _status_of(obj: dict) -> str:
     ok = obj.get("ok")
@@ -297,10 +503,7 @@ def normalize(tool_name: str, obj: dict) -> dict:
         acts.append(existing.strip())
     acts.extend(_collect_hints(out))
     if status == "error":
-        code = out.get("error_code")
-        info = ERROR_CODES.get(code) if code else None
-        if info:
-            acts.extend(info["next_actions"])
+        acts.extend(code_actions(tool_name, out.get("error_code") or ""))
     # 去重保序；并剔除与 error / error_hint 原文重复的项（它们本身不是「动作」）
     seen = set(x for x in (out.get("error"), out.get("error_hint")) if isinstance(x, str))
     final = []

@@ -73,7 +73,9 @@
 - **随附 companion 技能 `skills/mdkdebug/SKILL.md`**：把「怎么用这套工具」写成 AI 可直接读的技能文件
   （先自检再动手、四条主线工作流、`session_state` 接续、三个输出控制旋钮、参数与工具面约定、出错先看谁），
   避免每次冷启动都从 `list_tools` 摸索；
-- **随附模拟调试器**：无需硬件即可离线联调与跑测试。
+- **不依赖 Keil 的芯片也能调**：`toolchain_*` 自己探测 gcc/make/cmake 并跑构建、`target_*` 把接口与 trace 参数固化成 20 份档案、`ocd_*` 用 OpenOCD 做内存/寄存器/断点/烧录——RISC-V、ESP32 这类不用 MDK 的目标走这条链路，与 Keil 链路互不干扰；
+- **SWD/SWO 两条 trace 通路 + 目标侧插桩**：`trace_swo_*` 走 TPIU/ITM 单线输出，`trace_rtt_*` 主机侧自研读写 SEGGER 兼容环形缓冲（不依赖上位机），另有 SWD 采样剖析（明标侵入式）与 DWT 计数器；主机侧只能看到“目标愿意发出来的东西”，所以配套提供目标侧插桩组件 `components/trace/`（ITM/RTT/UART 三后端，只依赖 CMSIS），事件按带 CRC8 的 MTF 帧传出，丢包与坏帧**如实计数上报**；
+- **随附模拟调试器**：无需硬件即可离线联调与跑测试（UVSOCK 与 OpenOCD 各一份）。
 
 ## 工作原理
 
@@ -122,6 +124,10 @@ AI 客户端通过 MCP 协议把用户/模型意图转成工具调用；`mdkdebu
 | Python | ≥ 3.11（开发 / 验证于 3.12） |
 | Keil | uVision 5，且已配置 UVSOCK 调试插件（见"对接真实 Keil"） |
 | Keil UV4 | `UV4.exe` 用于编译 / 烧录，可自动探测或 `--uv4-path` 指定（通常随 Keil 安装于 `UV4/UV4.exe`） |
+| OpenOCD（可选） | 调非 MDK 芯片 / 用 trace 时需要：可自动探测，也可在 `ocd_start(exe=...)` 指定；不需要时四个 `ocd_*`/`trace_*` 工具组可裁掉（见“工具面裁剪”） |
+| 交叉工具链（可选） | `toolchain_*` 系列会自动扫描常见安装位置；本机没有的家族列在 `missing` 里，不报错 |
+
+> **MDK 与非 MDK 两条链路互相独立**：只调 Keil 工程时不需要 OpenOCD，只调 RISC-V / ESP32 时不需要装 Keil。
 
 ### Python 组件依赖
 
@@ -169,13 +175,22 @@ mdk_agent/
 │   ├── mapfile.py            # .map 链接映射文件解析（Program Size/sections/symbols/栈使用/未用段）
 │   ├── outctl.py             # 高输出工具的输出控制（compact / max_lines / full）
 │   ├── session.py            # 跨会话状态存储（state.json：原子写 + 旧版备份 + diff）
-│   └── server.py             # MCP Server 与 99 个工具定义
+│   ├── toolchain.py          # 非 MDK：gcc/make/cmake 探测、构建、ELF/size/objcopy、编译错误解析
+│   ├── targets.py            # 非 MDK：目标档案（接口/速度/SWO/RTT 参数）与按名称、ELF 自动识别
+│   ├── ocd.py                # 非 MDK：OpenOCD telnet 会话与内存/寄存器/断点/烧录操作
+│   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
+│   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署
+│   └── server.py             # MCP Server 与 145 个工具定义
+├── components/
+│   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
+│                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
 ├── skills/
 │   └── mdkdebug/SKILL.md     # 随附 companion 技能（工作流 / 参数约定 / 输出控制 / 排障入口）
 ├── tools/
 │   └── run_all_tests.py      # 统一测试闸门（工具数一致性检查 + 逐批回归）
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
+│   ├── mock_openocd.py       # 模拟 OpenOCD 的 telnet 服务器（含假 RAM / RTT 控制块，离线联调）
 │   ├── test_batch*.py        # 各批次 mock 回归（批次 8 拆为 8a/8b/8cd；逐批覆盖该批新增工具）
 │   └── test_e2e / test_mcp / test_stdio / test_enhanced / test_unhardcode / test_diag.py
 │                             # 协议闭环 / MCP 工具注册 / stdio 握手 / 增强功能 / 去硬编码 / 诊断
@@ -212,7 +227,12 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **99** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导）：
+共 **145** 个，分两大块：
+
+- **MDK 族（99 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
+- **非 MDK 族（46 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案**（接口·速度·SWO·RTT 参数档案与自动识别，4 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace**（SWO·RTT·采样剖析·DWT·插桩组件部署，16 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+
+下表为 MDK 族工具：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -320,9 +340,115 @@ python run_server.py --transport http --http-port 8300
 
 > 编译烧录 / Keil 启动工具的 `project` 均可省略：省略时使用启动参数 `--default-project` 指定的默认工程。
 
+## 非 MDK 芯片与 trace（不依赖 Keil）
+
+这一块工具**完全不碰 Keil / UVSOCK**：只要本机装了工具链与 OpenOCD，就能对 RISC-V、ESP32 等非 MDK 芯片做编译、烧录、调试与 trace。四组工具共 **46 个**。
+
+### 工具链（`toolchain_*`，10 个）
+
+用**自动探测**代替写死路径：启动时扫一组候选目录，找出本机实际装了哪些家族的编译器并把 `bin` 目录入库，工具调用只写家族名，不写绝对路径。
+
+| 工具 | 说明 | 主要参数 |
+|------|------|----------|
+| `toolchain_list` | 列出已探测到的工具链家族与其中的可执行文件（`arm-none-eabi` / `riscv-none-elf` / `riscv32-esp-elf` / `xtensa-esp-elf` / `make` / `cmake` / `ninja` …）；`with_version=true` 顺带取版本（会启动子进程，较慢） | `family?`、`refresh?`、`with_version?` |
+| `toolchain_env` | 组装环境变量（把家族 `bin` 拼进 `PATH`，可再叠 `path_extra`），用于「手动跑一条命令」的场景；`show_only=true` 只看不返回可执行命令 | `families?`、`path_extra?`、`reset?`、`show_only?` |
+| `toolchain_run` | 在已组装的环境里跑任意工具（`tool` 可为家族名或可执行名），回传 stdout/stderr/退出码；能写 stdin（`input_text`） | `tool`、`args`、`cwd?`、`timeout?`、`family?`、`env_extra?`、`input_text?` |
+| `toolchain_detect_project` | 判断一个目录是什么工程（Makefile / CMakeLists / ESP-IDF / uvprojx…），给出根目录、判据 `evidence`、候选 `.elf` 与建议构建目录 | `path?`、`max_up?` |
+| `toolchain_build` | 按探测结果构建（make / cmake / idf.py），支持 `jobs`/`clean`/`generator`/`config_args`/`extra_make_args`；`dry_run=true` 只回将要执行的步骤不真跑 | `project?`、`build_dir?`、`target?`、`jobs?`、`clean?`、`generator?`、`config_args?`、`timeout?`、`families?`、`dry_run?`、`extra_make_args?` |
+| `toolchain_compile` | 直接编一个或多个源文件（不建工程），自动拼 `--target`/`-mcpu`/`-mfpu`/`-mfloat-abi`；`syntax_only=true` 只做语法检查（快速校验改动的源文件） | `files`、`family?`、`out?`、`defs?`、`includes?`、`flags?`、`cpu?`、`fpu?`、`float_abi?`、`syntax_only?`、`cwd?`、`timeout?`、`extra_args?`、`objdir?` |
+| `toolchain_elf_info` | 解析 ELF 头：架构 / 机器 / 入口 / 段表（不依赖外部工具，纯 Python 解析） | `elf` |
+| `toolchain_size` | 跑 `size` 看 section 占用（`by_section=true` 给逐段明细与占比），返回工具路径与完整命令便于复核 | `elf`、`family?`、`by_section?`、`top?` |
+| `toolchain_objcopy` | 生成 bin/hex/ihex/srec 等镜像格式 | `elf`、`fmt?`、`out?`、`family?`、`extra?` |
+| `toolchain_errors` | **把编译器日志变成结构化错误**：逐条给出 `file`/`line`/`col`/`severity`/`message`/`hint`，警告单独放 `warnings` 不混进 `errors`，便于 AI 直接改代码 | `text`、`limit?` |
+
+### 目标档案（`target_*`，3 个）
+
+把「这颗芯片用哪种接口、多快、SWO 主频与速率、RTT 控制块地址、DWT 是否可用」固化成 **20 份档案**（STM32F401/F411/F429/F407/F446/F103/F7/H7/L4、GD32F303、Cortex-M 通用、RISC-V 通用、ESP32/C3/C6/S2/S3、nRF52、RP2040、AIR001），避免每次调试都手写一长串 OpenOCD 参数。
+
+| 工具 | 说明 | 主要参数 |
+|------|------|----------|
+| `target_list` | 列出全部档案（可按 `arch` / `keyword` 过滤），一眼看清有哪些现成配置 | `arch?`、`keyword?` |
+| `target_show` | 出一份档案的完整参数，并直接给出可用的 **OpenOCD 参数串**（`openocd_args`），可原样喂给 `ocd_start` | `profile`、`interface?`、`target?`、`transport?`、`speed?`、`extra_cfg?` |
+| `target_guess` | **不认识芯片名/`.elf` 时先猜档案**：按型号名正则（`STM32F407ZGT6`→`stm32f407`）或 ELF 的 `e_machine` 推断，**多候选时全列出来不挑一个像样的** | `elf?`、`name?` |
+
+### OpenOCD（`ocd_*`，17 个）
+
+会话自动管理（起一次、后续工具复用），telnet 协议层做了输出整形：剔回显、折叠 Jim-Tcl 调用栈、提取 `Error:`（`Warn :` 不算失败）。
+
+| 工具 | 说明 | 主要参数 |
+|------|------|----------|
+| `ocd_start` | 起 OpenOCD 会话（可只给档案名让它自己拼参数），可追加 `commands` 预先下发；已在跑时默认复用，`restart=true` 才重启 | `profile?`、`interface?`、`target?`、`transport?`、`speed?`、`extra_cfg?`、`commands?`、`telnet_port?`、`gdb_port?`、`tcl_port?`、`cwd?`、`exe?`、`restart?`、`wait?`、`log_file?` |
+| `ocd_stop` | 关会话：默认走 telnet `shutdown` 优雅退出，失败才终止进程 | `graceful?`、`timeout?` |
+| `ocd_status` | 会话与目标状态（`probe_target=true` 顺带探一次目标） | `probe_target?` |
+| `ocd_cmd` | 下发任意 OpenOCD 命令（可多行），返回逐条结果；未知命令会带回 OpenOCD 的真实报错，不由工具猜原因 | `command`、`timeout?` |
+| `ocd_cfg_list` | 列出可用的 OpenOCD 配置（`interface` / `target` / `board`），并标注本机**实际存在**哪些 | `kind?`、`keyword?` |
+| `ocd_probe` | 一次拿全：IDCODE、CPUID（实现者/变体/`partno`→内核名）、DAP 信息、target 列表、Flash bank 列表、OpenOCD 版本 | — |
+| `ocd_control` | 运行控制：`halt` / `resume` / `reset`（halt/init/run 三种）/ `step` / `wait_halt` | `action`、`target?`、`timeout?` |
+| `ocd_read_mem` | 读内存（`width` 8/16/32），回 `data_hex` 并给出 `got_bytes`/`expected_bytes`/`complete`，**读不全就明说不完整** | `addr`、`n_bytes?`、`width?` |
+| `ocd_write_mem` | 写内存，**默认写后回读校验**（`verified`/`mismatch`）；校验用读命令而非写命令回显 | `addr`、`data_hex?`、`words?`、`width?`、`verify?`、`target?`、`timeout?` |
+| `ocd_reg` | 读全部寄存器或读/写指定寄存器 | `name?`、`value?`、`target?`、`timeout?` |
+| `ocd_bp` | 软件断点：`set` / `clear` / `list` / 按 `clear_all` 全清；**送 Keil/OpenOCD 前自动清掉代码地址的 Thumb 位**（裸地址带 bit0 会报 illegal address），并回 `note` 说明做过归一 | `action`、`addr?`、`length?`、`target?`、`timeout?` |
+| `ocd_wp` | 数据观察点：`read` / `write` / `access` 三种类型 | `action`、`addr?`、`length?`、`kind?`、`target?`、`timeout?` |
+| `ocd_flash` | 烧录：支持 `probe` / `write_image`（可 `erase`/`verify`/`reset`），回 `duration_s` 与输出 | `file`、`addr?`、`verify?`、`reset?`、`erase?`、`target?`、`timeout?` |
+| `ocd_flash_info` | 列出 Flash bank（编号/名称/驱动/基址/容量，含 `parsed_banks` 结构化结果） | `bank?`、`timeout?` |
+| `ocd_load` | 下载镜像到内存（`load_image`），调试中快速换程序 | `file`、`addr?`、`timeout?` |
+| `ocd_gdb` | 借 GDB 批处理做一件 OpenOCD 原生不好做的事（可指定 `elf` 与 `gdb` 路径） | `commands`、`elf?`、`gdb?` 等 |
+| `ocd_log` | 读 OpenOCD 日志尾巴（可按 `keyword` 过滤），排查启动失败用 | `lines?`、`keyword?` |
+
+### trace（`trace_*`，16 个）
+
+三条通路：**SWO/ITM**（经 TPIU 单线输出）、**RTT**（目标内存环形缓冲，主机侧自研读写，不依赖 SEGGER 上位机）、**SWD 采样**（`halt` 采 PC，明确标注侵入式）。三条通路解码出的事件（含 MTF 帧）汇入同一缓冲区，由 `trace_events` 统一取。
+
+| 工具 | 说明 | 主要参数 |
+|------|------|----------|
+| `trace_guide` | 主题式使用引导（接线、SWO 速率怎么定、RTT 集成、采样剖析代价…），不认识的方法名会列出可选主题而不是给空 | `topic?` |
+| `trace_status` | trace 紧凑状态：模式、事件**计数**、各后端状态、解码器统计（不是把事件全倒出来） | — |
+| `trace_swo_start` | 配 TPIU + 开 ITM 端口（`coreclk`/`baud` 缺省从档案取），开始把 SWO 数据落到文件 | `file?`、`coreclk?`、`baud?`、`ports?`、`profile?` |
+| `trace_swo_read` | **增量读** SWO 文件（每批只给新增事件，不重复倒）；返回事件、解码器统计与后端状态 | `max_events?`、`ports?` |
+| `trace_swo_stop` | 关 ITM 端口、停采集 | — |
+| `trace_decode` | 离线复解：把一段 hex 或一个文件按 ITM+MTF 解成事件（不接硬件也能查问题） | `data_hex?`、`file?`、`ports?`、`limit?` |
+| `trace_events` | 取事件缓冲（可按 `kind`/`channel` 过滤），回 `total_matched`/`buffer_total`/`counts` | `limit?`、`kind?`、`channel?` |
+| `trace_clear` | 清空事件缓冲（`reset=true` 连解码器一起复位） | `reset?` |
+| `trace_rtt_find` | **在 RAM 里扫 SEGGER RTT 控制块**（按魔数扫描，扫描范围可指定成 `0x…-0x…`）；扫不到就如实说没找到，**不硬猜一个地址** | `elf?`、`ranges?`、`id_str?` |
+| `trace_rtt_attach` | 按地址挂 RTT，读出上下行通道数与通道名；**先校验 `SEGGER RTT` 魔数**，地址不对时明确报「不是 RTT 控制块」（不让全 0 RAM 冒充合法块） | `addr`、`size?`、`elf?`、`id_str?` |
+| `trace_rtt_read` | 读上行通道（读后自动把 RdOff 写回目标，否则目标以为没被消费、数据会堆死） | `channel?`、`max_bytes?`、`timeout?` |
+| `trace_rtt_write` | 写下行通道（文本或 `hex_data` 二进制），给目标下发命令 | `channel?`、`data?`、`hex_data?` |
+| `trace_rtt_detach` | 解除挂接并回本次统计 | — |
+| `trace_profile` | **采样剖析**：周期性 `halt` 采 PC 再 `resume`，按函数聚合出热点；返回 `intrusive: true` 与 `warning`，明说会扰动时序 | `samples?`、`elf?`、`interval_ms?`、`top?`、`timeout?` |
+| `trace_dwt_counters` | 读 DWT 六个计数器（CYCCNT/CPICNT/EXCCNT/SLEEPCNT/LSUCNT/FOLDCNT）与 CYCCNT 使能位 | — |
+| `trace_instrument` | **把目标侧插桩组件部署进你的工程**（见下）：按 `backend` 生成配置、拷贝组件源码与 `.mk`，已有文件默认 SKIP 不覆盖 | `target_dir`、`backend?`、`itm_port?`、`rtt_up?`、`rtt_down?`、`rtt_buf?`、`coreclk?`、`overwrite?`、`swo_baud?`、`dbgmcu_cr?` |
+
+### 目标侧插桩组件（`components/trace/`）
+
+trace 不能只靠主机侧「猜」目标行为，需要在被调试代码里插一小段组件把事件送出来。组件随仓库提供（源码注释为英文，避免旧版编译器中文注释乱码），支持 **ITM / RTT / UART** 三种后端，只依赖 CMSIS，不绑定 HAL：
+
+| 文件 | 说明 |
+|------|------|
+| `mdk_trace.h` | 组件主头：API + MTF 常量 + `MDK_TRACE_SCOPE()` / ISR 进出宏 |
+| `mdk_trace_config_default.h` | 全部 `#ifndef` 兜底：什么都不配也能编，且**只在四后端都没定义时才默认 ITM**，不会双后端打架 |
+| `mdk_trace.c` | DWT/`mcycle` 时间戳、MTF 组帧（CRC8）、三种后端的发送实现 |
+| `mdk_trace_rtt.c` / `.h` | SEGGER 兼容的 RTT 控制块与环形缓冲（**目标侧绝不写 RdOff**，由主机侧推进） |
+| `CMakeLists.txt` / `README.md` | 静态库 `mdk_trace` 的构建与使用说明 |
+
+典型用法（更多见组件内 README）：
+
+```c
+mdk_trace_init();                       /* 选后端、配时基 */
+MDK_TRACE_SCOPE(adc_isr);               /* 进出成对打点 */
+MDK_TRACE_EVENT(ID_ADC_DONE, 123);      /* 带 id + 数值的事件 */
+```
+
+一条完整的非 MDK 链路大致是：
+
+```text
+toolchain_detect_project → toolchain_build → toolchain_errors（有错就改）
+target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_instrument(target_dir=...)
+→ 重新编译烧录 → trace_rtt_find / trace_swo_start → trace_events → trace_dwt_counters / trace_profile
+```
+
 ### 工具面裁剪（可选，`MDKDEBUG_TOOLSETS`）
 
-工具多了以后，把全部工具塞进上下文会稀释注意力。可用环境变量 `MDKDEBUG_TOOLSETS` 只暴露需要的组，例如 `MDKDEBUG_TOOLSETS=serial`（只留串口 10 个）、`core,build`（调试核心 + 编译烧录）：
+工具多了以后，把全部工具塞进上下文会稀释注意力。可用环境变量 `MDKDEBUG_TOOLSETS` 只暴露需要的组，例如 `MDKDEBUG_TOOLSETS=serial`（只留串口 7 个）、`core,build`（调试核心 + 编译烧录）；调非 MDK 芯片时用 `MDKDEBUG_TOOLSETS=toolchain,target,ocd,trace` 把近百个 Keil 工具的描述全部收起来：
 
 | 组名 | 内容 |
 |---|---|
@@ -332,6 +458,10 @@ python run_server.py --transport http --http-port 8300
 | `build` | 编译 / 清理 / 烧录 / 工程配置（13 个） |
 | `serial` | 宿主机串口监听与命令应答（7 个） |
 | `advanced` | 诊断 / 剖析 / SVD / 工程编辑等进阶能力（25 个） |
+| `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
+| `target` | 非 MDK：目标档案查询与自动识别（3 个） |
+| `ocd` | 非 MDK：OpenOCD 会话 / 内存 / 寄存器 / 断点 / 烧录（17 个） |
+| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 插桩组件部署（16 个） |
 
 三条防翻车约定：**不设环境变量时行为完全不变**（默认全开）；**未归类的工具一律保留**（宁可少裁不错杀，组名写错时也不裁剪只给告警）；`list_tools` / `get_version` / `capabilities` 三个元工具**永不被裁**（否则 AI 连工具清单都问不出来）。裁剪结果会记入 `capabilities.tool_surface`，随时可核对。
 
@@ -474,9 +604,9 @@ AI 修改代码后，可按如下顺序实现"自己编译、自己烧录、自�
 
 ## 测试
 
-无需真实 Keil，使用 `tests/mock_uvsock_server.py` 模拟调试器：
+无需真实 Keil，也无需真实 OpenOCD：MDK 链路用 `tests/mock_uvsock_server.py` 模拟调试器，非 MDK 链路用 `tests/mock_openocd.py` 模拟 OpenOCD（内建假 RAM 与 RTT 控制块，能验证内存读写、寄存器、断点、烧录与 RTT 收发）。
 
-**跑全部**（推荐，先做一致性检查再跑 21 个测试模块）：
+**跑全部**（推荐，先做一致性检查再跑 22 个测试模块）：
 
 ```bash
 python tools/run_all_tests.py          # 实际工具数 vs tests/README 里写死的断言 + 跑全部测试
@@ -489,12 +619,14 @@ python tools/run_all_tests.py --no-run # 只做一致性检查（秒级，改工
 python tests/test_e2e.py     # UVClient 协议闭环（25 项）
 python tests/test_mcp.py     # MCP Server 工具注册与调用（19 项）
 python tests/test_stdio.py   # stdio 全链路客户端握手（7 项）
+python -m tests.test_batch36 # 非 MDK：工具链 / 档案 / OpenOCD / trace 四组（116 项）
 ```
 
 单独启动模拟调试器供人工联调：
 
 ```bash
-python -m tests.mock_uvsock_server --port 4823
+python -m tests.mock_uvsock_server --port 4823   # 模拟 Keil 调试器
+python -m tests.mock_openocd --port 4444         # 模拟 OpenOCD telnet（打印实际监听端口）
 ```
 
 ## 可靠性约定（读前必看）
