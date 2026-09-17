@@ -109,6 +109,14 @@ class MockUVSOCKServer:
         self.breakpoints = []  # 断点符号/地址列表
         # 命令窗口额外输出行（复现真机「UVSOCK 回成功、窗口里却是 *** error N」）
         self.exec_console_extra = []
+        # 真机格式断点表（批次22）：非 None 时 BL 按真机格式输出并带 CNT，
+        # 每条为 {"number", "kind": "exec"/"access", "access", "address", "length",
+        #          "expr", "count", "enabled"}，供 wait_breakpoint 的 CNT 命中判定测试。
+        self.bl_table = None
+        # BL 被读取的次数（批次22）：配合 bl_bump_after_reads 模拟「等待期间断点命中」——
+        # 基线读取看到旧 CNT，第 N 次读取后 CNT 自增，于是停止后的读取能看到增量。
+        self.bl_reads = 0
+        self.bl_bump_after_reads = []   # [(第几次读之后, 断点编号, 增量), ...]
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
@@ -349,6 +357,32 @@ class MockUVSOCKServer:
         # 未知命令
         return uvsock.UV_STATUS_NOT_SUPPORTED, b""
 
+    # ---- 真机格式断点表（批次22） ----
+
+    def _render_bl_row(self, b):
+        """按真机 BL 输出格式渲染一条断点（须能被 client._BP_LINE_RE 解析）。
+
+        真机样例：
+          0: (E 0x08000DB4) '..\\main.c\\77', CNT=1, enabled
+          3: (A WR 0x20000000 len=1) '0x20000000', CNT=1, enabled
+        """
+        if (b.get("kind") or "exec") == "access":
+            head = "A %s %s len=%s" % (b.get("access", "WR"), b.get("address", "0x0"),
+                                       b.get("length", 1))
+        else:
+            head = "E %s" % (b.get("address", "0x0"),)
+        return "%s: (%s) '%s', CNT=%s, %s" % (
+            b.get("number", 0), head, b.get("expr", ""), b.get("count", 0),
+            "enabled" if b.get("enabled", True) else "disabled")
+
+    def bump_bp_count(self, number, delta=1):
+        """模拟断点命中：把编号对应断点的 CNT 增加 delta。返回是否找到。"""
+        for b in (self.bl_table or []):
+            if b.get("number") == number:
+                b["count"] = int(b.get("count") or 0) + delta
+                return True
+        return False
+
     def _exec_cmd(self, data):
         """解析并执行命令窗口命令（BS/BK/BL）。data 为完整 EXECCMD 结构。"""
         # flags(4) + reserved(28) + SSTR{nLen(4) + char[256]}
@@ -374,15 +408,39 @@ class MockUVSOCKServer:
                            + b"\\mdk_test\\../Core/Src/main.c")
             return st, payload
         if op == 'BK' and rest:
+            if rest[0] == '*' and self.bl_table is not None:
+                self.bl_table = []
+                self.breakpoints = []
+                return uvsock.UV_STATUS_SUCCESS, b""
+            if self.bl_table is not None and rest[0].isdigit():
+                n = int(rest[0])
+                if not any(b.get("number") == n for b in self.bl_table):
+                    # 真机：编号不存在时报 error（按地址清数据观察点即 error 72）
+                    err = "*** error 72: invalid item number"
+                    self._push_console(err)
+                    self._push_async(uvsock.UV_DBG_EXEC_CMD, uvsock.UV_STATUS_FAILED, err)
+                    return uvsock.UV_STATUS_SUCCESS, b""
+                self.bl_table = [b for b in self.bl_table if b.get("number") != n]
+                return uvsock.UV_STATUS_SUCCESS, b""
             if rest[0].isdigit() and int(rest[0]) < len(self.breakpoints):
                 self.breakpoints.pop(int(rest[0]))
             elif rest[0] in self.breakpoints:
                 self.breakpoints.remove(rest[0])
             return uvsock.UV_STATUS_SUCCESS, b""
         if op == 'BL':
-            text = "\n".join(
-                f"{i}: {bp}" for i, bp in enumerate(self.breakpoints)) or ""
-            self._push_console(text)  # 断点列表作为命令输出（0x5020）
+            if self.bl_table is not None:
+                # 先按「本次是第几次读」结算自增，再渲染，这样第 N 次读就能看到增量
+                self.bl_reads += 1
+                for item in list(self.bl_bump_after_reads):
+                    after_n, num, delta = item
+                    if self.bl_reads >= after_n:
+                        self.bump_bp_count(num, delta)
+                        self.bl_bump_after_reads.remove(item)
+                for b in self.bl_table:
+                    self._push_console(self._render_bl_row(b))   # 真机：每条断点一行
+            else:
+                for i, bp in enumerate(self.breakpoints):
+                    self._push_console(f"{i}: {bp}")
             return uvsock.UV_STATUS_SUCCESS, b""
         if op == 'EVAL' and rest:
             name = rest[0]

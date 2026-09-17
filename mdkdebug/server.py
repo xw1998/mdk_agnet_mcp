@@ -812,17 +812,43 @@ def _example_value(name: str, spec: dict):
     return "<%s>" % name
 
 
+# 参数别名表：主参数 -> 别名。为了让别名在直接调用时也能用，主参数在 schema 里
+# 变成了可选（框架只认 schema 的 required）；但对调用方而言它仍是必填，故这里把
+# 必填口径补回，使描述/list_tools 与实际校验一致，避免"看似可选、一传才报错"。
+_ALIAS_HINT = {
+    "read_mem": {"n_bytes": "length"},
+    "find_symbol": {"query": "name"},
+}
+
+
+def _req_params(tool_name: str, params: dict) -> list:
+    """必填参数口径 = schema required + 别名的宿主参数（如 read_mem 的 n_bytes）。"""
+    req = list(params.get("required") or [])
+    for main in (_ALIAS_HINT.get(tool_name) or {}):
+        if main not in req:
+            req.append(main)
+    return req
+
+
+def _alias_note(tool_name: str) -> str:
+    """别名提示文本，如"（别名：n_bytes 也可写作 length）"。"""
+    amap = _ALIAS_HINT.get(tool_name) or {}
+    if not amap:
+        return ""
+    return "（别名：" + "；".join("%s 也可写作 %s" % (k, v) for k, v in amap.items()) + "）"
+
+
 def _param_signature(tool) -> str:
     """由工具 inputSchema 生成"必填参数 + 调用示例"文本块。"""
     params = getattr(tool, "parameters", None) or {}
     props = params.get("properties") or {}
     if not props:
         return "无（直接调用，args 传 {}）"
-    required = list(params.get("required") or [])
+    required = _req_params(getattr(tool, "name", ""), params)
     optional = [n for n in props if n not in required]
     req_txt = ", ".join(required) if required else "无"
     opt_txt = ", ".join(optional) if optional else "无"
-    return "必填: %s；可选: %s" % (req_txt, opt_txt)
+    return "必填: %s；可选: %s%s" % (req_txt, opt_txt, _alias_note(getattr(tool, "name", "")))
 
 
 def _param_hint_block(tool) -> str:
@@ -836,7 +862,7 @@ def _param_hint_block(tool) -> str:
     props = params.get("properties") or {}
     if not props:
         return "\n【参数】无（直接调用）\n【调用示例】{}"
-    required = list(params.get("required") or [])
+    required = _req_params(getattr(tool, "name", ""), params)
     example = {}
     for nm, spec in props.items():
         if nm in required:
@@ -845,6 +871,124 @@ def _param_hint_block(tool) -> str:
         example = {}
     return ("\n【参数】%s\n【调用示例】%s"
             % (_param_signature(tool), json.dumps(example, ensure_ascii=False)))
+
+
+# ---------------- 符号重定位偏移（App 侧变量按符号名直读） ----------------
+# 背景：App 运行期重定位后，运行地址 = .axf 里的链接地址 + delta（SVCrtOS 里是 0xF000）。
+# 此前读 App 变量必须手工算偏移，这里做成全局设置 + 按调用覆盖。
+_reloc_cfg = {"delta": 0}
+
+
+def _parse_reloc_delta(v):
+    """解析重定位偏移（0x 十六进制 / 十进制 / 可带负号）；空值返回 None。"""
+    t = str(v or "").strip()
+    if not t:
+        return None
+    neg = t.startswith("-")
+    body = t[1:].strip() if neg else t
+    try:
+        val = int(body, 16) if body.lower().startswith("0x") else int(body, 10)
+    except ValueError:
+        raise ValueError("reloc_delta 需为 0x 十六进制或十进制整数（可带负号），收到 %r" % v)
+    return -val if neg else val
+
+
+def _eff_reloc_delta(arg=None):
+    """确定本次生效的重定位偏移：显式参数优先，其次全局设置。返回 (delta, 说明)。"""
+    d = _parse_reloc_delta(arg)
+    if d is not None:
+        return d, "本次调用显式指定"
+    d = int(_reloc_cfg.get("delta") or 0)
+    return d, ("全局 set_reloc_delta(0x%X)" % d if d else "未设置重定位偏移（默认 0）")
+
+
+def _resolve_addr_with_reloc(addr_arg, client, delta):
+    """解析地址参数，并对**符号名**应用重定位偏移。
+
+    只偏移符号名：显式数字地址（如 '0x20000100'）通常是调用方给的确切运行地址，
+    再偏移会读到别处；而符号地址（.axf 链接地址）在 App 重定位场景下必须 +delta。
+    """
+    try:
+        return _parse_addr(addr_arg), None
+    except (ValueError, TypeError):
+        pass
+    a, note = _resolve_addr_arg(addr_arg, client)
+    if not delta:
+        return a, note
+    run = (int(a) + int(delta)) & 0xFFFFFFFF
+    tip = "已按 reloc_delta=0x%X 偏到运行地址 0x%X（符号地址是链接地址）" % (delta, run)
+    return run, ((note + "；" + tip) if note else tip)
+
+
+def _read_variable_reloc(client, name, count, read_memory, delta, dnote):
+    """重定位偏移下的变量读取。
+
+    Keil 表达式 '&name' 返回的是链接地址，直接求值会读到错误位置；因此这里取链接地址
+    +delta 得运行地址，再从运行地址读内存并解析（小端整数 / 浮点）。
+    """
+    out = {"ok": False, "name": name,
+           "reloc_delta": "0x%X" % delta, "reloc_note": dnote}
+    link = None
+    ar = client.calc_expression("&" + name)
+    if isinstance(ar, dict) and ar.get("ok") and isinstance(ar.get("value"), int):
+        link = int(ar["value"]) & ~1
+        out["link_address_source"] = "调试器表达式 &%s" % name
+    if link is None:
+        loc = _get_locator()
+        hit = loc.symbol_addr(name) if loc is not None else None
+        if hit:
+            link = int(hit["addr"])
+            out["link_address_source"] = ".axf 符号表"
+    if link is None:
+        out["error"] = "无法解析符号 '%s' 的链接地址（符号不存在或未进入调试态）" % name
+        return out
+    run = (link + int(delta)) & 0xFFFFFFFF
+    out["link_address"] = hex(link)
+    out["run_address"] = hex(run)
+    out["address"] = hex(run)
+    size = None
+    sz = client.calc_expression("sizeof(%s)" % name)
+    if isinstance(sz, dict) and sz.get("ok") and isinstance(sz.get("value"), int):
+        size = int(sz["value"])
+    n = size if (size and 0 < size <= 1024) else 4
+    out["size_bytes"] = n
+    try:
+        mem = client.read_mem(run, n)
+    except Exception as e:  # noqa: BLE001
+        out["error"] = "读取运行地址失败: %s" % e
+        return out
+    if not mem.get("ok"):
+        out["error"] = "读取运行地址 0x%X 失败: %s" % (run, mem)
+        return out
+    data = bytes.fromhex(mem.get("data_hex") or "")
+    out["ok"] = True
+    if read_memory:
+        out["memory_hex"] = mem.get("data_hex")
+        out["ascii"] = mem.get("ascii")
+    out["value"] = int.from_bytes(data[:min(n, 8)], "little") if data else None
+    if n == 4 and len(data) >= 4:
+        out["value_as_float"] = struct.unpack("<f", data[:4])[0]
+    if count and int(count) > 0:
+        cnt = int(count)
+        elem = (size // cnt) if (size and size % cnt == 0) else 4
+        elems = []
+        for i in range(cnt):
+            try:
+                m = client.read_mem(run + i * elem, elem)
+            except Exception as e:  # noqa: BLE001
+                elems.append({"index": i, "error": str(e)})
+                break
+            if not m.get("ok"):
+                elems.append({"index": i, "error": "读取失败"})
+                break
+            d = bytes.fromhex(m.get("data_hex") or "")
+            elems.append({"index": i,
+                          "value": int.from_bytes(d[:elem], "little") if d else None})
+        out["elements"] = elems
+        out["elem_size"] = elem
+    out["value_note"] = ("value 按小端整数解析运行地址处的内存；浮点看 value_as_float，"
+                         "结构体/字符串看 memory_hex")
+    return out
 
 
 def _batch_alias_args(tool: str, args: dict) -> dict:
@@ -857,6 +1001,16 @@ def _batch_alias_args(tool: str, args: dict) -> dict:
             a["n_bytes"] = a["size"]
     a.pop("address", None)
     return a
+
+
+def _usage_summary(desc: str, limit: int = 90) -> str:
+    """从工具描述里取一句用途摘要（去掉追加的【参数】块，截到第一个句号）。"""
+    t = (desc or "").split("【参数】")[0].replace("\n", " ").strip()
+    for sep in ("。", "；", ". "):
+        i = t.find(sep)
+        if 0 <= i <= limit:
+            return t[:i]
+    return t[:limit]
 
 
 def _apply_param_hints(server) -> int:
@@ -1009,13 +1163,22 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "name 为变量名（如 'SData_UA'、'timer.sec'、'arr'）；"
             "count 可选：>0 时按数组逐元素读 name[0..count-1] 返回 elements；"
             "返回 {address, value, value_type, size_bytes, elements, memory_hex}。"
+            "**读 App 侧变量**（运行期重定位过）时传 reloc_delta=\"0xF000\"，或先调 "
+            "set_reloc_delta 设一次全局偏移：工具会把符号的链接地址 + 偏移当作运行地址去读，"
+            "返回 link_address / run_address，不必再手工换算（此时 value 按小端整数解析内存，"
+            "浮点看 value_as_float）。"
             "适合先查地址/数组内容，再配合 read_mem/write_mem 进一步读写。注意：需目标暂停（运行中读取会失败/错位）；依赖 .axf 调试符号。刚停止瞬间取值可能读到脏值。"
         ),
     )
-    async def read_variable(name: str, count: int = 0, read_memory: bool = True) -> str:
+    async def read_variable(name: str, count: int = 0, read_memory: bool = True,
+                            reloc_delta: str = "") -> str:
         try:
-            return _js(_get_client().read_variable(name, count=int(count or 0),
-                                                  read_memory=bool(read_memory)))
+            client = _get_client()
+            delta, dnote = _eff_reloc_delta(reloc_delta)
+            if not delta:
+                return _js(client.read_variable(name, count=int(count or 0),
+                                                read_memory=bool(read_memory)))
+            return _js(_read_variable_reloc(client, name, count, read_memory, delta, dnote))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "name": str(name), "error": str(e)})
 
@@ -1024,17 +1187,25 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="read_mem",
         title="读取目标内存",
         description=(
-            "从指定内存地址读取 n_bytes 个字节。"
+            "从指定内存地址读取 n_bytes（别名 length，二者传其一）个字节。"
             "addr 支持十六进制（如 '0x20000000'）、十进制，或符号名（如 'SystemCoreClock'、"
             "'svcrt_task_table'——自动查当前 .axf 符号表解析，命中时返回 addr_note 说明来源）；"
+            "读 App 侧符号可传 reloc_delta=\"0xF000\"（或先用 set_reloc_delta 设全局），"
+            "工具会把符号的链接地址偏到运行地址；**显式数字地址不会被偏移**；"
             "返回十六进制字节串及 ASCII 视图。注意：需目标暂停——目标运行期间 UVSOCK 推送异步消息会堆积，导致读取响应错位（典型报错 AMEM 响应数据过短），务必先 stop 再读。勿越界读外设保留区，可先 query_memory_map 确认范围。"
         ),
     )
-    async def read_mem(addr: str, n_bytes: int) -> str:
+    async def read_mem(addr: str, n_bytes: int = 0, length: int = 0,
+                       reloc_delta: str = "") -> str:
         try:
             client = _get_client()
-            a, note = _resolve_addr_arg(addr, client)
-            out = client.read_mem(a, int(n_bytes))
+            n = int(n_bytes or 0) or int(length or 0)
+            if n <= 0:
+                return _js({"ok": False, "addr": addr,
+                            "error": "参数不足：必须指定读取字节数 n_bytes（别名 length），应为正整数"})
+            delta, _dnote = _eff_reloc_delta(reloc_delta)
+            a, note = _resolve_addr_with_reloc(addr, client, delta)
+            out = client.read_mem(a, n)
             if note and isinstance(out, dict):
                 out = dict(out)
                 out["addr"] = hex(a)
@@ -1408,21 +1579,54 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     @server.tool(
         name="clear_breakpoint",
         title="清除断点",
-        description="清除指定符号或断点编号处的断点（命令窗口 BK）。注意：清除断点同样走命令窗口并触发异步消息，清除后立即 run/step 前建议稍等。需已进入调试。",
+        description=(
+            "清除断点。三种指定方式（任选其一）：expr 传符号/地址；bp_id 传本服务内部 id；"
+            "keil_number 传 Keil 界面/命令窗口 BL 里的真实断点编号。"
+            "清除走命令窗口 BK：**数据观察点按地址清不掉**（BK <地址> 时 UVSOCK 回成功、"
+            "窗口却报 error 72 invalid item number），必须按编号清除，故内部会自动把地址/"
+            "符号解析成 Keil 编号再 BK <编号>，解析不出才回退按地址。"
+            "bp_id 在本服务内无此 id 时会自动改按 Keil 真实编号处理并给出 note，"
+            "不必再用 clear_all_*(hard=true) 一刀切。"
+            "注意：清除断点同样走命令窗口并触发异步消息，清除后立即 run/step 前建议稍等。需已进入调试。"
+        ),
     )
-    async def clear_breakpoint(expr: str = "", bp_id: int | None = None) -> str:
+    async def clear_breakpoint(expr: str = "", bp_id: int | None = None,
+                               keil_number: int | None = None) -> str:
         try:
             # 定位清除目标：优先内部断点 id，其次按地址/符号名；用确切地址发 BK 更可靠
             target = (expr or "").strip()
             removed = []
-            if bp_id is not None:
+            cb_note = None
+            # keil_number：直接按 Keil 真实编号清除（数据观察点只能这样清）
+            if keil_number is None and bp_id is not None:
                 match = [b for b in _breakpoints if b.get("id") == bp_id]
-                if not match:
-                    return _js({"ok": False, "bp_id": bp_id,
-                                "error": f"内部断点表中无 id={bp_id}（可用 list_breakpoints 查看）"})
-                removed = match
-                target = removed[0].get("address") or removed[0].get("expr")
-            elif target:
+                if match:
+                    removed = match
+                    target = removed[0].get("address") or removed[0].get("expr")
+                else:
+                    # 内部表里没有：很可能是用户看到 Keil 界面/BL 输出的编号后直接传进来，
+                    # 这里改按 Keil 真实编号处理，避免「只有 BK * 一条路」。
+                    keil_number = bp_id
+                    cb_note = (f"内部断点表无 id={bp_id}，已改按 Keil 真实断点编号清除"
+                               f"（可用 list_breakpoints 的 real 字段核对编号）")
+            if keil_number is not None:
+                r = _get_client().clear_breakpoint(str(int(keil_number)))
+                if not r.get("ok"):
+                    return _js({"ok": False, "keil_number": keil_number,
+                                "error": f"按 Keil 编号 {keil_number} 清除失败: {r}"})
+                out = {"ok": True, "cleared_by": "keil_number",
+                       "keil_number": int(keil_number),
+                       "resolved": {"bp_number": r.get("bp_number"),
+                                    "target": r.get("cleared_target")},
+                       "status_text": r.get("status_text"),
+                       "note": r.get("note") or f"已按 Keil 编号 {int(keil_number)} 清除"}
+                if cb_note:
+                    out["resolve_note"] = cb_note
+                sync = _sync_internal_after_bk(_get_client())
+                if sync:
+                    out["internal_sync"] = sync
+                return _js(out)
+            if target:
                 removed = [b for b in _breakpoints
                            if b.get("address") == target or b.get("expr") == target]
             if not target:
@@ -1447,6 +1651,35 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     def _uvoptx_project_path(project: str) -> str:
         p = (project or "").strip() or (_builder_cfg.get("default_project") or "")
         return _uvoptx.uvoptx_path_for(p) if p else ""
+
+    def _sync_internal_after_bk(client) -> dict | None:
+        """BK 之后按 Keil 真实断点表回收内部记录，避免内部 id 表与板上实际脱节。"""
+        try:
+            real = client.list_breakpoints_real()
+        except Exception:  # noqa: BLE001
+            return None
+        if not real.get("ok"):
+            return None
+        alive = set()
+        for b in real.get("breakpoints") or []:
+            try:
+                a = int(str(b.get("address")), 16)
+            except Exception:  # noqa: BLE001
+                continue
+            alive.add(a)
+            alive.add(a | 1)
+        before_bp, before_wp = len(_breakpoints), len(_watchpoints)
+        def _alive(b):
+            try:
+                a = int(str(b.get("address")), 16)
+            except Exception:  # noqa: BLE001
+                return True
+            return a in alive or (a | 1) in alive
+        _breakpoints[:] = [b for b in _breakpoints if _alive(b)]
+        _watchpoints[:] = [w for w in _watchpoints if _alive(w)]
+        return {"internal_breakpoints": [before_bp, len(_breakpoints)],
+                "internal_watchpoints": [before_wp, len(_watchpoints)],
+                "real_total": real.get("count")}
 
     def _read_uvoptx_persistent(project: str = "") -> dict:
         path = _uvoptx_project_path(project)
@@ -1507,7 +1740,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="列出断点",
         description=("列出断点。返回两部分：① 本服务内部记录（breakpoints/内部 id，用于按 bp_id 清除）；"
                      "② real 字段——本会话 Keil 的**真实断点表**（解析命令窗口 BL 输出获得，含 Keil 断点编号、"
-                     "类型 exec/access、地址、CNT、enabled）。real 才是板上实际生效的断点：.uvoptx 持久化断点、"
+                     "类型 exec/access、地址、CNT、enabled）。注意：真机实测本版 Keil 的 CNT 是断点的计数条件"
+                     "设置值（.uvoptx 的 break_if_rcount），**不随命中递增**，不能当命中次数用。"
+                     "real 才是板上实际生效的断点：.uvoptx 持久化断点、"
                      "数据观察点都会出现在这里。注意清除数据观察点必须按 Keil 编号（按地址会报 error 72）。"
                      "另附 uvoptx 字段暴露工程里 BK 清不掉、下次进调试会自动恢复的持久化断点。"),
     )
@@ -1717,22 +1952,67 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     @server.tool(
+        name="set_reloc_delta",
+        title="设置 App 符号重定位偏移",
+        description=(
+            "设置全局符号重定位偏移（默认 0），解决「读 App 侧变量还要手工做 "
+            "- SVCRT_RELOC_DELTA(0xF000) 换算」的麻烦。"
+            "App 运行期重定位后：运行地址 = 链接地址(.axf 符号地址) + delta。设置一次后，"
+            "read_variable / read_mem / find_symbol / wait_breakpoint 都会自动把符号地址偏到"
+            "运行地址（显式传数字地址的不偏移），返回里同时给 link_address 与 run_address 便于核对。"
+            "delta 支持 0x 十六进制 / 十进制 / 负数；传 0 即关闭。"
+            "注意：只影响符号名解析，且是全局的——切回内核符号调试时记得清 0。"
+        ),
+    )
+    async def set_reloc_delta(delta: str = "0x0") -> str:
+        try:
+            d = _parse_reloc_delta(delta)
+            if d is None:
+                d = 0
+            old = int(_reloc_cfg.get("delta") or 0)
+            _reloc_cfg["delta"] = d
+            return _js({"ok": True, "previous_delta": "0x%X" % old,
+                        "reloc_delta": "0x%X" % d, "delta_dec": d,
+                        "note": ("已关闭符号重定位偏移（按符号名取地址不再偏移）" if d == 0 else
+                                 "此后按符号名取地址将自动 +0x%X，读 App 变量直接传符号名即可" % d)})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "delta": delta, "error": str(e)})
+
+    @server.tool(
         name="find_symbol",
         title="检索符号",
         description=(
-            "从 .axf ELF 符号表模糊检索 函数/全局变量 符号（query 为子串，大小写不敏感，空则列出全部）。"
+            "从 .axf ELF 符号表模糊检索 函数/全局变量 符号（query 为子串，大小写不敏感，空则列出全部；"
+            "参数名 query 与 name 等价，传哪个都行）。"
+            "传了 reloc_delta（或已 set_reloc_delta）时，每条结果会附带 run_addr ——"
+            "App 重定位后的实际运行地址，供 set_breakpoint / read_mem 直接使用。"
             "AI 想读取某个全局变量或跳到某函数而不知道确切名字时，先用它搜到符号名与地址，"
             "再配合 calc_expression / read_variable / set_breakpoint / disassemble 使用。"
             "kind 可取 all/func/object/global/local 过滤。需配置 .axf 调试符号。注意：依赖 .axf ELF 符号表（需已编译且配置 .axf），未编译或符号被 strip 时查不到；匹配为子串模糊，注意区分同名符号。"
         ),
     )
-    async def find_symbol(query: str = "", limit: int = 50, kind: str = "all") -> str:
+    async def find_symbol(query: str = "", limit: int = 50, kind: str = "all",
+                          name: str = "", reloc_delta: str = "") -> str:
         try:
+            q = (query or "").strip() or (name or "").strip()
             loc = _get_locator()
             if loc is None:
                 return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号，或未从工程推断到）"})
-            symbols = loc.search_symbols(query=query, limit=max(1, min(limit, 200)), kind=kind)
-            return _js({"ok": True, "query": query, "kind": kind, "count": len(symbols), "symbols": symbols})
+            symbols = loc.search_symbols(query=q, limit=max(1, min(limit, 200)), kind=kind)
+            out = {"ok": True, "query": q, "kind": kind,
+                   "count": len(symbols), "symbols": symbols}
+            delta, dnote = _eff_reloc_delta(reloc_delta)
+            if delta:
+                for sym in symbols:
+                    try:
+                        v = sym.get("addr")
+                        iv = int(str(v), 16) if str(v).lower().startswith("0x") else int(v)
+                        sym["run_addr"] = hex((iv + delta) & 0xFFFFFFFF)
+                    except Exception:  # noqa: BLE001
+                        continue
+                out["reloc_delta"] = "0x%X" % delta
+                out["reloc_note"] = dnote + "；run_addr = addr + reloc_delta"
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "query": query, "error": str(e)})
 
@@ -2525,7 +2805,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "symbol 传符号名（如 svcrt_ptable_lookup，自动解析为地址）；address 传 0x 地址；"
             "两者都不传时用工程 .uvoptx 里的持久化断点作候选（use_project_breakpoints 控制）。"
             "命中后返回里直接带 file/line/callstack，并累计该地址命中次数（breakpoint_stats 可查全部）。"
-            "注意：命中判定为「目标已停止 且 PC 等于候选地址」（自动兼容 Thumb 位）；"
+            "注意：命中判定为「目标已停止 且 PC 等于候选地址」（自动兼容 Thumb 位），"
+            "并额外支持数据观察点命中——数据断点触发时 PC 不等于观察地址，工具会在等待前后"
+            "各读一次 Keil 断点表的 CNT：若某条 CNT 增加即为命中项；"
+            "**真机实测（UVSOCK@4823 + STM32F401）本版 Keil 的 BL CNT 是断点计数条件设置值、"
+            "不随命中递增**，此时退化为「目标已停止 + PC 不在任何代码候选 + 存在观察点」"
+            "推断为观察点命中，返回 hit_kind（code/watch）、hit_entry（来源见 source 字段，"
+            "推断时 source=inferred）与 cnt_note（说明判定依据强度）；"
+            "候选来源除 symbol/address/.uvoptx 外，还包含本服务 set_watchpoint 设的数据观察点，"
+            "以及在无其他候选时取 Keil 真实断点表（list_breakpoints.real）中的执行断点；"
             "若本该命中却一直不停，先用 list_breakpoints / list_uvoptx_breakpoints 确认断点存在且启用"
             "（App 侧重定位后运行时地址与符号地址不同，应传实际运行地址）。需已进入调试。"
         ),
@@ -2533,24 +2821,39 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     async def wait_breakpoint(symbol: str = "", address: str = "",
                               timeout_s: float = 10.0, poll_ms: int = 100,
                               use_project_breakpoints: bool = True,
-                              project: str = "") -> str:
+                              project: str = "", reloc_delta: str = "") -> str:
         try:
             client = _get_client()
             candidates: list = []
             notes: list = []
+            delta, _dnote = _eff_reloc_delta(reloc_delta)
             if symbol:
                 loc = _get_locator()
                 hit = loc.symbol_addr(symbol) if loc is not None else None
                 if not hit:
                     return _js({"ok": False, "symbol": symbol,
                                 "error": "找不到符号（检查拼写，或先用 find_symbol 检索）"})
-                candidates.append(int(hit["addr"]))
-                notes.append("symbol %s -> %s" % (symbol, hex(hit["addr"])))
+                a0 = int(hit["addr"])
+                if delta:
+                    notes.append("symbol %s 链接地址 %s → 运行地址 %s（reloc_delta=0x%X）"
+                                 % (symbol, hex(a0), hex((a0 + delta) & 0xFFFFFFFF), delta))
+                    a0 = (a0 + delta) & 0xFFFFFFFF
+                candidates.append(a0)
+                notes.append("symbol %s -> %s" % (symbol, hex(a0)))
             if address:
                 a, an = _resolve_addr_arg(address, client)
                 candidates.append(int(a))
                 if an:
                     notes.append(an)
+            # 数据观察点：命中时 PC 不等于观察地址，必须单独作为一类候选交给 client 判定
+            watch_addrs = []
+            for w in list(_watchpoints):
+                try:
+                    watch_addrs.append(int(str(w.get("address")), 16))
+                except Exception:  # noqa: BLE001
+                    continue
+            if watch_addrs:
+                notes.append("并入本服务数据观察点 %d 个（命中按 CNT 判定）" % len(watch_addrs))
             if not candidates and use_project_breakpoints:
                 info = _read_uvoptx_persistent(project)
                 items = info.get("breakpoints") or info.get("bps") or []
@@ -2562,8 +2865,24 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 candidates = [c for c in candidates if c]
                 if candidates:
                     notes.append("候选来自 .uvoptx 持久化断点 %d 个" % len(candidates))
+            if not candidates:
+                # 无显式候选时退回 Keil 真实断点表（板上实际生效的断点），比只认 .uvoptx 更准
+                try:
+                    real = client.list_breakpoints_real()
+                    for b in (real.get("breakpoints") or []):
+                        if b.get("kind") != "exec":
+                            continue
+                        try:
+                            candidates.append(int(str(b.get("address")), 16))
+                        except Exception:  # noqa: BLE001
+                            continue
+                    if candidates:
+                        notes.append("候选来自 Keil 真实断点表 %d 个" % len(candidates))
+                except Exception:  # noqa: BLE001
+                    pass
             r = client.wait_breakpoint(candidates, timeout_s=float(timeout_s),
-                                      poll=max(0.01, int(poll_ms) / 1000.0))
+                                      poll=max(0.01, int(poll_ms) / 1000.0),
+                                      watch_addresses=watch_addrs)
             out = dict(r)
             if notes:
                 out["candidates_note"] = "；".join(notes)
@@ -2601,6 +2920,12 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "让目标 MCU 全速运行 timeout_ms 毫秒后自动暂停，并返回停靠位置（文件行+源码+完整调用栈）。"
             "用于验证时序 / 观察运行 N 毫秒后的状态。timeout_ms 默认 1000。"
+            "时长以分段字段给出，别混用：requested_run_ms 是你请求的运行时长；"
+            "actual_run_ms 是实测「run 返回 → 发 stop」的间隔（Windows 定时器粒度约 15.6ms，"
+            "请求 137ms 时实测常在 140~155ms，属 sleep 精度而非工具延迟）；"
+            "stop_wait_ms 是 stop 之后等目标确认停止的耗时（**这才是 wait_stopped.waited_ms 的含义**，"
+            "它与 timeout_ms 无关，不要当运行时长用）；total_ms 是整次调用总耗时。"
+            "halt 落点还受 UVSOCK 往返影响，毫秒级精度要求请改用 DWT 周期计数或 GPIO 打点。"
             "注意：到点 stop 后会轮询确认目标真正停止（stop 是异步生效的）才读 PC；"
             "若未能确认停止，返回 stopped=false + warning 且不返回停靠位置，"
             "避免把陈旧 PC（常量落复位附近 0x0800024c 之类）误当成停靠点。"
@@ -2620,17 +2945,31 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         try:
             client = _get_client()
             t = max(1, int(timeout_ms))
+            t_begin = time.monotonic()
             r = client.run()
             if not (r.get("ok") or r.get("status") in (11, 12, 22)):
                 return _js({"ok": False, "error": f"运行失败: {r}"})
+            t_ran = time.monotonic()
             await asyncio.sleep(t / 1000.0)
+            t_slept = time.monotonic()
             sp = client.stop()
             # stop 异步生效：必须轮询确认目标真正停下，否则读到的 PC 是陈旧值
             # （实测稳定返回复位附近地址，误判成"停在 Reset_Handler"）。
             ws = client.wait_until_stopped(timeout=1.0)
+            t_done = time.monotonic()
             out = {"ok": True, "action": "run_with_timeout", "timeout_ms": t,
                    "stopped": bool(ws.get("stopped")), "stop": sp, "wait_stopped": ws}
             out.update(r)
+            # 分段计时：此前只透出 wait_stopped.waited_ms，容易被误读成「实际运行时长」
+            # （它是 stop 后的确认耗时，与 timeout_ms 无关）。这里把三段分开写清。
+            out["requested_run_ms"] = t
+            out["actual_run_ms"] = int((t_slept - t_ran) * 1000)
+            out["stop_wait_ms"] = int((t_done - t_slept) * 1000)
+            out["total_ms"] = int((t_done - t_begin) * 1000)
+            out["timing_note"] = (
+                "actual_run_ms 为 run 返回到发 stop 的实测间隔（Windows sleep 粒度约 15.6ms，"
+                "与请求值有 ±16ms 级差异属正常）；stop_wait_ms = wait_stopped.waited_ms，"
+                "是 stop 后确认停住的耗时，不是运行时长。")
             if not ws.get("stopped"):
                 out["ok"] = False
                 out["warning"] = ("到点已发送 stop，但目标仍在运行（未能确认停止）；"
@@ -3019,46 +3358,89 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="read_peripheral",
         title="读取外设寄存器组（SFR）",
         description=(
-            "一键读取指定外设（如 RCC/GPIOA/USART1/SPI1/I2C1/TIM2/ADC1/SCB/SysTick）的全部寄存器当前值，"
+            "一键读取指定外设（如 RCC/GPIOA/USART1/SPI1/I2C1/TIM2/ADC1/SCB/SysTick）的寄存器当前值，"
             "并解析关键位域（时钟使能/波特率/GPIO 模式/定时器计数等）。"
+            "**强烈建议用 regs 只取需要的寄存器**（逗号分隔，可用全名或去掉外设前缀的裸名，"
+            "如 regs=\"MODER,OTYPER,IDR\" 或 \"GPIOC_MODER\"）：默认输出全部寄存器 + 逐位域，"
+            "一个 GPIO 就有十几个寄存器、几十个位域，很容易撑爆上下文；"
+            "只看值不看位域时再传 fields=\"off\"。返回里 reg_filter 回显本次筛选，"
+            "not_found_regs 列出传了但没匹配上的名字（拼错时能立刻发现）。"
             "排查时钟没使能、GPIO 模式配置错误、串口波特率不对、定时器计数是否跑起来等场景。"
             "需已进入调试状态。periph 为外设名（大小写不敏感）。注意：仅适配 STM32F4 寄存器布局；目标型号非 F4 时寄存器偏移/位域可能不准。需已进入调试且目标暂停。"
         ),
     )
-    async def read_peripheral(periph: str) -> str:
+    async def read_peripheral(periph: str, regs: str = "",
+                              fields: str = "auto") -> str:
         try:
             client = _get_client()
             p = _periph_get(periph)
             if not p:
                 avail = ", ".join(x["name"] for x in _periph_list())
                 return _js({"ok": False, "error": f"未知外设 {periph}，可用: {avail}"})
-            regs: list = []
+            # regs：按名筛选（全名或裸名，大小写不敏感），留空 = 全部
+            want = [x.strip().upper() for x in
+                    (regs or "").replace(";", ",").replace("|", ",").split(",")
+                    if x.strip()]
+            # 允许两种写法：裸名（MODER）或带外设前缀（GPIOC_MODER）——寄存器表里存的是
+            # 裸名，用户按 Keil 手册习惯写全名时也要能匹配上。
+            pfx = ((p.get("name") or "").strip().upper() + "_")
+            want_norm = set()
+            for w in want:
+                want_norm.add(w)
+                if pfx != "_" and w.startswith(pfx):
+                    want_norm.add(w[len(pfx):])
+            with_fields = str(fields or "auto").strip().lower() not in (
+                "off", "none", "no", "false", "0")
+            out_regs: list = []
+            hit_names: set = set()
             for name, rdef in p["regs"].items():
-                addr = p["base"] + rdef["off"]
-                val = _periph_read_u32(client, addr)
-                if val is None:
-                    regs.append({"reg": name, "addr": f"0x{addr:X}", "value": None})
-                    continue
                 # 同时给「裸名」（去掉外设前缀，如 GPIOC_MODER -> MODER），
                 # 便于脚本直接 regs["MODER"]，不用再手工 strip 前缀
                 _bare = name.split("_", 1)[1] if "_" in name else name
+                if want and (name.upper() not in want_norm and _bare.upper() not in want_norm):
+                    continue
+                hit_names.add(name.upper())
+                hit_names.add(_bare.upper())
+                if pfx != "_" and name.upper().startswith(pfx):
+                    hit_names.add(name.upper()[len(pfx):])
+                addr = p["base"] + rdef["off"]
+                val = _periph_read_u32(client, addr)
+                if val is None:
+                    out_regs.append({"reg": name, "addr": f"0x{addr:X}", "value": None})
+                    continue
                 entry = {"reg": name, "name": _bare,
                          "addr": f"0x{addr:X}", "value": f"0x{val:08X}", "raw": val}
-                # 关键位域解读
-                bits = []
-                for fname, lsb, width, enum in rdef.get("fields", []):
-                    fval = (val >> lsb) & ((1 << width) - 1)
-                    item = {"name": fname, "bits": f"{lsb}+{width}", "value": fval}
-                    if enum is not None:
-                        desc = enum.get(fval)
-                        if desc is not None:
-                            item["desc"] = desc
-                    bits.append(item)
-                if bits:
-                    entry["fields"] = bits
-                regs.append(entry)
-            return _js({"ok": True, "peripheral": p["name"], "base": f"0x{p['base']:08X}",
-                        "desc": p["desc"], "reg_count": len(regs), "regs": regs})
+                if with_fields:
+                    # 关键位域解读
+                    bits = []
+                    for fname, lsb, width, enum in rdef.get("fields", []):
+                        fval = (val >> lsb) & ((1 << width) - 1)
+                        item = {"name": fname, "bits": f"{lsb}+{width}", "value": fval}
+                        if enum is not None:
+                            desc = enum.get(fval)
+                            if desc is not None:
+                                item["desc"] = desc
+                        bits.append(item)
+                    if bits and with_fields:
+                        entry["fields"] = bits
+                out_regs.append(entry)
+            out = {"ok": True, "peripheral": p["name"], "base": f"0x{p['base']:08X}",
+                   "desc": p["desc"], "reg_count": len(out_regs), "regs": out_regs}
+            if want:
+                out["reg_filter"] = want
+                miss = [w for w in want
+                        if w not in hit_names
+                        and not (pfx != "_" and w.startswith(pfx) and w[len(pfx):] in hit_names)]
+                if miss:
+                    out["not_found_regs"] = miss
+                    out["note"] = ("以下寄存器名未匹配到（拼写或该外设无此寄存器）：%s；"
+                                   "可用 list_peripherals 查看该外设的寄存器清单" % "、".join(miss))
+                if not out_regs:
+                    out["ok"] = False
+                    out["error"] = "筛选后无任何寄存器可读，请核对 regs 里的名字"
+            if not with_fields and out_regs:
+                out["fields_mode"] = "off"
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "periph": periph, "error": str(e)})
 
@@ -3760,6 +4142,52 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                         "recommended_workflow": workflow, "scene_tools": scene_tools})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="list_tools",
+        title="列出全部工具与必填参数",
+        description=(
+            "一次列出本服务的全部工具：名称、用途、必填/可选参数与最小调用示例（example_args "
+            "可直接照抄成 args）。AI 冷启动、或不确定某工具准确参数名时先调它——"
+            "本服务的参数命名不统一（有 query/expr/addr/n_bytes 等），只靠 'Field required' "
+            "报错试错代价高；这里一次就能对齐。keyword 按工具名或用途子串过滤"
+            "（如 keyword=\"breakpoint\"、\"mem\"、\"断点\"），留空返回全部。"
+        ),
+    )
+    async def list_all_tools(keyword: str = "") -> str:
+        try:
+            tm = getattr(server, "_tool_manager", None)
+            tools = getattr(tm, "_tools", None) or {}
+            kw = (keyword or "").strip().lower()
+            items = []
+            for nm in sorted(tools.keys()):
+                t = tools[nm]
+                title = getattr(t, "title", "") or ""
+                desc = getattr(t, "description", "") or ""
+                if kw and kw not in nm.lower() and kw not in title.lower() \
+                        and kw not in desc.lower():
+                    continue
+                params = getattr(t, "parameters", None) or {}
+                props = params.get("properties") or {}
+                required = _req_params(nm, params)
+                example = {}
+                for n in required:
+                    spec = props.get(n) if isinstance(props.get(n), dict) else {}
+                    example[n] = _example_value(n, spec or {})
+                items.append({"tool": nm, "title": title,
+                              "required": required,
+                              "optional": [n for n in props if n not in required],
+                              "aliases": dict(_ALIAS_HINT.get(nm) or {}),
+                              "example_args": example,
+                              "usage": _usage_summary(desc)})
+            return _js({"ok": True, "count": len(items), "total": len(tools),
+                        "keyword": keyword, "tools": items,
+                        "note": "example_args 只含必填参数，可直接作为 args 传入；"
+                                "aliases 给出该工具接受的参数别名（如 n_bytes/length 等价）；"
+                                "required 中的参数哪怕 schema 标了默认值也必须给（如 read_mem 的 n_bytes）。"
+                                "每个工具的完整说明见其 description 末尾的【参数】/【调用示例】"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "keyword": keyword, "error": str(e)})
 
     # 为每个工具描述追加【参数】/【调用示例】：AI 冷启动可直接照抄参数名，
     # 不必靠 "Field required" 反复试错。

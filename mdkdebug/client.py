@@ -624,7 +624,13 @@ class UVClient:
         （清除数据观察点必须按编号）；.uvoptx 持久化断点也会出现在这里。
         """
         r = self.exec_command_checked("BL", settle=settle)
-        lines = [t for t in (r.get("console") or []) if ":" in t and "(" in t]
+        # 真机是「每条断点一帧」，但一次读取也可能把多行合并在一个条目里，
+        # 故先按行拆开再匹配，避免只解析出第一条。
+        lines = []
+        for item in (r.get("console") or []):
+            for piece in str(item).splitlines():
+                if ":" in piece and "(" in piece:
+                    lines.append(piece)
         bps = self.parse_breakpoint_table(lines)
         return {"ok": bool(r.get("ok")), "count": len(bps), "breakpoints": bps,
                 "console": r.get("console") or [],
@@ -901,12 +907,43 @@ class UVClient:
         """返回断点命中计数 {hex(addr): count}。"""
         return {hex(k): v for k, v in self._bp_hits.items()}
 
+    def bp_count_snapshot(self):
+        """读一次 Keil 真实断点表的命中计数(CNT)快照 {number: {"count": n, "entry": {...}}}。
+
+        真机实测：BL 输出每条断点带 `CNT=<命中次数>`，是判断「到底哪个断点命中了」的
+        唯一可靠依据——数据观察点命中时 PC 不会等于观察地址，只看 PC 必然漏判。
+        目标正在运行 / 命令窗口不可用时返回 None，调用方应降级判定。
+        """
+        try:
+            real = self.list_breakpoints_real()
+        except Exception:  # noqa: BLE001
+            return None
+        if not real.get("ok"):
+            return None
+        snap = {}
+        for b in real.get("breakpoints") or []:
+            try:
+                snap[int(b["number"])] = {"count": b.get("count"), "entry": b}
+            except Exception:  # noqa: BLE001
+                continue
+        return snap or None
+
     def wait_breakpoint(self, addresses=None, timeout_s: float = 10.0,
-                        poll: float = 0.1) -> dict:
+                        poll: float = 0.1, watch_addresses=None,
+                        use_cnt: bool = True) -> dict:
         """带超时地等待目标停在（给定）断点上。
 
         addresses: 候选断点地址列表（int）。传空表示「不限定地址」——目标停下即算命中，
         用于只想等一个停止事件的场景。地址匹配自动兼容 Thumb 位（pc 与 addr 差 1）。
+        watch_addresses: 数据观察点地址列表（int）。数据断点命中时 PC 不等于观察地址，
+        故不能按 PC 判定。判定顺序：① 等待前后各读一次 Keil 断点表的 CNT，若某条 CNT
+        增加，该条即命中项（代码断点同样适用）；② 取不到有效增量时退化为「目标已停止
+        + PC 不在任何代码候选 + 存在数据观察点」推断为观察点命中，并在 hit_entry.source
+        标注 "inferred"、cnt_note 说明依据强度。
+        注意（真机实测 UVSOCK@4823 + STM32F401）：同一断点命中多次，BL 输出的 CNT 恒为 1
+        ——该字段是断点的计数条件设置值（.uvoptx 的 break_if_rcount），不是命中次数，
+        故②才是常见路径；hit_kind 给 "code"/"watch"，hit_entry 注明来源。
+        use_cnt: 是否启用 CNT 判定（默认 True；置 False 可省掉两次 BL 读取）。
 
         判定链路刻意保守：先确认目标已停止，再用 read_cpu_registers_stable 读取
         （含收敛判定 + 复查仍在运行），因此返回的 pc_confidence 可信度可直接采信；
@@ -921,7 +958,15 @@ class UVClient:
                 adrs.append(int(a))
             except Exception:  # noqa: BLE001
                 continue
+        watch_addrs = []
+        for a in (watch_addresses or []):
+            try:
+                watch_addrs.append(int(a))
+            except Exception:  # noqa: BLE001
+                continue
         t0 = time.time()
+        # 命中计数基线：等待期间目标可能在运行，读失败也只是降级，不影响主流程
+        cnt_base = self.bp_count_snapshot() if use_cnt else None
         deadline = t0 + max(0.0, float(timeout_s))
         polls = 0
         last: dict = {}
@@ -942,14 +987,81 @@ class UVClient:
                         if pc == a or (pc | 1) == a or pc == (a | 1):
                             matched = a
                             break
-                elif pc is not None:
-                    matched = pc      # 未给候选断点：停下即视为命中
+                elif pc is not None and not watch_addrs:
+                    # 既无代码候选、也无数据观察点：停下即视为命中（不限定地址的等待）
+                    matched = pc
+                # 数据观察点命中时 PC 不会等于观察地址，只按 PC 判定必然漏判（用户反馈：
+                # 「实测已命中仍报 hit:false」）。可靠依据是 Keil 断点表的 CNT：停止后与
+                # 等待前各读一次，CNT 增加的那条就是命中项（代码断点与数据观察点都适用）。
+                hit_kind = "code" if matched is not None else None
+                hit_entry = None
+                cnt_delta = {}
+                cnt_after = self.bp_count_snapshot() if use_cnt else None
+                if cnt_base and cnt_after:
+                    for num, cur in cnt_after.items():
+                        prev = (cnt_base.get(num) or {}).get("count")
+                        now = cur.get("count")
+                        if isinstance(prev, int) and isinstance(now, int) and now > prev:
+                            cnt_delta[int(num)] = now - prev
+                if cnt_delta:
+                    num = max(cnt_delta, key=lambda k: cnt_delta[k])
+                    hit_entry = dict(cnt_after[num].get("entry") or {})
+                    hit_entry["source"] = "cnt"
+                    if matched is None:
+                        hit_kind = ("watch" if hit_entry.get("kind") == "access"
+                                    else "code")
+                        try:
+                            matched = int(str(hit_entry.get("address")), 16)
+                        except Exception:  # noqa: BLE001
+                            matched = None
+                elif matched is None and watch_addrs:
+                    # CNT 增量不可用（或本版 Keil 的 BL CNT 并非命中次数）时的退步判定：
+                    # 目标确实已停、又有数据观察点、PC 又不在任何代码候选上 → 判为观察点触发。
+                    # 实测（UVSOCK@4823 + STM32F401）：同一断点命中 3 次，BL 输出的 CNT 恒为 1，
+                    # 该字段是断点的计数条件设置值（.uvoptx 的 break_if_rcount），不是命中次数，
+                    # 故这里以推断为主，并在 hit_entry/cnt_note 里标明依据强度。
+                    if cnt_base and cnt_after:
+                        why = ("断点表 CNT 未随命中递增（本版 Keil 的 BL CNT 是断点计数条件、"
+                               "不是命中次数），已按「目标已停止且 PC 不在任何代码候选上」推断")
+                    else:
+                        why = ("未能取得断点表 CNT（等待开始时目标可能在运行或命令窗口不可用），"
+                               "已按「目标已停止且 PC 不在任何代码候选上」推断")
+                    hit_kind = "watch"
+                    matched = int(watch_addrs[0])
+                    hit_entry = {"kind": "access", "address": hex(int(watch_addrs[0])),
+                                 "source": "inferred", "note": why}
+                if hit_entry is None and matched is not None and cnt_after:
+                    # 真机实测本版 Keil 的 BL CNT 不随命中递增，此时按 PC 命中的代码断点
+                    # 在 CNT 快照里找回同地址项，保证 hit=true 时也能说明"命中的是哪条"。
+                    for _num, _cur in cnt_after.items():
+                        _ent = dict(_cur.get("entry") or {})
+                        try:
+                            _ea = int(str(_ent.get("address")), 16)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if _ea in (matched, matched | 1) or (_ea | 1) == matched:
+                            _ent["source"] = "pc"
+                            hit_entry = _ent
+                            break
                 waited = int((time.time() - t0) * 1000)
                 out = {"ok": True, "hit": matched is not None, "stopped": True,
                        "pc": hex(pc) if pc is not None else None,
                        "waited_ms": waited, "polls": polls, "registers": regs,
                        "candidates": [hex(a) for a in adrs],
                        "pc_confidence": regs.get("pc_confidence")}
+                if hit_kind:
+                    out["hit_kind"] = hit_kind
+                if hit_entry:
+                    out["hit_entry"] = hit_entry
+                if cnt_delta:
+                    out["cnt_delta"] = {str(k): v for k, v in cnt_delta.items()}
+                if use_cnt and not (cnt_base and cnt_after):
+                    out["cnt_note"] = ("未能取得断点命中计数(CNT)基线（等待开始时目标可能在运行或"
+                                       "命令窗口不可用），本次命中判定已降级；如需精确判定，"
+                                       "可先 stop 再 wait_breakpoint")
+                if hit_kind == "watch" and (hit_entry or {}).get("source") == "inferred":
+                    out["cnt_note"] = ("本版 Keil 的 BL CNT 不随命中递增（是断点计数条件），"
+                                       "数据观察点命中判定已降级为推断：hit_entry.source=inferred")
                 if matched is None:
                     # 目标已停止但 PC 不在候选地址：静默返回 hit=false 会让调用方无从下手，
                     # 这里直接说明「为什么会没命中」以及下一步该做什么。
@@ -961,6 +1073,9 @@ class UVClient:
                         % (out.get("pc"), "、".join(out.get("candidates") or []) or "未指定"))
                 if matched is not None:
                     out["hit_address"] = hex(matched)
+                    if hit_kind == "watch":
+                        out["hit_address_note"] = ("这是命中的数据观察点地址（不是 PC）："
+                                                   "数据断点触发时 PC 停在访问该地址的指令处")
                     out["hit_count"] = self.note_breakpoint_hit(matched)
                 for k in ("warning", "repeat_warning"):
                     if regs.get(k):

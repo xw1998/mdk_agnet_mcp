@@ -79,9 +79,14 @@ async def main():
         c2 = load(await call(server, "clear_breakpoint", {"expr": "0x08000db6"}))
         check("clear by address ok", c2.get("ok") is True and c2.get("remaining") == 0, str(c2))
 
-        # 6. clear 不存在的 id 报错
+        # 6. 内部表里没有该 id：按 Keil 真实编号清除；编号也不存在（真机/本 mock 均报
+        #    `*** error 72: invalid item number`）时必须如实上报失败，不能当作清除成功。
+        srv.bl_table = []          # 空真实断点表 → 任何编号都不存在
         c3 = load(await call(server, "clear_breakpoint", {"bp_id": 999}))
-        check("clear 不存在 id 报错", c3.get("ok") is False, str(c3))
+        check("clear 不存在的 id 报错", c3.get("ok") is False, str(c3))
+        check("失败原因来自命令窗口报错（非 status 假成功）",
+              "命令窗口报错" in (c3.get("error") or ""), str(c3.get("error")))
+        srv.bl_table = None
 
         # 7. set_watchpoint 返回 watchpoint_id
         w1 = load(await call(server, "set_watchpoint", {"expr": "0x20000000"}))
