@@ -34,6 +34,10 @@ from . import builder, mapfile, winutil, uvoptx as _uvoptx, __version__
 from . import serialmon
 from . import aliases as _aliases
 from . import errors as _errors
+from . import keilkb as _keilkb
+from . import cmdscript as _cmdscript
+from . import svd as _svd
+from . import uvprojx as _uvprojx
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -1575,7 +1579,111 @@ def _batch_alias_args(tool: str, args: dict) -> dict:
 
 
 # 这些工具的关键可选参数直接决定调用成败，示例里一并给出（照抄即可用）
+# ----------------------------------------------------------------------
+# 工具面裁剪（工具集分组）
+# ----------------------------------------------------------------------
+# 起因：工具数已近百个，每个工具的 description 都要塞进上下文，冷启动成本很高；
+# 而上层场景往往是「这次只做串口抓日志」「这次只编译烧录」，用不到其余工具。
+# 参照 McuBuddy 的 MCUBUDDY_TOOLSETS 做的同类机制。
+#
+# 设计原则（防翻车）：
+# 1. **默认全开**——不设 MDKDEBUG_TOOLSETS 时行为完全不变，不打扰既有用户；
+# 2. **未归类的工具一律保留**，只裁剪「明确归到别的组」的工具，宁可少裁也不错杀；
+# 3. `list_tools` / `get_version` / `capabilities` 永远保留，否则 AI 连
+#    「现在有哪些工具」都问不出来，会陷入瞎试；
+# 4. 裁剪结果会写进日志，并用 capabilities 可见，出问题时一眼看出是被裁掉了。
+_TOOLSETS = {
+    "core": {
+        "enter_debug", "exit_debug", "get_status", "run", "stop", "step", "reset",
+        "run_timeout", "reset_connection", "wait_state", "wait_breakpoint",
+        "set_breakpoint", "clear_breakpoint", "clear_all_breakpoints", "list_breakpoints",
+        "read_mem", "write_mem", "calc_expression", "read_variable",
+        "keil_command", "batch_debug_script", "keil_health", "diagnose",
+        "restart_keil", "launch_uvision", "close_uvision", "list_uvision_instances",
+        "read_console_output", "read_async_messages", "dismiss_dialog",
+        "mdk_guide", "target_info",
+    },
+    "mem": {
+        "read_mem_multi", "fill_mem", "search_mem", "snapshot", "snapshot_diff",
+        "read_struct", "read_locals", "read_registers", "set_register", "cache_info",
+    },
+    "symbol": {
+        "set_symbol_file", "list_symbol_projects", "find_symbol", "address_for_line",
+        "get_current_location", "run_to_line", "disassemble", "parse_map",
+    },
+    "build": {
+        "build_project", "rebuild_project", "clean_project", "flash_download",
+        "build_and_flash", "flash_debug", "parse_build_errors", "explain_build_error",
+        "uvprojx_read", "uvprojx_edit", "project_targets", "set_debug_target",
+        "read_project_config",
+    },
+    "serial": {
+        "serial_list_ports", "serial_monitor_start", "serial_monitor_status",
+        "serial_monitor_stop", "serial_read", "serial_write", "serial_expect",
+    },
+    "advanced": {
+        "clear_faults", "fault_report", "wait_fault", "dwt", "profile_function",
+        "profile_sampling", "itm_trace", "list_peripherals", "read_peripheral",
+        "write_peripheral", "query_memory_map", "svd_list", "svd_decode",
+        "watchdog_freeze", "watch", "set_watchpoint", "clear_watchpoint",
+        "clear_all_watchpoints", "list_watchpoints", "breakpoint_stats",
+        "set_conditional_breakpoint", "clear_uvoptx_breakpoints",
+        "list_uvoptx_breakpoints", "batch", "set_reloc_delta",
+    },
+}
+
+_TOOLSET_ALWAYS = {"list_tools", "get_version", "capabilities"}
+
+
+def _toolset_assigned() -> set:
+    out = set()
+    for names in _TOOLSETS.values():
+        out |= set(names)
+    return out
+
+
+def _toolset_env() -> str:
+    return (os.environ.get("MDKDEBUG_TOOLSETS") or "").strip()
+
+
+def _toolset_plan(tool_names=None) -> dict:
+    """解析 MDKDEBUG_TOOLSETS，算出该保留/移除哪些工具。
+
+    返回 {requested, unknown_groups, unassigned, removed, available_groups, on}。
+    不设该环境变量（或设成 all/full/*）时 on=False，removed 为空 = 不裁剪。
+    """
+    groups = _toolset_env()
+    names = set(tool_names or [])
+    assigned = _toolset_assigned()
+    unassigned = sorted(n for n in names if n not in assigned) if names else []
+    if not groups or groups.lower() in ("all", "full", "*"):
+        return {"on": False, "requested": [], "unknown_groups": [], "unassigned": unassigned,
+                "removed": [], "available_groups": sorted(_TOOLSETS)}
+    want = [t for t in groups.replace(",", " ").replace(";", " ").split() if t]
+    want = [t.lower() for t in want]
+    unknown = sorted(set(t for t in want if t not in _TOOLSETS))
+    want = [t for t in want if t in _TOOLSETS]
+    if not want:
+        return {"on": False, "requested": [], "unknown_groups": unknown,
+                "unassigned": unassigned, "removed": [],
+                "available_groups": sorted(_TOOLSETS),
+                "note": "MDKDEBUG_TOOLSETS 里没有可识别的组名，按不裁剪处理"}
+    keep = set(_TOOLSET_ALWAYS) | set(unassigned)
+    for g in want:
+        keep |= set(_TOOLSETS[g])
+    removed = sorted(n for n in names if n not in keep)
+    return {"on": True, "requested": want, "unknown_groups": unknown,
+            "unassigned": unassigned, "removed": removed,
+            "kept": sorted(n for n in names if n in keep),
+            "available_groups": sorted(_TOOLSETS)}
+
+
 _KEY_OPTIONALS = {
+    "wait_state": {"state": "stopped", "timeout_s": 10},
+    "svd_list": {"device": "STM32F401RCTx"},
+    "svd_decode": {"peripheral": "USART2", "register": "CR1", "value": "0x200C"},
+    "uvprojx_edit": {"action": "add_include_path", "paths": "../Core/Src"},
+    "address_for_line": {"file": "main.c", "line": 100},
     "serial_write": {"text": "help", "eol": "crlf"},
     "watchdog_freeze": {"action": "status"},
     "serial_expect": {"pattern": "msh />", "timeout_s": 5, "send": "help", "eol": "auto"},
@@ -1903,6 +2011,63 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     # ---------------- 表达式 / 变量 ----------------
+    # ---------------- 批次35-1：任意 Keil 命令直通 ----------------
+    @server.tool(
+        name="keil_command",
+        title="执行任意 Keil 命令窗口命令",
+        description=(
+            "把一条命令**原样**送进 Keil 命令窗口执行（走 UVSOCK 的 EXEC_CMD），"
+            "并把命令窗口输出/报错一并带回来。本工具是「万能兜底」：当某个专用工具不覆盖你要的"
+            "操作时，用官方命令直接做，不必等封装。\n"
+            "**常用命令**：`BS <符号|地址>` 下断点、`BK <编号>` 删断点、`BL` 列断点、"
+            "`BK *` 全清、`G` 运行、`G, main` 运行到 main、`T` 单步(进)、`P` 单步(过)、"
+            "`O` 单步(出)、`EVAL <表达式>` 求值、`WS <变量>` 加观察、`RESET` 复位、"
+            "`_RDWORD(0x地址)` 读 32 位内存、`printf(\"fmt\", x)` 打印到命令窗口、"
+            "`LOG >>文件` / `LOG OFF` 把命令窗口输出落盘。\n"
+            "**三条真机实测的坑（务必看）**：\n"
+            "1. 单步的官方缩写是 **`T`/`P`/`O`**；写 `Step`/`Tstep`/`Pstep` 会回 "
+            "`*** error 34: undefined identifier`（无窗口焦点时单步会退化成**指令级**，不进源码级）。\n"
+            "2. 命令报错**不会**反映在 UVSOCK 的 status 上（Keil 恒回 status=0）——"
+            "本工具已解析命令窗口的 `*** error N: message` 并自动给出错误码含义，"
+            "判断成败请看返回里的 ok / errors，不要只看 status。\n"
+            "3. 一次只能一条命令（含换行/回车会被拒），多步请用 batch 或 batch_debug_script。\n"
+            "返回：ok / status / console（命令窗口新增行）/ errors（含 code+meaning+fix）/ reply。"
+            "**高风险**：`BK *`、`RESET`、`G` 等会改变目标运行状态。"
+        ),
+    )
+    async def keil_command(command: str, settle_ms: int = 120,
+                           explain_errors: bool = True) -> str:
+        try:
+            client = _get_client()
+            settle = max(0, min(int(settle_ms or 0), 5000)) / 1000.0
+            r = client.exec_command_checked(command, settle=settle)
+            out = {"ok": bool(r.get("ok")), "status": r.get("status"),
+                   "command": r.get("command") or command,
+                   "console": r.get("console") or []}
+            if r.get("output") is not None:
+                out["reply"] = r["output"]
+            elif r.get("output_hex"):
+                out["reply_hex"] = r["output_hex"]
+            errs = r.get("errors") or []
+            if errs:
+                out["errors"] = errs
+                out["error"] = r.get("error")
+                if explain_errors:
+                    out["error_meanings"] = [
+                        {k: v for k, v in _keilkb.explain_command_error(
+                            e.get("text") or "", e.get("code")).items()
+                         if k in ("code", "meaning", "cause", "fix", "confidence",
+                                  "matched", "note", "generic_fix")}
+                        for e in errs]
+            if not out["console"] and not out.get("reply") and not out.get("reply_hex"):
+                out["console_note"] = ("命令窗口没有新增输出。部分命令（如 BS 成功）默认静默，"
+                                       "其成功与否看 ok/status；要确认效果请用专用读取工具"
+                                       "（list_breakpoints / calc_expression / read_registers）。")
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e), "command": command})
+
+
     @server.tool(
         name="calc_expression",
         title="读取表达式 / 变量值",
@@ -4434,16 +4599,65 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "返回值含 reused / pid / instances（当前同工程窗口数）。"
             "用户无需手动打开 Keil，AI 可通过本工具拉起；想看当前开了几个窗口用 list_uvision_instances，"
             '想把多余的收掉用 close_uvision(keep="latest")。'
+            "uvsock_port：传端口号则给这次启动加官方开关 `-s <端口>`，让**新实例**在该端口上开 UVSOCK——"
+            "当用户的 Keil 里 UVSOCK 没打开/端口被改过时，光拉起 Keil 仍连不上，这个参数能一步到位"
+            "（注意 MCP 服务自身的 UVSOCK 端口也要一致）。no_layout=true 加 `-sg` 禁用 uvguix 布局文件："
+            "用户改过窗口布局、布局文件损坏导致 UV4 起得极慢或报错时用它绕开。"
         ),
     )
-    async def launch_uvision(project: str = "", reuse: bool = True) -> str:
+    async def launch_uvision(project: str = "", reuse: bool = True,
+                             uvsock_port: int = 0, no_layout: bool = False) -> str:
         try:
             if _builder_cfg["uv4"] is None:
                 raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定")
             p = _resolve_project(project)
-            return _js(builder.launch_uvision(_builder_cfg["uv4"], p, reuse=bool(reuse)))
+            return _js(builder.launch_uvision(_builder_cfg["uv4"], p, reuse=bool(reuse),
+                                              uvsock_port=(int(uvsock_port) or None),
+                                              no_layout=bool(no_layout)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="batch_debug_script",
+        title="UV4 命令行批处理调试（-d + 初始化文件）",
+        description=(
+            "用 Keil 官方**命令行批处理**通道跑一段固定的调试脚本："
+            "`UV4 -d <工程> -j0` 进调试并执行**初始化文件**里的命令序列。"
+            "不依赖 UVSOCK（不需要 Keil 里开着 UVSOCK、也不怕连接被占/空闲断连），"
+            "适合**可重复的冒烟/回归**（复位后采现场、跑几步看寄存器、抓一段打印），"
+            "以及 UVSOCK 不可用时的降级通道。交互式排查请仍用 UVSOCK（enter_debug + keil_command）"
+            "——那条通道可以中途改主意，本通道是「一条道跑到黑」。\n"
+            "commands：命令清单（数组，或换行分隔的字符串），一行一条。常用的有 "
+            "`g, main`（运行到 main）、`BS <符号>`（下断点）、`BL`、`G`（跑到断点）、`T`/`P`/`O`（单步）、"
+            "`EVAL <表达式>`、`printf(\"%08X\", _RDWORD(0x20000000))`（无头读内存）。\n"
+            "**四条真机实测的坑（工具已尽力兜住）**：\n"
+            "1. **命令报错不改退出码**（UV4 恒回 0）：成败只认日志里的 `*** error N, line M`。"
+            "本工具把退出码、逐条命令的 error、以及每条命令是否走到完成标记分开返回，"
+            "ok 字段是综合判定结果。\n"
+            "2. `Go main` / `Go` 会**挂死**（官方语法是 `g, main`，逗号不可省）；"
+            "`DISPLAY`/`SAVE` 在 `-j0` 无头模式下也**挂死**。这两类写法会被静态检查提前告警，"
+            "但仍请避开。\n"
+            "3. 无窗口焦点时单步退化为**指令级**（`T` 会进函数逐条指令走）。\n"
+            "4. 每轮 15~25s（含进调试 + Erase/Program/Verify），显著慢于 UVSOCK；timeout_s 默认 240。\n"
+            "实现细节：初始化文件与 trace 日志写在系统临时目录（ASCII 路径，真机实测中文路径会 "
+            "UnicodeEncodeError），并把路径写入 .uvoptx 的 `<tIfile>`；**前置备份、无论成败都还原**，"
+            "不会把你的工程改脏。返回 artifacts 里给出 init_file / trace_log / workdir 现场路径，"
+            "log_tail 是日志尾部。**高风险**：会真正进调试并下载程序（Erase/Program/Verify）。"
+        ),
+    )
+    async def batch_debug_script(commands, project: str = "", timeout_s: int = 240,
+                                 visible: bool = False) -> str:
+        try:
+            p = _resolve_project(project)
+            t = int(timeout_s or 0) or 240
+            r = await asyncio.to_thread(
+                _cmdscript.run_debug_script, _builder_cfg["uv4"], p, commands,
+                max(20, min(t, 1800)), bool(visible))
+            _release_serial("UV4 -d 批处理调试（batch_debug_script）", r)
+            return _js(r)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e), "channel": "uv4-cmdline"})
+
 
     @server.tool(
         name="list_uvision_instances",
@@ -5062,29 +5276,89 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             loc = _get_locator()
             text = errors_text or ""
             # ARMCLANG (AC6): path\file.c:12:5: error: message
-            ac6 = re.findall(r'^(.+?\.(?:c|h|cpp|s|S)):(\d+):(\d+):\s*(error|warning):\s*(.+)$',
+            # 诊断号：AC5 形如 `#20: identifier ...`；AC6 多数无号，但带号时同义。
+            # 之前只保留消息文本，把 `#20` 丢掉，AI 无法据此查手册/复用诊断经验。
+            ac6 = re.findall(r'^(.+?\.(?:c|h|cpp|s|S)):(\d+):(\d+):\s*(error|warning|note):\s*(.+)$',
                              text, re.M)
             # ARMCC5 (AC5): path\file.c(12): error:  message
             ac5 = re.findall(r'^(.+?\.(?:c|h|cpp|s|S))\((\d+)\):\s*(error|warning):\s*(.+)$',
                              text, re.M)
+            code_re = re.compile(r'#(\d+)\s*:')
             items = []
             for m in ac6:
                 file, line, col, lvl, msg = m
                 resolved = loc.resolve_source_path(file) if loc else file
+                msg = msg.strip()
+                cm = code_re.search(msg)
                 items.append({"file": resolved, "line": int(line), "column": int(col),
-                              "level": lvl, "message": msg.strip()})
+                              "level": lvl, "message": msg,
+                              "error_code": (int(cm.group(1)) if cm else None),
+                              "compiler": "AC6", "format": "file:line:col"})
             for m in ac5:
                 file, line, lvl, msg = m
                 resolved = loc.resolve_source_path(file) if loc else file
+                msg = msg.strip()
+                cm = code_re.search(msg)
                 items.append({"file": resolved, "line": int(line), "column": None,
-                              "level": lvl, "message": msg.strip()})
+                              "level": lvl, "message": msg,
+                              "error_code": (int(cm.group(1)) if cm else None),
+                              "compiler": "AC5", "format": "file(line)"})
             errors = [x for x in items if x["level"] == "error"]
             warnings = [x for x in items if x["level"] == "warning"]
+            # 去重后的诊断号列表：AI 可直接拿去 explain_build_error 批量解读
+            codes = sorted({x["error_code"] for x in items if x["error_code"] is not None})
             return _js({"ok": True, "count": len(items),
                         "error_count": len(errors), "warning_count": len(warnings),
-                        "items": items})
+                        "error_codes": codes,
+                        "items": items,
+                        "hint": ("把任意一条 item 的 message（或 error_code）交给 "
+                                 "explain_build_error 可拿到含义/常见原因/处置清单") if items else None})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="explain_build_error",
+        title="解读编译错误 / Keil 命令报错",
+        description=(
+            "把一条编译诊断或 Keil 命令报错翻译成 人话：含义 + 常见原因 + **可执行的处置清单**。\n"
+            "两种输入：\n"
+            "- **编译诊断**：传行文本如 `main.c(120): error:  #20: identifier \"x\" is undefined`，"
+            "给 build_project/rebuild_project/parse_build_errors 返回里的任意一条 message 即可；"
+            "也可只传 `code=20`。匹配策略是**文本特征优先**（AC5/AC6 措辞都认），码号兜底。\n"
+            "- **命令报错**：传 `*** error 57: illegal address (0x08000DB5)` 这类文本，"
+            "或 `code=57`。码表条目**全部来自真机实测**（57 非法地址/Thumb 位、65 断点超限、"
+            "72 需按编号清断点、145 断点已存在可忽略、34 未定义标识符）。\n"
+            "**未收录的码不做猜测**：会明确回 confidence=unknown 并给通用排查路径，"
+            "避免编造一个看起来合理的错因把排查带偏。kind 可显式指定 build/command，"
+            "留空则自动判别（含 `*** error` 视为命令报错）。"
+        ),
+    )
+    async def explain_build_error(text: str = "", code: str = "",
+                                  kind: str = "") -> str:
+        try:
+            k = (kind or "").strip().lower()
+            text = text or ""
+            num = None
+            if str(code or "").strip():
+                try:
+                    num = int(str(code).strip(), 0)
+                except ValueError:
+                    return _js({"ok": False, "error": "code 必须是数字（如 20 或 0x14）",
+                                "code": code})
+            if not k:
+                if "*** error" in text.lower() or "error " in text.lower()[:12]:
+                    k = "command"
+                else:
+                    k = "build"
+            r = (_keilkb.explain_command_error(text, num) if k == "command"
+                 else _keilkb.explain_build_error(text, num))
+            r["kind"] = k
+            if k == "command":
+                r["known_codes"] = _keilkb.known_debug_codes()
+            return _js(r)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
 
     @server.tool(
         name="parse_map",
@@ -5935,6 +6209,441 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="wait_state",
+        title="等待目标进入指定状态（通用等待）",
+        description=(
+            "轮询等待目标进入某个状态，**把「等待 + 超时 + 现场」三件事一次做完**，"
+            "省掉 AI 自己 sleep + get_status 的轮询循环（那种循环既慢又容易在超时后不知道现场是什么）。"
+            "state 取值：`stopped`（已停下，含 halt 后）、`running`（执行中）、"
+            "`not_debugging`（未进入调试）、`expr`（表达式成立，需配 expr 参数，"
+            "如 expr=\"uwTick > 1000\" 或 expr=\"state == 3\"，非 0 即视为成立）。"
+            "timeout_s 默认 10；poll_ms 默认 200。返回 matched（是否等到）、"
+            "elapsed_s、polls、observed（最终观测到的状态）、以及超时时的 timeout_kind"
+            "（timeout=等到了时间还没到目标状态 / unreachable=调试通道本身连不上 / "
+            "never_debugging=目标停在 not_debugging 但你等的是调试态）。"
+            "**不要用它替代 wait_breakpoint**：断点命中要用 wait_breakpoint（它认断点 id 与命中计数，"
+            "比轮询 PC 更可靠）；本工具适合「等标志位/等变量变化/等目标自己停下来」这类含糊等待。"
+        ),
+    )
+    async def wait_state(state: str = "stopped", timeout_s: int = 10,
+                         poll_ms: int = 200, expr: str = "") -> str:
+        try:
+            client = _get_client()
+            want_raw = str(state or "stopped").strip().lower()
+            syn = {"stopped": "stopped", "stop": "stopped", "halt": "stopped",
+                   "halted": "stopped", "stop_ped": "stopped",
+                   "running": "running", "run": "running", "executing": "running",
+                   "not_debugging": "not_debugging", "idle": "not_debugging",
+                   "no_debug": "not_debugging", "nodebug": "not_debugging",
+                   "expr": "expr", "expression": "expr"}
+            want = syn.get(want_raw)
+            if want is None:
+                return _js({"ok": False, "state": state,
+                            "error": "未知状态 %s" % state,
+                            "available": sorted(set(syn.values())),
+                            "usage": "stopped / running / not_debugging / expr"})
+            if want == "expr" and not (expr or "").strip():
+                return _js({"ok": False, "state": state, "expr": expr,
+                            "error": "state=expr 时必须给 expr（如 expr=\"uwTick > 1000\"）"})
+            deadline = time.time() + max(0.2, float(timeout_s or 10))
+            interval = max(0.05, float(poll_ms or 200) / 1000.0)
+            t0 = time.time()
+            polls = 0
+            observed = "?"
+            last_status = {}
+            last_value = None
+            while True:
+                polls += 1
+                st = client.get_status() or {}
+                last_status = st
+                if not st.get("ok"):
+                    observed = "unreachable"
+                    matched = False
+                elif not st.get("debugging"):
+                    observed = "not_debugging"
+                    matched = (want == "not_debugging")
+                elif st.get("running"):
+                    observed = "running"
+                    matched = (want == "running")
+                else:
+                    observed = "stopped"
+                    matched = (want == "stopped")
+                if want == "expr" and st.get("ok") and st.get("debugging"):
+                    ev = client.calc_expression(expr) or {}
+                    last_value = ev
+                    matched = bool(ev.get("ok")) and bool(ev.get("value"))
+                if matched:
+                    return _js({"ok": True, "state": want, "matched": True,
+                                "elapsed_s": round(time.time() - t0, 3), "polls": polls,
+                                "observed": observed, "expr": expr or None,
+                                "expr_value": (last_value or {}).get("value")
+                                if isinstance(last_value, dict) else None,
+                                "note": "已等到目标状态，可以直接做下一步（读内存/看寄存器/继续运行）。"})
+                if time.time() >= deadline:
+                    tk = "unreachable" if observed == "unreachable" else "timeout"
+                    if observed == "not_debugging" and want in ("stopped", "running"):
+                        tk = "never_debugging"
+                    hints = {
+                        "timeout": "超时未达目标状态，现场见 observed/status；"
+                                   "先判断是该调大 timeout_s，还是目标根本没走到那一步。",
+                        "unreachable": "调试通道本身不可用（Keil 未运行/UVSOCK 未开/连接被占），"
+                                       "先调 keil_health 定位，再调 restart_keil 或 reset_connection。",
+                        "never_debugging": "目标一直不在调试态，先 enter_debug。",
+                    }
+                    return _js({"ok": False, "state": want, "matched": False,
+                                "timeout_kind": tk, "elapsed_s": round(time.time() - t0, 3),
+                                "polls": polls, "observed": observed,
+                                "status": last_status, "expr": expr or None,
+                                "hint": hints.get(tk), "timeout_s": timeout_s})
+                await asyncio.sleep(interval)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "state": state, "error": str(e)})
+
+    def _svd_autodevice() -> str:
+        """不给 device 时，从当前工程的 uvprojx <Device> 推断型号。
+
+        真机踩过的坑：盘上有几十份不同厂商的 .svd，不指定器件就会挑到别的芯片，
+        把 0x40020000(GPIOA) 判成 TIMER2——**看似权威的错答案比报错更危险**。
+        """
+        try:
+            p = _resolve_project("")
+            if p and os.path.isfile(p):
+                cfg = _uvprojx.read_config(p)
+                dev = str(cfg.get("device") or "").strip()
+                if dev:
+                    return dev
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    @server.tool(
+        name="svd_list",
+        title="列出 CMSIS-SVD 外设（按器件找 .svd）",
+        description=(
+            "用芯片厂商的 **CMSIS-SVD** 文件回答「这个地址/外设叫什么、有哪些寄存器」——"
+            "它比本服务内置的 STM32F4 硬编码寄存器表更权威，且**换型号也能用**。"
+            "三种用法：① 只给 device（如 `STM32F401RCTx`）→ 在已安装的 Pack 里找匹配的 .svd "
+            "并列出其中的外设；② 给 svd_file 直接指定某份 .svd；③ 都不给 → 只列出盘上候选的 .svd 文件"
+            "（便于先看清有哪些可用）。keyword 按外设名子串过滤（如 `USART`、`GPIO`）。"
+            "**定位逻辑（真机踩过坑）**：包根不是 `Keil_v5/ARM/PACK`（本机该目录是空的！），"
+            "而是 `TOOLS.INI` 里 `RTEPATH=` 指向的目录，本服务会先读 TOOLS.INI 再回退猜。"
+            "另：SVD 文件名按容量档写（`STM32F401xE`），与订货型号（`STM32F401RCTx`）互不包含，"
+            "因此按**公共前缀**匹配，返回 found / device 供你核对是否选错档位。"
+            "疑点：SVD 只用于「解释读到的值」，**不会**用它去写寄存器。"
+            "解析出的值用 svd_decode 解位域；地址→外设的反查也走 svd_decode(address=...)。"
+        ),
+    )
+    async def svd_list(device: str = "", svd_file: str = "", keyword: str = "") -> str:
+        try:
+            eff_dev, auto_dev = (device or "").strip(), False
+            if not svd_file and not eff_dev and not _svd.loaded():
+                eff_dev = _svd_autodevice()
+                auto_dev = bool(eff_dev)
+            if not svd_file and not eff_dev and not _svd.loaded():
+                cands = _svd.find_svd_files("", limit=40)
+                return _js({"ok": True, "mode": "candidates",
+                            "count": len(cands), "files": cands,
+                            "note": "给 device= 或 svd_file= 进一步加载并列出外设；"
+                                    "也可设 MDKDEBUG_SVD 环境变量固定一份 .svd。"
+                                    "若当前工程已打开，本服务会先按工程 <Device> 自动推断。"})
+            r = _svd.load(path=svd_file or "", device=eff_dev or (device or ""))
+            if not r.get("ok"):
+                return _js(r)
+            kw = (keyword or "").strip().lower()
+            names = [n for n in _svd.peripheral_names()
+                     if not kw or kw in n.lower()]
+            out = {"ok": True, "mode": "peripherals", "device": _svd.device(),
+                   "path": r.get("path"), "matched_from": r.get("device_hint"),
+                   "device_auto": auto_dev,
+                   "peripheral_count": len(names), "peripherals": names}
+            if kw and not names:
+                out["note"] = "keyword 没匹配到任何外设，去掉过滤看看全部 %d 个" % \
+                              len(_svd.peripheral_names())
+            out["next"] = "用 svd_decode(peripheral=\"USART2\") 看寄存器清单；" \
+                          "svd_decode(address=\"0x4000440C\", value=\"0x200C\") 按地址解位域。"
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="svd_decode",
+        title="按 CMSIS-SVD 解码寄存器值（含地址反查）",
+        description=(
+            "把读到的寄存器值按 **CMSIS-SVD** 的 bitOffset/bitWidth 拆成位域，"
+            "并给出枚举值含义（如 `UE=1` / `MODER3=2 (Alternate function mode)`）——"
+            "比内置硬编码表更权威，且支持任意有 SVD 的型号。"
+            "两种定位方式：① `peripheral`+`register`（register 支持前缀匹配，写 `CR1` 即可）；"
+            "② 只给 `address`（自动反查外设与寄存器）——**这是最省事的方式**："
+            "先用 read_mem/read_peripheral 拿到地址和值，直接丢进来。\n"
+            "**真机踩过的坑（已修）**：地址反查曾用固定 0x4000 窗口判范围，"
+            "在 `0x40003800`(SPI2) 与 `0x40004400`(USART2) 这种只隔 3KB 的密集排布下会串台"
+            "（实测把 USART2 的 CR1 判成 SPI2）。现在优先用 SVD 的 `<addressBlock>` 界定真实范围、"
+            "并让 addressBlock 随 `derivedFrom` 继承（真机上 USART2 只是 `derivedFrom=\"USART6\"` 的空壳）；"
+            "实在没有 addressBlock 才退化为「最近前缀」。返回的 `matched_by` 会告诉你这次是"
+            "`addressBlock` 还是 `nearest_base` 判定的——看到 `nearest_base` 说明把握低一档，请核对。\n"
+            "value 支持 `0x`/十进制/纯数字字符串；只给 peripheral 不给 register 时返回该外设的寄存器清单。"
+            "**本工具只解释，不写寄存器**（写外设请用 write_peripheral / write_mem）。"
+        ),
+    )
+    async def svd_decode(peripheral: str = "", register: str = "", value=0,
+                         address: str = "", svd_file: str = "", device: str = "") -> str:
+        try:
+            eff_dev, auto_dev = (device or "").strip(), False
+            if (svd_file or device) or not _svd.loaded():
+                if not eff_dev and not svd_file:
+                    eff_dev = _svd_autodevice()
+                    auto_dev = bool(eff_dev)
+                r = _svd.load(path=svd_file or "", device=eff_dev)
+                if not r.get("ok"):
+                    return _js(r)
+            try:
+                val = _parse_addr(value) if isinstance(value, str) else int(value or 0)
+            except Exception:  # noqa: BLE001
+                return _js({"ok": False, "value": value,
+                            "error": "value 解析失败，支持 0x 前缀或十进制（如 0x200C / 8204）"})
+            addr = None
+            if str(address or "").strip():
+                try:
+                    addr = _parse_addr(str(address).strip())
+                except Exception:  # noqa: BLE001
+                    return _js({"ok": False, "address": address,
+                                "error": "address 解析失败，支持 0x 前缀或十进制"})
+            out = _svd.decode_value(peripheral=peripheral or "",
+                                    register=register or "", value=val, address=addr)
+            if isinstance(out, dict):
+                # 透出「这次用的是哪份 .svd」——选错文件会给出看似权威的错答案，
+                # 必须让调用方能一眼看出判定依据来自哪个芯片的手册。
+                out["svd_device"] = _svd.device()
+                out["svd_file"] = _svd._CACHE.get("path")
+                out["device_auto"] = auto_dev
+                if auto_dev:
+                    out["device_hint"] = ("未指定 device，已按当前工程的 <Device> 自动加载 %s；"
+                                          "若目标芯片不是它，请显式传 device= 或 svd_file="
+                                          % _svd.device())
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="uvprojx_read",
+        title="只读查看 uVision 工程配置（target/包含路径/分组文件）",
+        description=(
+            "读 .uvprojx（Keil 工程文件）里的关键配置，**不做任何写入**。what 取值："
+            "`targets`（有哪些 target）、`config`（某 target 的器件/包含路径/宏/输出名/优化等级）、"
+            "`groups`（工程分组与各组源文件）、`all`（默认，三者都给）。target 为空时用第一个。"
+            "用途：AI 在改工程前先看清现状——本服务多个工具（build/flash/set_debug_target）"
+            "都吃 target 名，名字打错很费时间，先跑本工具拿到准确名字。"
+            "改工程用 uvprojx_edit。解析用 ElementTree 只读打开，**不会**回写文件。"
+        ),
+    )
+    async def uvprojx_read(project: str = "", target: str = "", what: str = "all") -> str:
+        try:
+            p = _resolve_project(project)
+            if not os.path.isfile(p):
+                return _js({"ok": False, "project": p, "error": "工程文件不存在"})
+            w = (what or "all").strip().lower()
+            out = {"ok": True, "project": p, "what": w}
+            if w in ("all", "targets"):
+                out["targets"] = _uvprojx.list_targets(p)
+            if w in ("all", "config"):
+                out["config"] = _uvprojx.read_config(p, target or "")
+            if w in ("all", "groups"):
+                out["groups"] = _uvprojx.list_groups(p)
+            out["next"] = "改工程用 uvprojx_edit（会先自动备份 .uvprojx）；" \
+                          "切调试目标用 set_debug_target。"
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="uvprojx_edit",
+        title="受控编辑 uVision 工程（加包含路径/加文件/按正则删除）",
+        description=(
+            "改 .uvprojx 的**受控编辑**通道，专治「手工往工程里加一个 .c 文件」这种体力活。"
+            "action 取值：`add_include_path`（paths=目录列表）、`del_include_path`（pattern=正则）、"
+            "`add_files`（group + files，分组不存在会自动新建）、`remove_files`（pattern=正则，"
+            "匹配 FilePath）。project 为空用默认工程；target 为空用第一个 target。"
+            "paths/files 接受数组或逗号/分号分隔字符串。\n"
+            "**三条真机约定，请照做**：\n"
+            "1. **先读后写**：动手前先 uvprojx_read 看清现有分组名与包含路径，避免加出重复项；"
+            "2. **一定留着备份**：默认 backup=true，写前把原文件复制成 `<工程名>.uvprojx.mdkdebug.bak`，"
+            "返回值里有 backup（备份文件的绝对路径）——改完编译通过再考虑删；\n"
+            "3. **改完要重编译**：工程文件变了但 .axf 没变，调试看到的是旧固件的符号。\n"
+            "实现上是**文本级替换**（不是 ElementTree 序列化），保留原缩进与属性顺序，"
+            "所以 diff 干净、不会把文件洗一遍；每处替换都断言锚点唯一，命中数不为 1 就放弃写入并报错。"
+            "**中风险**：会真实修改用户的工程文件（已自动备份）。"
+        ),
+    )
+    async def uvprojx_edit(action: str, project: str = "", target: str = "",
+                           paths="", pattern: str = "", group: str = "",
+                           files="", backup: bool = True) -> str:
+        try:
+            p = _resolve_project(project)
+            if not os.path.isfile(p):
+                return _js({"ok": False, "project": p, "error": "工程文件不存在"})
+            a = (action or "").strip().lower()
+            bk = bool(backup)
+            if a == "add_include_path":
+                items = _csv_tokens(paths)
+                if not items:
+                    return _js({"ok": False, "action": a, "error": "paths 不能为空"})
+                return _js(_uvprojx.add_include_path(p, items, target or "", backup=bk))
+            if a == "del_include_path":
+                if not (pattern or "").strip():
+                    return _js({"ok": False, "action": a, "error": "pattern（正则）不能为空"})
+                return _js(_uvprojx.del_include_path(p, pattern, target or "", backup=bk))
+            if a == "add_files":
+                items = _csv_tokens(files)
+                if not (group or "").strip() or not items:
+                    return _js({"ok": False, "action": a,
+                                "error": "add_files 需要 group 与 files"})
+                return _js(_uvprojx.add_files(p, group, items, backup=bk))
+            if a == "remove_files":
+                if not (pattern or "").strip():
+                    return _js({"ok": False, "action": a, "error": "pattern（正则）不能为空"})
+                return _js(_uvprojx.remove_files(p, pattern, backup=bk))
+            return _js({"ok": False, "action": action,
+                        "error": "未知 action %s" % action,
+                        "available": ["add_include_path", "del_include_path",
+                                      "add_files", "remove_files"]})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="address_for_line",
+        title="源码 文件:行号 → 地址（反查）",
+        description=(
+            "给「源文件+行号」返回对应机器码地址，补齐反查方向——"
+            "get_current_location 是「地址→文件:行」，本工具是「文件:行→地址」。"
+            "典型用途：想让目标停在某一行，但那里没有符号；用本工具拿到地址，"
+            "再用 set_breakpoint(addr=...) 下**行级断点**。file 可用文件名（`main.c`）"
+            "或相对/绝对路径；line 为源码行号。返回 address（偶数，可直接喂 set_breakpoint）"
+            "与 thumb_address（带 Thumb 位 +1）。\n"
+            "**为什么特意给出偶数地址**：Keil 官方命令通道对奇数地址一律回 `error 57 illegal address`"
+            "（真机实测，符号 `&func|1` 这种写法必被拒），所以下裸地址断点前先确认地址是偶数。\n"
+            "按「小于等于该行的最近一条行记录」匹配（编译器不会给每行都生成地址），"
+            "返回 matched_line 告诉你实际落在哪一行；找不到时 ok=false 并给 nearby "
+            "（同文件已收录的行号，便于判断是文件没被收录还是行号超了）。"
+            "需已加载符号（.axf / .map），符号来源用 set_symbol_file 切换。"
+        ),
+    )
+    async def address_for_line(file: str, line: int) -> str:
+        try:
+            loc = _get_locator()
+            if loc is None:
+                return _js({"ok": False, "file": file, "line": line,
+                            "error": "未加载符号文件（.axf/.map），先调 set_symbol_file 或确认工程已编译"})
+            ln = int(line)
+            addr = loc.line_to_addr(file, ln)
+            # 0 不是有效代码地址（locator 已跳过 DWARF 的文件起始占位行，这里再兜一层）
+            if not addr:
+                nearby = []
+                try:
+                    want_base = os.path.basename(str(file).replace("\\", "/")).lower()
+                    for a, f, l in getattr(loc, "_rows", []) or []:
+                        if os.path.basename(str(f).lower()) == want_base:
+                            nearby.append(int(l))
+                except Exception:  # noqa: BLE001
+                    nearby = []
+                nearby = sorted(set(nearby))
+                return _js({"ok": False, "file": file, "line": ln,
+                            "error": "该文件/行号没有对应地址（文件未被符号收录，或行号超出编译出的范围）",
+                            "nearby_lines": (nearby[:20] + ["..."] + nearby[-10:])
+                            if len(nearby) > 30 else nearby,
+                            "symbol_source": _symbol_cfg.get("source_type")})
+            return _js({"ok": True, "file": file, "line": ln,
+                        "address": int(addr) & ~1,
+                        "address_hex": "0x%08X" % (int(addr) & ~1),
+                        "thumb_address_hex": "0x%08X" % ((int(addr) & ~1) | 1),
+                        "symbol_source": _symbol_cfg.get("source_type"),
+                        "note": "下裸地址断点请用 address（偶数）；奇数地址会被 Keil 拒为 error 57。"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "file": file, "line": line, "error": str(e)})
+
+    @server.tool(
+        name="capabilities",
+        title="能力自检（本服务能做什么、哪条通道现在通）",
+        description=(
+            "冷启动第一步的**能力自检**：一次看清这台上有什么可用、以及每条通道当前通不通，"
+            "避免 AI 拿不存在的功能去试错。返回四块：\n"
+            "1. `channels`：两条调试通道的可用性——`uvsock`（交互式，需 Keil 运行且 UVSOCK 已开）"
+            "与 `uv4_cmdline`（UV4 -d 批处理，不依赖 UVSOCK）；附各自实测结论与何时该用哪条。\n"
+            "2. `modules`：本服务内置模块是否就绪——uvprojx 编辑、CMSIS-SVD 解码、"
+            "Keil 报错知识库（含已实测的命令错误码条数）、串口监视、构建器等。\n"
+            "3. `env`：UV4 路径、默认工程、符号文件来源、端口、工具裁剪设置。\n"
+            "4. `tool_surface`：当前暴露的工具数（受 MDKDEBUG_TOOLSETS 影响），以及推荐工作流。\n"
+            "与 keil_health 的分工：keil_health 做**诊断**（坏了帮你定位坏在哪一环），"
+            "capabilities 做**枚举**（有什么、哪条路现在能走）。"
+        ),
+    )
+    async def capabilities() -> str:
+        try:
+            ch = {}
+            ver = None
+            try:
+                ver = _get_client().get_version() or {}
+            except Exception as e:  # noqa: BLE001
+                ver = {"ok": False, "error": str(e)}
+            if isinstance(ver, dict) and ver.get("ok"):
+                ch["uvsock"] = {"available": True, "keil_version": ver.get("version"),
+                                "detail": "UVSOCK 连接可用，可交互式调试（enter_debug / keil_command / 断点 / 内存）"}
+            else:
+                ch["uvsock"] = {"available": False,
+                                "detail": "UVSOCK 不可用（Keil 未运行 / UVSOCK 未开 / 端口不符 / 模态框阻塞）",
+                                "next": ["keil_health 定位断点", "restart_keil 拉起并存活性检查"],
+                                "raw": ver}
+            uv4 = _builder_cfg.get("uv4")
+            ch["uv4_cmdline"] = {
+                "available": bool(uv4 and os.path.isfile(uv4)),
+                "uv4": uv4,
+                "detail": "UV4 -d + 初始化文件批处理通道（batch_debug_script），"
+                          "不依赖 UVSOCK；但每轮 15~25s、命令报错不改退出码、"
+                          "DISPLAY/SAVE 与 Go main 会挂死（工具已做静态告警）。",
+                "when_to_use": "可重复的冒烟/回归；UVSOCK 不可用时的降级通道。",
+            }
+            if not uv4:
+                ch["uv4_cmdline"]["next"] = "启动服务时用 --uv4-path 指定 UV4.exe"
+            try:
+                svd_ok = bool(_svd.loaded())
+                svd_info = {"loaded": svd_ok, "device": _svd.device() if svd_ok else None,
+                            "path": (_svd._CACHE.get("path") if svd_ok else None)}
+            except Exception as e:  # noqa: BLE001
+                svd_info = {"loaded": False, "error": str(e)}
+            mods = {
+                "uvprojx_edit": {"available": hasattr(_uvprojx, "add_files"),
+                                 "detail": "工程受控编辑（包含路径/分组文件增删，自动备份）"},
+                "svd": dict({"available": True,
+                             "detail": "CMSIS-SVD 解析（derivedFrom/cluster/addressBlock，RTEPATH 探测）"},
+                            **svd_info),
+                "keilkb": {"available": True,
+                           "detail": "Keil 报错知识库：编译诊断规则 + 命令错误码",
+                           "known_command_codes": len(_keilkb.known_debug_codes())},
+                "serial": {"available": True, "detail": "串口监视/读写（端口占用与释放语义见 serial_monitor_start）"},
+                "builder": {"available": bool(uv4), "detail": "UV4 命令行编译/烧录（-b/-f，隐藏窗口，日志捕获）"},
+            }
+            env = {"uv4_path": uv4,
+                   "default_project": _builder_cfg.get("default_project"),
+                   "symbol_source": _symbol_cfg.get("source_type"),
+                   "symbol_file": _symbol_cfg.get("axf"),
+                   "uvsock_port": (getattr(_client, "port", None) if _client is not None else None),
+                   "toolsets_env": os.environ.get("MDKDEBUG_TOOLSETS", ""),
+                   "svd_env": os.environ.get("MDKDEBUG_SVD", "")}
+            surface = {"tool_count": None, "note": "受 MDKDEBUG_TOOLSETS 影响"}
+            try:
+                tm = getattr(server, "_tool_manager", None)
+                surface["tool_count"] = len(getattr(tm, "_tools", None) or {})
+                surface["toolsets_active"] = _toolset_plan().get("requested")
+            except Exception:  # noqa: BLE001
+                pass
+            return _js({"ok": True, "channels": ch, "modules": mods, "env": env,
+                        "tool_surface": surface,
+                        "recommended": ["capabilities 看能做什么", "keil_health 看现在通不通",
+                                        "list_tools 查准确参数名",
+                                        "mdk_guide 看典型工作流"]})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="list_tools",
         title="列出全部工具与必填参数",
         description=(
@@ -5983,6 +6692,31 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                 "每个工具的完整说明见其 description 末尾的【参数】/【调用示例】"})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "keyword": keyword, "error": str(e)})
+
+    # 工具面裁剪：MDKDEBUG_TOOLSETS=core,serial 之类只暴露相关工具，
+    # 避免近百个工具的描述挤占上下文。默认不设 = 全开，行为与以前完全一致。
+    try:
+        _tm = getattr(server, "_tool_manager", None)
+        _all = sorted((getattr(_tm, "_tools", None) or {}).keys())
+        _plan = _toolset_plan(_all)
+        if _plan.get("on"):
+            for _nm in _plan.get("removed") or []:
+                try:
+                    _tm.remove_tool(_nm)
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("裁剪工具 %s 失败：%s", _nm, _e)
+            logger.info("MDKDEBUG_TOOLSETS=%s 已裁剪：保留 %d 个 / 移除 %d 个（保留组：%s）",
+                        _toolset_env(), len(_plan.get("kept") or []),
+                        len(_plan.get("removed") or []), ",".join(_plan["requested"]))
+            if _plan.get("unknown_groups"):
+                logger.warning("MDKDEBUG_TOOLSETS 里有未知组名：%s（可用：%s）",
+                               ",".join(_plan["unknown_groups"]),
+                               ",".join(_plan["available_groups"]))
+        elif _plan.get("unknown_groups"):
+            logger.warning("MDKDEBUG_TOOLSETS 里没有可识别的组名：%s",
+                           ",".join(_plan["unknown_groups"]))
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("工具面裁剪失败（按不裁剪继续）：%s", _e)
 
     # 为每个工具描述追加【参数】/【调用示例】：AI 冷启动可直接照抄参数名，
     # 不必靠 "Field required" 反复试错。

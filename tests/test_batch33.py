@@ -595,7 +595,7 @@ async def group_f_surface(server):
         check("F1 工具已注册：%s" % nm, nm in tools)
 
     n = len(tools)
-    check("F2 工具总数 88（批次33 新增串口枚举 / 原子等待 / 清理 3 个）", n == 88, n)
+    check("F2 工具总数 98（批次35 新增 10 个）", n == 98, n)
 
     d = tools["flash_download"].description or ""
     check("F3 高风险工具描述带【风险】高并点明不可逆",

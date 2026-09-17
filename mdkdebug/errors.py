@@ -37,11 +37,15 @@ RISK_HIGH = {
     "flash_download", "flash_debug", "build_and_flash", "clean_project",
     "fill_mem", "write_peripheral", "close_uvision", "restart_keil",
     "reset", "set_breakpoint", "clear_all_breakpoints", "write_mem",
+    # UV4 -d 批处理会真正进调试并下载程序（Erase/Program/Verify）
+    "batch_debug_script",
 }
 RISK_MEDIUM = {
     "build_project", "rebuild_project", "launch_uvision", "run", "stop",
     "step", "reset_connection", "dismiss_dialog", "serial_write", "serial_expect",
     "set_reloc_delta", "serial_monitor_start", "serial_monitor_stop",
+    # 会真实修改用户的 .uvprojx（写前自动备份，但仍是不可逆的文件改动）
+    "uvprojx_edit",
 }
 
 # ----------------------------------------------------------------------

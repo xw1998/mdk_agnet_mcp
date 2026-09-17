@@ -545,8 +545,17 @@ def list_uvision_instances(project: str = "") -> dict:
     return out
 
 
-def launch_uvision(uv4: str, project: str, reuse: bool = True) -> dict:
+def launch_uvision(uv4: str, project: str, reuse: bool = True,
+                   uvsock_port: int | None = None,
+                   no_layout: bool = False) -> dict:
     """可见方式启动 Keil uVision 并打开指定工程（供调试查看界面）。
+
+    两个官方命令行开关（吸收自 dsh-keil-mcp / McuBuddy 的痛点）：
+    - ``uvsock_port=<端口>`` → 追加 ``-s <端口>``：让**这次拉起的实例**在指定端口上开
+      UVSOCK。默认（不开 -s）用的是 Options 里保存的 UVSOCK 设置；当用户的 Keil 里
+      UVSOCK 没打开/端口被改过时，光"拉起 Keil"仍然连不上，-s 能一步到位。
+    - ``no_layout=True`` → 追加 ``-sg``：禁用 uvguix 布局文件。用户改过窗口布局后，
+      布局文件损坏或与工程不匹配时 UV4 可能起得极慢甚至报错布局，-sg 可绕开。
 
     以**脱离调用方 job** 的方式启动（CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS |
     CREATE_NEW_PROCESS_GROUP），并把标准流接到 DEVNULL。否则由 MCP 服务拉起的 UV4 会
@@ -572,18 +581,32 @@ def launch_uvision(uv4: str, project: str, reuse: bool = True) -> dict:
                 "hint": ('如需收敛到单窗口：close_uvision(keep="latest")；'
                          "如需看全部实例：list_uvision_instances。"),
             }
-    r = winutil.launch_detached(uv4, project)
+    extra = []
+    if uvsock_port:
+        extra += ["-s", str(int(uvsock_port))]
+    if no_layout:
+        extra.append("-sg")
+    r = winutil.launch_detached(uv4, project, extra_args=extra)
     if not r.get("ok"):
         return {"ok": False, "error": r.get("error", "启动 Keil 失败")}
-    return {
+    out = {
         "ok": True, "reused": False,
         "pid": r.get("pid"),
         "creationflags": r.get("creationflags"),
         "breakaway": r.get("breakaway"),
+        "extra_args": extra,
         "msg": "已脱离父进程启动 Keil uVision 并打开工程",
         "hint": "UVSOCK 需数秒才监听；可用 keil_health 确认 port_listening，"
                 "或用 restart_keil 一步完成关闭→重启→等待→重连。",
     }
+    if uvsock_port:
+        out["uvsock_port"] = int(uvsock_port)
+        out["hint"] = ("已用 -s %d 让本实例在指定端口开 UVSOCK；"
+                       "请把 MCP 服务的 UVSOCK 端口也设成一致（--port / 服务参数）。"
+                       % int(uvsock_port))
+    if no_layout:
+        out["no_layout"] = True
+    return out
 
 
 def _uv4_pids() -> list[int]:

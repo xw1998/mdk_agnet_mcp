@@ -266,6 +266,11 @@ class Locator:
         for a, f, l in self._rows:
             if l > line:
                 continue
+            # DWARF 行表会给「文件起始」放一条地址为 0 的占位记录：真机实测
+            # main.c:10 这类编译不出地址的行会被它匹配上，返回 ok=true + 0x00000000
+            # —— 比报错危险（AI 会真的去 0 号地址下断点），这里直接跳过。
+            if not a:
+                continue
             f_low = f.lower()
             if not (os.path.basename(f_low) == want_base
                     or os.path.normpath(f_low.replace("\\", "/")).lower() == want_norm

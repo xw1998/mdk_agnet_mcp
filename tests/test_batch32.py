@@ -361,7 +361,7 @@ async def group_h_cache(server, mock):
 async def group_i_surface(server):
     print("I. 工具面回归")
     tools = {t.name: t for t in await server.list_tools()}
-    check("I1 工具总数 83→88（新增 watchdog_freeze / cache_info）", len(tools) == 88, len(tools))
+    check("I1 工具总数 83→98（批次34/35 继续增加）", len(tools) == 98, len(tools))
     check("I2 watchdog_freeze / cache_info 已注册",
           "watchdog_freeze" in tools and "cache_info" in tools, sorted(tools))
     wd = tools["watchdog_freeze"].description or ""
@@ -396,7 +396,7 @@ async def group_i_surface(server):
           (wfw or {}).get("example_args", {}).get("action") == "status", wfw)
 
     lt2 = await call(server, "list_tools", {})
-    check("I11 total 与工具数一致", lt2.get("total") == 88, lt2.get("total"))
+    check("I11 total 与工具数一致", lt2.get("total") == 98, lt2.get("total"))
 
 async def main():
     mock = MockUVSOCKServer("127.0.0.1", PORT).start()

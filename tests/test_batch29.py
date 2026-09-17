@@ -331,7 +331,7 @@ async def group_d_tools(server):
     for nm in ("serial_monitor_start", "serial_read",
                "serial_monitor_status", "serial_monitor_stop"):
         check("D8 工具已注册：%s" % nm, nm in names)
-    check("D9 工具总数 77→85（批次29 串口 4 个 + 批次30 加 2 + 批次32 加 2）", len(names) == 88, len(names))
+    check("D9 工具总数 77→98（批次29 串口 4 + 批次30 加 2 + 批次32 加 2 + 批次35 加 10）", len(names) == 98, len(names))
 
     st = await call(server, "serial_monitor_status")
     check("D10 无监听时 status 不报错（ok=true、running=false、附可用串口）",

@@ -53,6 +53,11 @@
 - **UV4 自动探测**：优先显式 `--uv4-path`，其次探测常见安装目录，再查 Windows 注册表；
 - **连接缓存**：常驻服务内共享一条 TCP 连接，空闲自动断开、下次调用自动重连；
 - **并发调用可安全并行**：所有 UVSOCK 命令经**统一闸门串行化**——进程内 RLock（同进程多线程）+ 跨进程锁文件（多个 mdkdebug 实例共用同一调试通道时也只允许一个发命令），超时降级并如实记入遥测；`get_status` / `keil_health` 会回报**其他 mdkdebug 实例**（PID + 心跳年龄）并在有竞争时给出 `concurrency_warning`，把「写入被静默吞掉」从猜测变成可见证据；详见 [docs/PITFALLS.md](./docs/PITFALLS.md)；
+- **第二条调试通道：Keil 官方命令行批处理（`UV4 -d`）**：`batch_debug_script` 把一串命令写成初始化文件挂到 `.uvoptx` 的 `<tIfile>`，以 `-j0` 无人值守执行，按日志逐条判定执行结果。**为什么要它**：不依赖 UVSOCK 交互式会话，进程隔离、天然可重放，适合「跑一段固定脚本 → 拿结果」的冒烟/回归；UVSOCK 不可用时也是降级通道。已处理三个真机硬坑：初始化文件与 trace 落到 ASCII 临时目录、`.uvoptx` 前置备份 + finally **字节级**还原、`<tIfile>` 唯一性先数再换；静态 lint 会拦下真机会挂死的写法（`Go main` / `DISPLAY` / `SAVE` / `Step`）并给正确写法；
+- **报错知识库**：`explain_build_error` + `keil_command` 把编译诊断文本与 Keil 命令错误码翻成「含义 / 根因 / 修法」（`#20 identifier is undefined`、`error 57 illegal address`、`error 145` 断点已存在…）。**只收录真机实测过的条目**，未收录的一律 `confidence=unknown` + 通用排查路径，不编造含义；
+- **CMSIS-SVD 解码**：`svd_list` / `svd_decode` 按芯片厂商的 SVD 解释寄存器值（比内置硬编码表更权威、换型号也能用）：支持 `derivedFrom` 继承、`cluster`、数组与枚举位域；**地址反查**按 `<addressBlock>` 界定真实范围（固定窗口会在外设密集排布处串台），结果附 `matched_by` 标可信度、附 `svd_device` 标明用的是哪份 SVD；不给器件时按当前工程 `<Device>` 推断，**绝不盲挑盘上第一份 .svd**；
+- **工程文件受控编辑**：`uvprojx_read` / `uvprojx_edit` 只读查看与增删包含路径/文件；改前默认备份、文本级替换不重排工程、锚点唯一性校验后再写，空改动不落盘（不写坏用户工程）；
+- **通用等待与能力自述**：`wait_state` 一次完成「等待 + 超时 + 现场」（`timeout` / `unreachable` / `never_debugging` 三种超时分开报）；`capabilities` 一次问清当前环境两条通道、内置模块与工具面；`address_for_line` 补齐「源码行 → 地址」反查（返回偶数地址，避开 Keil 的 `error 57`）；
 - **随附模拟调试器**：无需硬件即可离线联调与跑测试。
 
 ## 工作原理
@@ -147,7 +152,7 @@ mdk_agent/
 │   ├── locator.py            # 基于 .axf DWARF 的符号定位（地址↔文件:行 双向 + 源码读取）
 │   ├── periph.py             # 内置 STM32F4 常用外设寄存器表（RCC/GPIO/USART/SPI/I2C/TIM/...）+ 内存区域地图
 │   ├── mapfile.py            # .map 链接映射文件解析（Program Size/sections/symbols/栈使用/未用段）
-│   └── server.py             # MCP Server 与 88 个工具定义
+│   └── server.py             # MCP Server 与 98 个工具定义
 ├── tests/
 │   ├── mock_uvsock_server.py # 模拟 Keil 调试器的 UVSOCK 服务器（离线联调）
 │   ├── test_batch*.py        # 各批次 mock 回归（批次 8 拆为 8a/8b/8cd；逐批覆盖该批新增工具）
@@ -186,7 +191,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **88** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导）：
+共 **98** 个（调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导）：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
@@ -205,6 +210,7 @@ python run_server.py --transport http --http-port 8300
 | `step` | 单步执行，成功后自动附带停靠位置（`stopped_file`/`stopped_line`/`stopped_address`）+ 源码上下文 + 调用栈 | `mode`：`into`/`over`/`out`/`instruction` |
 | `run_to_line` | 运行到指定行（run to cursor），接受 `文件:行号` 或 `0x地址` | `target`（如 `main.c:77`） |
 | `get_current_location` | 读取当前 PC，定位到 文件:行号 + 源码上下文 + 完整调用栈回溯 + 源码漂移提示 + 断点命中反馈 | — |
+| `address_for_line` | **源码 文件:行号 → 地址**（`get_current_location` 的反方向）：想在没符号的行上下断点时，先拿地址再 `set_breakpoint(expr=地址)`。按「≤ 该行的最近一条行记录」匹配并返回 `matched_line`；返回**偶数地址**（Keil 对奇数地址一律报 `error 57`）与带 Thumb 位的 `thumb_address_hex`。编译不出地址的行**不会**被 DWARF 的文件起始占位行（地址 0）糊弄成 `0x00000000` | `file`、`line` |
 | `read_locals` | 读取当前函数 参数+局部变量 及其值（DWARF 解析变量名，`calc_expression` 在当前上下文求值） | — |
 | `snapshot` | 状态快照：位置（文件行+PC）+ 源码上下文 + 完整调用栈 + 局部变量 + 指定全局变量，一站式看清当前运行状态 | `globals`、`source_context` |
 | `watch` | 变量组：批量读取多个表达式/变量的当前值，便于固定观察一组信号 | `exprs` |
@@ -221,6 +227,8 @@ python run_server.py --transport http --http-port 8300
 | `fault_report` | HardFault/异常定位：读 SCB（ICSR/HFSR/CFSR/MMFAR/BFAR）判异常类型+原因，从异常栈帧恢复 PC/LR/R0-R3/xPSR，排查死机/跑飞。**CFSR/HFSR 是粘滞位**（写 1 清除或复位才归零），故返回 `fault_timing`：`timeliness`=`current`（正处在 fault handler，即当下故障）/`sticky`（很可能只是历史残位，别当当前故障）/`none`，并给出 `first_seen`/`last_seen`/`last_cleared` | — |
 | `clear_faults` | 清除 CFSR/HFSR 粘滞位（W1C，写 `0xFFFFFFFF`，同时清 MMFAR/BFAR 的 VALID），返回 `before`/`after`/`cleared` 供对照——用于**区分新旧异常**：清位 → 跑一段 → 重新 `fault_report`，位又置起来才是新发生的 | — |
 | `set_conditional_breakpoint` | 条件断点：仅在 condition（C 表达式如 R0==5）成立/第 count 次命中时才停，减少无关中断 | `expr`、`condition`、`count` |
+| `svd_list` | **按 CMSIS-SVD 列外设**：在已安装的 Pack 里按订货型号找 `.svd` 并列出外设（`keyword` 过滤）。**定位逻辑踩过坑**：包根不是 `Keil_v5/ARM/PACK`（本机该目录是空的！），而是 `TOOLS.INI` 里 `RTEPATH=` 指向的目录；SVD 文件名按容量档写（`STM32F401xE`）与订货型号（`STM32F401RCTx`）互不包含，故按**公共前缀**匹配并返回 `found` 供核对。**不给 device 时不会乱挑**：先按当前工程 `<Device>` 推断，推不出来就报错并列候选清单（真机实测盲挑会把 GPIOA 判成别的芯片的外设）| `device?`、`svd_file?`、`keyword?` |
+| `svd_decode` | **按 SVD 解寄存器位域 / 按地址反查外设**：给 `peripheral`+`register` 或**只给 `address`**（自动反查，配合 `read_mem` 拿到的值最省事），把值拆成位域并给枚举含义（如 `MODER3=2 (Alternate function mode)`）。反查有 `matched_by` 标可信度：`addressBlock`（SVD 里有真实地址块，最准）或 `nearest_base`（退化的最近前缀，需核对）；结果里透出 `svd_device`/`svd_file`，避免「看的是别的芯片的手册」而不自知。本工具**只解释不写寄存器** | `peripheral?`、`register?`、`value?`、`address?`、`svd_file?`、`device?` |
 | `read_peripheral` | 外设寄存器一键读：内置 STM32F4 外设表（RCC/GPIO/USART/SPI/I2C/TIM/...），读指定外设寄存器并解析关键位域；`regs` 只取指定寄存器（如 `MODER,OTYPER`，裸名/前缀名都可，**也接受字符串数组 `["MODER","ODR"]`**）、`fields=off` 关位域解读，避免整表输出撑爆上下文 | `periph`、`regs?`、`fields?` |
 | `list_peripherals` | 列出内置外设寄存器表（外设名+基址+说明） | — |
 | `itm_trace` | ITM/Debug(printf) Viewer trace：检查 Trace 配置(DEMCR/ITM->TCR/TER)是否就绪 + 拉取串口窗口缓冲中的 ITM 打印文本 | `port`、`size` |
@@ -233,20 +241,24 @@ python run_server.py --transport http --http-port 8300
 | `wait_fault` | 运行至异常 / 断点并自动诊断：轮询等待停止，若停异常则读 ICSR/CFSR 判类型 + 收集现场，复现崩溃自动抓现场 | `timeout_ms` |
 | `parse_build_errors` | 解析编译错误 / 警告为结构化列表（文件:行:列 + 消息），兼容 AC5 `path(line):` 与 AC6 `path:line:col:` 两种格式 | `errors_text` |
 | `parse_map` | 解析 .map 链接映射文件：Program Size / sections / symbols / 栈使用 / 未用段，检查 FLASH/RAM 占用与栈溢出风险 | — |
+| `explain_build_error` | **编译/命令报错知识库**：把 AC5/AC6 的编译诊断文本或 Keil 命令错误码翻成「含义 + 根因 + 修法」，如 `#20 identifier is undefined`、`error 57 illegal address`、`error 145` 断点已存在。**只收录真机实测过的条目**，未收录的一律 `confidence=unknown` + 通用排查路径，不编造含义 | `text?`、`code?` |
 | `read_mem_multi` | 一次读取多个地址的内存（每项 {addr, n_bytes}，缺省 32），减少 AI 往返 | `addresses` |
 | `batch` | 一次提交多条只读命令聚合返回（read_mem/read_variable/calc_expression/get_status/read_registers），减少往返 | `commands` |
 | `project_targets` | 枚举工程全部 target + 当前 target + 调试 target（UV_PRJ_ENUM_TARGETS/GET_CUR_TARGET/GET_DEBUG_TARGET） | — |
 | `set_debug_target` | 切换调试 target（UV_PRJ_SET_DEBUG_TARGET），多 target 工程切目标后重新进调试 | `target` |
 | `read_project_config` | 读取工程配置：各 target 编译器（AC5/AC6）、优化级别（-O0~-Otime）、编译宏 Define、包含路径、`update_flash_before_debugging`（调试前是否自动下载程序）（.uvprojx 解析） | `project`、`target`（可选） |
+| `uvprojx_read` | **只读查看 .uvprojx**：`what` 取 `targets` / `config` / `groups` / `all`，返回各 target 的器件、编译器（AC5/AC6）、优化级别、Define、包含路径与分组文件树——排查「不同 target 行为不同」时先看这里 | `project?`、`target?`、`what?` |
+| `uvprojx_edit` | **受控编辑 .uvprojx**（增删包含路径 / 增删文件）：改前**默认先备份**（`<工程名>.uvprojx.mdkdebug.bak`，返回值里给 `backup`），文本级替换不重排整个工程文件，锚点唯一性校验后再写；`sku` 类空改动不落盘（曾把字面量 `None` 写进 `<IncludePath>` 静默损坏工程，已修）。属**中风险**工具：会改用户工程文件 | `action`（add_include_path / del_include_path / add_files / remove_files）、`project?`、`paths?`、`pattern?`、`group?`、`files?`、`backup?` |
 | `target_info` | 查询目标器件信息：实时读 DBGMCU->IDCODE 判 DEV_ID/REV_ID 映射型号 + SCB->CPUID 判内核 + 标称 Flash/RAM 容量与内存布局，排查资源吃紧/选错型号/容量不符 | — |
 | `profile_sampling` | 采样剖析定位热点：让目标运行，周期性暂停采 PC 归到函数统计占比（run/stop 采样，非硬件 ETM，会轻微扰动时序），找哪个函数占 CPU 最多 | `duration_ms`、`interval_ms`、`max_samples` |
 | `mdk_guide` | 环境自检+工作流引导：一键自检 Keil/UVSOCK/UV4/.axf/源码漂移/调试态/RTOS 类型，返回推荐调试工作流与各场景应调用的工具，AI 落地第一件事先调它 | — |
+| `capabilities` | **能力自述**：一次问清「这台机器上现在能干什么」——两条调试通道各自可用性（UVSOCK 交互 / UV4 命令行）、内置模块（SVD / 命令知识库 / 工程编辑 / 定位器）、工程与符号来源、工具面（总数与当前 `MDKDEBUG_TOOLSETS` 裁剪状态）。AI 冷启动或换环境后的第一个工具 | — |
 | `enter_debug` | 自动进入 Keil 调试模式；**已在调试态时返回 `already_in_debug=true`**，不再报失败（省一轮 `exit`/`enter`）；注意副作用：工程勾选 Update Target before Debugging 时会**自动下载最新程序进 Flash**。进调试后**默认自动冻结看门狗**（`freeze_watchdogs`） | `freeze_watchdogs?`（默认 true）；进调试时会**报告 `.uvoptx` 遗留断点**（这些断点会随进调试被 Keil 自动恢复，软件断点命令清不掉，是「目标行为诡异」的隐蔽干扰源） |
 | `exit_debug` | 自动退出 Keil 调试模式 | — |
 | `set_breakpoint` | 在符号 / 地址处设软件断点；已存在时 Keil 报 `error 145`，按成功处理并附 `already_exists`。**地址路径与符号路径同一套归一**：入参地址带 Thumb 位（bit0=1）时自动按偶地址下断并返回 `thumb_bit_stripped`/`address_normalized`（真机实测 Keil 的 `BS` 对奇数地址一律报 `error 57: illegal address`）；失败时返回 `diagnosis`（错误码含义 + 地址落在哪个内存区 + 是否在 .axf 覆盖范围 + 下一步建议） | `expr`（如 `main`、`0x08001034`；奇地址会自动清 bit0） |
 | `clear_breakpoint` | 清除断点：`expr`（符号/地址）、`bp_id`（内部 id）、`keil_number`（Keil 界面/BL 里的**真实断点编号**，数据观察点只能这样清）；`bp_id` 在内部表找不到时自动按 Keil 编号处理并给 `resolve_note` | `expr?`、`bp_id?`、`keil_number?` |
 | `list_breakpoints` | 列出断点（含对应的 文件:行号 位置）；`real` / `real_total` 给出 Keil 侧**真实断点表**（编号/类型/访问方式/地址/长度/命中计数/启用状态） | — |
-| `launch_uvision` | 可见方式拉起 Keil 打开工程；已有同工程窗口则**复用并前置**，不新开；以 `CREATE_BREAKAWAY_FROM_JOB` **脱离父进程 job** 启动，不会随调用链被回收 | `project`、`reuse?`（默认 true） |
+| `launch_uvision` | 可见方式拉起 Keil 打开工程；已有同工程窗口则**复用并前置**，不新开；以 `CREATE_BREAKAWAY_FROM_JOB` **脱离父进程 job** 启动，不会随调用链被回收。可选追加 `-s <端口>` 让**这次拉起的实例**在指定端口开 UVSOCK（用户 Keil 里 UVSOCK 没开/端口被改过时一步到位）、`-sg` 禁用 uvguix 布局（布局文件损坏导致起不来时绕开） | `project`、`reuse?`（默认 true）、`uvsock_port?`、`no_layout?` |
 | `list_uvision_instances` | 列出当前 Keil 实例（PID / 启动时间 / 打开的工程），一眼看清是否残留多个窗口 | `project?` |
 | `close_uvision` | 关闭 Keil 实例；`keep="latest"/"oldest"` 可**只保留一个窗口**、其余关闭 | `force?`、`keep?`、`project?` |
 | `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口；编译后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
@@ -254,7 +266,9 @@ python run_server.py --transport http --http-port 8300
 | `clean_project` | 清理工程（`UV4 -c`，删除中间产物不动源码）；编译失败的 `next_actions` 会指到这里——增量编译残留可疑时先 clean 再 build | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
 | `flash_download` | 烧录到目标 Flash（`UV4 -f`，烧录后自动检查调试通道）；**烧录后若仍在调试态则自动退出调试**（`exit_debug_after`，旧会话符号已过期），返回值 `debug_session` 说明处理过程 | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
 | `build_and_flash` | 编译成功后才烧录，AI 全流程闭环（自带通道自愈）；烧录后同样自动退出旧调试会话（`exit_debug_after`，返回 `debug_session`） | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
+| `batch_debug_script` | **Keil 官方命令行批处理调试（第二条通道）**：把一串命令写成初始化文件挂到 `.uvoptx` 的 `<tIfile>`，用 `UV4 -d -j0` 无人值守执行，按日志逐条判定「执行到没有」。**为什么留着它**：命令通道不依赖 UVSOCK 交互式会话，进程隔离、天然可重放，适合「跑一段固定脚本 → 拿结果」的场景。已处理三个真机硬坑：初始化文件与 trace 必须落在 ASCII 临时目录（中文路径会 `UnicodeEncodeError`）、`.uvoptx` **前置备份 + finally 字节级还原**（Keil 退出会回写，不还原就是脏工程）、`<tIfile>` 唯一性先数再换（多 target 工程常有多个）。静态 lint 会拦下真机会挂死的写法（`Go main`、`DISPLAY`、`SAVE`、`Step`）并给出正确写法；`EXIT` 缺失时自动补一条 | `commands`、`project?`、`timeout_s?`、`visible?` |
 | `flash_debug` | 「关旧 Keil→新固件上板→开新→进调试」一体闭环，规避旧窗口调试旧代码；上板方式自动选路（`flash_plan`：`debug_download` 由 Keil 进调试时自动下载 / `explicit_flash` 显式烧录） | `project`、`target` |
+| `keil_command` | **命令窗口直通**：把命令原样发给 Keil 命令窗口并结构化返回（成功/报错行、错误码含义、是否可用 `batch_debug_script` 批处理）。调试语义与 Keil 官方命令行一致——同事反馈「命令方式问题更少」时可直接用；报错会带上错误码解读 | `command`、`timeout_s?` |
 | `read_console_output` | 读取命令窗口输出 | `clear?` |
 | `read_async_messages` | 读取异步消息/报错 | `clear?` |
 | `serial_monitor_start` | **宿主机串口日志监听**（后台线程收 → 按行切分 → ring buffer）：`port` 可写 `"COM9"` 或 `9`（留空取第一个可用口），`baud` 默认 115200，`capacity` 默认保留 2000 行；端口不存在/被占用时 `ok=false` 并附 `available_ports`，不会静默失败；重复 start 时 `restart=false` 可避免抢占。**用完就还**：`idle_release_s`（默认 900s，0=不自动）为无人访问多久后自动释放端口——释放只放掉 COM 口，已收日志仍保留、可继续 `serial_read`，需要接着采集重新 start 会复用同一实例（`resumed=true`）不丢日志 | `port?`、`baud?`、`databits?`、`parity?`、`stopbits?`、`capacity?`、`encoding?`、`label?`、`restart?`、`idle_release_s?` |
@@ -272,6 +286,7 @@ python run_server.py --transport http --http-port 8300
 | `list_symbol_projects` | 列出预登记候选符号工程 | — |
 | `set_reloc_delta` | 设置 App 侧重定位偏移（运行地址 = 链接地址 + delta，如 SVCrtOS 的 `0xF000`）：设一次全局生效，`read_variable` / `read_mem` / `find_symbol` / `wait_breakpoint` 会按符号名自动换算；**只偏移符号名，显式数字地址不偏移** | `delta`（`0x` 或十进制，可负，`0x0` 清除） |
 | `list_tools` | 列出全部工具的名称/用途/**必填参数**/别名与最小调用示例（`example_args` 可直接照抄成 args），`keyword` 按工具名或用途过滤——AI 冷启动不必再靠 `Field required` 报错试错 | `keyword?` |
+| `wait_state` | **通用等待**：轮询等目标进入 `stopped` / `running` / `not_debugging` / `expr`（表达式成立），把「等待 + 超时 + 现场」一次做完，省掉 AI 自己 sleep + 查状态的轮询循环；超时给 `timeout_kind`（`timeout` 到点未达 / `unreachable` 通道连不上 / `never_debugging` 目标根本没进调试）与最终 `observed`，不再「超时了还不知道现场是什么」。**断点命中请用 `wait_breakpoint`**（认断点 id 与命中计数，比轮询 PC 可靠）| `state`（默认 stopped）、`timeout_s?`、`poll_ms?`、`expr?` |
 | `wait_breakpoint` | 带超时等待断点命中（symbol/address 或 .uvoptx 持久化断点），命中即回源码位置并计数；支持**数据观察点命中判定**（返回 `hit_kind` = code/watch、`hit_entry` 命中断点项与来源、`cnt_note` 判定依据强度）；**只认等待期间新发生的停止**（调用时目标已停着则 `hit=false`、`stop_is_new=false`、`new_stop_basis=not_new`，`note` 说明「目标在等待期间未曾运行」）；未命中时给 `note` 说明 PC 与候选地址并提示下一步 | `symbol?`、`address?`、`timeout_s?`、`poll_ms?`、`use_project_breakpoints?`、`project?`、`reloc_delta?` |
 | `breakpoint_stats` | 断点命中统计 | — |
 | `keil_health` | Keil 调试通道健康自检（UV4 进程 / UVSOCK 端口 / 模态框），Keil 未运行也能返回；检测到模态框时给出**正文（`message`）与可点按钮（`button_texts`）** | — |
@@ -282,6 +297,21 @@ python run_server.py --transport http --http-port 8300
 > 编译烧录工具均以**隐藏窗口**后台执行，不闪现 Keil 界面；`launch_uvision` 则以**可见**方式打开 Keil 供调试查看。
 
 > 编译烧录 / Keil 启动工具的 `project` 均可省略：省略时使用启动参数 `--default-project` 指定的默认工程。
+
+### 工具面裁剪（可选，`MDKDEBUG_TOOLSETS`）
+
+工具多了以后，把全部工具塞进上下文会稀释注意力。可用环境变量 `MDKDEBUG_TOOLSETS` 只暴露需要的组，例如 `MDKDEBUG_TOOLSETS=serial`（只留串口 10 个）、`core,build`（调试核心 + 编译烧录）：
+
+| 组名 | 内容 |
+|---|---|
+| `core` | 进出调试 / 运行控制 / 状态（32 个） |
+| `mem` | 内存与外设读写（10 个） |
+| `symbol` | 符号与源码定位（8 个） |
+| `build` | 编译 / 清理 / 烧录 / 工程配置（13 个） |
+| `serial` | 宿主机串口监听与命令应答（7 个） |
+| `advanced` | 诊断 / 剖析 / SVD / 工程编辑等进阶能力（25 个） |
+
+三条防翻车约定：**不设环境变量时行为完全不变**（默认全开）；**未归类的工具一律保留**（宁可少裁不错杀，组名写错时也不裁剪只给告警）；`list_tools` / `get_version` / `capabilities` 三个元工具**永不被裁**（否则 AI 连工具清单都问不出来）。裁剪结果会记入 `capabilities.tool_surface`，随时可核对。
 
 ### 参数约定（别名 / 类型宽容 / 单位换算）
 
