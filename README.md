@@ -474,4 +474,4 @@ Copyright (c) 2026 <春雫>
 ## 参考与致谢
 
 - [KeilAssistant](https://gitee.com/keyoushide/keil-assistant)：UVSOCK/TCP 协议参考实现
-- [debug-keil-uvsc](https://github.com/)：uvsc DLL 封装，提供完整 `EXECCMD` / `SSTR` 结构定义与命令窗口断点语义
+- debug-keil-uvsc：uvsc DLL 封装，提供完整 `EXECCMD` / `SSTR` 结构定义与命令窗口断点语义
