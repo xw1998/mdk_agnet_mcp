@@ -37,11 +37,20 @@ READONLY = {
     "parse_build_errors", "explain_build_error", "snapshot_diff", "wait_breakpoint",
     "wait_state", "mdk_guide", "capabilities", "list_tools",
     "list_peripherals", "svd_list", "svd_decode", "uvprojx_read",
+    # 分散加载文件：读结构与静态校验都不写文件；scatter_edit 才写。
+    "scatter_read", "scatter_check",
     # 非 MDK 链路：探测与解析（不 bind 端口、不起进程）
     "toolchain_list", "toolchain_detect_project", "toolchain_elf_info",
     "toolchain_size", "toolchain_errors", "target_list", "target_show", "target_guess",
     "debug_config",
     "trace_scope_read",
+    # 覆盖率：只有「读快照」是纯只读；start/stop/clear 会起停后台线程、
+    # 并可能改写 DEMCR/DWT_CTRL（restore=true 时会恢复原值，但仍是写目标）。
+    "coverage_read",
+    # 多核：列举与读 CPUID 都不改目标状态；core_select 才动。
+    "core_list", "core_info",
+    # ETM 探测：只读 ROM table / ID 块，不写任何目标寄存器。
+    "trace_etm_probe",
     "ocd_cfg_list", "ocd_status", "ocd_log", "ocd_probe", "ocd_flash_info",
     "ocd_read_mem",
     "trace_guide", "trace_status", "trace_decode", "trace_events",
@@ -85,9 +94,11 @@ NON_IDEMPOTENT = {
     "close_uvision", "ocd_start", "ocd_stop", "run", "run_timeout", "step",
     "wait_fault", "trace_instrument", "toolchain_env", "session_state",
     "uvprojx_edit", "batch", "batch_debug_script", "flash_debug",
+    "scatter_edit", "core_select",
     "restart_keil", "reset_connection", "trace_swo_start", "trace_swo_stop",
     "trace_profile", "profile_function", "profile_sampling",
     "trace_scope_start", "trace_scope_stop", "trace_pcsample",
+    "coverage_start", "coverage_stop", "coverage_clear",
 }
 
 # ----------------------------------------------------------------------
@@ -119,7 +130,9 @@ MUTATING = {
     "trace_rtt_attach", "trace_rtt_detach", "trace_rtt_read", "trace_rtt_write",
     "trace_swo_start", "trace_swo_stop", "trace_scope_start",
     "trace_scope_stop", "trace_pcsample",
+    "coverage_start", "coverage_stop", "coverage_clear",
     "uvprojx_edit", "wait_fault",
+    "scatter_edit", "core_select",
     "watchdog_freeze", "write_mem", "write_peripheral",
 }
 

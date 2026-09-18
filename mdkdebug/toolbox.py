@@ -60,7 +60,8 @@ TOOLSETS = {
     "build": {
         "build_project", "rebuild_project", "clean_project", "flash_download",
         "build_and_flash", "flash_debug", "parse_build_errors", "explain_build_error",
-        "uvprojx_read", "uvprojx_edit", "project_targets", "set_debug_target",
+        "uvprojx_read", "uvprojx_edit",
+        "scatter_read", "scatter_edit", "scatter_check", "project_targets", "set_debug_target",
         "read_project_config",
     },
     "serial": {
@@ -93,6 +94,7 @@ TOOLSETS = {
     },
     "target": {
         "target_list", "target_show", "target_guess", "debug_config",
+        "core_list", "core_select", "core_info",
     },
     "ocd": {
         "ocd_start", "ocd_stop", "ocd_status", "ocd_cmd", "ocd_cfg_list",
@@ -107,6 +109,8 @@ TOOLSETS = {
         "trace_rtt_detach", "trace_profile", "trace_dwt_counters",
         "trace_instrument", "trace_scope_start", "trace_scope_read",
         "trace_scope_stop", "trace_pcsample",
+        "coverage_start", "coverage_read", "coverage_stop", "coverage_clear",
+        "trace_etm_probe",
     },
     # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组。
     "rtos": {
@@ -132,7 +136,7 @@ GROUP_NOTES = {
     "serial": "串口：列端口、启停监视、读日志、写命令、等应答、Modbus 主站（RTU/ASCII + 裸帧旁听）",
     "advanced": "进阶：异常现场、watch、数据断点、SVD 外设、批量脚本、DWT",
     "toolchain": "非 MDK 构建：gcc/make/cmake 工具链探测、编译、ELF 分析",
-    "target": "目标档案：RISC-V/ESP32 等目标型号、调试配置推断",
+    "target": "目标档案：RISC-V/ESP32 等目标型号、调试配置推断、多核目标列选",
     "ocd": "OpenOCD：启停、命令直通、内存/寄存器/断点/烧录、GDB server",
     "trace": "trace：SWO/ITM、RTT、变量时间线、DWT 计数、PC 采样、插桩",
     "rtos": "RTOS 任务感知：任务列表/状态、栈水位、队列信号量对象",

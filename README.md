@@ -186,7 +186,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 162 个工具定义
+│   └── server.py             # MCP Server 与 173 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -235,10 +235,11 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **162** 个（**默认只暴露 37 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **173** 个（**默认只暴露 37 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
-- **MDK 族（107 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导 / **工具面按需装载**（`toolset`）（下表）。
-- **非 MDK 族（54 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案**（接口·速度·SWO·RTT 参数档案与自动识别 + 工程现场配置发现，4 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署，20 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **MDK 族（107 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
+- **非 MDK 族（59 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**，25 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **常驻元工具（4 个）**——`toolset`（工具面按需装载）/ `list_tools` / `capabilities` / `get_version`：**永不被裁**，否则 AI 连工具清单都问不出来、也装不回来。
 - **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
 
 下表为 MDK 族工具：
@@ -298,6 +299,9 @@ python run_server.py --transport http --http-port 8300
 | `project_targets` | 枚举工程全部 target + 当前 target + 调试 target（UV_PRJ_ENUM_TARGETS/GET_CUR_TARGET/GET_DEBUG_TARGET） | — |
 | `set_debug_target` | 切换调试 target（UV_PRJ_SET_DEBUG_TARGET），多 target 工程切目标后重新进调试 | `target` |
 | `read_project_config` | 读取工程配置：各 target 编译器（AC5/AC6）、优化级别（-O0~-Otime）、编译宏 Define、包含路径、`update_flash_before_debugging`（调试前是否自动下载程序）（.uvprojx 解析） | `project`、`target`（可选） |
+| `scatter_read` | **读分散加载文件(.sct)结构**：按行解析区域头（`RW_IRAM1 0x20000000 0x00040000 {...}`）与选择器（`.ANY`/`.ANY1`/`*`），返回 `regions`/`selectors`/`unsupported`/`errors` 与原始行号。**只读不解析语义**：不做地址推导、不替代链接器结论 | `path` |
+| `scatter_edit` | **受控编辑 .sct**：按行做文本级替换（保住缩进与注释，不整体序列化），支持 `set_region` / `add_region` / `remove_region` / `add_selector` / `remove_selector` 五种操作。**改前强制备份**（`<文件>.mdkdebug.bak`）、**改后重解析校验**，校验不过**不落盘**（宁可报错也不给你一个链接不起来的 .sct）；`dry_run=true` 只看会改成什么样 | `path`、`ops`、`dry_run?`、`backup?`、`create?`、`memmap?` |
+| `scatter_check` | **静态校验**（结论看 `clean`/`problems`，`ok` 只表示检查跑完了）：重复区域名 / 缺 size / size 为 0 / 区域重叠 / 超出内存地图（`memmap` 写法 `0x08000000:0x00100000,0x20000000:0x00030000`）。**说清楚不做什么**：不装载链接器、不校验选择器能不能匹配到段，这些只能靠链接结果验证 | `path`、`memmap?` |
 | `uvprojx_read` | **只读查看 .uvprojx**：`what` 取 `targets` / `config` / `groups` / `all`，返回各 target 的器件、编译器（AC5/AC6）、优化级别、Define、包含路径与分组文件树——排查「不同 target 行为不同」时先看这里 | `project?`、`target?`、`what?` |
 | `uvprojx_edit` | **受控编辑 .uvprojx**（增删包含路径 / 增删文件）：改前**默认先备份**（`<工程名>.uvprojx.mdkdebug.bak`，返回值里给 `backup`），文本级替换不重排整个工程文件，锚点唯一性校验后再写；`sku` 类空改动不落盘（曾把字面量 `None` 写进 `<IncludePath>` 静默损坏工程，已修）。属**中风险**工具：会改用户工程文件 | `action`（add_include_path / del_include_path / add_files / remove_files）、`project?`、`paths?`、`pattern?`、`group?`、`files?`、`backup?` |
 | `target_info` | 查询目标器件信息：实时读 DBGMCU->IDCODE 判 DEV_ID/REV_ID 映射型号 + SCB->CPUID 判内核 + 标称 Flash/RAM 容量与内存布局，排查资源吃紧/选错型号/容量不符 | — |
@@ -393,6 +397,16 @@ python run_server.py --transport http --http-port 8300
 | `target_guess` | **不认识芯片名/`.elf` 时先猜档案**：按型号名正则（`STM32F407ZGT6`→`stm32f407`）或 ELF 的 `e_machine` 推断，**多候选时全列出来不挑一个像样的** | `elf?`、`name?` |
 | `debug_config` | **从工程现场发现调试配置**：解析 `.vscode/launch.json`（cortex-debug，支持 JSONC 注释），把 `device`/`interface`/`configFiles`/`executable`/`svdFile` 直接翻成可喂给 `ocd_start` 的 `profile`/`interface`/`target`，省掉「猜 cfg 名→猜错→再猜」。返回值里的 **`config_source` 一定看**：逐字段说明参数出处；`servertype` 不是 openocd 时会明确说只能借型号与可执行文件。`ocd_start` 在**一个连接参数都没给**时也会自动查一次（`MDKDEBUG_NO_LAUNCH_DISCOVERY=1` 可关） | `path?`、`name?`、`start_dir?`、`list_only?` |
 
+### 多核目标（`core_*`，3 个）
+
+H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容易踩的坑不是「读不到」，而是**读到了另一个核**——两个核的 SCS 地址完全一样（`0xE000E000` 那段在各自核里），所以读到的 CPUID / 断点 / 现场属于谁，只由调试器当前挂在哪个 AP/target 上决定。**两条链路的能力不对称，而且这个不对称是真实的**：
+
+| 工具 | 说明 | 主要参数 |
+|------|------|----------|
+| `core_list` | 列可用核。**OpenOCD 链路真列**（执行 `targets`，带 `*` 的是当前选中）。**Keil/UVSOCK 链路如实报不支持**（`reason="unsupported-on-keil"` + `why`/`how_to`）——一条 UVSOCK 会话绑的是当前调试的那个核，协议里没有换核操作；双核要分别在两个 target/工程里连（`project_targets` / `set_debug_target`）。**本工具不会假装做了一次核切换** | `link?`（auto/keil/ocd） |
+| `core_select` | 切换 OpenOCD 当前选中的 target（= 换核）。核名必须与 `core_list` 给的**一字不差**，给错直接 `bad-core-name` 并列可用值，**不退化成「最近的那个核」**（那等于把另一个核的现场端上来）；**切完再查一遍确认**，不把「命令没报错」当成功 | `name`、`link?` |
+| `core_info` | 读 Cortex-M 的 `CPUID`（`0xE000ED00`）解出实现者/型号/修订，型号按 ARM 的 PARTNO 表查（**表外的给 null，不拿别的型号顶上**）。同时交代「这个值属于哪个核」：Keil 侧说明它属于当前调试的工程/核；OpenOCD 侧带上当前选中的 target 与全部名单，提醒你**不是最后一个核就一定是你的核**。它证明「这是哪一款内核」，**不证明「这是哪个核实例」** | `link?` |
+
 ### OpenOCD（`ocd_*`，17 个）
 
 会话自动管理（起一次、后续工具复用），telnet 协议层做了输出整形：剔回显、折叠 Jim-Tcl 调用栈、提取 `Error:`（`Warn :` 不算失败）。
@@ -445,6 +459,11 @@ python run_server.py --transport http --http-port 8300
 | `trace_scope_stop` | 停掉后台轮询线程并汇总（忘了停会一直占 SWD 带宽） | — |
 | `trace_pcsample` | **DWT 硬件 PC 采样（同样不 halt 目标）**：开 `DEMCR.TRCENA`+`DWT_CTRL.PCSAMPLENA`，主机只轮询 `DWT_PCSR`，按函数聚合。与 `trace_profile` 的本质区别是**不停核、不扰动实时性**。采样器不工作（部分芯片 errata）或采样值几乎不变时会**明确报错**，不给一份看着像样的分布；默认结束恢复 `DEMCR`/`DWT_CTRL` 原值 | `samples?`、`interval_ms?`、`elf?`、`top?`、`enable_dwt?`、`restore?`、`timeout?`、`link?` |
 | `trace_instrument` | **把目标侧插桩组件部署进你的工程**（见下）：按 `backend` 生成配置、拷贝组件源码与 `.mk`，已有文件默认 SKIP 不覆盖 | `target_dir`、`backend?`、`itm_port?`、`rtt_up?`、`rtt_down?`、`rtt_buf?`、`coreclk?`、`overwrite?`、`swo_baud?`、`dbgmcu_cr?` |
+| `coverage_start` | **代码覆盖率（PC 采样法，不停目标）**：开 `DEMCR.TRCENA` + `DWT_CTRL.PCSAMPLENA`，主机只轮询 `DWT_PCSR`，按 `.axf` 的 DWARF 把 PC 归到**函数**与**行**。函数/行**总数是静态事实**（调试信息里就有），触达来自硬件采样器。**三种情形拒绝编数据**：采样器不工作（`sampler_active=false`）/ 没有符号表 / scope 匹配不到任何函数。结论只说 `unseen`（**没看到**）而不是 `uncovered`（未覆盖）——采不到 ≠ 没执行过 | `interval_ms?`、`elf?`、`scope?`、`link?`、`max_samples?`、`duration_s?`、`enable_dwt?`、`restore?`、`timeout?` |
+| `coverage_read` | 看当前快照：`hit/total/percent`、按命中次数排序的 `top`、以及**没看到过的**函数/行 `unseen`；另给 `pc_attribution.mapped/unmapped`，PC 采到但归不到任何函数的比例一目了然 | `top?`、`unseen?` |
+| `coverage_stop` | 停掉后台采样线程并出最终报告（默认把 `DEMCR`/`DWT_CTRL` 恢复原值，`restore=false` 可保留） | `restore?`、`top?`、`unseen?` |
+| `coverage_clear` | 清空已有样本，从这一刻重新开始统计 | — |
+| `trace_etm_probe` | **ETM/ETB 指令级 trace 能力探测**（只探测、不抓取）：走一遍 CoreSight ROM table（默认 `0xE00FF000`）、认一认常规 ETM 窗口 `0xE0041000`（Cortex-M4 PIL 调试地图里这段就是 ETM trace unit，窗口上是合法 CoreSight 组件即说明单元在），并交代两条链路的真实抓取能力。`present`（芯片上有没有，**没测出来给 `null`，不拿「抓不到」冒充「没有」**）与 `supported`（恒为 `false`，Keil/UVSOCK 无 trace 抓取接口、OpenOCD 对 Cortex-M 不提供 ETM 抓取驱动）分得很开，并给出替代方案（SWO/ITM、RTT、PC 采样、DWT）。**不做部件号→名字的硬猜**：只给原始部件号与架构规定的组件类别码 | `link?`、`rom_base?`、`scan?` |
 
 ### RTOS 任务感知（`rtos_*`，3 个）
 
@@ -521,13 +540,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-162 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 37 个**（`core` 组 33 个 + 4 个元工具），其余 125 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+173 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 37 个**（`core` 组 33 个 + 4 个元工具），其余 136 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 162 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 173 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -539,13 +558,13 @@ toolset(action="load",   toolsets="all")        # 一次全装 162 个（=full/*
 | `core` | 进出调试 / 运行控制 / 状态 / 跨会话状态（33 个） |
 | `mem` | 内存与外设读写（10 个） |
 | `symbol` | 符号与源码定位（8 个） |
-| `build` | 编译 / 清理 / 烧录 / 工程配置（13 个） |
+| `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑（16 个） |
 | `serial` | 宿主机串口监听与命令应答 + Modbus 主站（14 个） |
-| `advanced` | 诊断 / 剖析 / SVD / 工程编辑等进阶能力（25 个） |
+| `advanced` | 诊断 / 剖析 / SVD / 工程编辑 / 复位循环识别等进阶能力（26 个） |
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
-| `target` | 非 MDK：目标档案查询与自动识别、工程现场调试配置发现（4 个） |
+| `target` | 非 MDK：目标档案查询与自动识别、工程现场调试配置发现、多核目标列举与切换（7 个） |
 | `ocd` | 非 MDK：OpenOCD 会话 / 内存 / 寄存器 / 断点 / 烧录（17 个） |
-| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 插桩组件部署（20 个） |
+| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 插桩组件部署 / 代码覆盖率 / ETM 能力探测（25 个） |
 | `rtos` | RTOS 任务感知：任务列表 / 栈水位 / 队列信号量（3 个；跨 Keil 与 OpenOCD 两条链路） |
 
 四条防翻车约定：**收起 ≠ 坏了**——收起只是不进工具清单，`load` 装回来立刻可用（返回值里的 `exposed` 是新暴露数）；**`list_tools` / `get_version` / `capabilities` / `toolset` 四个元工具永不被裁**（否则 AI 连工具清单都问不出来也装不回来），未归类的工具一律保留、组名写错时只告警不裁剪（宁可少裁不错杀）；**装完若客户端报「未知工具」**，多半是它缓存了旧的 tools/list——重新拉一次清单即可；**装载状态随时可核对**：`toolset(action="status")` 与 `capabilities.tool_surface` 都会报当前装载组、收起数与注册总数。

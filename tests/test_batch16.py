@@ -240,7 +240,7 @@ async def main():
         check("D-keil_health 描述提到模态框", "模态" in (tools["keil_health"].description or ""), "")
         check("D-restart_keil 描述提示会关闭所有实例",
               "关闭所有 Keil 实例" in (tools["restart_keil"].description or ""), "")
-        check("D1 工具数 68→162", len(tools) == 162, str(len(tools)))
+        check("D1 工具数 68→173", len(tools) == 173, str(len(tools)))
 
         await call(server, "exit_debug", {})
     finally:

@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 162 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 173 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的三条纪律
@@ -48,7 +48,11 @@ snapshot → 改配置 → snapshot_diff           # 内存/寄存器快照对�
 query_memory_map / read_peripheral / svd_decode   # 地址属于哪块、外设寄存器什么值
 fault_report / wait_fault                   # 异常与硬件错误现场
 watch_reset                                 # 反复复位/启动即死：按间隔读 DHCSR.S_RESET_ST（可传 flags_addr 交叉验证）
+coverage_start → coverage_read → coverage_stop   # 跑到哪些函数/行：DWT PC 采样，不停目标
+trace_etm_probe                             # 先问「这块板能不能抓指令 trace」：只探测不抓取，抓不到直说
 ```
+
+**多核目标先问是哪个核**：`core_info`（我连的这个核是哪一款内核）/ `core_list` + `core_select`（OpenOCD 链路真列真切；Keil 链路如实报不支持——一条 UVSOCK 会话就绑当前调试的那个核，双核要分别在两个 target/工程里连）。两个核的 SCS 地址完全一样，**读到的现场属于谁只由调试器当前挂的 AP/target 决定**。
 
 ### 3. 串口日志（宿主机侧，不经 Keil）
 
@@ -146,7 +150,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 37 个（`core` 33 个 + 4 个元工具），其余 125 个按需装载——
+- **工具面默认精简**：默认只暴露 37 个（`core` 33 个 + 4 个元工具），其余 136 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`。
 - **统一信封**：所有工具返回体都带 `status`（ok/error/…) 与 `next_actions`（下一步建议）；
@@ -164,6 +168,10 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 | 读到的内存值可疑 | `cache_info`（H7 D-Cache 直读可能是旧值）、`snapshot_diff` 对比 |
 | Keil 弹了模态框卡住 | `dismiss_dialog`、`keil_health` |
 | 烧进去跑不起来 / 反复复位 | `watch_reset`（复位循环识别，`flags_addr` 给出芯片复位标志寄存器可坐实有没有复位）、`watchdog_freeze`（先冻住看门狗再复现）。注意 Keil 的 `reset` 命令**不产生真实复位**（DWT CYCCNT 不归零、`RCC_CSR` 不置新标志），用它复现复位现象会白测 |
+| 想知道「测试跑到哪些函数/行」 | `coverage_start` → 跑流程 → `coverage_read` / `coverage_stop`（PC 采样，不停目标）。结论读 `unseen`（**没看到**，不是「未覆盖」）；采样器不工作/无符号表时会明确报错，不给一份看着像样的分布 |
+| 双核 / 怕看的是另一个核 | `core_info`、`core_list`、`core_select`（Keil 链路只给"不支持 + 怎么办"，不假装切了核） |
+| 问能不能抓 ETM 指令级 trace | `trace_etm_probe`（给 `present` 与 `supported` 两个**分开**的答案，并给替代方案）；`trace_guide` 看这台机器上实际有哪些 trace 手段 |
+| 要改 .sct / 校验分散加载文件 | `scatter_read` → `scatter_check` → `scatter_edit`（改前备份、改后重解析校验，校验不过不落盘） |
 
 ## 七、一条总原则
 
