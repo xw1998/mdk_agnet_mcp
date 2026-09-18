@@ -22,6 +22,11 @@ import asyncio
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
+import os as _os_env  # noqa: E402
+# 批次42：工具面默认已改为「精简（只开 core）+ 按需加载」；
+# 本批测试校验的是**全量**工具面，所以显式要求不裁剪。
+_os_env.environ.setdefault("MDKDEBUG_TOOLSETS", "all")
+
 from mdkdebug.server import create_server  # noqa: E402
 from mdkdebug.client import UVClient  # noqa: E402
 
@@ -55,7 +60,7 @@ async def main():
         # 1. 新工具已注册（64 → 66）
         check("read_console_output 已注册", "read_console_output" in tools, "")
         check("read_async_messages 已注册", "read_async_messages" in tools, "")
-        check("工具总数=153", len(tools) == 153, f"实际 {len(tools)}")
+        check("工具总数=154", len(tools) == 154, f"实际 {len(tools)}")
 
         # 2. server 层：set_breakpoint 发 BS 命令，其命令输出可经 read_console_output 读到
         sb = load(await call(server, "set_breakpoint", {"expr": "main"}))

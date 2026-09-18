@@ -31,6 +31,11 @@ os.environ.pop("MDKDEBUG_COMPACT", None)
 os.environ.pop("MDKDEBUG_MAX_LINES", None)
 
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
+import os as _os_env  # noqa: E402
+# 批次42：工具面默认已改为「精简（只开 core）+ 按需加载」；
+# 本批测试校验的是**全量**工具面，所以显式要求不裁剪。
+_os_env.environ.setdefault("MDKDEBUG_TOOLSETS", "all")
+
 from mdkdebug import session as _session  # noqa: E402
 from mdkdebug import outctl as _outctl  # noqa: E402
 from mdkdebug.server import create_server  # noqa: E402
@@ -285,7 +290,7 @@ async def group_e_surface(server):
 
     tools = await server.list_tools()
     names = sorted(t.name for t in tools)
-    check("E1 工具总数 153（批次36 再 +46，批次40 +3）", len(names) == 153, len(names))
+    check("E1 工具总数 154（批次36 再 +46，批次40 +3，批次42 +1）", len(names) == 154, len(names))
     check("E2 session_state 已注册", "session_state" in names, names)
     by = {t.name: t for t in tools}
     props = (by["list_tools"].input_schema or {}).get("properties") or {}
@@ -302,7 +307,7 @@ async def group_e_surface(server):
 
     t5 = await call(server, "list_tools", {"max_lines": 5})
     check("E7 直调 max_lines：列表 5 条而 count 仍是全量（并说明计数字段口径）",
-          len(t5.get("tools") or []) == 5 and t5.get("count") == 153 and
+          len(t5.get("tools") or []) == 5 and t5.get("count") == 154 and
           (t5.get("output") or {}).get("truncated") is True and
           "全量" in (t5.get("output") or {}).get("hint", ""), t5.get("output"))
 
@@ -314,8 +319,8 @@ async def group_e_surface(server):
           (comp_len, full_len))
 
     big = await call(server, "list_tools", {"compact": True, "max_lines": 5, "full": True})
-    check("E9 full=true 直调取回全量 153 条且无 output",
-          big.get("count") == 153 and len(big.get("tools") or []) == 153 and "output" not in big,
+    check("E9 full=true 直调取回全量 154 条且无 output",
+          big.get("count") == 154 and len(big.get("tools") or []) == 154 and "output" not in big,
           big.get("count"))
 
     bad = await call(server, "list_tools", {"max_line": 5})

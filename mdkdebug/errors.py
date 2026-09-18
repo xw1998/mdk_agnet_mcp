@@ -238,6 +238,29 @@ ERROR_CODES = {
             "也可以直接用 link=\"keil\" 或 link=\"ocd\" 指定链路，报错里会分别给出两条链路的缺失原因",
         ],
     },
+    "toolset-unknown-group": {
+        "text": "toolset 的 toolsets 参数里没有可识别的组名",
+        "next_actions": [
+            "可用组只有这 11 个：core mem symbol build serial advanced toolchain target ocd trace rtos",
+            "不确定就先调 toolset(action=status)：它会列出每个组的工具数与当前装载情况",
+        ],
+    },
+    "toolset-not-ready": {
+        "text": "工具面按需加载在当前 MCP SDK 上不可用（找不到预期的工具注册表接口）",
+        "next_actions": [
+            "这是 SDK 兼容性问题，不是工程配置问题：此时全部工具都还在，能力一个不少",
+            "用 capabilities 看 tool_surface 的 tool_count 确认当前工具面",
+            "要固定成全开：启动前设环境变量 MDKDEBUG_TOOLSETS=all",
+        ],
+    },
+    "toolset-bad-action": {
+        "text": "toolset 的 action 只能是 status / load / unload",
+        "next_actions": [
+            "看当前工具面：toolset(action=status)",
+            "装回某组：toolset(action=load, toolsets=mem,trace)",
+            "收起某组：toolset(action=unload, toolsets=trace)",
+        ],
+    },
     "invalid-argument": {
         "text": "参数不合法或缺失",
         "next_actions": ["用 list_tools(keyword=...) 查该工具的参数签名与最小调用示例 example_args", "参数名/类型都做了容忍，仍报错请按规范名传参"],
@@ -541,6 +564,9 @@ def _classify_structured(obj: dict) -> str:
         return "rtos-no-queue-registry"
     if _rr == "no-mem-link":
         return "rtos-no-mem-link"
+    # 工具面（批次42）：reason 里已经写了码，直接透传，别让分类器去猜中文
+    if isinstance(_rr, str) and _rr.startswith("toolset-"):
+        return _rr
     return ""
 
 # 非 MDK 工具名前缀：这些工具用不到 Keil 侧的下一步动作（keil_health / UVSOCK 那套）

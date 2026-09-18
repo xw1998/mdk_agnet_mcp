@@ -24,6 +24,11 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
+import os as _os_env  # noqa: E402
+# 批次42：工具面默认已改为「精简（只开 core）+ 按需加载」；
+# 本批测试校验的是**全量**工具面，所以显式要求不裁剪。
+_os_env.environ.setdefault("MDKDEBUG_TOOLSETS", "all")
+
 from mdkdebug.server import create_server  # noqa: E402
 from mdkdebug import uvoptx as U  # noqa: E402
 
@@ -150,7 +155,7 @@ async def main():
                   "list_uvoptx_breakpoints" in tools, "")
             check("clear_uvoptx_breakpoints 已注册",
                   "clear_uvoptx_breakpoints" in tools, "")
-            check("工具总数=153", len(tools) == 153, f"实际 {len(tools)}")
+            check("工具总数=154", len(tools) == 154, f"实际 {len(tools)}")
 
             # 3a. 读取（project 显式传）
             lv = load(await call(server, "list_uvoptx_breakpoints", {"project": uvoptx2}))

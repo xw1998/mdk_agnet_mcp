@@ -102,7 +102,7 @@ MUTATING = {
     "session_state", "set_breakpoint", "set_conditional_breakpoint",
     "set_debug_target", "set_register", "set_reloc_delta", "set_symbol_file",
     "set_watchpoint", "step", "stop", "toolchain_build", "toolchain_compile",
-    "toolchain_env", "toolchain_objcopy", "toolchain_run", "trace_clear",
+    "toolchain_env", "toolchain_objcopy", "toolchain_run", "toolset", "trace_clear",
     "trace_dwt_counters", "trace_instrument", "trace_profile",
     "trace_rtt_attach", "trace_rtt_detach", "trace_rtt_read", "trace_rtt_write",
     "trace_swo_start", "trace_swo_stop", "trace_scope_start",

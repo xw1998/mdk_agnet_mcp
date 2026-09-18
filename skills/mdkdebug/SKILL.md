@@ -103,8 +103,9 @@ session_state(action="load", apply=true)            # 开工接续：只恢复�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面裁剪**：`MDKDEBUG_TOOLSETS=core,build,serial` 可只暴露相关分组，降低冷启动成本；
-  不设＝全开。可用组名见 `capabilities`。
+- **工具面默认精简**：默认只暴露 37 个（`core` 33 个 + 4 个元工具），其余 117 个按需装载——
+  `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
+  启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`。
 - **统一信封**：所有工具返回体都带 `status`（ok/error/…) 与 `next_actions`（下一步建议）；
   失败时还有 `error_code` 与 `error_hint`。
 

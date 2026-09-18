@@ -34,6 +34,11 @@ os.makedirs(GUARD_DIR, exist_ok=True)
 os.environ["MDKDEBUG_GUARD_DIR"] = GUARD_DIR
 
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
+import os as _os_env  # noqa: E402
+# 批次42：工具面默认已改为「精简（只开 core）+ 按需加载」；
+# 本批测试校验的是**全量**工具面，所以显式要求不裁剪。
+_os_env.environ.setdefault("MDKDEBUG_TOOLSETS", "all")
+
 from mdkdebug import guard, serialmon  # noqa: E402
 from mdkdebug import server as srv  # noqa: E402
 from mdkdebug import uvsock as uvproto  # noqa: E402
@@ -331,7 +336,7 @@ async def group_d_tools(server):
     for nm in ("serial_monitor_start", "serial_read",
                "serial_monitor_status", "serial_monitor_stop"):
         check("D8 工具已注册：%s" % nm, nm in names)
-    check("D9 工具总数 77→153（批次29 串口 4 + 批次30 加 2 + 批次32 加 2 + 批次35 加 10 + 批次34 加 1 + 批次36 非MDK族 46 + 批次40 rtos 3）", len(names) == 153, len(names))
+    check("D9 工具总数 77→154（批次29 串口 4 + 批次30 加 2 + 批次32 加 2 + 批次35 加 10 + 批次34 加 1 + 批次36 非MDK族 46 + 批次40 rtos 3 + 批次42 toolset 1）", len(names) == 154, len(names))
 
     st = await call(server, "serial_monitor_status")
     check("D10 无监听时 status 不报错（ok=true、running=false、附可用串口）",

@@ -30,6 +30,11 @@ os.makedirs(GUARD_DIR, exist_ok=True)
 os.environ["MDKDEBUG_GUARD_DIR"] = GUARD_DIR
 
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
+import os as _os_env  # noqa: E402
+# 批次42：工具面默认已改为「精简（只开 core）+ 按需加载」；
+# 本批测试校验的是**全量**工具面，所以显式要求不裁剪。
+_os_env.environ.setdefault("MDKDEBUG_TOOLSETS", "all")
+
 from mdkdebug import serialmon  # noqa: E402
 from mdkdebug import builder  # noqa: E402
 from mdkdebug import errors  # noqa: E402
@@ -595,7 +600,7 @@ async def group_f_surface(server):
         check("F1 工具已注册：%s" % nm, nm in tools)
 
     n = len(tools)
-    check("F2 工具总数 153（批次35 +10 + 批次34 +1 + 批次36 +46 + 批次40 +3）", n == 153, n)
+    check("F2 工具总数 154（批次35 +10 + 批次34 +1 + 批次36 +46 + 批次40 +3 + 批次42 +1）", n == 154, n)
 
     d = tools["flash_download"].description or ""
     check("F3 高风险工具描述带【风险】高并点明不可逆",

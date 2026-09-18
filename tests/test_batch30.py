@@ -38,6 +38,11 @@ os.makedirs(GUARD_DIR, exist_ok=True)
 os.environ["MDKDEBUG_GUARD_DIR"] = GUARD_DIR
 
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
+import os as _os_env  # noqa: E402
+# 批次42：工具面默认已改为「精简（只开 core）+ 按需加载」；
+# 本批测试校验的是**全量**工具面，所以显式要求不裁剪。
+_os_env.environ.setdefault("MDKDEBUG_TOOLSETS", "all")
+
 from mdkdebug import serialmon  # noqa: E402
 from mdkdebug import client as uvclient  # noqa: E402
 from mdkdebug import server as srv  # noqa: E402
@@ -437,8 +442,8 @@ async def group_g_tools(server):
     tools = {t.name: t for t in await server.list_tools()}
     for nm in ("clear_faults", "serial_write"):
         check("G1 工具已注册：%s" % nm, nm in tools)
-    check("G2 工具总数 81→99（批次33 再 +3，批次35 +10，批次34 +1）",
-          len(tools) == 153, len(tools))
+    check("G2 工具总数 154（批次33 再 +3，批次35 +10，批次34 +1，批次36 +46，批次40 +3，批次42 +1）",
+          len(tools) == 154, len(tools))
     d = tools["serial_write"].description or ""
     check("G3 serial_write 描述点明「一边收一边发」与依赖监听持口",
           "一边收一边发" in d and "serial_monitor_start" in d, d[:160])

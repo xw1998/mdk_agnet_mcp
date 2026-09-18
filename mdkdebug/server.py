@@ -47,6 +47,7 @@ from . import ocd as _ocd
 from . import trace as _trace
 from . import workspace as _workspace
 from . import rtos as _rtos
+from . import toolbox as _toolbox
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -1692,134 +1693,24 @@ def _batch_alias_args(tool: str, args: dict) -> dict:
 
 # 这些工具的关键可选参数直接决定调用成败，示例里一并给出（照抄即可用）
 # ----------------------------------------------------------------------
-# 工具面裁剪（工具集分组）
+# 工具面（分组 / 默认精简 / 运行期装卸）——实现都在 toolbox.py
 # ----------------------------------------------------------------------
-# 起因：工具数已近百个，每个工具的 description 都要塞进上下文，冷启动成本很高；
-# 而上层场景往往是「这次只做串口抓日志」「这次只编译烧录」，用不到其余工具。
-# 参照 McuBuddy 的 MCUBUDDY_TOOLSETS 做的同类机制。
+# 起因：工具数到 154 个，每个工具的 description 都要进上下文，把窗口稀释掉，
+# 对小模型的注意力尤其不友好。批次42 起**默认只暴露 core 组 + 引导工具**，
+# 其余组用 toolset(action=load, toolsets=mem,trace) 按需装回来。
 #
-# 设计原则（防翻车）：
-# 1. **默认全开**——不设 MDKDEBUG_TOOLSETS 时行为完全不变，不打扰既有用户；
-# 2. **未归类的工具一律保留**，只裁剪「明确归到别的组」的工具，宁可少裁也不错杀；
-# 3. `list_tools` / `get_version` / `capabilities` 永远保留，否则 AI 连
-#    「现在有哪些工具」都问不出来，会陷入瞎试；
-# 4. 裁剪结果会写进日志，并用 capabilities 可见，出问题时一眼看出是被裁掉了。
-_TOOLSETS = {
-    "core": {
-        "enter_debug", "exit_debug", "get_status", "run", "stop", "step", "reset",
-        "run_timeout", "reset_connection", "wait_state", "wait_breakpoint",
-        "set_breakpoint", "clear_breakpoint", "clear_all_breakpoints", "list_breakpoints",
-        "read_mem", "write_mem", "calc_expression", "read_variable",
-        "keil_command", "batch_debug_script", "keil_health", "diagnose",
-        "restart_keil", "launch_uvision", "close_uvision", "list_uvision_instances",
-        "read_console_output", "read_async_messages", "dismiss_dialog",
-        "mdk_guide", "target_info", "session_state",
-    },
-    "mem": {
-        "read_mem_multi", "fill_mem", "search_mem", "snapshot", "snapshot_diff",
-        "read_struct", "read_locals", "read_registers", "set_register", "cache_info",
-    },
-    "symbol": {
-        "set_symbol_file", "list_symbol_projects", "find_symbol", "address_for_line",
-        "get_current_location", "run_to_line", "disassemble", "parse_map",
-    },
-    "build": {
-        "build_project", "rebuild_project", "clean_project", "flash_download",
-        "build_and_flash", "flash_debug", "parse_build_errors", "explain_build_error",
-        "uvprojx_read", "uvprojx_edit", "project_targets", "set_debug_target",
-        "read_project_config",
-    },
-    "serial": {
-        "serial_list_ports", "serial_monitor_start", "serial_monitor_status",
-        "serial_monitor_stop", "serial_read", "serial_write", "serial_expect",
-    },
-    "advanced": {
-        "clear_faults", "fault_report", "wait_fault", "dwt", "profile_function",
-        "profile_sampling", "itm_trace", "list_peripherals", "read_peripheral",
-        "write_peripheral", "query_memory_map", "svd_list", "svd_decode",
-        "watchdog_freeze", "watch", "set_watchpoint", "clear_watchpoint",
-        "clear_all_watchpoints", "list_watchpoints", "breakpoint_stats",
-        "set_conditional_breakpoint", "clear_uvoptx_breakpoints",
-        "list_uvoptx_breakpoints", "batch", "set_reloc_delta",
-    },
-    # ---- 非 MDK 能力族（批次36）----
-    # 这四个组的存在意义：调 RISC-V / ESP32 这类不用 Keil 的目标时，
-    # MDKDEBUG_TOOLSETS=toolchain,target,ocd,trace 即可把上下文压到只剩
-    # 这一条链路，不必让近百个 Keil 工具的描述挤占窗口。
-    "toolchain": {
-        "toolchain_list", "toolchain_env", "toolchain_run",
-        "toolchain_detect_project", "toolchain_build", "toolchain_compile",
-        "toolchain_elf_info", "toolchain_size", "toolchain_objcopy",
-        "toolchain_errors",
-    },
-    "target": {
-        "target_list", "target_show", "target_guess", "debug_config",
-    },
-    "ocd": {
-        "ocd_start", "ocd_stop", "ocd_status", "ocd_cmd", "ocd_cfg_list",
-        "ocd_probe", "ocd_control", "ocd_read_mem", "ocd_write_mem", "ocd_reg",
-        "ocd_bp", "ocd_wp", "ocd_flash", "ocd_flash_info", "ocd_load",
-        "ocd_gdb", "ocd_log",
-    },
-    "trace": {
-        "trace_guide", "trace_status", "trace_swo_start", "trace_swo_read",
-        "trace_swo_stop", "trace_decode", "trace_events", "trace_clear",
-        "trace_rtt_find", "trace_rtt_attach", "trace_rtt_read", "trace_rtt_write",
-        "trace_rtt_detach", "trace_profile", "trace_dwt_counters",
-        "trace_instrument", "trace_scope_start", "trace_scope_read",
-        "trace_scope_stop", "trace_pcsample",
-    },
-    # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组，
-    # 靠 MDKDEBUG_TOOLSETS=rtos 也能单独开出来。
-    "rtos": {
-        "rtos_info", "rtos_tasks", "rtos_objects",
-    },
-}
-
-_TOOLSET_ALWAYS = {"list_tools", "get_version", "capabilities"}
-
-
-def _toolset_assigned() -> set:
-    out = set()
-    for names in _TOOLSETS.values():
-        out |= set(names)
-    return out
+# 分组表、默认策略、plan() 与运行期装卸都在 toolbox.py；这里只留别名，
+# 免得历史调用点（capabilities / 测试）找不到名字。
+_TOOLSETS = _toolbox.TOOLSETS
+_TOOLSET_ALWAYS = _toolbox.ALWAYS
 
 
 def _toolset_env() -> str:
-    return (os.environ.get("MDKDEBUG_TOOLSETS") or "").strip()
+    return _toolbox.env_raw()
 
 
 def _toolset_plan(tool_names=None) -> dict:
-    """解析 MDKDEBUG_TOOLSETS，算出该保留/移除哪些工具。
-
-    返回 {requested, unknown_groups, unassigned, removed, available_groups, on}。
-    不设该环境变量（或设成 all/full/*）时 on=False，removed 为空 = 不裁剪。
-    """
-    groups = _toolset_env()
-    names = set(tool_names or [])
-    assigned = _toolset_assigned()
-    unassigned = sorted(n for n in names if n not in assigned) if names else []
-    if not groups or groups.lower() in ("all", "full", "*"):
-        return {"on": False, "requested": [], "unknown_groups": [], "unassigned": unassigned,
-                "removed": [], "available_groups": sorted(_TOOLSETS)}
-    want = [t for t in groups.replace(",", " ").replace(";", " ").split() if t]
-    want = [t.lower() for t in want]
-    unknown = sorted(set(t for t in want if t not in _TOOLSETS))
-    want = [t for t in want if t in _TOOLSETS]
-    if not want:
-        return {"on": False, "requested": [], "unknown_groups": unknown,
-                "unassigned": unassigned, "removed": [],
-                "available_groups": sorted(_TOOLSETS),
-                "note": "MDKDEBUG_TOOLSETS 里没有可识别的组名，按不裁剪处理"}
-    keep = set(_TOOLSET_ALWAYS) | set(unassigned)
-    for g in want:
-        keep |= set(_TOOLSETS[g])
-    removed = sorted(n for n in names if n not in keep)
-    return {"on": True, "requested": want, "unknown_groups": unknown,
-            "unassigned": unassigned, "removed": removed,
-            "kept": sorted(n for n in names if n in keep),
-            "available_groups": sorted(_TOOLSETS)}
+    return _toolbox.plan(tool_names)
 
 
 _KEY_OPTIONALS = {
@@ -1832,6 +1723,7 @@ _KEY_OPTIONALS = {
     "watchdog_freeze": {"action": "status"},
     "serial_expect": {"pattern": "msh />", "timeout_s": 5, "send": "help", "eol": "auto"},
     "clean_project": {},
+    "toolset": {"action": "load", "toolsets": "mem,trace"},
     "serial_list_ports": {},
 }
 
@@ -2052,7 +1944,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                   uv4_path: str | None = None,
                   default_project: str | None = None,
                   axf_path: str | None = None,
-                  symbol_projects: list | None = None) -> MCPServer:
+                  symbol_projects: list | None = None,
+                  toolsets: str | None = None) -> MCPServer:
     global _client, _builder_cfg, _symbol_cfg, _SYMBOL_PROJECTS
     # 合并符号工程注册表：内置(仓库内相对) + 环境变量注入 + 启动参数注入
     _SYMBOL_PROJECTS = (_builtin_symbol_projects()
@@ -6989,11 +6882,20 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                    "uvsock_port": (getattr(_client, "port", None) if _client is not None else None),
                    "toolsets_env": os.environ.get("MDKDEBUG_TOOLSETS", ""),
                    "svd_env": os.environ.get("MDKDEBUG_SVD", "")}
-            surface = {"tool_count": None, "note": "受 MDKDEBUG_TOOLSETS 影响"}
+            surface = {"tool_count": None, "note": "受工具面策略影响"}
             try:
                 tm = getattr(server, "_tool_manager", None)
+                st = _toolbox.status(server)
                 surface["tool_count"] = len(getattr(tm, "_tools", None) or {})
-                surface["toolsets_active"] = _toolset_plan().get("requested")
+                surface["registered_total"] = st["total_registered"]
+                surface["hidden"] = st["hidden"]
+                surface["loaded_groups"] = st["loaded_groups"]
+                surface["not_loaded_groups"] = sorted(
+                    g for g in st["available_groups"] if g not in st["loaded_groups"])
+                surface["groups"] = {g: v["size"] for g, v in st["groups"].items()}
+                surface["how_to_load"] = st["hint"]
+                surface["note"] = ("默认精简：只暴露 %s，其余组按需 toolset(action=load) 装回来。"
+                                   % "、".join(st["default_groups"]))
             except Exception:  # noqa: BLE001
                 pass
             return _js({"ok": True, "channels": ch, "modules": mods, "env": env,
@@ -7191,6 +7093,42 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "action": action, "error": str(e)})
 
     @server.tool(
+        name="toolset",
+        title="工具面装卸（按组按需加载工具）",
+        description=(
+            "本服务的工具按 11 个组划分，**默认只暴露 core 组**（调试核心 + 环境引导），"
+            "其余组用到时现装——这样上下文里只放当前真正用得上的工具描述，"
+            "工具多的时候这是省上下文的主要手段。"
+            "action=status 看当前暴露了哪些组、各组多少个、还差什么；"
+            "action=load 把 toolsets 指定的组装回来（例：toolsets=mem,trace，toolsets=all 一次全装 154 个）；"
+            "action=unload 把某组收起来（例：toolsets=trace）。"
+            "可用组与含义：core 调试核心/引导、mem 内存进阶、symbol 符号反汇编、"
+            "build 编译烧录、serial 串口、advanced 异常/watch/SVD、"
+            "toolchain 非MDK构建、target 目标档案、ocd OpenOCD、"
+            "trace SWO/RTT/变量时间线、rtos 任务感知。"
+            "**装卸后工具面立即变化，但很多 MCP 客户端缓存了工具列表**："
+            "若装完仍报未知工具，先重新拉一次 tools/list 再调。"
+            "list_tools / get_version / capabilities / toolset 这四个永远保留。"
+        ),
+    )
+    async def toolset_tool(action: str = "status", toolsets: str = "") -> str:
+        try:
+            act = (action or "status").strip().lower()
+            if act == "status":
+                return _js(_toolbox.status(server))
+            if act == "load":
+                return _js(_toolbox.load(toolsets, server))
+            if act == "unload":
+                return _js(_toolbox.unload(toolsets, server))
+            return _js({"ok": False, "action": action,
+                        "error": "action 只能是 status / load / unload",
+                        "reason": "toolset-bad-action",
+                        "hint": "例：action=load, toolsets=mem,trace",
+                        "example_args": {"action": "load", "toolsets": "mem,trace"}})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="list_tools",
         title="列出全部工具与必填参数",
         description=(
@@ -7240,9 +7178,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "keyword": keyword, "error": str(e)})
 
-    # 非 MDK 能力族（工具链 / 目标档案 / OpenOCD / trace）。
-    # 这些模块各自把工具注册进来，放在工具面裁剪之前，这样 _TOOLSETS 里
-    # 新加的组才有东西可裁。任一族注册失败都只记日志，不让整个 server 起不来。
+    # 非 MDK 能力族（工具链 / 目标档案 / OpenOCD / trace / RTOS）。
+    # 这些模块各自把工具注册进来，且都排在工具面策略（toolbox.install）之前，
+    # 这样 toolbox 里新加的组才有东西可裁。任一族注册失败都只记日志，
+    # 不让整个 server 起不来。
     _extra_counts = {}
     for _mod_name, _mod in (("toolchain", _toolchain), ("targets", _targets),
                             ("ocd", _ocd), ("trace", _trace),
@@ -7253,31 +7192,6 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             logger.warning("注册 %s 工具族失败（该族不可用，其余功能不受影响）：%s",
                            _mod_name, _e)
     logger.info("非 MDK 工具族注册：%s", _extra_counts)
-
-    # 工具面裁剪：MDKDEBUG_TOOLSETS=core,serial 之类只暴露相关工具，
-    # 避免近百个工具的描述挤占上下文。默认不设 = 全开，行为与以前完全一致。
-    try:
-        _tm = getattr(server, "_tool_manager", None)
-        _all = sorted((getattr(_tm, "_tools", None) or {}).keys())
-        _plan = _toolset_plan(_all)
-        if _plan.get("on"):
-            for _nm in _plan.get("removed") or []:
-                try:
-                    _tm.remove_tool(_nm)
-                except Exception as _e:  # noqa: BLE001
-                    logger.warning("裁剪工具 %s 失败：%s", _nm, _e)
-            logger.info("MDKDEBUG_TOOLSETS=%s 已裁剪：保留 %d 个 / 移除 %d 个（保留组：%s）",
-                        _toolset_env(), len(_plan.get("kept") or []),
-                        len(_plan.get("removed") or []), ",".join(_plan["requested"]))
-            if _plan.get("unknown_groups"):
-                logger.warning("MDKDEBUG_TOOLSETS 里有未知组名：%s（可用：%s）",
-                               ",".join(_plan["unknown_groups"]),
-                               ",".join(_plan["available_groups"]))
-        elif _plan.get("unknown_groups"):
-            logger.warning("MDKDEBUG_TOOLSETS 里没有可识别的组名：%s",
-                           ",".join(_plan["unknown_groups"]))
-    except Exception as _e:  # noqa: BLE001
-        logger.warning("工具面裁剪失败（按不裁剪继续）：%s", _e)
 
     # 批次34：给高输出工具的 schema 补 compact/max_lines/full（必须在 _apply_param_hints
     # 之前——提示块是按 schema 算出来的，先注入才能出现在【参数】说明里）。
@@ -7290,6 +7204,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     # 不必靠 "Field required" 反复试错。
     hinted = _apply_param_hints(server)
     logger.info("已为 %d 个工具补充参数调用示例", hinted)
+
+    # 工具面：默认精简 + 运行期按需装卸（实现在 toolbox.py）。
+    # **必须在输出控制与参数示例注入之后**——Tool 对象是在这里被快照的，
+    # 快照之后再改装，后面 load 回来的就丢了那两批注入的说明。
+    # spec 传 None 时交给 toolbox 先看 MDKDEBUG_TOOLSETS，没设才用默认 profile。
+    try:
+        _toolbox.install(server, spec=toolsets)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("工具面策略应用失败（按全开继续）：%s", _e)
 
     # 批次34：启动时只**提示**上次会话状态的存在，不自动应用——上下文接续由调用方
     # 显式调 session_state(action="load", apply=true) 决定（工具不替 AI 猜该用哪份上下文）。

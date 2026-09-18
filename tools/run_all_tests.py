@@ -38,12 +38,13 @@ BATCHES = [
     "test_batch31", "test_batch32", "test_batch33", "test_batch34",
     "test_batch35", "test_batch36", "test_batch37",
     "test_batch38",
-    "test_batch39", "test_batch40",
+    "test_batch39", "test_batch40", "test_batch42",
 ]
 
 # --fast：改一两个模块时先跑这几批（覆盖协议层/统一信封/非 MDK 链路），全绿再跑全量
 FAST_SET = ["test_e2e", "test_mcp", "test_batch33", "test_batch35", "test_batch36",
-            "test_batch37", "test_batch38", "test_batch39", "test_batch40"]
+            "test_batch37", "test_batch38", "test_batch39", "test_batch40",
+            "test_batch42"]
 
 # 并发禁区：这些模块共用同一个「守卫端口」，同时跑会互相干扰（真检查过端口占用）：
 #   test_batch29 断言 14999 没在监听，test_batch35 的子进程会去 bind 14999
@@ -74,11 +75,16 @@ def dec(b):
 
 
 def actual_tool_count():
-    """唯一事实来源：真起一个 server 数注册了多少个工具。"""
+    """唯一事实来源：真起一个 server 数注册了多少个工具。
+
+    显式传 ``toolsets="all"``：工具面默认精简（只暴露 core 组），但本检查要对齐的是
+    **注册总数**——各测试的「工具总数」断言与 README 描述写的都是这个数。
+    显式参数优先于 MDKDEBUG_TOOLSETS 环境变量，检查结果不会随环境漂。
+    """
     if ROOT not in sys.path:
         sys.path.insert(0, ROOT)
     from mdkdebug import server as srv  # noqa: E402
-    server = srv.create_server()
+    server = srv.create_server(toolsets="all")
     return len(asyncio.run(server.list_tools()))
 
 
@@ -89,6 +95,10 @@ def scan_test_counts(n):
       • 同一行内同时有『工具数(总)』与 `== N`；
       • 断言标签在上一行、`== N` 在下一行（多行 check 写法）——
         这类最容易被漏掉，正是本检查要防的情况。
+
+    扫描只认『工具总数 / 工具数 / 工具个数』这类**总量**措辞，比较的是注册总数（154）。
+    若某条断言说的是**别的量**（如某个分组的规模、某接口返回的 total），
+    断言标签就不要用『工具数』这个词，否则会被本检查误判——用『规模 / 条数 / 项数』描述。
     """
     hits = []
     tdir = os.path.join(ROOT, "tests")

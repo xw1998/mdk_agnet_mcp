@@ -25,6 +25,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
+import os as _os_env  # noqa: E402
+# 批次42：工具面默认已改为「精简（只开 core）+ 按需加载」；
+# 本批测试校验的是**全量**工具面，所以显式要求不裁剪。
+_os_env.environ.setdefault("MDKDEBUG_TOOLSETS", "all")
+
 from mdkdebug.server import create_server  # noqa: E402
 from mdkdebug import winutil as wu  # noqa: E402
 
@@ -251,7 +256,7 @@ async def group_c_async(server):
     tools = await server.list_tools()
     names = [t.name for t in tools]
     check("C1 dismiss_dialog 已注册", "dismiss_dialog" in names, "缺失")
-    check("C2 工具总数 76→153", len(names) == 153, len(names))
+    check("C2 工具总数 76→154", len(names) == 154, len(names))
     d = {t.name: (t.description or "") for t in tools}
     check("C3 描述说明会读正文与按钮",
           "正文" in d.get("dismiss_dialog", "") and "按钮" in d.get("dismiss_dialog", ""))

@@ -31,6 +31,11 @@ os.makedirs(GUARD_DIR, exist_ok=True)
 os.environ["MDKDEBUG_GUARD_DIR"] = GUARD_DIR
 
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
+import os as _os_env  # noqa: E402
+# 批次42：工具面默认已改为「精简（只开 core）+ 按需加载」；
+# 本批测试校验的是**全量**工具面，所以显式要求不裁剪。
+_os_env.environ.setdefault("MDKDEBUG_TOOLSETS", "all")
+
 from mdkdebug import keilkb  # noqa: E402
 from mdkdebug import cmdscript  # noqa: E402
 from mdkdebug import svd as _svd  # noqa: E402
@@ -380,7 +385,7 @@ async def group_e_surface(server, uv4):
 
     tools = await server.list_tools()
     names = sorted(t.name for t in tools)
-    check("E1 工具总数 153（工具面只增不减；批次34 +1，批次36 +46，批次40 +3）", len(names) == 153, len(names))
+    check("E1 工具总数 154（工具面只增不减；批次34 +1，批次36 +46，批次40 +3，批次42 +1）", len(names) == 154, len(names))
     for n in ("keil_command", "explain_build_error", "batch_debug_script", "wait_state",
               "svd_list", "svd_decode", "uvprojx_read", "uvprojx_edit",
               "address_for_line", "capabilities"):
@@ -422,7 +427,7 @@ async def group_e_surface(server, uv4):
           and "uv4_cmdline" in ch, r)
     check("E10 capabilities：报出内置模块与工具数",
           (r.get("modules") or {}).get("keilkb", {}).get("available") is True
-          and (r.get("tool_surface") or {}).get("tool_count") == 153, r)
+          and (r.get("tool_surface") or {}).get("tool_count") == 154, r)
 
     r = await call(server, "address_for_line", {"file": "__no_such_file__.c", "line": 10})
     check("E11 address_for_line：文件没被符号收录时如实报错，不瞎给地址",
@@ -483,15 +488,15 @@ async def group_e_surface(server, uv4):
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace", timeout=180)
-    check("E19 MDKDEBUG_TOOLSETS=serial 时工具面被裁到 10 个",
-          out.stdout.strip().endswith("10"), out.stdout[-200:] + out.stderr[-200:])
+    check("E19 MDKDEBUG_TOOLSETS=serial 时工具面被裁到 11 个（7 串口 + 4 常驻）",
+          out.stdout.strip().endswith("11"), out.stdout[-200:] + out.stderr[-200:])
 
     env2 = dict(os.environ, MDKDEBUG_TOOLSETS="bogus")
     out2 = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env2,
                           capture_output=True, text=True, encoding="utf-8",
                           errors="replace", timeout=180)
-    check("E20 未知组名时不裁剪（宁可少裁不错杀；“153”即当前全量工具数）",
-          out2.stdout.strip().endswith("153"),
+    check("E20 未知组名时不裁剪（宁可少裁不错杀；“154”即当前全量工具数）",
+          out2.stdout.strip().endswith("154"),
           out2.stdout[-200:] + out2.stderr[-200:])
 
     env3 = dict(os.environ, MDKDEBUG_TOOLSETS="core,build")

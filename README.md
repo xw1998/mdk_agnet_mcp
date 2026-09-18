@@ -124,7 +124,7 @@ AI 客户端通过 MCP 协议把用户/模型意图转成工具调用；`mdkdebu
 | Python | ≥ 3.11（开发 / 验证于 3.12） |
 | Keil | uVision 5，且已配置 UVSOCK 调试插件（见"对接真实 Keil"） |
 | Keil UV4 | `UV4.exe` 用于编译 / 烧录，可自动探测或 `--uv4-path` 指定（通常随 Keil 安装于 `UV4/UV4.exe`） |
-| OpenOCD（可选） | 调非 MDK 芯片 / 用 trace 时需要：可自动探测，也可在 `ocd_start(exe=...)` 指定；不需要时四个 `ocd_*`/`trace_*` 工具组可裁掉（见“工具面裁剪”） |
+| OpenOCD（可选） | 调非 MDK 芯片 / 用 trace 时需要：可自动探测，也可在 `ocd_start(exe=...)` 指定；不需要时 `ocd` / `trace` 两组可收起（见[工具面](#工具面默认精简--按需装载)） |
 | 交叉工具链（可选） | `toolchain_*` 系列会自动扫描常见安装位置；本机没有的家族列在 `missing` 里，不报错 |
 
 > **MDK 与非 MDK 两条链路互相独立**：只调 Keil 工程时不需要 OpenOCD，只调 RISC-V / ESP32 时不需要装 Keil。
@@ -180,7 +180,7 @@ mdk_agent/
 │   ├── ocd.py                # 非 MDK：OpenOCD telnet 会话与内存/寄存器/断点/烧录操作
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署
-│   └── server.py             # MCP Server 与 153 个工具定义
+│   └── server.py             # MCP Server 与 154 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -229,9 +229,9 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **153** 个，分两大块：
+共 **154** 个（**默认只暴露 37 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
-- **MDK 族（99 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
+- **MDK 族（100 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导 / **工具面按需装载**（`toolset`）（下表）。
 - **非 MDK 族（54 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案**（接口·速度·SWO·RTT 参数档案与自动识别 + 工程现场配置发现，4 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署，20 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 - **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
 
@@ -296,7 +296,7 @@ python run_server.py --transport http --http-port 8300
 | `target_info` | 查询目标器件信息：实时读 DBGMCU->IDCODE 判 DEV_ID/REV_ID 映射型号 + SCB->CPUID 判内核 + 标称 Flash/RAM 容量与内存布局，排查资源吃紧/选错型号/容量不符 | — |
 | `profile_sampling` | 采样剖析定位热点：让目标运行，周期性暂停采 PC 归到函数统计占比（run/stop 采样，非硬件 ETM，会轻微扰动时序），找哪个函数占 CPU 最多 | `duration_ms`、`interval_ms`、`max_samples` |
 | `mdk_guide` | 环境自检+工作流引导：一键自检 Keil/UVSOCK/UV4/.axf/源码漂移/调试态/RTOS 类型，返回推荐调试工作流与各场景应调用的工具，AI 落地第一件事先调它 | — |
-| `capabilities` | **能力自述**：一次问清「这台机器上现在能干什么」——两条调试通道各自可用性（UVSOCK 交互 / UV4 命令行）、内置模块（SVD / 命令知识库 / 工程编辑 / 定位器）、工程与符号来源、工具面（总数与当前 `MDKDEBUG_TOOLSETS` 裁剪状态）。AI 冷启动或换环境后的第一个工具 | — |
+| `capabilities` | **能力自述**：一次问清「这台机器上现在能干什么」——两条调试通道各自可用性（UVSOCK 交互 / UV4 命令行）、内置模块（SVD / 命令知识库 / 工程编辑 / 定位器）、工程与符号来源、工具面（注册总数 / 当前装载组 / 收起数与装回来的办法，`tool_surface`）。AI 冷启动或换环境后的第一个工具 | — |
 | `enter_debug` | 自动进入 Keil 调试模式；**已在调试态时返回 `already_in_debug=true`**，不再报失败（省一轮 `exit`/`enter`）；注意副作用：工程勾选 Update Target before Debugging 时会**自动下载最新程序进 Flash**。进调试后**默认自动冻结看门狗**（`freeze_watchdogs`） | `freeze_watchdogs?`（默认 true）；进调试时会**报告 `.uvoptx` 遗留断点**（这些断点会随进调试被 Keil 自动恢复，软件断点命令清不掉，是「目标行为诡异」的隐蔽干扰源） |
 | `exit_debug` | 自动退出 Keil 调试模式 | — |
 | `set_breakpoint` | 在符号 / 地址处设软件断点；已存在时 Keil 报 `error 145`，按成功处理并附 `already_exists`。**地址路径与符号路径同一套归一**：入参地址带 Thumb 位（bit0=1）时自动按偶地址下断并返回 `thumb_bit_stripped`/`address_normalized`（真机实测 Keil 的 `BS` 对奇数地址一律报 `error 57: illegal address`）；失败时返回 `diagnosis`（错误码含义 + 地址落在哪个内存区 + 是否在 .axf 覆盖范围 + 下一步建议） | `expr`（如 `main`、`0x08001034`；奇地址会自动清 bit0） |
@@ -503,9 +503,20 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 → 重新编译烧录 → trace_rtt_find / trace_swo_start → trace_events → trace_dwt_counters / trace_profile
 ```
 
-### 工具面裁剪（可选，`MDKDEBUG_TOOLSETS`）
+### 工具面（默认精简 + 按需装载）
 
-工具多了以后，把全部工具塞进上下文会稀释注意力。可用环境变量 `MDKDEBUG_TOOLSETS` 只暴露需要的组，例如 `MDKDEBUG_TOOLSETS=serial`（只留串口 7 个）、`core,build`（调试核心 + 编译烧录）；调非 MDK 芯片时用 `MDKDEBUG_TOOLSETS=toolchain,target,ocd,trace` 把近百个 Keil 工具的描述全部收起来：
+154 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 37 个**（`core` 组 33 个 + 4 个元工具），其余 117 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+
+```text
+toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
+toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
+toolset(action="unload", toolsets="trace")      # 收起
+toolset(action="load",   toolsets="all")        # 一次全装 154 个（=full/*）
+```
+
+装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 7 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
+
+共 11 个组（`core` 为默认装载组）：
 
 | 组名 | 内容 |
 |---|---|
@@ -521,7 +532,7 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 | `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 插桩组件部署（20 个） |
 | `rtos` | RTOS 任务感知：任务列表 / 栈水位 / 队列信号量（3 个；跨 Keil 与 OpenOCD 两条链路） |
 
-三条防翻车约定：**不设环境变量时行为完全不变**（默认全开）；**未归类的工具一律保留**（宁可少裁不错杀，组名写错时也不裁剪只给告警）；`list_tools` / `get_version` / `capabilities` 三个元工具**永不被裁**（否则 AI 连工具清单都问不出来）。裁剪结果会记入 `capabilities.tool_surface`，随时可核对。
+四条防翻车约定：**收起 ≠ 坏了**——收起只是不进工具清单，`load` 装回来立刻可用（返回值里的 `exposed` 是新暴露数）；**`list_tools` / `get_version` / `capabilities` / `toolset` 四个元工具永不被裁**（否则 AI 连工具清单都问不出来也装不回来），未归类的工具一律保留、组名写错时只告警不裁剪（宁可少裁不错杀）；**装完若客户端报「未知工具」**，多半是它缓存了旧的 tools/list——重新拉一次清单即可；**装载状态随时可核对**：`toolset(action="status")` 与 `capabilities.tool_surface` 都会报当前装载组、收起数与注册总数。
 
 ### 参数约定（别名 / 类型宽容 / 单位换算）
 
