@@ -381,6 +381,28 @@ def record(func_index, entries, exits=(), backend=None, max_events: int = 2000,
         out["error"] = ("resume 失败：%s（目标没跑起来就不会有事件）"
                         % (rs.get("error") or rs.get("status_text") or "未知原因"))
         return out
+    # 真机实测（F401 / trace_record 盯 2000ms 周期的任务函数）：目标已处于停止态时，
+    # resume 可能「回显成功但没真的跑」，于是整段录制一次都不命中，返回却是 ok + 空事件——
+    # 正是「看似权威的错答案」。这里复核一次运行态：明确仍在停止就报错并撤掉断点，
+    # 复核不出结论（链路没给 running）就只如实记 unknown，不替目标下判断。
+    _desc = {}
+    try:
+        _desc = backend.describe() or {}
+    except Exception:                                          # noqa: BLE001
+        _desc = {}
+    if "running" in _desc:
+        out["target_running_after_resume"] = _desc.get("running")
+    if _desc.get("running") is False:
+        left = []
+        for a in planted:
+            ok, _info = backend.clear_bp(a)
+            if not ok:
+                left.append("0x%X" % a)
+        out["breakpoints_left"] = left
+        out["error"] = ("resume 返回成功，但复核发现目标仍处于停止态（%s）：本次录制不会"
+                        "有任何事件，已撤掉布下的断点。请先 run 让目标跑起来再录"
+                        % (_desc.get("status_text") or "running 为假"))
+        return out
     deadline = t_start + max(0.05, float(max_ms) / 1000.0)
     polls = 0
     pending_divergence = 0
@@ -442,8 +464,19 @@ def record(func_index, entries, exits=(), backend=None, max_events: int = 2000,
     out["polls"] = polls
     out["cyccnt_available"] = any(e.get("cyc") is not None for e in rec.events)
     if not out["cyccnt_available"]:
-        out["cyccnt_note"] = ("读不到 DWT_CYCCNT（未使能或该内核没有），所以事件里没有 cyc/"
-                              "gap_cyc；时间轴请以 t_ms 为准，不要编造成周期数")
+        if rec.events:
+            out["cyccnt_note"] = ("事件里没有 cyc/gap_cyc：这次命中读不到 DWT_CYCCNT"
+                                  "（未使能或该内核没有）；时间轴请以 t_ms 为准，"
+                                  "不要编造成周期数")
+        else:
+            # 零事件时压根没读过 CYCCNT，说「读不到」就是把「没测」说成「没有」。
+            out["cyccnt_note"] = ("本轮没有任何命中，无法判定 CYCCNT 是否可用——"
+                                  "不要据此说「该内核没有 DWT_CYCCNT」；"
+                                  "要单独确认请调 trace_dwt_counters")
+    if not rec.events:
+        out["no_hit"] = ("录制窗口（%.0f ms）内一次都没命中：要么被监控函数的调用周期比"
+                         "窗口长（把 max_ms 调大，或换更频繁被调用的函数），要么目标其实"
+                         "没在跑。这不等于「函数没被调用」。" % float(max_ms))
     if pending_divergence:
         out["divergence_note"] = "有 %d 次命中读不到 CYCCNT" % pending_divergence
     out["link_limits"] = _limits(backend)

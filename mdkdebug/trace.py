@@ -845,6 +845,7 @@ def profile_samples(samples: int = 200, elf: str = "", interval_ms: float = 0,
                     top: int = 15, timeout: float = 20.0,
                     link: str = "auto") -> dict:
     """halt → 读 PC → resume 的采样剖析（侵入式，明确标注）。两条链路通用。"""
+    elf = str(elf or "").strip() or _session_axf()
     lk, lerr = _link.pick(link, who="halt 采样")
     if lk is None:
         return dict(lerr)
@@ -969,6 +970,22 @@ def _elf_symbol(elf: str, name: str):
     return None, None
 
 
+def _session_axf() -> str:
+    """会话里已经定位好的符号文件（set_symbol_file / --axf / --symbol-project）。
+
+    采样类工具（scope / pcsample / profile）原先只在调用方显式传 elf= 时才把地址翻成
+    函数名，哪怕会话里已经定位好了 .axf——「先 set_symbol_file 再采样」这条最自然的
+    用法反而拿不到名字。这里补回落，显式参数仍然优先。
+    """
+    try:
+        from . import server as _server
+        a = ((getattr(_server, "_symbol_cfg", None) or {}).get("axf") or "")
+        if a and os.path.isfile(a):
+            return os.path.abspath(a)
+    except Exception:                                          # noqa: BLE001
+        pass
+    return ""
+
 def _parse_vars(spec: str, elf: str = "") -> dict:
     """解析变量清单："g_cnt@0x20000000:4, g_flag, 0x20000010:1"。
 
@@ -1001,8 +1018,20 @@ def _parse_vars(spec: str, elf: str = "") -> dict:
             try:
                 addr = int(ab, 0)
             except ValueError:
-                invalid.append({"item": s, "why": "地址不是数字：%r" % ab})
-                continue
+                # 没有 @ 时整串被当成地址；但写法也可能就是裸变量名（"g_cnt"）。
+                # 文档承诺「只给名字就用 elf 查地址与大小」，这里必须真去 ELF 查，
+                # 不能拿「地址不是数字」把用户挡在门外。
+                if not name:
+                    name = ab
+                a, esz = _elf_symbol(elf, name)
+                if a is None:
+                    why = ("ELF 里没找到符号 %r" % name) if elf else \
+                          ("没给地址也没给 elf，无法把 %r 当变量名解析" % name)
+                    invalid.append({"item": s, "why": why})
+                    continue
+                addr = a
+                if not size and esz:
+                    size = int(esz)
         else:
             if not name:
                 invalid.append({"item": s, "why": "既没地址也没名字"})
@@ -1056,6 +1085,7 @@ def scope_start(vars: str, elf: str = "", period_ms: float = 100.0,
     返回里会如实给出 link 与丢点统计，不假装是干净样本。
     """
     import threading
+    elf = str(elf or "").strip() or _session_axf()
     lk, lerr = _link.pick(link, who="轮询目标内存")
     if lk is None:
         out = dict(lerr)
@@ -1200,6 +1230,7 @@ def pc_sample(samples: int = 500, interval_ms: float = 10.0, elf: str = "",
     而且部分芯片修订版上 PC 采样器根本不工作——那种情况会明确报
     `sampler_inactive` 而不是给一份看着像样的分布。
     """
+    elf = str(elf or "").strip() or _session_axf()
     lk, lerr = _link.pick(link, who="读 DWT 寄存器")
     if lk is None:
         return dict(lerr)
