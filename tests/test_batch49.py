@@ -1145,6 +1145,24 @@ def section_m():
     check("M11 非 trace_ 的非 MDK 工具仍按 OpenOCD 给（别改坏原行为）",
           "ocd_status" in " ".join(ERR.code_actions("ocd_status", "unknown-error")), "")
 
+    links = g.get("links") or ""
+    check("M12 swd_limits 收录 MDK 原生那条（Event Recorder/Event Statistics），"
+          "并说清它不占 SWO 引脚",
+          "Event Recorder" in limits and "Event Statistics" in limits
+          and "不是 SWO 引脚" in limits, "")
+    check("M13 明确它是插桩式（不调 API 的地方不会自动有记录），不许被当成自动捕获",
+          "必须插桩" in limits and "不是**自动捕获所有函数" in limits, "")
+    check("M14 把「侵入式」拆成插桩/停机两个维度，并点明 RTT 不停机",
+          "插桩" in limits and "停机" in limits and "停机但不停机" not in limits
+          and "RTT / Event Recorder **不会**" in limits, "")
+    check("M15 给出四类选型口径（改代码与否 × 停机与否 + 无损那条）",
+          "选型：SWD 两线做函数级观测" in limits and "全自动、无损、每跳都记" in limits, "")
+    check("M16 links 说明 MDK 原生窗口不归本工具集解码（不让人误以为有工具）",
+          "Event Recorder" in links and "不解码" in links, "")
+    check("M17 结论行三类手段齐全（非侵入观测 / 免插桩停机 / 插桩不停机）",
+          all(x in limits.split("结论：")[-1] for x in
+              ("trace_scope", "trace_record", "Event Recorder")), "")
+
 
 def main():
     section_a()
