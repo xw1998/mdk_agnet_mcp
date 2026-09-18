@@ -1106,6 +1106,46 @@ def section_k():
           "_periph_device_guard" in seg and "allow_mismatch" in seg, seg[:200])
 
 
+def section_m():
+    print("M. 批次51 trace 文档缺口与「没录过」的下一步")
+    from mdkdebug import errors as ERR
+    from mdkdebug import trace as TRC
+
+    g = TRC.GUIDE
+    howto = g.get("howto") or ""
+    limits = g.get("swd_limits") or ""
+    check("M1 howto 讲清 SWD 两线也能录函数进入/退出（不再是只有采样）",
+          "trace_record" in howto and "FPB" in howto and "CYCCNT" in howto, howto[-200:])
+    check("M2 swd_limits 明确 trace_record 是侵入式且受 FPB 槽位限制",
+          "trace_record" in limits and "侵入式" in limits and "FPB" in limits,
+          limits[-200:])
+    check("M3 说明它不需要 SWO 引脚、也不需要目标侧 RTT 代码（别让用户白接线）",
+          "不需要 SWO" in limits and "RTT" in limits, "")
+    check("M4 结论行把 trace_record 归进 SWD 两线能做到的事",
+          "trace_record" in limits.split("结论：")[-1], limits[-160:])
+    check("M5 同时给出选型口径（事件用 record / 占比用 pcsample）",
+          "两者怎么选" in limits, "")
+
+    srv = SV.create_server(port=PORT + 3)
+    r = call(srv, "trace_record", {"action": "read"})
+    check("M6 「没录过」带机器可读错误码 no-recording（不靠中文猜）",
+          r.get("ok") is False and r.get("error_code") == "no-recording", r)
+    env = ERR.normalize("trace_record", {"ok": False, "error_code": "no-recording",
+                                         "error": "本进程还没有录制过"})
+    joined = " ".join(env.get("next_actions") or [])
+    check("M7 信封不再把 trace_record 的失败指去 ocd_status/OpenOCD",
+          "ocd_status" not in joined and "OpenOCD" not in joined, joined)
+    check("M8 但给出的是「先跑 run 录一次」这条真正该做的",
+          "action=\"run\"" in joined, joined)
+    check("M9 trace_record 的通用未归类错误先指向 trace_guide（双链路都指得对）",
+          "trace_guide" in " ".join(ERR.code_actions("trace_record", "unknown-error")), "")
+    other = " ".join(ERR.code_actions("trace_swo_status", "unknown-error"))
+    check("M10 其他 trace_ 工具同样先指 trace_guide，不再给 OpenOCD 兜底那一套",
+          "trace_guide" in other and "toolchain_list" not in other, other)
+    check("M11 非 trace_ 的非 MDK 工具仍按 OpenOCD 给（别改坏原行为）",
+          "ocd_status" in " ".join(ERR.code_actions("ocd_status", "unknown-error")), "")
+
+
 def main():
     section_a()
     section_b()
@@ -1118,6 +1158,7 @@ def main():
     section_i()
     section_j()
     section_k()
+    section_m()
     print("\n批次49 结果：%d 通过 / %d 失败" % (len(PASS), len(FAIL)))
     if FAIL:
         print("失败项：")

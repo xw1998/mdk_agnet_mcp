@@ -504,6 +504,15 @@ ERROR_CODES = {
             "读已落盘的采集用 trace_swo_read(file=...)（采集结束后仍可回看）",
         ],
     },
+    "no-recording": {
+        "text": "本进程还没有做过 trace_record 录制，没有可回看的时间线",
+        "next_actions": [
+            "先 trace_record(action=\"run\", funcs=...) 录一次：read/status 只看得到"
+            "**同一进程里**刚录完的那份报告，跨进程不保留",
+            "函数名不确定：find_symbol 或 list_tools(keyword=\"symbol\") 先找到目标函数",
+            "只要「整体热点占比」、不需要进入/退出事件：改用 trace_pcsample 或 trace_profile",
+        ],
+    },
     "unknown-error": {
         "text": "未归类的失败",
         "next_actions": ["调 keil_health 看 Keil 侧状态", "用 read_async_messages 读 Keil 的异步报错原文"],
@@ -700,12 +709,26 @@ def is_modbus_tool(tool_name: str) -> bool:
 def is_non_mdk_tool(tool_name: str) -> bool:
     return str(tool_name or "").startswith(_NON_MDK_PREFIXES)
 
+# trace_* 是**双链路**工具族（Keil 与 OpenOCD 都能跑，见 trace_guide(topic=...)）：
+# 一律按 OpenOCD 给下一步，会把 Keil 链路上的用户指向 ocd_status —— 方向错。
+# 这里只给链路无关的动作：先查 trace_guide 讲清该链路支持到哪一步。
+_TRACE_ACTIONS = {
+    "unknown-error": [
+        "先 trace_guide 看该链路（keil / ocd）支持到哪一步、缺什么前置条件",
+        "读返回里的 output / raw 拿原始报错再判断，不要替目标猜原因",
+        "keil 链路的 trace 工具多数要目标处于调试态（先 enter_debug）；"
+        "ocd 链路先 ocd_status 确认会话还在",
+    ],
+}
+
 def code_actions(tool_name: str, code: str) -> list:
     """取某个错误码在该链路下的下一步动作（非 MDK 族对通用码做替换）。"""
     if not code:
         return []
     if is_modbus_tool(tool_name) and code in _MODBUS_ACTIONS:
         return list(_MODBUS_ACTIONS[code])
+    if str(tool_name or "").startswith("trace_") and code in _TRACE_ACTIONS:
+        return list(_TRACE_ACTIONS[code])
     if is_non_mdk_tool(tool_name) and code in _NON_MDK_ACTIONS:
         return list(_NON_MDK_ACTIONS[code])
     info = ERROR_CODES.get(code)

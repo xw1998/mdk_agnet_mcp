@@ -833,6 +833,27 @@ RTT 通路闭环时 `trace_rtt_read` 明明读回了 `boot: mdkdebug rtt probe` 
 代码里仍保留了一道运行期失败特征判定（`_BROKEN_RE`，命中「起得来、退出码 0、其实没跑」的 exe
 就判不可用），但注释只描述事实，不挂具体包的结论。
 
+### 11.16 别再拿「工具名前缀」当链路归属：`trace_*` 是双链路工具族
+
+统一信封里为了让「非 MDK 链路」的错误拿到对的下一步，按前缀把 `ocd_` / `toolchain_` /
+`target_` / `trace_` 判成「非 MDK 工具」，于是这些工具报 `unknown-error` 时拿到的是
+OpenOCD 兜底动作（「读返回里的 output / raw」「用 ocd_status / toolchain_list」）。
+
+真机复现：Keil 链路下 `trace_record(action="read")` 在没录过的进程里失败，信封给的下一步
+竟然指向 `ocd_status` —— 而本机根本没跑 OpenOCD，用户照着做就是白跑一趟。
+根因是 `trace_*` **不是**「非 MDK 工具」：它们是**双链路**的（Keil 与 OpenOCD 都能跑，
+本身就是「无法合并成同一个就分开支持」的产物），前缀切法在这里不成立。
+
+修法两层：
+1. 失败要有自己的码：`trace_record` 的「本进程还没录过」补 `error_code="no-recording"`
+   （并给专属 `next_actions`：先跑 `action="run"` 录一次；只要占比就换 `trace_pcsample`）。
+   工具自己给的 `error_code` 优先于文本猜码——这正是「宁可报错不给错答案」的落点。
+2. 通用码要按**工具族**而不是前缀给动作：新增 `_TRACE_ACTIONS`，让 `trace_*` 的
+   `unknown-error` 先指向 `trace_guide`（讲清该链路支持到哪一步），而不是 `ocd_status`。
+
+教训：分类表按「名字前缀」划，早晚会碰上一个跨链路/跨族的名字。判据要跟着**实际语义**
+（这个工具能不能跑在 Keil 上）走，而不是命名习惯。
+
 ## 十二、Keil 窗口复用 / 惰性符号 / 写入与回显（本轮真机实测）
 
 本轮的坑都属同一类：**工具手里明明有信息却不拿去用，于是给出一份看起来很确定、实际是错的答案**。

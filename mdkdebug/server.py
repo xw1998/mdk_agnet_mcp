@@ -5009,6 +5009,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 rep = (_trace_rec or {}).get("report")
                 if not rep:
                     return _js({"ok": False, "action": a,
+                                "error_code": "no-recording",
                                 "error": "本进程还没有录制过（先 trace_record(action=\"run\")）"})
                 if a == "status":
                     out = {k: v for k, v in rep.items() if k != "timeline"}
