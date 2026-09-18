@@ -35,3 +35,8 @@ docs/*
 # 例外：随仓库分发的文档
 !docs/build-flash-debug-guide.md
 !docs/PITFALLS.md
+
+# README 里引用的回放页与截图必须真正进仓库，否则 gitee 上显示为空白/裂图。
+# docs/* 用来挡生成物（如 docs/.gen_utf8），这里把 docs/demo 单独放出来。
+!docs/demo/
+!docs/demo/**

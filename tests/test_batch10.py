@@ -155,7 +155,7 @@ async def main():
                   "list_uvoptx_breakpoints" in tools, "")
             check("clear_uvoptx_breakpoints 已注册",
                   "clear_uvoptx_breakpoints" in tools, "")
-            check("工具总数=181", len(tools) == 181, f"实际 {len(tools)}")
+            check("工具总数=184", len(tools) == 184, f"实际 {len(tools)}")
 
             # 3a. 读取（project 显式传）
             lv = load(await call(server, "list_uvoptx_breakpoints", {"project": uvoptx2}))

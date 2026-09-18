@@ -13,31 +13,42 @@
 
 ## 先看一个真板实测的结果
 
-![单核 RTOS 任务切换回放](docs/demo/trace-replay-canvas.png)
+![SVCrtOS 任务切换无缝 trace 回放](docs/demo/trace-replay-swd.png)
 
-上面这张图不是示意图，是 **STM32F401 上真跑一个 RTOS 的实测回放**：
-30,800 条记录、20,523 次上下文切换、10,277 次阻塞事件，**0 条丢失**，
-时间戳取目标侧 `DWT_CYCCNT`（11.9 ns/拍），所以 10 µs 级的切片也分辨得出来。
+上面这张图不是示意图，是 **STM32F401 上真跑一个 RTOS 的实测回放**：5.36 s 连续录制、
+**56,355 条事件、5,386 次上下文切换、24,136 次中断进出、0 条丢失**，编码后只有
+**3.67 字节/事件（相对 12 字节记录 3.27× 压缩）**，时间戳取目标侧 `DWT_CYCCNT`（11.9 ns/拍），
+所以微秒级的切片也分辨得出来。
 
-**它是怎么拿到的**——这句最重要：**录制期间目标全程全速运行，一次都没停**。
+**它怎么做到「只接 SWD 两线还能连续不丢」**——两件事：
+
+1. **目标侧先压缩**。每次切换 / 中断 / 阻塞编成 token：命中字典只写 1 字节槽号 + 变长时间差，
+   新键才写全量四元组 `(type, kind, id, arg)`；槽号是四元组的直接映射哈希。
+2. **背压而不是覆盖**。字节写进 8 KB RAM 环，主机用 `trace_swd_read` 增量搬走并回报
+   `drained`；环满时**丢新事件并计数（`lost_events`）**，绝不覆盖没搬走的区域。
+   于是任何时刻停下，**已经录下的那一段都是完整的**；只要平均搬运速度跟得上，就一条都不丢。
 
 ```
-trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0)
-  → （让目标全速跑，跑多久都行）
-  → trace_buff_status(...)   # total / lost / wrapped
-  → trace_buff_dump(..., out_file="trace.json", names="0x10=switch,0x11=wait")
-  → trace_buff_reset(...)
+trace_instrument(backend="swd", swd_bytes=8192)
+  → trace_swd_status(...)    # 环容量 / 未读字节 / lost / 压缩比
+  → trace_swd_read(..., out_file="trace.json")   # 搬走未读的那一段并解成事件
+  → （循环：跑一段 → 搬一段；停机搬走不会丢任何东西）
 ```
 
-固件自己往静态环形缓冲里 memcpy（微秒级、不 halt、不改执行流向、不用 SWO/ETM），
-调试器只在**事后**把缓冲搬出来一次。这条路子把「想看清高频事件」和「不想扰动系统」这两件
-过去互斥的事同时做到了——**SWD 两线就够**，不需要 SWO 引脚、不需要 ETM。
+前提说清楚：这条路要先**插桩**（编译期改代码），事件率约 10k/s 时 8 KB 环只够 0.22 s，
+**搬运间隔必须短于这个窗口**；也别指望它替代 SWO/ETM——它解决的是「板子只焊了 SWD 两线」
+这个场景。SWO/RTT/ETM 怎么选，见 `trace_guide`。
 
-可交互版本（滚轮缩放 / 拖动平移 / 单击定位 / 逐次跳转切换 / 倍速回放）：
-[`docs/demo/trace-replay-singlecore.html`](docs/demo/trace-replay-singlecore.html)，
-页面刻意把「单核、同一时刻只有一个任务在跑」画在脸上：CPU 占用带同一时刻只有一种颜色，
-每个任务的运行电平**同一像素列里只会亮一条**——不把单核画成并行的泳道。
-详见 [docs/demo/README.md](docs/demo/README.md)。
+可交互版本（滚轮缩放 / 拖动平移 / 单击定位 / 回放，含任务泳道、上下文切换带、
+PendSV/SysTick 中断活动与阻塞事件通道）：
+[`docs/demo/trace-replay-swd.html`](docs/demo/trace-replay-swd.html)。
+*gitee 只能预览 HTML 源码*，把仓库 clone 下来双击这个文件（无需服务器、无外部依赖）
+就能看到上面截图里的交互页面。
+页面刻意把「单核、同一时刻只有一个任务在跑」画在脸上：每个任务的运行条**同一像素列里只会亮一条**，
+不把单核画成并行的泳道。详见 [docs/demo/README.md](docs/demo/README.md)。
+
+<!-- 早先用「全速跑 + 事后一次性搬走 24 KB 缓冲」录的那一版留在这里做对照：
+     trace-replay-singlecore.html（分块导出、块间有空洞、会丢旧记录） -->
 
 ---
 
@@ -218,7 +229,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 181 个工具定义
+│   └── server.py             # MCP Server 与 184 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -267,10 +278,10 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **181** 个（**默认只暴露 38 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **184** 个（**默认只暴露 38 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
 - **MDK 族（110 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
-- **非 MDK 族（64 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**，30 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **非 MDK 族（67 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**，33 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 - **常驻元工具（4 个）**——`toolset`（工具面按需装载）/ `list_tools` / `capabilities` / `get_version`：**永不被裁**，否则 AI 连工具清单都问不出来、也装不回来。
 - **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
 
@@ -581,13 +592,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-181 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 38 个**（`core` 组 34 个 + 4 个元工具），其余 143 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+184 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 38 个**（`core` 组 34 个 + 4 个元工具），其余 146 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 181 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 184 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -605,7 +616,7 @@ toolset(action="load",   toolsets="all")        # 一次全装 181 个（=full/*
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
 | `target` | 非 MDK：目标档案查询与自动识别、工程现场调试配置发现、多核目标列举与切换（7 个） |
 | `ocd` | 非 MDK：OpenOCD 会话 / 内存 / 寄存器 / 断点 / 烧录（17 个） |
-| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 函数运行时线录制 / 插桩组件部署（含目标侧缓冲后端）/ 代码覆盖率 / ETM 能力探测（30 个） |
+| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 函数运行时线录制 / 插桩组件部署（含目标侧缓冲后端、SWD 无缝流后端）/ 代码覆盖率 / ETM 能力探测（33 个） |
 | `rtos` | RTOS 任务感知：任务列表 / 栈水位 / 队列信号量（3 个；跨 Keil 与 OpenOCD 两条链路） |
 
 四条防翻车约定：**收起 ≠ 坏了**——收起只是不进工具清单，`load` 装回来立刻可用（返回值里的 `exposed` 是新暴露数）；**`list_tools` / `get_version` / `capabilities` / `toolset` 四个元工具永不被裁**（否则 AI 连工具清单都问不出来也装不回来），未归类的工具一律保留、组名写错时只告警不裁剪（宁可少裁不错杀）；**装完若客户端报「未知工具」**，多半是它缓存了旧的 tools/list——重新拉一次清单即可；**装载状态随时可核对**：`toolset(action="status")` 与 `capabilities.tool_surface` 都会报当前装载组、收起数与注册总数。

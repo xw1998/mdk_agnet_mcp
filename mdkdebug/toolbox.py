@@ -124,6 +124,8 @@ TOOLSETS = {
         "trace_eventrec",
         # 目标侧静态环形缓冲后端（批次55）：全速录、事后 dump，链路只需 SWD 两线。
         "trace_buff_status", "trace_buff_dump", "trace_buff_reset",
+        # SWD 无缝流后端（批次56）：目标压缩入环 + 主机增量搬走，未读区永不覆盖。
+        "trace_swd_status", "trace_swd_read", "trace_swd_reset",
     },
     # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组。
     "rtos": {

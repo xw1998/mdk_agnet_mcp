@@ -28,6 +28,9 @@
 #if MDK_TRACE_BACKEND_BUFF
 #  include "mdk_trace_buff.h"
 #endif
+#if MDK_TRACE_BACKEND_SWD
+#  include "mdk_trace_swd.h"
+#endif
 
 /* A frame length field is one byte, so a payload above 255 would silently wrap
  * and produce garbage on the host. Fail at build time instead. */
@@ -227,7 +230,9 @@ static uint32_t _rv_cycles(void)
 
 /* ================================================================ CRC + MTF */
 
-#if !MDK_TRACE_BACKEND_BUFF
+/* Neither in-chip backend has a transport: no MTF framing, no CRC, no byte
+ * output path. They decode the payload locally instead. */
+#if !MDK_TRACE_BACKEND_BUFF && !MDK_TRACE_BACKEND_SWD
 /* CRC-8, poly 0x07, init 0x00, no reflection, no final xor.
  * Bit by bit on purpose: a table or nibble variant saves cycles this path does
  * not need, and this stays obviously identical to the host implementation. */
@@ -281,9 +286,12 @@ static void _raw_out(const uint8_t *p, uint32_t n)
  * build and a buff build therefore cannot drift apart and start reporting
  * different things for the same event.
  */
-#endif /* !MDK_TRACE_BACKEND_BUFF */
+#endif /* !MDK_TRACE_BACKEND_BUFF && !MDK_TRACE_BACKEND_SWD */
 
-#if MDK_TRACE_BACKEND_BUFF
+#if MDK_TRACE_BACKEND_BUFF || MDK_TRACE_BACKEND_SWD
+/* The MTF payload the caller built is the single definition of what each
+ * event type carries; both in-chip backends decode it here rather than having
+ * every mdk_trace_*() branch on the backend. */
 static uint16_t _rd_u16(const uint8_t *p)
 {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
@@ -294,7 +302,9 @@ static uint32_t _rd_u32(const uint8_t *p)
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
+#endif
 
+#if MDK_TRACE_BACKEND_BUFF
 static void _buff_receive(uint8_t type, const uint8_t *payload, uint8_t len)
 {
     switch (type) {
@@ -334,6 +344,49 @@ static void _buff_receive(uint8_t type, const uint8_t *payload, uint8_t len)
 }
 #endif /* MDK_TRACE_BACKEND_BUFF */
 
+#if MDK_TRACE_BACKEND_SWD
+/* Frames the compressed stream cannot represent (text / raw). Counted rather
+ * than silently dropped: the host reports how many were lost, so a "clean"
+ * trace that quietly ate every debug print can never happen. */
+static uint32_t _swd_unsupported;
+
+static void _swd_receive(uint8_t type, const uint8_t *payload, uint8_t len)
+{
+    switch (type) {
+    case MDK_TRACE_TYPE_EVENT:
+        if (len < 11u) { _swd_unsupported++; return; }
+        mdk_trace_swd_event(type, payload[2], _rd_u16(payload), _rd_u32(payload + 7));
+        break;
+    case MDK_TRACE_TYPE_ISR:
+        if (len < 7u) { _swd_unsupported++; return; }
+        mdk_trace_swd_event(type, payload[2], _rd_u16(payload), 0u);
+        break;
+    case MDK_TRACE_TYPE_COUNTER:
+    case MDK_TRACE_TYPE_KV:
+    case MDK_TRACE_TYPE_FAULT:
+    case MDK_TRACE_TYPE_SCHED:
+        if (len < 6u) { _swd_unsupported++; return; }
+        mdk_trace_swd_event(type, MDK_TRACE_SWD_K_POINT,
+                            _rd_u16(payload), _rd_u32(payload + 2));
+        break;
+    case MDK_TRACE_TYPE_MARK:
+    case MDK_TRACE_TYPE_TS:
+        if (len < 4u) { _swd_unsupported++; return; }
+        mdk_trace_swd_event(type, MDK_TRACE_SWD_K_POINT, 0u, _rd_u32(payload));
+        break;
+    case MDK_TRACE_TYPE_RESET:
+        /* The payload is a text banner ("init"). Sending the first four bytes
+         * as an integer would hand the host a number that looks like a tag
+         * but is really ASCII. type alone is the signal; arg stays 0. */
+        mdk_trace_swd_event(type, MDK_TRACE_SWD_K_POINT, 0u, 0u);
+        break;
+    default:
+        _swd_unsupported++;
+        break;
+    }
+}
+#endif /* MDK_TRACE_BACKEND_SWD */
+
 void mdk_trace_send(uint8_t type, const uint8_t *payload, uint8_t len)
 {
 #if MDK_TRACE_BACKEND_BUFF
@@ -343,6 +396,13 @@ void mdk_trace_send(uint8_t type, const uint8_t *payload, uint8_t len)
     _buff_receive(type, payload, len);
     _stats.frames++;
     _stats.bytes += MDK_TRACE_BUFF_REC_SIZE;
+#elif MDK_TRACE_BACKEND_SWD
+    if (!_ready) {
+        return;
+    }
+    _swd_receive(type, payload, len);
+    _stats.frames++;
+    _stats.bytes += 2u;     /* the CTL/event overhead is not knowable here */
 #else
     uint8_t hdr[3];
     uint8_t crc;
@@ -713,6 +773,8 @@ const char *mdk_trace_backend_name(void)
     return "uart";
 #elif MDK_TRACE_BACKEND_BUFF
     return "buff";
+#elif MDK_TRACE_BACKEND_SWD
+    return "swd";
 #else
     return "none";
 #endif
@@ -747,6 +809,13 @@ void mdk_trace_init(void)
      * after a watchdog bite or a fault-induced reset those are the only
      * records that matter. See MDK_TRACE_BUFF_CLEAR_ON_INIT. */
     mdk_trace_buff_init();
+#endif
+
+#if MDK_TRACE_BACKEND_SWD
+    /* After the time base is running, so the first event has a sane dt.
+     * swd_init() clears the ring by default - see MDK_TRACE_SWD_CLEAR_ON_INIT
+     * for why the seamless backend is the one that must NOT keep history. */
+    mdk_trace_swd_init();
 #endif
 
     _ready = 1;
@@ -792,6 +861,15 @@ void mdk_trace_get_stats(mdk_trace_stats_t *out)
     out->frames   = mdk_trace_buff_total();
     out->bytes    = mdk_trace_buff_total() * MDK_TRACE_BUFF_REC_SIZE;
     out->dropped  = mdk_trace_buff_lost();
+#endif
+#if MDK_TRACE_BACKEND_SWD
+    /* Same reasoning as buff, plus one thing that only swd has: the events the
+     * host was too slow to drain are dropped by the backend and counted in
+     * the control block. Reporting the transport numbers here would describe
+     * a perfectly healthy trace that had in fact lost thousands of events. */
+    out->frames   = mdk_trace_swd_blob.ctrl.events;
+    out->bytes    = mdk_trace_swd_blob.ctrl.head;
+    out->dropped  = mdk_trace_swd_blob.ctrl.lost_events + _swd_unsupported;
 #endif
 }
 

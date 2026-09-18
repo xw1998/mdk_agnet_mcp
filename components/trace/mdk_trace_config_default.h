@@ -20,20 +20,22 @@
  *   MDK_TRACE_BACKEND_RTT   any core, host pokes RAM through the probe
  *   MDK_TRACE_BACKEND_UART  plain serial, host reads the COM port
  *   MDK_TRACE_BACKEND_BUFF  RAM ring buffer only, host dumps it afterwards
+ *   MDK_TRACE_BACKEND_SWD   compressed RAM ring, host drains it over SWD
  *   MDK_TRACE_BACKEND_NONE  compile but emit nowhere (useful for sizing)
  *
  * ITM / RTT / UART are *stream* backends: the event leaves the chip as it
- * happens and the host has to keep up. BUFF is the *buff* backend: nothing
- * leaves the chip, the core pays a few stores per event and the run keeps its
- * real timing, then `trace_buff_dump` reads the whole window out. Pick stream
- * to watch a live system, buff to find out what actually happened at speed.
+ * happens and the host has to keep up. BUFF and SWD are the two in-chip
+ * backends: nothing leaves the chip, the core pays a few stores per event and
+ * the run keeps its real timing. Pick stream to watch a live system, buff to
+ * dump one window after the fact, swd to record continuously without ever
+ * losing the run (the host drains it in slices and the ring recycles).
  *
  * A generated mdk_trace_config.h only defines the one backend it selected, so
  * the ITM fallback must not fire when any backend was already chosen.
  */
 #if !defined(MDK_TRACE_BACKEND_ITM) && !defined(MDK_TRACE_BACKEND_RTT) && \
     !defined(MDK_TRACE_BACKEND_UART) && !defined(MDK_TRACE_BACKEND_BUFF) && \
-    !defined(MDK_TRACE_BACKEND_NONE)
+    !defined(MDK_TRACE_BACKEND_SWD) && !defined(MDK_TRACE_BACKEND_NONE)
 #  define MDK_TRACE_BACKEND_ITM 1
 #endif
 #ifndef MDK_TRACE_BACKEND_ITM
@@ -48,8 +50,52 @@
 #ifndef MDK_TRACE_BACKEND_BUFF
 #  define MDK_TRACE_BACKEND_BUFF 0
 #endif
+#ifndef MDK_TRACE_BACKEND_SWD
+#  define MDK_TRACE_BACKEND_SWD 0
+#endif
 #ifndef MDK_TRACE_BACKEND_NONE
 #  define MDK_TRACE_BACKEND_NONE 0
+#endif
+
+/* ------------------------------------------------------------- swd backend
+ * Backend SWD only. Same idea as BUFF (an in-chip ring located by the symbol
+ * `mdk_trace_swd_blob`) but with two differences that matter:
+ *
+ *   1. the ring is a *byte* ring of compressed tokens, not fixed 12 byte
+ *      records, so a typical event costs ~2.3 bytes instead of 12;
+ *   2. the target never overwrites what the host has not read yet. When the
+ *      ring is full it DROPS the new event and counts it in lost_events, so
+ *      whatever is already recorded stays readable and the host can keep
+ *      draining forever. That is what makes a lossless continuous recording
+ *      possible on two SWD wires.
+ *
+ * MDK_TRACE_SWD_BYTES must be a power of two (the ring index is a mask, not a
+ * modulo - a divide inside an ISR is not worth it). 8192 bytes holds roughly
+ * 3400 events at the measured ~2.35 bytes/event.
+ */
+#ifndef MDK_TRACE_SWD_BYTES
+#  define MDK_TRACE_SWD_BYTES 8192
+#endif
+
+/* dt = DWT cycles >> MDK_TRACE_SWD_TS_SHIFT. Narrower than the BUFF knob on
+ * purpose: 0 (one cycle resolution) is the right answer unless a single gap
+ * exceeds 2^32 cycles, and in a continuous recording the host anchors the
+ * timeline on the control block's absolute cycle count anyway.
+ */
+#ifndef MDK_TRACE_SWD_TS_SHIFT
+#  define MDK_TRACE_SWD_TS_SHIFT 0
+#endif
+
+/* 1 (default) - clear the ring on init.
+ *
+ * This is the opposite of the BUFF default, and deliberately so. A seamless
+ * host reads from drained towards head; stale bytes from a previous run would
+ * be spliced onto the new run with no visible seam at all - no reset record,
+ * no sequence marker, just a timeline that quietly lies. Clearing is the only
+ * safe default here; the host can still ask for a clip with trace_swd_reset.
+ */
+#ifndef MDK_TRACE_SWD_CLEAR_ON_INIT
+#  define MDK_TRACE_SWD_CLEAR_ON_INIT 1
 #endif
 
 /* ---------------------------------------------------------------- buff mode

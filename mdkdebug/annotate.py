@@ -63,6 +63,9 @@ READONLY = {
     # 目标侧静态环形缓冲（批次55）：只读目标 RAM + 本地 .axf。工具自身不 halt 目标，
     # 也不搬数据（搬运由固件在运行时完成），纯粹「搬出来看」。
     "trace_buff_status", "trace_buff_dump",
+    # SWD 无缝流（批次56）：status/read 只读目标 RAM 控制块与环，并把搬走的字节
+    # 通过写 drained 回报目标——写的是**读数游标**（协议自身的一部分），不动用户数据。
+    "trace_swd_status", "trace_swd_read",
     "trace_rtt_find", "trace_swo_read",
     # 串口：只列端口与读日志
     "serial_list_ports", "serial_monitor_status", "serial_read",
@@ -149,6 +152,9 @@ MUTATING = {
     # 目标侧缓冲复位（批次55）：往目标 RAM 的控制块写 reset_req，确实改目标状态；
     # 且是延迟生效（下一条记录才处理），重复写不等价于一次写。
     "trace_buff_reset",
+    # SWD 无缝流复位（批次56）：同样写 reset_req，目标重开一段录制（清环、清字典、
+    # seq+1、写 SYNC 标记）。同样是延迟生效。
+    "trace_swd_reset",
 }
 
 # 本服务面向**本机**的开发环境（Keil 进程、调试探针、本地工具链、本地文件），

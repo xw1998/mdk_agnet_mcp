@@ -34,6 +34,7 @@ import time
 
 from . import traceproto as _tp
 from . import linkio as _link
+from . import swd as _swd
 
 __all__ = ["state", "reset_state", "register"]
 
@@ -50,6 +51,7 @@ _T = {
     "itm_state": {},
     "swo": None,
     "rtt": None,
+    "swd": None,             # 无缝流会话（解码器 + 本地游标 + 已解事件）
     "counters": {"chunks": 0, "bytes": 0, "itm_packets": 0, "mtf_frames": 0},
     "error": None,
 }
@@ -92,7 +94,7 @@ def reset_state(keep_events: bool = False) -> dict:
     ev = list(_T["events"]) if keep_events else []
     _T.update({"mode": None, "started_at": 0.0, "events": ev, "decoder": None,
                "rtt_decoder": None,
-               "itm_state": {}, "swo": None, "rtt": None,
+               "itm_state": {}, "swo": None, "rtt": None, "swd": None,
                "counters": {"chunks": 0, "bytes": 0, "itm_packets": 0,
                             "mtf_frames": 0}, "error": None})
     return {"ok": True, "cleared_events": not keep_events,
@@ -1372,6 +1374,8 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
                      swo_baud: int = 2000000, dbgmcu_cr: int = 0xE0042004,
                      buff_records: int = 2048, buff_ts_shift: int = 0,
                      buff_clear_on_init: bool = False,
+                     swd_bytes: int = 8192, swd_ts_shift: int = 0,
+                     swd_clear_on_init: bool = True,
                      fault_frame: bool = True) -> dict:
     """把插桩组件拷进工程，并生成 mdk_trace_config.h + 构建片段。"""
     if not target_dir:
@@ -1401,6 +1405,8 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
                         swo_baud, dbgmcu_cr, buff_records=buff_records,
                         buff_ts_shift=buff_ts_shift,
                         buff_clear_on_init=buff_clear_on_init,
+                        swd_bytes=swd_bytes, swd_ts_shift=swd_ts_shift,
+                        swd_clear_on_init=swd_clear_on_init,
                         fault_frame=fault_frame)
     cfg_path = os.path.join(dst, "mdk_trace_config.h")
     if os.path.exists(cfg_path) and not overwrite:
@@ -1421,6 +1427,8 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
         sources.append("mdk_trace_rtt.c")
     if b == "buff":
         sources.append("mdk_trace_buff.c")
+    if b == "swd":
+        sources.append("mdk_trace_swd.c")
     nxt = ["把 %s 加入工程编译" % " / ".join(sources),
            "include mdk_trace.mk（Make）或 add_subdirectory（CMake）",
            "在初始化处调 mdk_trace_init()；用 MDK_TRACE_SCOPE() 打点",
@@ -1431,6 +1439,12 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
     if b == "buff":
         nxt += ["buff 模式：目标跑完或出事后 trace_buff_dump(elf=你的.axf) 一次性读回",
                 "buff 模式不需要 SWO 引脚、不需要主机实时跟读，但缓冲写满会覆盖最旧的"]
+    elif b == "swd":
+        nxt += ["swd 模式：反复 trace_swd_read(elf=你的.axf) 把已录的那段搬走；"
+                "主机平均搬运速度跟得上事件产生速度，就能一直录下去且零丢失",
+                "swd 模式只要 SWD 两线：不要 SWO 引脚、不抢目标时间、不停机；"
+                "背压而不是覆盖 —— 跟不上时目标丢新事件并计入 lost_events",
+                "swd 模式可以把上下文切换、异常 handler 都插上（开销约几十个周期/条）"]
     else:
         nxt += ["SWO 通路：trace_swo_start + 目标侧 MDK_TRACE_BACKEND_ITM",
                 "RTT 通路：trace_rtt_attach(elf=你的.elf)"]
@@ -1443,9 +1457,11 @@ def _gen_config_h(backend: str, itm_port: int, rtt_up: int, rtt_down: int,
                   rtt_buf: int, coreclk: int, swo_baud: int = 2000000,
                   dbgmcu_cr: int = 0xE0042004, buff_records: int = 2048,
                   buff_ts_shift: int = 0, buff_clear_on_init: bool = False,
+                  swd_bytes: int = 8192, swd_ts_shift: int = 0,
+                  swd_clear_on_init: bool = True,
                   fault_frame: bool = True) -> str:
     b = (backend or "itm").strip().lower()
-    if b not in ("itm", "rtt", "uart", "none", "buff"):
+    if b not in ("itm", "rtt", "uart", "none", "buff", "swd"):
         b = "itm"
     lines = [
         "#ifndef MDK_TRACE_CONFIG_H",
@@ -1471,6 +1487,15 @@ def _gen_config_h(backend: str, itm_port: int, rtt_up: int, rtt_down: int,
         "#define MDK_TRACE_BUFF_CLEAR_ON_INIT %d" % (1 if buff_clear_on_init else 0),
         "/* fault handler 里多存一份寄存器现场（PC/LR/SP/xPSR/HFSR/MMFAR/BFAR） */",
         "#define MDK_TRACE_FAULT_FRAME       %d" % (1 if fault_frame else 0),
+        "/* swd 模式（MDK_TRACE_BACKEND_SWD）：SWD 两线无缝流，压缩 + 背压 */",
+        "/* 环容量（字节）：必须是 2 的幂；8192 字节约存 3400 条事件 */",
+        "#define MDK_TRACE_SWD_BYTES         %d" % int(swd_bytes),
+        "/* dt = DWT 周期 >> TS_SHIFT；0 = 最细。单个间隔超 2^32 周期（84MHz 下 51s）才需要抬 */",
+        "#define MDK_TRACE_SWD_TS_SHIFT      %d" % int(swd_ts_shift),
+        "/* 0 = 复位后保留上一次运行的环内容（两段会被无缝拼在一起，很危险） */",
+        "#define MDK_TRACE_SWD_CLEAR_ON_INIT %d" % (1 if swd_clear_on_init else 0),
+        "/* 把控制块的 cycles 换算成秒用；必填，否则时间轴只有周期数 */",
+        "#define MDK_TRACE_SWD_CPU_HZ        %d" % int(coreclk or 0),
         "",
         "/* 事件 ID 区间（主机侧按区间分派语义） */",
         "#define MDK_TRACE_ID_APP_BASE      0x1000",
@@ -1936,6 +1961,550 @@ def buff_reset(elf: str = "", addr="", wait: bool = True, link: str = "auto") ->
             "别把 pending 当成 applied：要看有没有生效就再读一次 trace_buff_status 看 seq。")
     return out
 
+# ============================ swd 无缝流模式（压缩 + 背压；SWD 两线连续录）
+#
+# 和 buff 的分工一句话说清：
+#   buff = 写满覆盖最旧的，事后一次性读回 —— 用来圈一段**短过程**；
+#   swd  = 未读区永不被覆盖，主机增量搬走 —— 用来录**全程**。
+#
+# 目标把事件压进 RAM 环（典型 2.3 字节/事件），主机每次只搬走 [drained, head)
+# 并把 drained 推上去，环于是循环使用。只要主机平均搬运速度 ≥ 事件产生速度，
+# 这个录制就永远不结束、也不丢东西——这就是「无缝」。
+#
+# 三条必须如实告诉用户的边界（不藏着）：
+#   ① 主机跟不上时目标**丢弃新事件**（绝不覆盖未读区），权威计数在 lost_events；
+#   ② 字典只有 64 槽：事件四元组 (type,kind,id,arg) 的工作集超过 64 种时命中率
+#      崩塌，压缩比从 ~5x 掉到 1x 上下（这时该归并 id，或改用 buff 模式）；
+#   ③ 主机「半路接管」时流里没有起点信息——会话第一条事件之前的绝对时刻拿不到，
+#      只能给相对时刻（返回里 time_origin 字段说明用的是哪种）。
+
+_SWD_MAX_SESSION_EVENTS = 500000
+
+
+def _swd_locate(elf: str = "", addr=""):
+    """定位 blob 地址。只管地址，不读内容——校验魔数是读的人的责任。"""
+    if addr:
+        try:
+            a = int(str(addr), 16) if str(addr).lower().startswith("0x") else int(addr)
+            if a > 0:
+                return a, {"method": "explicit"}
+        except (TypeError, ValueError):
+            pass
+        return None, {"ok": False, "error_code": "invalid-argument",
+                      "error": "addr 不是合法地址：%r" % (addr,)}
+    e = elf or _session_axf()
+    if e:
+        a, sz = _elf_symbol(e, _swd.SYMBOL)
+        if a:
+            return a, {"method": "elf_symbol", "symbol": _swd.SYMBOL,
+                       "blob_bytes": sz, "elf": os.path.abspath(e)}
+        return None, {
+            "ok": False, "error_code": "swd-symbol-missing",
+            "error": "ELF 里找不到符号 %s" % _swd.SYMBOL,
+            "elf": os.path.abspath(e),
+            "hint": "① 固件是不是用 MDK_TRACE_BACKEND_SWD 编的（别的后端里根本没有这个符号）；"
+                    "② 符号被 --gc-sections 回收了？让它被真正引用到；"
+                    "③ 也可以 addr=0x... 直接给 blob 地址"}
+    return None, {"ok": False, "error_code": "swd-locate-failed",
+                  "error": "既没给 addr 也没给 elf，无法定位 %s" % _swd.SYMBOL,
+                  "hint": "给 elf=你的.axf（首选），或 addr=0x...；"
+                          "会话里已 set_symbol_file 过的话可以都不给"}
+
+
+def _swd_read_ctrl(addr: int, link: str = "auto"):
+    raw, meta = _read_mem_words(addr, _swd.CTRL_BYTES, link=link)
+    if raw is None:
+        return None, {"ok": False, "addr": "0x%X" % addr,
+                      "error_code": "swd-read-failed",
+                      "error": (meta or {}).get("error") or "读控制块失败",
+                      "link": (meta or {}).get("link")}
+    info = _swd.parse_ctrl(raw, addr)
+    if not info.get("ok"):
+        if raw.count(0) == len(raw):
+            info = dict(info)
+            info["degenerate"] = "all_zero"
+            info["error_code"] = "swd-read-degenerate"
+            info["error"] = ("控制块位置整片读回 0x00 —— **这不等于没有事件**，"
+                             "是这次读不可信")
+            info["hint"] = ("目标全速运行时经 SWD 读 SRAM 可能整片读回 0（Keil 链路实测如此）："
+                            "① 先 halt 再读——无缝流的未读数据不会因停机丢失；"
+                            "② 或换链路重试；③ 别把这个 0 当成「没有事件」下结论。")
+        return None, info
+    info["addr"] = "0x%X" % addr
+    info["ctrl_addr"] = addr
+    info["read_meta"] = {k: (meta or {}).get(k) for k in
+                         ("read_confidence", "while_running", "degenerate",
+                          "read_unstable", "reread_count") if k in (meta or {})}
+    return info, None
+
+
+def _swd_read_stream(ring_addr: int, cap: int, start: int, n: int,
+                     link: str = "auto", chunk: int = 1024):
+    """按**逻辑**偏移 [start, start+n) 读环内容，跨环尾时自动分两段。
+
+    只读用得着的那一段，不整片搬：增量搬运是这条通路的核心动作，
+    每次多读一倍就是白花一倍的调试链路时间。
+    """
+    out = bytearray()
+    meta = {}
+    done = 0
+    while done < n:
+        take = min(chunk, n - done)
+        phys = (start + done) & (cap - 1)
+        first = min(take, cap - phys)
+        d, m = _read_mem_words(ring_addr + phys, first, link=link)
+        if d is None:
+            return None, {"ok": False, "error_code": "swd-read-failed",
+                          "error": (m or {}).get("error") or "读环形缓冲失败",
+                          "at": "0x%X" % (ring_addr + phys),
+                          "bytes_read": done, "link": (m or {}).get("link")}
+        if len(d) < first:
+            return None, {"ok": False, "error_code": "swd-read-short",
+                          "error": "环形缓冲读短了：0x%X 处读到 %d 字节，期望 %d"
+                                   % (ring_addr + phys, len(d), first),
+                          "bytes_read": done,
+                          "hint": "目标可能刚被 halt 或正在复位；重试一次通常就好"}
+        out += d
+        meta = m or meta
+        rest = take - first
+        if rest:
+            d2, m2 = _read_mem_words(ring_addr, rest, link=link)
+            if d2 is None or len(d2) < rest:
+                return None, {"ok": False, "error_code": "swd-read-short",
+                              "error": "环形缓冲回绕段读失败/读短（0x%X，期望 %d 字节）"
+                                       % (ring_addr, rest),
+                              "bytes_read": done + first}
+            out += d2
+            meta = m2 or meta
+        done += take
+    return bytes(out), meta
+
+
+def _swd_session(addr: int) -> dict:
+    s = _T.get("swd")
+    if s is None or s.get("addr") != addr:
+        s = {"addr": addr, "dec": _swd.Decoder(), "events": [], "faults": [],
+             "drained": None, "seq": None, "rel_cycles": 0, "restarts": 0,
+             "syncs": 0, "bytes_read": 0, "events_seen": 0,
+             "anchor_cycle": None, "cursor_write_failed": False}
+        _T["swd"] = s
+    return s
+
+
+def _swd_fold(s: dict, items: list, ts_shift: int, cpu_hz: int,
+              names: dict) -> list:
+    """把解码出的 token 序列折成带时间的事件列表，并推进会话的时间累计。
+
+    gap / sync 要按**流里的先后**插进事件序列（因此用 Decoder.items 而不是把
+    events 与 ctl 分开看）——时间轴上一条断口画在哪一格，取决于它前面是哪条事件。
+    """
+    out = []
+    cur_fault = None
+    for it in items:
+        if it[0] == "ctl":
+            sub, val = it[1], it[2]
+            if sub == _swd.CTL_LOST:
+                out.append({"type": "gap", "kind": "lost", "events_dropped": val,
+                            "rel_cycles": s["rel_cycles"],
+                            "note": "目标在这里丢了 %d 条事件（宿主没跟上）" % val})
+            elif sub == _swd.CTL_SYNC:
+                s["syncs"] += 1
+                out.append({"type": "sync", "kind": "point", "seq": val,
+                            "rel_cycles": s["rel_cycles"],
+                            "note": "目标在这里重开了录制段（seq=%d），字典已清" % val})
+            continue
+        key, dt = it[1], it[2]
+        t, k, i, a = key
+        s["rel_cycles"] = (s["rel_cycles"] + (dt << ts_shift)) & _swd.U32
+        s["events_seen"] += 1
+        typ = _swd.TYPES.get(t, "type%d" % t)
+        ev = {"type": typ, "kind": _swd.KINDS.get(k, "kind%d" % k),
+              "id": i, "arg": a, "dt_cycles": dt << ts_shift,
+              "rel_cycles": s["rel_cycles"]}
+        if cpu_hz:
+            ev["t_us"] = round(s["rel_cycles"] * 1e6 / cpu_hz, 3)
+        nm = names.get(i)
+        if nm:
+            ev["id_name"] = nm
+        if typ == "sched" and i == 0:
+            ev["from"] = (a >> 4) & 0xF
+            ev["to"] = a & 0xF
+        elif typ == "fault" and _swd.FAULT_BASE <= i < _swd.FAULT_BASE + 0x100:
+            ev["fault_class"] = _swd.FAULT_CLASS.get(i - _swd.FAULT_BASE, "unknown")
+            ev["cfsr"] = "0x%08X" % a
+            ev["cfsr_bits"] = _buff_cfsr_bits(a)
+            cur_fault = {"class": ev["fault_class"], "cfsr": ev["cfsr"],
+                         "cfsr_bits": ev["cfsr_bits"], "registers": {},
+                         "_ev": ev}
+            s["faults"].append(cur_fault)
+        elif typ == "kv" and i in _swd.FAULT_REGS:
+            ev["reg"] = _swd.FAULT_REGS[i]
+            ev["value_hex"] = "0x%08X" % a
+            if cur_fault is not None and ev["reg"] not in cur_fault["registers"]:
+                cur_fault["registers"][ev["reg"]] = ev["value_hex"]
+        out.append(ev)
+    return out
+
+
+def _swd_anchor(s: dict, anchor: int, cpu_hz: int, out: list) -> None:
+    """把本批事件从「会话起点为 0」换算成绝对 DWT 周期。
+
+    anchor 是**会话最后一条事件**的绝对周期数（取自控制块 cycles）。
+    往前按 dt 倒推即可，不需要另存每条的绝对时刻。
+    """
+    rel_total = s["rel_cycles"]
+    for ev in out:
+        if "rel_cycles" not in ev:
+            continue
+        cyc = (anchor - rel_total + ev["rel_cycles"]) & _swd.U32
+        ev["cycles"] = cyc
+        if cpu_hz:
+            ev["t_us"] = round(cyc * 1e6 / cpu_hz, 3)
+    for f in s["faults"]:
+        ev = f.get("_ev")
+        if ev is not None and "cycles" in ev:
+            f["cycles"] = ev["cycles"]
+            f["t_us"] = ev.get("t_us")
+            f.pop("_ev", None)
+
+
+def _swd_session_view(s: dict, limit: int = 0) -> dict:
+    evs = s["events"]
+    faults = [{k: v for k, v in f.items() if k != "_ev"} for f in s["faults"]]
+    by_type, by_id = {}, {}
+    for e in evs:
+        by_type[e["type"]] = by_type.get(e["type"], 0) + 1
+        if "id" in e:
+            by_id[e["id"]] = by_id.get(e["id"], 0) + 1
+    lim = int(limit or 0)
+    tail = evs[-lim:] if (lim and len(evs) > lim) else evs
+    return {
+        "event_count": len(evs),
+        "counts_by_type": by_type,
+        "top_ids": sorted(({"id": k, "count": v} for k, v in by_id.items()),
+                          key=lambda x: -x["count"])[:20],
+        "faults": faults,
+        "events": tail,
+        "truncated": bool(lim and len(evs) > lim),
+    }
+
+
+def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
+    """只读 80 字节控制块：够便宜，能一眼看出「宿主跟不跟得上」。"""
+    a, loc = _swd_locate(elf=elf, addr=addr)
+    if a is None:
+        return loc
+    info, err = _swd_read_ctrl(a, link=link)
+    if info is None:
+        if isinstance(err, dict) and err.get("seq") is not None:
+            err["note"] = ("控制块读到了字段但不自洽——先看 seq 是不是变了"
+                           "（目标重开会把游标归零）")
+        return err
+    out = dict(info)
+    out["ok"] = True
+    out["locate"] = loc
+    s = _T.get("swd")
+    if s and s.get("addr") == a:
+        out["session"] = {
+            "events_decoded": len(s["events"]),
+            "local_drained": s["drained"],
+            "unread_bytes": (info["head"] - s["drained"]) & _swd.U32
+                            if s["drained"] is not None else None,
+            "want_resync": bool(s.get("seq") is not None
+                                and s["seq"] != info["seq"]),
+        }
+    if info["events"]:
+        out["overall_bytes_per_event"] = round(info["head"] / float(info["events"]), 2)
+        out["compression_vs_12B"] = round(12.0 / max(0.01, info["head"] / float(info["events"])), 2)
+    out["next"] = ["trace_swd_read 把未读的那段搬走并解成事件",
+                   "trace_swd_reset 让目标开一段新录制"]
+    if not out["cpu_hz"]:
+        out.setdefault("warnings", []).append(
+            "控制块里 cpu_hz=0：dt 只能给周期数，给不了微秒。"
+            "把 MDK_TRACE_SWD_CPU_HZ（或 trace_instrument 的 coreclk=）设成真实主频。")
+    if out["pending"] >= out["cap"]:
+        out.setdefault("warnings", []).append(
+            "环已经满了（pending=cap=%d）：宿主一点没搬，目标现在**每条事件都在丢**"
+            % out["cap"])
+    elif out["pending"] > out["cap"] * 3 // 4:
+        out.setdefault("warnings", []).append(
+            "环已用 %d/%d：宿主搬运速度跟不上事件产生速度时会开始丢事件"
+            % (out["pending"], out["cap"]))
+    if info["lost_events"]:
+        out.setdefault("warnings", []).append(
+            "lost_events=%d（lost_bytes=%d）：这次录制**不是完整的**，"
+            "时间轴上有没记下来的东西" % (info["lost_events"], info["lost_bytes"]))
+    if info["reset_req"]:
+        out.setdefault("warnings", []).append(
+            "控制块里的 reset_req 还是 1：目标还没执行它（下一条事件写入时才处理）")
+    return out
+
+
+def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
+             names: str = "", link: str = "auto", reset_session: bool = False,
+             max_session_events: int = _SWD_MAX_SESSION_EVENTS) -> dict:
+    """无缝流的**核心动作**：把 [drained, head) 搬走 → 解码 → 把 drained 推上去。
+
+    多次调用会累加成一个连续的时间线（会话状态留在进程内）。
+    返回 events 只给最新 limit 条；全量用 out_file 落盘。
+    """
+    a, loc = _swd_locate(elf=elf, addr=addr)
+    if a is None:
+        return loc
+    if reset_session:
+        _T["swd"] = None
+    info, err = _swd_read_ctrl(a, link=link)
+    if info is None:
+        return err
+    s = _swd_session(a)
+    notes = []
+
+    # ---- 目标重新初始化过？它的游标可能已经归零，旧游标不能再拿来做减法
+    if s["seq"] is not None and info["seq"] != s["seq"]:
+        unread = 0 if s["drained"] is None else (info["head"] - s["drained"]) & _swd.U32
+        if s["drained"] is not None and unread <= info["cap"]:
+            notes.append("目标重开录制时丢弃了宿主还没读走的 %d 字节" % unread)
+        s["dec"] = _swd.Decoder()
+        s["drained"] = info["drained"]
+        s["rel_cycles"] = 0
+        s["anchor_cycle"] = None
+        s["restarts"] += 1
+        notes.append("目标重开过录制（seq -> %d）：宿主解码器已重来，"
+                     "此前解出的事件仍保留在会话里，它们与之后的事件不在同一条时间基上"
+                     % info["seq"])
+    s["seq"] = info["seq"]
+
+    drained = s["drained"]
+    if drained is None:
+        drained = info["drained"]
+    s["drained"] = drained
+    pending = (info["head"] - drained) & _swd.U32
+    if pending > info["cap"]:
+        return {"ok": False, "addr": "0x%X" % a, "locate": loc,
+                "error_code": "swd-cursor-mismatch",
+                "error": "宿主游标 %d 与控制块的 head=%d 对不上（差 %d > cap=%d）"
+                         % (drained, info["head"], pending, info["cap"]),
+                "hint": "多半是宿主会话与目标不同步（MCP 重启过、换了固件、目标复位过）。"
+                        "① reset_session=true 重新建立会话；"
+                        "② 或先 trace_swd_reset 让目标侧重开一段录制。",
+                "seq": info["seq"], "ctrl": {k: info[k] for k in
+                                              ("head", "drained", "cap", "events", "tokens")}}
+
+    data = b""
+    rmeta = {}
+    if pending:
+        data, rmeta = _swd_read_stream(info["ring_addr"], info["cap"],
+                                       drained, pending, link=link)
+        if data is None:
+            return rmeta
+
+    dec = s["dec"]
+    base_ev, base_ct, base_it = len(dec.events), len(dec.ctl), len(dec.items)
+    if data:
+        try:
+            dec.feed(data)
+        except _swd.StreamDesync as e:
+            # 回滚这一批：不推进游标，让同一段字节下次重新解——否则会解出
+            # 半截事件、而剩下的字节再也对不上。
+            del dec.events[base_ev:]
+            del dec.ctl[base_ct:]
+            del dec.items[base_it:]
+            return {"ok": False, "addr": "0x%X" % a, "locate": loc,
+                    "error_code": "swd-stream-desync", "error": str(e),
+                    "at_drained": drained, "unread_bytes": pending,
+                    "hint": "宿主字典与目标字典不同步（语义上等价于流从中间开始）。"
+                            "无缝流没有「从半路接上」的办法——跑 trace_swd_reset "
+                            "让目标重开一段录制，两边字典一起清掉。\n"
+                            "常见成因：MCP 进程重启后接了上一次录制的游标；"
+                            "或目标在宿主离线期间复位过。"}
+
+    if data and dec.leftover:
+        # head 一定落在 token 边界上，读到半截说明这一读不可信。
+        del dec.events[base_ev:]
+        del dec.ctl[base_ct:]
+        del dec.items[base_it:]
+        return {"ok": False, "addr": "0x%X" % a, "locate": loc,
+                "error_code": "swd-partial-token",
+                "error": "读完 %d 字节后还剩 %d 字节凑不成一个完整 token"
+                         % (len(data), dec.leftover),
+                "hint": "head 一定是 token 边界，出现半截多半是链路读短了。重试一次；"
+                        "仍这样就用 trace_swd_reset 重开一段。"}
+
+    # ---- 推进目标侧游标。必须**先读后推**：推早了目标就会覆写没搬走的字节。
+    write_err = None
+    if pending:
+        w = _write_mem(a + _swd.OFF_DRAINED, struct.pack("<I", info["head"]))
+        if not w.get("ok"):
+            w = _write_mem(a + _swd.OFF_DRAINED, struct.pack("<I", info["head"]))
+        if not w.get("ok"):
+            write_err = w.get("error") or "写 drained 失败"
+            s["cursor_write_failed"] = True
+        else:
+            s["cursor_write_failed"] = False
+        s["drained"] = info["head"]
+
+    # ---- 对上锚：本批读完后控制块没再动过，cycles 就是**本会话最后一条事件**的时刻
+    stable = False
+    if pending:
+        info2, _e2 = _swd_read_ctrl(a, link=link)
+        stable = bool(info2 and info2.get("ok")
+                      and info2["head"] == info["head"]
+                      and info2["seq"] == info["seq"]
+                      and info2["lost_events"] == info["lost_events"])
+        if stable:
+            s["anchor_cycle"] = info2["cycles"]
+            s["cpu_hz"] = info2["cpu_hz"]
+            s["ts_shift"] = info2["ts_shift"]
+
+    if "cpu_hz" not in s:
+        s["cpu_hz"] = info["cpu_hz"]
+        s["ts_shift"] = info["ts_shift"]
+
+    new_items = dec.items[base_it:]
+    evs = _swd_fold(s, new_items, s["ts_shift"], s["cpu_hz"],
+                    _buff_parse_names(names))
+    if s["anchor_cycle"] is not None:
+        _swd_anchor(s, s["anchor_cycle"], s["cpu_hz"], evs)
+    s["events"].extend(evs)
+    if len(s["events"]) > int(max_session_events or 0) > 0:
+        drop = len(s["events"]) - int(max_session_events)
+        del s["events"][:drop]
+        s["session_events_dropped"] = s.get("session_events_dropped", 0) + drop
+    s["bytes_read"] += len(data)
+
+    view = _swd_session_view(s, limit=limit)
+    out = {
+        "ok": True, "addr": "0x%X" % a, "locate": loc,
+        "ctrl": {k: info[k] for k in ("version", "cap", "ring_off", "head",
+                                       "drained", "pending", "lost_events",
+                                       "lost_bytes", "events", "tokens", "seq",
+                                       "ts_shift", "cpu_hz", "cycles", "enabled")},
+        "cursor_before": drained,
+        "cursor_after": s["drained"],
+        "bytes_drained": len(data),
+        "new_events": len(evs),
+        "session": {"events": view["event_count"], "bytes_read": s["bytes_read"],
+                    "restarts": s["restarts"], "syncs": s["syncs"],
+                    "anchored": s["anchor_cycle"] is not None,
+                    "dropped_from_session": s.get("session_events_dropped", 0)},
+        "time_origin": ("绝对（DWT 周期数，锚在控制块 cycles 上）"
+                        if s["anchor_cycle"] is not None else
+                        "相对（会话第一条事件为 0；本批没对上锚）"),
+        "measured_bytes_per_event": (round(s["bytes_read"] / float(view["event_count"]), 2)
+                                     if view["event_count"] else None),
+        "overall_bytes_per_event": (round(info["head"] / float(info["events"]), 2)
+                                    if info["events"] else None),
+        "counts_by_type": view["counts_by_type"],
+        "top_ids": view["top_ids"],
+        "faults": view["faults"],
+        "events": view["events"],
+        "truncated": view["truncated"],
+        "read_meta": {k: rmeta.get(k) for k in ("read_confidence", "while_running")
+                      if k in rmeta} or None,
+        "next": ["连续录：反复调 trace_swd_read，每次它只搬走新增的那一段",
+                 "想看整体健康度用 trace_swd_status（更便宜）"],
+    }
+    if notes:
+        out["notes"] = notes
+    if not pending:
+        out["note"] = "没有新数据：从上次读到现在的这一段是空的"
+    if write_err:
+        out["warnings"] = out.get("warnings", []) + [
+            "写回 drained 失败（%s）：字节已经解出来了，但目标仍以为它们没被读走；"
+            "环满之后目标会开始丢事件。建议 trace_swd_reset 重开一段。" % write_err]
+    if rmeta.get("degenerate") or rmeta.get("read_unstable"):
+        out["warnings"] = out.get("warnings", []) + [
+            "这次读的置信度不高（%s）：结果可能不完整，建议重读一次复核"
+            % (rmeta.get("degenerate") or "read_unstable")]
+    if info["lost_events"]:
+        out["warnings"] = out.get("warnings", []) + [
+            "lost_events=%d：目标因为宿主跟不上丢了事件，这条时间线不是完整的"
+            % info["lost_events"]]
+    if view["faults"]:
+        out["warnings"] = out.get("warnings", []) + [
+            "录到 %d 次异常，faults 字段里是类别、CFSR 拆位与寄存器现场"
+            % len(view["faults"])]
+    if out_file:
+        try:
+            p = os.path.abspath(out_file)
+            d = os.path.dirname(p)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"meta": {k: v for k, v in out.items()
+                                    if k not in ("events", "next", "locate", "faults")},
+                           "events": s["events"], "faults": view["faults"],
+                           "counts_by_type": view["counts_by_type"],
+                           "top_ids": view["top_ids"]},
+                          f, ensure_ascii=False, default=str)
+            out["out_file"] = p
+            out["out_records"] = len(s["events"])
+        except OSError as e:
+            out["warnings"] = out.get("warnings", []) + ["写 out_file 失败：%s" % e]
+    return out
+
+
+def swd_reset(elf: str = "", addr="", wait: bool = True, link: str = "auto") -> dict:
+    """请目标**开一段新录制**：清环、清计数、字典两边一起清、seq 加一。
+
+    这是无缝流唯一的「重新对齐」手段：宿主字典与目标字典不同步时，只能靠目标
+    重开一段来把两边一起归零——宿主单方面清字典只会让后续每个 HIT 都解错。
+    与 buff 一样是**延迟生效**的：目标在下一條事件写入时才处理，长期没有插桩
+    事件时会一直挂着（返回 request_latched 说明这一点）。
+    """
+    a, loc = _swd_locate(elf=elf, addr=addr)
+    if a is None:
+        return loc
+    info, err = _swd_read_ctrl(a, link=link)
+    if info is None:
+        return err
+    seq0 = info["seq"]
+    w = _write_mem(a + _swd.OFF_RESET_REQ, struct.pack("<I", 1))
+    out = {"ok": bool(w.get("ok")), "addr": "0x%X" % a, "locate": loc,
+           "wrote": "0x%X" % (a + _swd.OFF_RESET_REQ), "write_meta": w,
+           "seq_before": seq0}
+    if not w.get("ok"):
+        out["error_code"] = "swd-reset-write-failed"
+        out["error"] = w.get("error") or "写 reset_req 失败"
+        out["hint"] = ("目标全速运行时写 SRAM 可能不生效（Keil 链路尤其如此）："
+                       "先 halt（stop）再试；实在不行让固件自己调 "
+                       "mdk_trace_swd_init()。")
+        return out
+    if not wait:
+        out["applied"] = False
+        out["note"] = "已请求；reset_req 只在下一条事件写入时被处理"
+        return out
+    info2, _e2 = _swd_read_ctrl(a, link=link)
+    if info2 is None:
+        out["applied"] = False
+        out["pending"] = True
+        out["note"] = "写入成功，但控制块重读失败，无法确认是否已生效"
+        return out
+    applied = info2["seq"] != seq0
+    out["seq_after"] = info2["seq"]
+    out["applied"] = applied
+    out["request_latched"] = None if applied else True
+    if applied:
+        out["note"] = ("新录制已开始（seq %d -> %d）：环已清空，"
+                       "宿主下次 trace_swd_read 会自己认出 seq 变了并重置解码器"
+                       % (seq0, info2["seq"]))
+        s = _T.get("swd")
+        if s and s.get("addr") == a:
+            s["seq"] = info2["seq"]
+            s["drained"] = info2["drained"]
+            s["dec"] = _swd.Decoder()
+            s["rel_cycles"] = 0
+            s["anchor_cycle"] = None
+            s["restarts"] += 1
+    else:
+        out["note"] = ("reset_req 已写进去但还没被执行（seq 仍是 %d）：它在下一条事件"
+                       "写入时才处理。目标若长期没有插桩事件，它会一直挂着——这不是"
+                       "失败，但也不能当成「已清空」" % seq0)
+        out.setdefault("warnings", []).append(
+            "别把 pending 当成 applied：要看有没有生效就再读一次 trace_swd_status 看 seq。")
+    return out
+
+
 # ================================================================ MCP 注册
 
 def _default_js(obj) -> str:
@@ -2090,7 +2659,80 @@ GUIDE = {
         "    · 要实时看 → stream；要最细粒度 + 一次完整过程 → buff。\n"
         "    · 高频事件（>1000 次/秒）× 长时间 → 两者都不行（stream 会丢、buff 会回卷）："
         "把插桩点收窄到真正关心的那几个，或把 TS_SHIFT 与记录数按需求配平。\n"
-        "    · 两套插桩点宏是同一份代码，只改 MDK_TRACE_BACKEND_* 重编切后端。"
+        "  **swd**（无缝流：目标压缩入环、主机增量搬走）：MDK_TRACE_BACKEND_SWD\n"
+        "    · 第三种模式，也是「只有 SWD 两线、又要不丢」时的正解：事件先被**压缩**"
+        "写进 RAM 里的环形缓冲，主机定期经 SWD 把「还没搬走的那一段」搬出来，"
+        "再把游标回报给目标；环循环使用。\n"
+        "    · 与 buff 的关键差别是**满了怎么办**：buff 写满**覆盖最旧**（事后 dump 只看得到窗口），"
+        "swd 是**未读区永不覆盖**——写不下就整条丢弃并计数（背压）。"
+        "所以只要主机平均搬运速度 ≥ 事件产生速度，就是**零丢失**；跟不上时丢了多少也如实报。\n"
+        "    · 与 stream 的关键差别是**什么时候离开芯片**：stream 事件一发生就推出去（要主机"
+        "实时接住）；swd 事件留在芯片里等主机来搬，因此不占 SWO 引脚、也不抢目标执行时间。\n"
+        "    · 压缩：把 (type, kind, id, arg) 当字典键，重复出现的事件只发一个 6bit 槽号。"
+        "典型负载 **2.35 字节/事件**（定长记录要 12 字节，约 5.1×）。\n"
+        "    · **必须知道的边界**：字典只有 64 槽且是直接映射哈希。"
+        "**不同四元组超过 64 个（工作集大于字典）时命中率归零**，退化到约 11.3 字节/事件。"
+        "所以插桩点要收窄、ID 要复用（同一「任务切换」语义别用一堆不同 arg 去编码）。\n"
+        "    · 三个工具：trace_swd_status（环容量/游标/丢了多少/压缩比）→ "
+        "trace_swd_read（增量搬一批并解成时间线）→ trace_swd_reset（开一段新录制）。\n"
+        "    · 两条硬规矩：① **一丢就双方清字典**——命中只发槽号，两边字典不同步会解出"
+        "**错误的 key**，比丢数据严重得多，所以对齐标记必须是「整条流重来」；"
+        "② **搬走的字节在游标推进之前不能被覆盖**，读数顺序固定为"
+        "「读控制块 → 读字节 → 解码 → 校验没有半截 token → 推进游标 → 重读控制块对锚」，"
+        "`trace_swd_read` 已按这个顺序做；读到半截会回滚这一批、不推进游标，宁可报错也不给错答案。\n"
+        "    · 适合：长时间连续录、要保证「一条都没丢」，而手上只有 SWD 两线。\n"
+        "  怎么选：\n"
+        "    · 要实时看 → stream；要最细粒度 + 一次完整过程 → buff。\n"
+        "    · 要**长时间连续、不丢**、且只有 SWD 两线 → swd（见 topic=swd_seamless）。\n"
+        "    · 高频事件（>1000 次/秒）× 长时间 → stream 会丢、buff 会回卷，"
+        "swd 能扛但需要主机持续搬运：把插桩点收窄到真正关心的那几个，"
+        "或把 TS_SHIFT 与记录数按需求配平。\n"
+        "    · 三种模式的插桩点宏是同一份代码，只改 MDK_TRACE_BACKEND_* 重编切后端。"
+    ),
+    "swd_seamless": (
+        "只有 SWD 两线，怎么做到**无缝（不丢）**地连续录制——这是 swd 后端要解决的问题，"
+        "先记住一句话：\n"
+        "  **事件先压缩进目标内存的环，主机定期来搬走已录部分，环循环用；"
+        "只要平均搬运速度 ≥ 产生速度，就一条都不丢。**\n"
+        "为什么别的路都走不通：\n"
+        "  · ITM/SWO 要占 SWO 引脚——只有两线时没有这根线；\n"
+        "  · RTT 要主机主动读，读的时候抢目标时间，长期高频会掉；\n"
+        "  · 直接轮询内存（trace_scope 那类）粒度粗，中间发生的事看不见；\n"
+        "  · buff 全速录但**写满覆盖最旧**，只能看一个窗口，看不到全程。\n"
+        "所以唯一能连续的路径就是上面那句：**在环上做「背压」，而不是「覆盖」。**\n"
+        "三个必须配对的设计（缺一个就不是无缝了）：\n"
+        "  ① **背压**：写 token 前先算「这条要 n 字节，未读空间还够不够」，不够就整条丢弃"
+        "并计数（lost_events / lost_bytes），**绝不覆盖还没被搬走的区域**。"
+        "另外留一小块保留区（16 字节）只给控制帧用，保证「我丢过数据所以要重对齐」"
+        "这条标记在最坏情况下仍然写得进去。\n"
+        "  ② **压缩**：把 (type, kind, id, arg) 四元组当字典键，重复出现的事件只发一个 6bit "
+        "槽号（命中），没见过的才发完整字面量并写进字典。典型负载 12 字节 → **2.35 字节/事件**。\n"
+        "     **边界要说在前面**：字典 64 槽、直接映射哈希（O(1)，中断里开销可预测）。"
+        "工作集超过 64 个不同四元组时命中率会归零，退化到约 11.3 字节/事件——"
+        "这时要么把插桩点收窄、ID 复用，要么加大缓冲。\n"
+        "  ③ **单边游标**：主机每搬走一批就把「读到哪儿了」写回目标（drained），"
+        "目标只在这之后才允许复写那段空间。游标只有一个主人，不会两边各记一套。\n"
+        "丢了怎么办——**必须双方一起清字典**：\n"
+        "  · 命中只发槽号，字典不同步会把槽号解成**另一个 key**——这比丢数据严重得多，"
+        "是典型的「看似权威的错答案」；\n"
+        "  · 所以对齐手段只有一个：目标重开一段录制（清环、清字典、seq+1，并写一个 SYNC 标记），"
+        "主机看到 seq 变了就跟着重置解码器。\n"
+        "  · 这个动作由 `trace_swd_reset` 触发：宿主往控制块偏移 64 写 reset_req=1，"
+        "目标在**下一条事件**开头清零并重开。\n"
+        "  · 注意它是**延迟生效**的：目标长期没有事件时请求会一直挂着。"
+        "返回里的 `applied` / `request_latched` 就是告诉你「生效了没有」，"
+        "**别把 pending 当成 applied**，要确认就再读一次 status 看 seq。\n"
+        "主机侧一次搬运的固定顺序（trace_swd_read 内部就是这么做的）：\n"
+        "  读控制块 → 读字节 → 喂解码器 → 校验没有半截 token（leftover 必须为 0）→ "
+        "推进 drained → 重读控制块对锚。\n"
+        "  · 先读后推是硬要求：推早了目标就会覆写你还没搬走的字节；\n"
+        "  · leftover 非 0 说明读到了半截 token → **回滚这一批、不推进游标**，"
+        "报 swd-partial-token，宁可这次不推进也不给错解码；\n"
+        "  · 只有「读完本批后 head / seq / lost_events 都没变」时，"
+        "控制块里的周期计数才被当成最后一条事件的绝对时刻（anchor），否则时间原点标为「相对」。\n"
+        "上手三步：\n"
+        "  trace_swd_status → trace_swd_read（可反复调，一直看新的）→ trace_swd_reset（开新的）\n"
+        "  插桩点怎么选见 topic=instrument_points；两种老模式见 topic=instrument_modes。"
     ),
     "instrument_points": (
         "「桩插在哪儿」比「怎么读」更决定这次 trace 有没有用。按对排查的价值排序：\n"
@@ -2158,8 +2800,11 @@ def register(server, js=None) -> int:
         title="Trace 方案选型与接线指南（SWO / RTT / SWD 采样）",
         description=(
             "讲清楚各条 trace 通路的硬件要求与代价，以及接线、ITM、RTT 的注意点。"
-            "topic 可取：howto（总览与取舍）/ instrument_modes（**插桩的两种工作模式："
-            "stream 持续录持续读 vs buff 全速录事后一次性读回，各自代价与选型**）/ "
+            "topic 可取：howto（总览与取舍）/ instrument_modes（**插桩的三种工作模式："
+            "stream 持续录持续读 / buff 全速录事后一次性读回 / swd 无缝流（目标压缩入环、"
+            "主机增量搬走），各自代价与选型**）/ swd_seamless（**只有 SWD 两线时怎么做"
+            "无缝不丢的连续录制：背压而非覆盖、四元组字典压缩、丢失即双方清字典、"
+            "reset_req 握手与延迟生效、搬字节的固定顺序**）/ "
             "instrument_points（**该往哪儿插桩：HardFault 等异常 handler 排第一，"
             "其次是看门狗喂狗点与任务切换点，以及哪些地方不该插**）/ "
             "lessons（**这几次在真板上撞出来的 7 个坑：运行态读 RAM 读回 0、"
@@ -2169,7 +2814,8 @@ def register(server, js=None) -> int:
             "采样能做，指令级录制做不到）/ swd_wiring（接线）/ links（Keil 链路 vs "
             "OpenOCD 链路：观测类工具都带 link 参数）/ rtt_notes / itm_notes / "
             "when_unavailable（没数据时怎么排查）；留空返回全部。\n"
-            "**没有 SWO 引脚并不等于不能 trace**：RTT 只要 SWD，采样剖析连缓冲都不要，MDK 原生 Event Recorder / Event Statistics 也只要 SWD（trace_eventrec 直接读它的缓冲），"
+            "**没有 SWO 引脚并不等于不能 trace**：RTT 只要 SWD，无缝流（swd）也只要 SWD，"
+            "采样剖析连缓冲都不要，MDK 原生 Event Recorder / Event Statistics 也只要 SWD（trace_eventrec 直接读它的缓冲），"
             "只是能拿到的东西不同——这份指南就是帮你按手头硬件选对路子。"
         ),
     )
@@ -2599,18 +3245,23 @@ def register(server, js=None) -> int:
         title="把插桩组件部署进工程（生成配置头 + 构建片段）",
         description=(
             "把 components/trace/ 的目标侧插桩组件拷进你的工程，并按参数生成 "
-            "mdk_trace_config.h（后端选择 ITM/RTT/UART、ITM 端口、RTT 通道数与缓冲大小、"
-            "CPU 主频、SWO 波特率、DBGMCU_CR 地址）与 mdk_trace.mk（Make 集成片段）。\n"
+            "mdk_trace_config.h（后端选择 ITM/RTT/UART/BUFF/SWD、ITM 端口、RTT 通道数与"
+            "缓冲大小、CPU 主频、SWO 波特率、DBGMCU_CR 地址）与 mdk_trace.mk（Make 集成片段）。\n"
             "**为什么必须有目标侧组件**：SWO/RTT 只是通道，芯片不会自己往外说话——"
             "得有代码在关键点把事件写进 ITM/RTT 缓冲，主机才 trace 得到东西。"
             "安装完按返回的 next 步骤接进构建（CMake 用 add_subdirectory 或直接加源文件）。"
             "target_dir 指定部署目录（如工程里的 components/trace）。\n"
-            "**backend 四选一**：itm / rtt / uart（stream：事件立刻出芯片，主机实时跟读）/ "
+            "**backend 五选一**：itm / rtt / uart（stream：事件立刻出芯片，主机实时跟读）/ "
             "**buff（全速录：事件只写进 RAM 环形缓冲，事后用 trace_buff_dump 一次性读回，"
-            "时间粒度可以开到每 CPU 周期）**。buff 的旋钮：buff_records（记录数 × 12B = "
-            "静态 RAM）、buff_ts_shift（0 = 每周期，间隔可能超 51s 才需调大）、"
-            "buff_clear_on_init（默认 false = 复位后保留上一次运行的记录，看门狗/fault "
-            "复位时那是唯一证据）、fault_frame（异常 handler 里多存一份寄存器现场）。\n"
+            "时间粒度可以开到每 CPU 周期）** / **swd（无缝流：事件压缩后写进环形缓冲，"
+            "主机用 trace_swd_read 增量搬走、未读区永不覆盖，只要平均搬运速度跟得上就零丢失；"
+            "只有 SWD 两线、又要长时间不丢时选它）**。\n"
+            "buff 的旋钮：buff_records（记录数 × 12B = 静态 RAM）、buff_ts_shift（0 = 每周期，"
+            "间隔可能超 51s 才需调大）、buff_clear_on_init（默认 false = 复位后保留上一次运行的"
+            "记录，看门狗/fault 复位时那是唯一证据）、fault_frame（异常 handler 里多存一份寄存器现场）。\n"
+            "swd 的旋钮：swd_bytes（环字节数 = 静态 RAM，默认 8192）、swd_ts_shift（0 = 每周期）、"
+            "swd_clear_on_init（**默认 true**，与 buff 相反——无缝流主机是从游标往 head 读，"
+            "环里留着上一次运行的字节会把两段无关运行无缝拼在一起，没有可见接缝，最危险）。\n"
             "该往哪儿插桩见 trace_guide(topic=\"instrument_points\")。"
         ),
     )
@@ -2623,7 +3274,10 @@ def register(server, js=None) -> int:
                                buff_records: int = 2048,
                                buff_ts_shift: int = 0,
                                buff_clear_on_init: bool = False,
-                               fault_frame: bool = True) -> str:
+                               fault_frame: bool = True,
+                               swd_bytes: int = 8192,
+                               swd_ts_shift: int = 0,
+                               swd_clear_on_init: bool = True) -> str:
         try:
             return _js(deploy_component(target_dir, backend=backend,
                                         itm_port=int(itm_port), rtt_up=int(rtt_up),
@@ -2634,7 +3288,10 @@ def register(server, js=None) -> int:
                                         buff_records=int(buff_records),
                                         buff_ts_shift=int(buff_ts_shift),
                                         buff_clear_on_init=bool(buff_clear_on_init),
-                                        fault_frame=bool(fault_frame)))
+                                        fault_frame=bool(fault_frame),
+                                        swd_bytes=int(swd_bytes),
+                                        swd_ts_shift=int(swd_ts_shift),
+                                        swd_clear_on_init=bool(swd_clear_on_init)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "target_dir": target_dir, "error": str(e)})
     n += 1
@@ -2703,6 +3360,77 @@ def register(server, js=None) -> int:
                                wait: bool = True, link: str = "auto") -> str:
         try:
             return _js(buff_reset(elf=elf, addr=addr, wait=bool(wait), link=link))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_swd_status",
+        title="swd 无缝流：读控制块（容量 / 未读字节 / 丢了多少 / 压缩比）",
+        description=(
+            "swd 无缝流后端（压缩 + 背压，只要 SWD 两线的**连续**录制）的健康快照。"
+            "只读 80 字节控制块，很便宜。返回：head/drained/pending、重复次数 seq、"
+            "lost_events/lost_bytes、环容量、时间粒度 ts_shift、cpu_hz，"
+            "以及整体的 overall_bytes_per_event 与 compression_vs_12B。\n"
+            "**定位**：默认按 ELF 符号 mdk_trace_swd_blob 找（elf= 或会话已 set_symbol_file 的可省），"
+            "也可以 addr=0x... 直接给；找不到会明确报 swd-symbol-missing，不会猜。\n"
+            "**读回整片 0 不等于没事件**：目标全速运行时经 SWD 读 RAM 可能整片读回 0，"
+            "这种情况会报 swd-read-degenerate 并让你先 halt；停一下不会丢数据。\n"
+            "pending 接近 cap 时会在 warnings 里提醒：宿主再跟不上，目标就要开始丢事件了。"
+        ),
+    )
+    async def trace_swd_status(elf: str = "", addr: str = "",
+                               link: str = "auto") -> str:
+        try:
+            return _js(swd_status(elf=elf, addr=addr, link=link))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_swd_read",
+        title="swd 无缝流：把未读的那段搬走并解成事件（连续录制的主操作）",
+        description=(
+            "**无缝流的核心动作**：读控制块 → 读 [drained, head) → 解码 → 把 drained 推上去。"
+            "目标因此可以循环使用那块环，主机反复调这个工具就能一直录下去。\n"
+            "与 buff 的关键区别：**未读区永不被覆盖**。宿主跟不上时目标丢**新**事件并计入 "
+            "lost_events（权威计数），已经录下的那部分始终是完整可读的。\n"
+            "多次调用会累加成一个连续时间线（会话状态在进程内）；返回的 events 只给最新 limit 条，"
+            "全量用 out_file 落盘——几万条不要往对话里塞。\n"
+            "事件里 auto 带出 gap（丢了一段）、sync（目标重开了录制段）、fault（异常，含 CFSR 拆位"
+            "与寄存器现场）。\n"
+            "**宿主一侧没有「从半路接上」的办法**：HIT token 只带槽号，字典一旦漂移就会解出错误的 id，"
+            "那时会报 swd-stream-desync，正确做法是 trace_swd_reset 让目标重开一段。"
+        ),
+    )
+    async def trace_swd_read(elf: str = "", addr: str = "", limit: int = 200,
+                             out_file: str = "", names: str = "",
+                             link: str = "auto",
+                             reset_session: bool = False) -> str:
+        try:
+            return _js(swd_read(elf=elf, addr=addr, limit=int(limit),
+                                out_file=out_file, names=names, link=link,
+                                reset_session=bool(reset_session)))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_swd_reset",
+        title="swd 无缝流：让目标开一段新录制（清环 + 两边一起清字典）",
+        description=(
+            "往控制块的 reset_req 写 1，目标在下一条事件写入时清环、清计数、字典两边一起清、seq 加一，"
+            "并往新流里写一个 SYNC 标记。\n"
+            "**这是无缝流唯一的重新对齐手段**：宿主字典与目标字典不同步时，宿主单方面清字典只会让"
+            "后续每个 HIT 都解错——只能由目标重开一段把两边一起归零。\n"
+            "与 buff 一样是**延迟生效**的：目标长期没有插桩事件时会一直挂着（返回 request_latched），"
+            "那不是失败，但也不能当成「已清空」。生效与否以 seq 是否变化为准（wait=true 会重读确认）。"
+        ),
+    )
+    async def trace_swd_reset(elf: str = "", addr: str = "",
+                              wait: bool = True, link: str = "auto") -> str:
+        try:
+            return _js(swd_reset(elf=elf, addr=addr, wait=bool(wait), link=link))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

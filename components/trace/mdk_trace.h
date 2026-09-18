@@ -214,9 +214,13 @@ unsigned mdk_trace_rtt_pending(void);   /* bytes waiting in the up channel   */
  * claim a switch happened on every tick even when the same task continued. */
 #define MDK_TRACE_SCHED(from, to)  do { mdk_trace_sched((from), (to)); } while (0)
 
-/* Fault snapshot. GCC / Clang / ARMClang (AC6) read the registers inline;
- * ARMCC 5 has no operand form for inline asm, so there the snapshot degrades
- * to "class + CFSR only" instead of inventing values it cannot read. */
+/* Fault snapshot. GCC / Clang / ARMClang (AC6) read the registers inline.
+ * ARMCC 5 cannot: its inline assembler rejects lr/r14 as an operand, and
+ * "register uint32_t x __asm(\"lr\")" is silently given a normal register
+ * (it emits STR r0, not MOV r0, lr), so the values would be invented. There
+ * the snapshot degrades to "class + CFSR only" - use
+ * mdk_trace_fault_capture(exc, msp, psp) from an assembly vector thunk when
+ * the full frame is needed on AC5. */
 #if defined(__CC_ARM) && !defined(__clang__)
 #  define MDK_TRACE_FAULT_CAPTURE()  mdk_trace_fault(0u, 0u)
 #elif defined(__arm__) || defined(__ARM_ARCH) || defined(__ARMCC_VERSION)
