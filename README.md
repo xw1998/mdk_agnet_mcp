@@ -54,6 +54,7 @@
 - **连接缓存**：常驻服务内共享一条 TCP 连接，空闲自动断开、下次调用自动重连；
 - **并发调用可安全并行**：所有 UVSOCK 命令经**统一闸门串行化**——进程内 RLock（同进程多线程）+ 跨进程锁文件（多个 mdkdebug 实例共用同一调试通道时也只允许一个发命令），超时降级并如实记入遥测；`get_status` / `keil_health` 会回报**其他 mdkdebug 实例**（PID + 心跳年龄）并在有竞争时给出 `concurrency_warning`，把「写入被静默吞掉」从猜测变成可见证据；详见 [docs/PITFALLS.md](./docs/PITFALLS.md)；
 - **第二条调试通道：Keil 官方命令行批处理（`UV4 -d`）**：`batch_debug_script` 把一串命令写成初始化文件挂到 `.uvoptx` 的 `<tIfile>`，以 `-j0` 无人值守执行，按日志逐条判定执行结果。**为什么要它**：不依赖 UVSOCK 交互式会话，进程隔离、天然可重放，适合「跑一段固定脚本 → 拿结果」的冒烟/回归；UVSOCK 不可用时也是降级通道。已处理三个真机硬坑：初始化文件与 trace 落到 ASCII 临时目录、`.uvoptx` 前置备份 + finally **字节级**还原、`<tIfile>` 唯一性先数再换；静态 lint 会拦下真机会挂死的写法（`Go main` / `DISPLAY` / `SAVE` / `Step`）并给正确写法；
+- **Modbus 主站（规范 RTU/ASCII + 非规范裸帧）**：`modbus_read` / `modbus_write` / `modbus_scan` / `modbus_sniff` / `modbus_raw` / `modbus_decode` / `modbus_session`。**为什么不能用串口日志监听做**：`serialmon` 是**按行**切分的日志通道，而 Modbus 是二进制帧（含 `\x00`、没有换行、多从站应答会连成一坨），按行切必然切坏——所以 Modbus 走**独立的二进制收发路径**，按**帧间静默 t3.5**（>19200 波特固定 1.75ms）切帧。协议侧：CRC16 / LRC 自己算、功能码 01/02/03/04/05/06/0F/10、异常帧译中文（`0x02` → 地址越界）、规范上限（读寄存器 ≤125 / 读线圈 ≤2000 / 写寄存器 ≤123）**在发出去之前就拦**。**关键取舍：字节回来了 ≠ 帧是对的**——`transact` 的 `ok` 只表示「有没有字节返回」，另给 `parsed_ok`；半帧 / CRC 不过时 `modbus_read` 判**失败**，且与「一个字节都没收到」分开报（`modbus-bad-crc` vs `modbus-timeout-no-response`，这两类问题的排查方向完全不同），而 `modbus_raw` 保持传输层口径——它存在的意义就是看非规范帧。端口是独占资源：串口日志监听正占着同口时**明确报错、不抢口**（抢来的「成功」会收到错数据）；同口同参数**复用不重开**，避免 DTR 抖动把目标板复位；帧方向**自动识别**——旁听/抓包得到的帧多半是主站请求，先按应答解、不符再按请求解，`05`/`06`/`08`/`16` 这类请求与应答同形的功能码如实标 `ambiguous`，**不把最常见的读请求一律判成「载荷不符」**。
 - **报错知识库**：`explain_build_error` + `keil_command` 把编译诊断文本与 Keil 命令错误码翻成「含义 / 根因 / 修法」（`#20 identifier is undefined`、`error 57 illegal address`、`error 145` 断点已存在…）。**只收录真机实测过的条目**，未收录的一律 `confidence=unknown` + 通用排查路径，不编造含义；
 - **CMSIS-SVD 解码**：`svd_list` / `svd_decode` 按芯片厂商的 SVD 解释寄存器值（比内置硬编码表更权威、换型号也能用）：支持 `derivedFrom` 继承、`cluster`、数组与枚举位域；**地址反查**按 `<addressBlock>` 界定真实范围（固定窗口会在外设密集排布处串台），结果附 `matched_by` 标可信度、附 `svd_device` 标明用的是哪份 SVD；不给器件时按当前工程 `<Device>` 推断，**绝不盲挑盘上第一份 .svd**；
 - **工程文件受控编辑**：`uvprojx_read` / `uvprojx_edit` 只读查看与增删包含路径/文件；改前默认备份、文本级替换不重排工程、锚点唯一性校验后再写，空改动不落盘（不写坏用户工程）；
@@ -184,7 +185,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 154 个工具定义
+│   └── server.py             # MCP Server 与 161 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -233,9 +234,9 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **154** 个（**默认只暴露 37 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **161** 个（**默认只暴露 37 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
-- **MDK 族（100 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导 / **工具面按需装载**（`toolset`）（下表）。
+- **MDK 族（107 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导 / **工具面按需装载**（`toolset`）（下表）。
 - **非 MDK 族（54 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案**（接口·速度·SWO·RTT 参数档案与自动识别 + 工程现场配置发现，4 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署，20 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 - **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
 
@@ -326,6 +327,13 @@ python run_server.py --transport http --http-port 8300
 | `serial_monitor_stop` | 停止监听并**释放串口**（不释放的话 Keil 串口窗口/其他工具会打不开，报 WinError=5）。**默认保留已收日志**（`clear_buffer=true` 才清空），释放后 `serial_read` 仍可读、重新 start 复用同一实例；正常情况下不必手工调它——调试/烧录/关 Keil 都会自动释放；未监听时也返回 `ok=true` | `clear_buffer?` |
 | `serial_list_ports` | **扫描本机串口**：列 `port`/`description`/`hwid`，并按 VID/PID 推断挂的芯片（CH340/CP210x/FTDI/mbed-DAPLink…，大小写不敏感；未收录的给原始 VID/PID）；**唯一候选自动采用、多候选只列名单不瞎猜**（`port_auto_selected`/`port_candidates`/`need_choice`） | `detail?` |
 | `serial_expect` | **串口原子 send+wait**：下发命令并等到匹配内容或超时，一步完成请求-响应；只认**调用之后新增**的输出（不拿缓冲区旧日志冒充命中）。支持 `pattern` 正则、`since` 增量、`case_sensitive`、`send`+`eol`（同 serial_write 口径）或 `hex` 原样下发；命中给 `matched_text`/`matched_group`/`waited_ms`，未命中区分「零字节新增」与「有输出但不匹配」 | `pattern`、`timeout_s?`、`send?`、`hex?`、`eol?`、`since?`、`regex?`、`case_sensitive?`、`max_lines?` |
+| `modbus_read` | **按规范读从站**：01 读线圈 / 02 读离散输入 / 03 读保持寄存器 / 04 读输入寄存器（RTU CRC16、ASCII LRC 都支持），返回解码值（`bits` / `registers` + 有符号视图）与**原始收发帧**。从站回异常帧不假装成功：`is_exception` + 异常码译中文。首次必须给 `port`，之后同会话可省略 | `slave?`、`func?`、`addr?`、`count?`、`port?`、`baud?`、`serial_format?`、`mode?`、`timeout_ms?`、`include_frames?` |
+| `modbus_write` | **按规范写从站**：05 写单线圈 / 06 写单寄存器 / 0F 写多线圈 / 10 写多寄存器；`verify=true` **写后自动回读校验**（05/06 的应答只是原样回显，不代表真写进去了）。**会改设备状态**，调用前确认对象与取值 | `slave?`、`func?`、`addr?`、`value?`、`values?`、`verify?`、`port?`、`baud?`、`serial_format?`、`timeout_ms?` |
+| `modbus_raw` | **非规范 / 私有协议的裸帧收发**：`as_text=true` 按文本下发，`auto_crc=true` 自动补 CRC16 / LRC（手算校验最容易错）。响应按**帧间静默**切段，每段给 hex / ascii 与「能不能按 Modbus 解」，**解不了就说解不了** | `req`、`as_text?`、`auto_crc?`、`expect_len?`、`max_frames?`、`port?`、`baud?`、`serial_format?`、`timeout_ms?` |
+| `modbus_decode` | **离线解析报文**（不占端口、不发一个字节）：hex 或 ASCII 帧、支持多行批量；给出从站 / 功能码 / 载荷 / 校验结论，失败明确是「长度不足 / CRC 不过 / LRC 不过 / hex 非法」。**自动判方向**：先按应答解、不符再按请求解，结果给 `direction=response/request`（同形功能码标 `ambiguous`） | `frame`、`mode?` |
+| `modbus_scan` | **扫在线的从站**：`slaves` 支持 `"1-16"` / `"1,3,5"` / `"1-8,20"`；有应答就列出（含异常码——**异常码不等于不在线**，它说明从站收到了但拒绝了参数）。范围超 `max_slaves` **直接报错**，不静默少扫还报「扫描完成」 | `slaves?`、`func?`、`addr?`、`count?`、`timeout_ms?`、`max_slaves?`、`port?`、`baud?`、`serial_format?` |
+| `modbus_sniff` | **被动旁听，不发一个字节**：按静默切帧后列出（协议逆向 / 确认总线上到底有没有在跑）。总线上没主站请求时**一帧都收不到是正常结果**，不是故障 | `duration_ms?`、`max_frames?`、`gap_ms?`、`port?`、`baud?`、`serial_format?`、`mode?` |
+| `modbus_session` | **会话状态 / 开 / 关端口**：串口是独占资源，会话会持有到显式关闭或空闲超时（`idle_release_s` 默认 900s，进程退出也会释放）。收工要接串口助手 / 日志监听，先 `action="close"` | `action?`（`status` / `open` / `close`）、`port?`、`baud?`、`serial_format?`、`mode?` |
 | `list_uvoptx_breakpoints` | 读取持久化断点(.uvoptx) | `project?` |
 | `clear_uvoptx_breakpoints` | 清除持久化断点(.uvoptx) | `project?`、`backup?` |
 | `clear_all_breakpoints` | 清除全部软件断点；`hard=true` 用 `BK *` 一次性清空 Keil 侧全部断点（含 .uvoptx 持久化断点），附 `real_after` 复核 | `include_uvoptx?`、`hard?` |
@@ -511,16 +519,16 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-154 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 37 个**（`core` 组 33 个 + 4 个元工具），其余 117 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+161 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 37 个**（`core` 组 33 个 + 4 个元工具），其余 124 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 154 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 161 个（=full/*）
 ```
 
-装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 7 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
+装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
 
 共 11 个组（`core` 为默认装载组）：
 
@@ -530,7 +538,7 @@ toolset(action="load",   toolsets="all")        # 一次全装 154 个（=full/*
 | `mem` | 内存与外设读写（10 个） |
 | `symbol` | 符号与源码定位（8 个） |
 | `build` | 编译 / 清理 / 烧录 / 工程配置（13 个） |
-| `serial` | 宿主机串口监听与命令应答（7 个） |
+| `serial` | 宿主机串口监听与命令应答 + Modbus 主站（14 个） |
 | `advanced` | 诊断 / 剖析 / SVD / 工程编辑等进阶能力（25 个） |
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
 | `target` | 非 MDK：目标档案查询与自动识别、工程现场调试配置发现（4 个） |
@@ -722,6 +730,7 @@ python -m tests.mock_openocd --port 4444         # 模拟 OpenOCD telnet（打�
 | 看故障 | `CFSR`/`HFSR` 是粘滞位，`fault_report` 用 `fault_timing.timeliness` 区分 `current`（正在 fault handler 里）/ `sticky`（历史残位）/ `none` | `timeliness=sticky` 时别当当前故障处理。确证新异常：`clear_faults()` → `run()` → `fault_report()` |
 | 并发调用 | 所有 UVSOCK 命令经统一闸门串行化（进程内 `RLock` + 跨进程锁文件），多实例竞争会在 `keil_health` / `get_status` 里报出来 | 同一台调试器上跑多个 MCP 实例时，写入可能被静默覆盖；需要严格顺序的多步写入请用 `batch` 一次提交 |
 | 输出裁剪 | 受控工具支持 `compact` / `max_lines` / `full`，**裁了就报**：丢过东西必有 `output.truncated` / `dropped` / `hint`，计数字段仍是全量 | `output.truncated=true` 时别当这就是全部；要全量用 `full=true`（细节见上节「高输出工具的输出控制」） |
+| Modbus 端口独占 | Modbus 会话与串口日志监听**互斥**：serial_monitor 正占着同口时 `modbus_*` 明确报 `modbus-port-held-by-monitor` 并让你先 `serial_monitor_stop`（**不抢口**——抢来的「成功」会收到错数据）；同口同参数**复用不重开**，避免 DTR 抖动复位目标板 | Modbus 是二进制帧协议，别拿按行切分的日志监听接它 |
 | 串口占用 | 调试结束 / 烧录 / 关 Keil 时自动释放端口（**释放只还口、日志保留**），另有空闲超时与进程退出兜底 | 同一个串口别被两处同时打开（本服务 + Keil 串口窗口会互相抢占，`WinError=5`） |
 
 **串口可收也可发**：端口按可读可写打开，收与发共用同一句柄；拿不到写权限时退回只读并置
@@ -735,6 +744,18 @@ serial_write(hex="7e 01 00 ff", eol="none")      # 二进制 / 镜像片段
 serial_read(since=上次 next_seq)                  # 长响应继续增量取
 exit_debug()                                     # 调试结束 → 自动还口，日志仍保留
 ```
+
+```text
+# 规范 Modbus：读 10 个保持寄存器（电表/变频器常见 9600 8E1）
+modbus_read(slave=1, func=3, addr=0, count=10, port="COM9", baud=9600, serial_format="8E1")
+modbus_write(slave=1, func=6, addr=0x10, value="0x1234", verify=True)  # 写后自动回读
+modbus_scan(slaves="1-16", port="COM9", baud=9600)                     # 从站号到底是几
+# 非规范 / 私有协议：裸帧收发（自动补 CRC，不用手算）
+modbus_raw(req="01 03 00 00 00 01", auto_crc=True, port="COM9", baud=9600)
+modbus_sniff(duration_ms=3000, port="COM9")    # 旁听：别人在问什么（不发一个字节）
+modbus_session(action="close")                 # 用完把口还回去
+```
+
 ## 设计要点
 
 - **连接缓存**：常驻服务内共享一条 TCP 连接，`idle_timeout` 空闲自动断开、下次调用自动重连，兼顾实时性与资源释放；

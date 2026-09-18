@@ -48,6 +48,10 @@ READONLY = {
     "trace_rtt_find", "trace_swo_read",
     # 串口：只列端口与读日志
     "serial_list_ports", "serial_monitor_status", "serial_read",
+    # Modbus：只有「离线解析报文」是纯只读（不碰端口、不发字节）。
+    # modbus_read 虽是读语义，但会**占用串口**并发字节到总线，
+    # 按本文件的口径（只读 = 不改状态且不占共享资源）不列入白名单。
+    "modbus_decode",
     # RTOS 任务感知：只读目标内存 + 本地 .axf，不改目标状态
     "rtos_info", "rtos_tasks", "rtos_objects",
 }
@@ -72,6 +76,9 @@ DESTRUCTIVE = {
 # ----------------------------------------------------------------------
 NON_IDEMPOTENT = {
     "serial_write", "serial_expect", "launch_uvision", "restart_keil",
+    # modbus_raw 可能发的是写请求（内容不限，工具不知道语义）；
+    # modbus_session 的 open/close 会改变端口持有状态。
+    "modbus_raw", "modbus_session",
     "close_uvision", "ocd_start", "ocd_stop", "run", "run_timeout", "step",
     "wait_fault", "trace_instrument", "toolchain_env", "session_state",
     "uvprojx_edit", "batch", "batch_debug_script", "flash_debug",
@@ -99,6 +106,8 @@ MUTATING = {
     "profile_sampling", "rebuild_project", "reset", "reset_connection",
     "restart_keil", "run", "run_timeout", "run_to_line", "serial_expect",
     "serial_monitor_start", "serial_monitor_stop", "serial_write",
+    "modbus_read", "modbus_write", "modbus_raw", "modbus_scan", "modbus_sniff",
+    "modbus_session",
     "session_state", "set_breakpoint", "set_conditional_breakpoint",
     "set_debug_target", "set_register", "set_reloc_delta", "set_symbol_file",
     "set_watchpoint", "step", "stop", "toolchain_build", "toolchain_compile",

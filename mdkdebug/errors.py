@@ -173,6 +173,77 @@ ERROR_CODES = {
         "text": "串口被其他程序占用（打开失败，WinError=5）",
         "next_actions": ["关闭 Keil 的串口窗口 / 其他串口工具（同一时刻只能一个进程持有）", "若占用者是本服务，reopen_count 会自动重连，稍后重试即可"],
     },
+    # ---- Modbus（批次44）----
+    # 这一族的关键是「收不到」与「收到但不对」必须分开：前者查接线/波特率/从站号，
+    # 后者查串口参数/帧长度/是不是别的协议。混成一句「失败」会让人在两个方向上乱试。
+    "modbus-no-session": {
+        "text": "还没有打开的 Modbus 会话，且本次没给 port",
+        "next_actions": [
+            "带上 port（如 port=\"COM9\"）与 baud / serial_format 重新调用",
+            "不确定是哪个口：先 serial_list_ports 看端口与芯片推断",
+            "想先确认能打开：modbus_session(action=\"open\", port=\"COM9\", baud=9600)",
+        ],
+    },
+    "modbus-no-port": {
+        "text": "给了串口参数但没给 port，无法判断参数作用在哪个口上",
+        "next_actions": ["把 port 一起给上（串口参数只在打开/切换端口时有意义）",
+                         "或用 modbus_session(action=\"status\") 看当前会话在哪个口"],
+    },
+    "modbus-port-held-by-monitor": {
+        "text": "该串口正被 serial_monitor_start 的日志监听占着（同一时刻只能一个持有者）",
+        "next_actions": [
+            "先 serial_monitor_stop() 释放端口，再调 modbus_*",
+            "调完 Modbus 想接着看日志：modbus_session(action=\"close\") 再 serial_monitor_start",
+        ],
+    },
+    "modbus-session-closed": {
+        "text": "Modbus 会话当前没有持有端口（已空闲自动释放或被关闭）",
+        "next_actions": ["带上 port 重新调用任意 modbus_* 工具即可重开（同参数会复用，不会重复初始化）",
+                         "用 modbus_session(action=\"status\") 确认会话状态与释放原因"],
+    },
+    "modbus-port-readonly": {
+        "text": "串口是以只读方式打开的，发不出 Modbus 请求",
+        "next_actions": ["确认端口没被别的程序（Keil 串口窗口 / 其他串口工具）独占",
+                         "modbus_session(action=\"close\") 后重开一次；仍只读则检查驱动是否允许写"],
+    },
+    "modbus-timeout-no-response": {
+        "text": "请求已发出，但在超时时间内**一个字节都没收到**（不是帧格式问题）",
+        "next_actions": [
+            "核对串口参数：波特率、校验位（Modbus 常用 9600 8E1 / 19200 8N1）、停止位、数据位",
+            "核对从站号（用 modbus_scan 扫一遍），并确认目标设备确实支持该功能码/地址",
+            "接线：A/B 是否交叉、GND 是否共地、终端电阻；必要时 modbus_sniff 旁听总线看有没有数据在跑",
+            "加大 timeout_ms（低速从站 + 长帧时 1000ms 可能不够）",
+        ],
+    },
+    "modbus-bad-crc": {
+        "text": "收到了 RTU 应答，但 CRC16 校验不过（帧被改过/被截断/参数不匹配）",
+        "next_actions": [
+            "先核对串口参数与波特率（校验位/停止位错会稳定地算不过 CRC）",
+            "看返回的 raw_hex：若长度不对，多半是超时太短被截断——加大 timeout_ms 或给 expect_len",
+            "总线上有多个设备/别的协议混跑时用 modbus_sniff 看原始帧，确认是不是抓错了对象",
+        ],
+    },
+    "modbus-bad-lrc": {
+        "text": "收到了 ASCII 应答，但 LRC 校验不过",
+        "next_actions": ["核对串口参数（ASCII 模式常见 7E1/8E1）与帧边界（':' 起、CRLF 止）",
+                         "modbus_decode 离线核对一遍这段报文的 LRC 算法是否与设备一致"],
+    },
+    "modbus-bad-frame": {
+        "text": "收到的字节不是一帧完整的 Modbus 报文（长度不足/半帧/非该协议）",
+        "next_actions": [
+            "加大 timeout_ms 或给 expect_len（知道应答应有长度时让它收够再返回）",
+            "用 modbus_sniff 按静默切帧看总线上真实出现的帧边界",
+            "确认对端确实说 Modbus：非规范/私有协议请用 modbus_raw 直接看 hex",
+        ],
+    },
+    "modbus-exception": {
+        "text": "从站返回了异常帧：通信是通的，它收到了请求但拒绝了",
+        "next_actions": [
+            "按 exception_code 对号入座：0x01 功能码不支持 / 0x02 地址越界 / 0x03 数量或取值非法 / 0x06 从站忙",
+            "0x02 常见于从站号对但寄存器地址基址不同（有的设备是 1-based）、或该型号没有这个寄存器",
+            "0x06/0x05 属于「稍后重试」类，等设备处理完再发，不要连发",
+        ],
+    },
     "timeout": {
         "text": "操作超时",
         "next_actions": ["调 keil_health 看 Keil 侧是否被模态框阻塞 / 端口是否还在监听", "确认目标是否在运行、命令是否本就耗时较长（可调大超时参数）"],
@@ -467,6 +538,11 @@ _RULES = (
     # 旧规则全不命中 → unknown-error（next_actions 指 keil_health），其实是纯参数错。
     (r"不支持的寄存器名|无法解析数值|不支持的寄存器", "invalid-argument"),
     (r"未到达函数入口", "function-not-reached"),
+    (r"正被串口日志监听占用", "modbus-port-held-by-monitor"),
+    (r"从站返回异常码", "modbus-exception"),
+    (r"CRC 校验失败", "modbus-bad-crc"),
+    (r"LRC 校验失败", "modbus-bad-lrc"),
+    (r"Modbus 会话当前未打开|会话当前未打开端口", "modbus-session-closed"),
     (r"一个字节都没有新增", "serial-expect-timeout-no-data"),
     (r"行但都不匹配", "serial-expect-timeout-no-match"),
     (r"没有串口监听在运行", "serial-not-monitoring"),
@@ -589,6 +665,28 @@ _NON_MDK_ACTIONS = {
     ],
 }
 
+# Modbus 族（modbus_*）在通用码上的下一步：不要指向 keil_health / UVSOCK，
+# 那一条链跟串口 Modbus 没有任何关系。
+_MODBUS_ACTIONS = {
+    "timeout": [
+        "加大 timeout_ms 后重试（低速从站 + 长帧本来就慢）",
+        "确认请求真的发出去了：返回里的 request_hex / sent_bytes",
+        "总线被别人占着（另一个主站）时也会一直等不到应答——modbus_sniff 看总线",
+    ],
+    "unknown-error": [
+        "读返回里的 request_hex / response_hex / frames：Modbus 侧的证据都在原始字节里，不要猜",
+        "离线用 modbus_decode 把这段报文解一遍，确认帧结构本身对不对",
+    ],
+    "invalid-argument": [
+        "用 list_tools(keyword=\"modbus\") 查参数签名与 example_args",
+        "功能码限定：读用 01/02/03/04，写用 05/06/0F/10；其余走 modbus_raw 裸帧",
+        "地址/数量上限按规范（读寄存器一次 ≤125、读线圈 ≤2000、写寄存器 ≤123）",
+    ],
+}
+
+def is_modbus_tool(tool_name: str) -> bool:
+    return str(tool_name or "").startswith("modbus_")
+
 def is_non_mdk_tool(tool_name: str) -> bool:
     return str(tool_name or "").startswith(_NON_MDK_PREFIXES)
 
@@ -596,6 +694,8 @@ def code_actions(tool_name: str, code: str) -> list:
     """取某个错误码在该链路下的下一步动作（非 MDK 族对通用码做替换）。"""
     if not code:
         return []
+    if is_modbus_tool(tool_name) and code in _MODBUS_ACTIONS:
+        return list(_MODBUS_ACTIONS[code])
     if is_non_mdk_tool(tool_name) and code in _NON_MDK_ACTIONS:
         return list(_NON_MDK_ACTIONS[code])
     info = ERROR_CODES.get(code)

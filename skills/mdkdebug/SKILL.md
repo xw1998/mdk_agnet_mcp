@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 154 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 161 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的三条纪律
@@ -21,7 +21,7 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
 3. **读到可疑数据不要急着下结论**：整帧 0、`UsageFault` 置位、读值与预期不符时，
    先看返回体里的 `note` / `next_actions` / `cache_info`，再复读一次或复位后对比。
 
-## 二、四条主线工作流
+## 二、五条主线工作流
 
 ### 1. 编译 → 烧录 → 进调试 → 看现象（最常用）
 
@@ -62,7 +62,31 @@ serial_monitor_stop                                             # 收工释放 C
 要点：`eol` 是关键参数（`crlf`/`cr`/`lf`/`auto`），照抄示例免得设备不回话；
 进调试/烧录/重启 Keil 会自动释放串口占用，已收日志仍可继续 `serial_read`。
 
-### 4. UVSOCK 不可用时的降级通道（命令行批处理）
+### 4. Modbus（规范 RTU/ASCII + 非规范裸帧）
+
+串口日志监听（`serial_*`）是**按行**切分的，接不了二进制帧协议——调 Modbus 走这一条：
+
+```
+modbus_scan(slaves="1-16", port="COM9", baud=9600, serial_format="8E1")  # 先确认从站号/波特率
+modbus_read(slave=1, func=3, addr=0, count=10)      # 首次给 port，之后同会话可省略
+modbus_write(slave=1, func=6, addr=0x10, value="0x1234", verify=True)
+modbus_raw(req="01 03 00 00 00 01", auto_crc=True) # 私有协议裸帧
+modbus_sniff(duration_ms=3000)                      # 旁听（不发字节）
+modbus_session(action="close")                     # 用完还口
+```
+
+要点：
+- **失败分类别混着猜**：一个字节都没收到 → `modbus-timeout-no-response`（接线 / 波特率 / 从站号）；
+  收到了但 CRC 不过 → `modbus-bad-crc`（串口参数 / 串扰）；从站回了异常帧 → `modbus-exception`
+  （**它在线，只是拒绝了参数**，按异常码改地址/数量/取值，别当通信故障查）。
+- 拿不准帧结构先用 `modbus_decode` **离线**解一遍（不占端口、不发字节），再去动总线。
+  它会**自动判方向**（先按应答解、不符再按请求解）：旁听抓到的帧多半是主站请求，
+  结果里的 `direction=response/request` 告诉你是哪边发的；`05`/`06`/`08`/`16` 这类
+  请求与应答**同形**的功能码如实标 `ambiguous`，不硬指一个方向。
+- Modbus 会话会**独占** COM 口（空闲 900s 自动释放）；要接着看日志或开串口助手，先
+  `modbus_session(action="close")`，否则会 `WinError=5`。
+
+### 5. UVSOCK 不可用时的降级通道（命令行批处理）
 
 UVSOCK 被模态框、端口冲突或 Keil 未启动挡住时，用 UV4 的 `-d` 批处理：
 

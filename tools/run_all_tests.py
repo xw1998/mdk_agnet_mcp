@@ -39,12 +39,13 @@ BATCHES = [
     "test_batch35", "test_batch36", "test_batch37",
     "test_batch38",
     "test_batch39", "test_batch40", "test_batch42", "test_batch43",
+    "test_batch44",
 ]
 
 # --fast：改一两个模块时先跑这几批（覆盖协议层/统一信封/非 MDK 链路），全绿再跑全量
 FAST_SET = ["test_e2e", "test_mcp", "test_batch33", "test_batch35", "test_batch36",
             "test_batch37", "test_batch38", "test_batch39", "test_batch40",
-            "test_batch42", "test_batch43"]
+            "test_batch42", "test_batch43", "test_batch44"]
 
 # 并发禁区：这些模块共用同一个「守卫端口」，同时跑会互相干扰（真检查过端口占用）：
 #   test_batch29 断言 14999 没在监听，test_batch35 的子进程会去 bind 14999
@@ -96,7 +97,7 @@ def scan_test_counts(n):
       • 断言标签在上一行、`== N` 在下一行（多行 check 写法）——
         这类最容易被漏掉，正是本检查要防的情况。
 
-    扫描只认『工具总数 / 工具数 / 工具个数』这类**总量**措辞，比较的是注册总数（154）。
+    扫描只认『工具总数 / 工具数 / 工具个数』这类**总量**措辞，比较的是注册总数（161）。
     若某条断言说的是**别的量**（如某个分组的规模、某接口返回的 total），
     断言标签就不要用『工具数』这个词，否则会被本检查误判——用『规模 / 条数 / 项数』描述。
     """

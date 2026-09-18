@@ -66,6 +66,10 @@ TOOLSETS = {
     "serial": {
         "serial_list_ports", "serial_monitor_start", "serial_monitor_status",
         "serial_monitor_stop", "serial_read", "serial_write", "serial_expect",
+        # Modbus 主站（批次44）：规范功能码 + 裸帧/旁听。放在串口组里，
+        # 因为「这次调串口」的场景里日志与 Modbus 往往同时要用。
+        "modbus_read", "modbus_write", "modbus_raw", "modbus_decode",
+        "modbus_scan", "modbus_sniff", "modbus_session",
     },
     "advanced": {
         "clear_faults", "fault_report", "wait_fault", "dwt", "profile_function",
@@ -124,7 +128,7 @@ GROUP_NOTES = {
     "mem": "内存进阶：批量读、搜索、填充、快照对比、结构体/局部变量/寄存器",
     "symbol": "符号与反汇编：查符号、行号定位、断点位置、反汇编、map 解析",
     "build": "编译烧录：build/rebuild/clean、下载、工程(.uvprojx)读写、多目标",
-    "serial": "串口：列端口、启停监视、读日志、写命令、等应答",
+    "serial": "串口：列端口、启停监视、读日志、写命令、等应答、Modbus 主站（RTU/ASCII + 裸帧旁听）",
     "advanced": "进阶：异常现场、watch、数据断点、SVD 外设、批量脚本、DWT",
     "toolchain": "非 MDK 构建：gcc/make/cmake 工具链探测、编译、ELF 分析",
     "target": "目标档案：RISC-V/ESP32 等目标型号、调试配置推断",

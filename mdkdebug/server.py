@@ -49,6 +49,7 @@ from . import workspace as _workspace
 from . import rtos as _rtos
 from . import toolbox as _toolbox
 from . import traceproto as _traceproto
+from . import modbus as _modbus
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -6461,6 +6462,529 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
+    # ---------------- Modbus 串口支持（规范 RTU/ASCII + 非规范裸帧，批次44） ----------------
+    # 用户反馈：「在添加串口规范modbus支持与不规范modbus支持」。
+    # 串口上跑的除了日志还有 Modbus：serialmon 按行切分日志，二进制帧接不了
+    # （\x00 被当字符、无换行、多从站应答混在一起）。这里补协议层，
+    # 端口复用 serialmon 的 HostSerial，保证两个功能不会各自定义一套 Windows 串口代码。
+    def _modbus_merge(req, res, keep_frames=False):
+        """把请求摘要与 transact 结果合成工具返回值（统一字段顺序，便于人读）。"""
+        out = {"ok": bool(res.get("ok")), "request": req.get("summary"),
+               "request_hex": res.get("request_hex"),
+               "slave": req.get("slave"), "func": req.get("func"),
+               "func_name": req.get("func_name"), "mode": req.get("mode"),
+               "port": res.get("port"), "elapsed_ms": res.get("elapsed_ms"),
+               "response_hex": res.get("response_hex"),
+               "sent_bytes": res.get("sent_bytes")}
+        for k in ("error", "error_code", "hint", "no_response", "response",
+                  "response_parsed", "parsed_ok", "parse_error", "frame_count",
+                  "discarded_before_tx", "multi_frame_note", "silence_terminated",
+                  "inter_frame_gap_ms"):
+            if k in res:
+                out[k] = res[k]
+        if keep_frames or (res.get("frame_count") or 0) > 1:
+            out["frames"] = res.get("frames")
+        if req.get("is_write"):
+            out["is_write"] = True
+        return {k: v for k, v in out.items() if v is not None}
+
+    async def _modbus_ready(port, baud, databits, parity, stopbits, mode, timeout_ms,
+                            serial_format=""):
+        """公共前置：按参数打开/复用 Modbus 会话。返回 (session, err)。"""
+        try:
+            r = _modbus.ensure(port=port, baud=baud, databits=databits, parity=parity,
+                               stopbits=stopbits, mode=mode,
+                               timeout_s=max(0.02, float(timeout_ms or 1000) / 1000.0),
+                               serial_format=serial_format)
+        except ValueError as e:
+            return None, {"ok": False, "error": str(e), "error_code": "invalid-argument"}
+        except Exception as e:  # noqa: BLE001
+            return None, {"ok": False, "error": str(e)}
+        if not r.get("ok"):
+            return None, r
+        return r["session"], None
+
+    async def _modbus_readback(sess, slave, addr, count, kind, timeout_s):
+        """写后回读：按功能码取「读」的对应物（线圈→01，寄存器→03）。"""
+        f = 0x01 if kind == "coil" else 0x03
+        try:
+            req = _modbus.make_request(sess.mode, slave, f, addr=addr, count=count)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        res = sess.transact(req["request"], timeout_s=timeout_s,
+                            expected_len=req["expected_len"])
+        out = {"request": req["summary"], "response_hex": res.get("response_hex")}
+        if not res.get("ok"):
+            out.update(ok=False, error=res.get("error"), error_code=res.get("error_code"))
+            return out
+        dec = (res.get("response") or {})
+        if kind == "coil":
+            out["read_back"] = dec.get("bits", [])[:count]
+        else:
+            out["read_back"] = dec.get("registers", [])[:count]
+        out["ok"] = True
+        return out
+
+    @server.tool(
+        name="modbus_read",
+        title="Modbus 读（规范功能码 01/02/03/04）",
+        description=(
+            "按 Modbus 规范读从站：**01 读线圈 / 02 读离散输入 / 03 读保持寄存器 / 04 读输入寄存器**，"
+            "RTU(CRC16) 与 ASCII(LRC) 两种模式都支持。返回解码后的值（bits / registers + 有符号视图）"
+            "与**原始收发帧**（request_hex / response_hex），便于核对时序与波形。"
+            "从站返回异常帧时不会假装成功：is_exception + 异常码会译成中文原因（如 0x02 地址越界）。"
+            "串口参数：port（如 \"COM9\"）+ baud（Modbus 常见 9600/19200）+ serial_format 简写"
+            "（\"8N1\"/\"8E1\"/\"8O1\"/\"8N2\"，给了它就不用单独填 databits/parity/stopbits）。"
+            "**重要：首次调用必须给 port** 才会开端口；之后同一会话可省略 port/baud 直接复用。"
+            "端口是独占资源：若 serial_monitor_start 正监听同一个口，本工具会明确报错并让你先 serial_monitor_stop"
+            "（不抢口——抢来的「成功」会收到错数据）。"
+            "超时且一个字节都没收到 → error_code=modbus-timeout-no-response（查接线/波特率/从站号）；"
+            "收到了但 CRC 不过 → modbus-bad-crc（查串口参数/串扰）——这两类是不同的问题，不要混着猜。"
+            "典型用法：modbus_read(slave=1, func=3, addr=0, count=10, port=\"COM9\", baud=9600, serial_format=\"8E1\")。"
+        ),
+    )
+    async def modbus_read(slave: int = 1, func: int = 3, addr: int = 0, count: int = 1,
+                          port: str = "", baud: int = 9600, serial_format: str = "",
+                          databits: int = 8, parity: str = "none", stopbits: float = 1,
+                          mode: str = "rtu", timeout_ms: int = 1000,
+                          include_frames: bool = False) -> str:
+        try:
+            sess, err = await _modbus_ready(port, baud, databits, parity, stopbits,
+                                            mode, timeout_ms, serial_format)
+            if err:
+                return _js(err)
+            req = _modbus.make_request(sess.mode, slave, func, addr=addr, count=count)
+            res = sess.transact(req["request"],
+                                timeout_s=max(0.02, float(timeout_ms) / 1000.0),
+                                expected_len=req["expected_len"])
+            if res.get("ok") and res.get("parsed_ok") is False:
+                # 收到了字节但帧不合法（半帧/CRC 错/不是 Modbus）——不当成功
+                res["ok"] = False
+                res["error"] = res.get("parse_error")
+                res["error_code"] = res.get("parse_error_code") or "modbus-bad-frame"
+            out = _modbus_merge(req, res, keep_frames=include_frames)
+            dec = res.get("response") or {}
+            if isinstance(dec, dict) and dec.get("kind") == "registers":
+                out["values"] = dec.get("registers")
+                out["values_hex"] = dec.get("registers_hex")
+                out["signed_values"] = dec.get("signed")
+            elif isinstance(dec, dict) and dec.get("kind") == "bits":
+                out["bits"] = dec.get("bits")
+                out["true_count"] = dec.get("true_count")
+            _parsed = res.get("response_parsed") or {}
+            if _parsed.get("is_exception"):
+                out["ok"] = False
+                out["is_exception"] = True
+                out["exception_code"] = _parsed.get("exception_code")
+                out["exception_text"] = _parsed.get("exception_text")
+                out["error"] = _parsed.get("error")
+                out["error_code"] = "modbus-exception"
+            if out.get("ok"):
+                out["hint"] = ("值可能是 32 位量：Modbus 只有 16 位寄存器，双字常见「高字在前」"
+                               "或「低字在前」两种拼法，需要时把两个寄存器按设备手册拼一下")
+            return _js(out)
+        except ValueError as e:
+            return _js({"ok": False, "error": str(e), "error_code": "invalid-argument"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="modbus_write",
+        title="Modbus 写（规范功能码 05/06/0F/10）",
+        description=(
+            "按 Modbus 规范写从站：**05 写单个线圈 / 06 写单个保持寄存器 / 0F 写多个线圈 / 10 写多个保持寄存器**。"
+            "单点用 value（线圈可写 true/false/1/0/on/off；寄存器写 0~65535），多点用 values"
+            "（逗号分隔字符串或数组，如 \"1,2,3\" / [0x1234, 0x5678]）。"
+            "verify=true 时**写后自动回读校验**（线圈回读用 01、寄存器回读用 03），把「写进去了没有」"
+            "一次做完——很多从站会静默丢弃越界写入，只看回显（05/06 的应答只是原样回显）会误判成功。"
+            "这是**会改目标设备状态**的操作：写寄存器/线圈可能改变输出、参数甚至保护阈值，"
+            "调用前请确认对象与取值。串口参数与 modbus_read 相同（首次必须给 port）。"
+            "返回含 request_hex / response_hex 与 verify 子结果；从站异常帧会译成中文原因。"
+        ),
+    )
+    async def modbus_write(slave: int = 1, func: int = 6, addr: int = 0,
+                           value: str = "", values: str = "", port: str = "",
+                           baud: int = 9600, serial_format: str = "",
+                           databits: int = 8, parity: str = "none", stopbits: float = 1,
+                           mode: str = "rtu", timeout_ms: int = 1000,
+                           verify: bool = False) -> str:
+        try:
+            sess, err = await _modbus_ready(port, baud, databits, parity, stopbits,
+                                            mode, timeout_ms, serial_format)
+            if err:
+                return _js(err)
+            f = int(func)
+            kw = {"addr": addr}
+            if f in (0x05, 0x06):
+                if str(value or "").strip() == "":
+                    return _js({"ok": False, "error_code": "invalid-argument",
+                                "error": "func 0x%02X 需要 value（单点写）；多点写请用 func 0F/10 + values" % f})
+                kw["value"] = value
+            elif f in (0x0F, 0x10):
+                if str(values or "").strip() == "":
+                    return _js({"ok": False, "error_code": "invalid-argument",
+                                "error": "func 0x%02X 需要 values（多点写）；单点写请用 func 05/06 + value" % f})
+                kw["values"] = values
+            else:
+                return _js({"ok": False, "error_code": "invalid-argument",
+                            "error": "modbus_write 只支持功能码 05/06/0F/10，收到 0x%02X" % f,
+                            "hint": "掩码写(16)/读写合一(17) 等不常用功能码可走 modbus_raw 下发裸帧"})
+            req = _modbus.make_request(sess.mode, slave, f, **kw)
+            res = sess.transact(req["request"],
+                                timeout_s=max(0.02, float(timeout_ms) / 1000.0),
+                                expected_len=req["expected_len"])
+            if res.get("ok") and res.get("parsed_ok") is False:
+                res["ok"] = False
+                res["error"] = res.get("parse_error")
+                res["error_code"] = res.get("parse_error_code") or "modbus-bad-frame"
+            out = _modbus_merge(req, res)
+            if isinstance(res.get("response"), dict):
+                out["write_echo"] = res["response"]
+            _parsed = res.get("response_parsed") or {}
+            if _parsed.get("is_exception"):
+                out["ok"] = False
+                out["is_exception"] = True
+                out["exception_code"] = _parsed.get("exception_code")
+                out["exception_text"] = _parsed.get("exception_text")
+                out["error"] = _parsed.get("error")
+                out["error_code"] = "modbus-exception"
+            if verify and out.get("ok"):
+                if f in (0x05, 0x0F):
+                    out["verify"] = await _modbus_readback(
+                        sess, slave, addr, 1 if f == 0x05 else len(_modbus.parse_values(values)),
+                        "coil", max(0.02, float(timeout_ms) / 1000.0))
+                else:
+                    out["verify"] = await _modbus_readback(
+                        sess, slave, addr, 1 if f == 0x06 else len(_modbus.parse_values(values)),
+                        "reg", max(0.02, float(timeout_ms) / 1000.0))
+                if out["verify"].get("ok"):
+                    out["verify_note"] = ("回读成功：写后读一致由设备决定（有些从站写入是异步生效的，"
+                                          "不一致时先看设备手册的写入时序）")
+            elif verify:
+                out["verify_note"] = "写请求本身没成功（见 error），跳过回读"
+            return _js(out)
+        except ValueError as e:
+            return _js({"ok": False, "error": str(e), "error_code": "invalid-argument"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="modbus_raw",
+        title="Modbus 裸帧收发（非规范/私有协议）",
+        description=(
+            "**不按规范**发送任意字节并回收响应，用于厂商私有协议、不规范实现、以及排查「到底谁在说话」。"
+            "req 默认按 hex 解析（\"01 03 00 00 00 01 84 0A\"，也接受连写/0x 前缀）；as_text=true 时按文本下发"
+            "（ASCII 帧、私有 ASCII 协议）。auto_crc=true 时把 req 当**不含校验的帧体**，自动补 CRC16(RTU)"
+            "或 LRC(ASCII)——手算校验最容易错，这个开关就是为它准备的。"
+            "响应不硬凑成一串 hex：按**帧间静默**自动切帧，每段给出 hex/ascii 以及「能不能按 Modbus 解」"
+            "（parsed.crc_ok / func / exception_code），解不了的部分标 decoded=false 并保留原文——"
+            "**判断不了就说不判断**，不猜一个像样的结论。"
+            "max_frames 控制最多收几段（总线多从站应答时会收多段）；expect_len>0 表示「收够这么多字节就返回」"
+            "（知道应答长度时用它，比等满超时快得多）。"
+            "会写总线的操作，请确认帧内容再发。串口参数与 modbus_read 相同（首次必须给 port）。"
+        ),
+    )
+    async def modbus_raw(req: str = "", as_text: bool = False, auto_crc: bool = False,
+                         expect_len: int = 0, max_frames: int = 4,
+                         port: str = "", baud: int = 9600, serial_format: str = "",
+                         databits: int = 8, parity: str = "none", stopbits: float = 1,
+                         mode: str = "rtu", timeout_ms: int = 500) -> str:
+        try:
+            if not str(req or "").strip():
+                return _js({"ok": False, "error_code": "invalid-argument",
+                            "error": "req 为空：要发什么？给 hex（\"01 03 00 00 00 01 84 0A\"）"
+                                     "或用 as_text=true 给文本"})
+            sess, err = await _modbus_ready(port, baud, databits, parity, stopbits,
+                                            mode, timeout_ms, serial_format)
+            if err:
+                return _js(err)
+            try:
+                data = str(req).encode("utf-8") if as_text else _modbus.parse_hex(req)
+            except ValueError as e:
+                return _js({"ok": False, "error": str(e), "error_code": "invalid-argument"})
+            crc_note = None
+            if auto_crc:
+                if sess.mode == "ascii":
+                    body = data if data[:1] == b":" else data
+                    core = _modbus.strip_ascii_frame(body)
+                    raw = bytes.fromhex(core.decode("ascii"))
+                    data = b":" + (raw + bytes([_modbus.lrc(raw)])).hex().upper().encode() + b"\r\n"
+                    crc_note = "已按 ASCII 追加 LRC"
+                else:
+                    c = _modbus.crc16(data)
+                    data = data + bytes([c & 0xFF, (c >> 8) & 0xFF])
+                    crc_note = "已按 RTU 追加 CRC16=0x%04X（低字节在前）" % c
+            res = sess.transact(data, timeout_s=max(0.02, float(timeout_ms) / 1000.0),
+                                expected_len=int(expect_len) or None,
+                                max_frames=max(1, int(max_frames or 1)))
+            out = {"ok": bool(res.get("ok")), "port": res.get("port"), "mode": sess.mode,
+                   "request_hex": res.get("request_hex"), "sent_bytes": res.get("sent_bytes"),
+                   "elapsed_ms": res.get("elapsed_ms"), "frame_count": res.get("frame_count"),
+                   "parsed_ok": res.get("parsed_ok"),
+                   "frames": res.get("frames"),
+                   "silence_terminated": res.get("silence_terminated"),
+                   "inter_frame_gap_ms": res.get("inter_frame_gap_ms"),
+                   "discarded_before_tx": res.get("discarded_before_tx")}
+            for k in ("error", "error_code", "hint"):
+                if k in res:
+                    out[k] = res[k]
+            if crc_note:
+                out["crc_note"] = crc_note
+            frames = res.get("frames") or []
+            if frames:
+                first = frames[0].get("parsed") or {}
+                out["first_frame_modbus_like"] = bool(first.get("ok"))
+                if first.get("ok"):
+                    out["first_frame"] = {k: first.get(k) for k in
+                                          ("slave", "func", "func_name", "is_exception",
+                                           "exception_code", "exception_text", "direction",
+                                           "direction_note", "decode")
+                                          if first.get(k) is not None}
+                else:
+                    out["first_frame_note"] = ("首段帧不符合 Modbus 结构（%s）："
+                                               "原始内容见 frames[0].hex，本工具不替它编解释"
+                                               % (first.get("error") or "校验/长度不符"))
+            elif not out.get("ok"):
+                out["note"] = ("没有收到任何字节：确认波特率/接线，或用 modbus_sniff 旁听总线看"
+                               "设备到底有没有在说话")
+            return _js(out)
+        except ValueError as e:
+            return _js({"ok": False, "error": str(e), "error_code": "invalid-argument"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="modbus_decode",
+        title="离线解析 Modbus 报文（不占端口）",
+        description=(
+            "把一段报文**离线**解析成结构：从站号、功能码（含中文含义）、载荷（线圈位/寄存器值/写回显/"
+            "异常码原因）、CRC16 或 LRC 校验是否通过。"
+            "frame 接受 hex 串（\"01 03 02 12 34 B5 33\"）或 ASCII 帧（\":0103021234B4\\r\\n\"，自动识别）；"
+            "支持一次给多行（用换行分隔）批量解析，适合把示波器/串口助手抓下来的报文粘进来。"
+            "mode=auto 自动判别，也可强制 rtu/ascii。"
+            "**自动判方向**：先按应答解，不符再按请求解（旁听/抓包得到的帧多半是主站请求），"
+            "结果里给 direction=response/request；05/06/08/16 这类请求与应答同形的功能码"
+            "如实标 direction=ambiguous，不硬指一个方向。"
+            "**不打开任何串口、不发任何字节**，是排查时最安全的工具：先离线看清帧结构，再去动总线。"
+            "解析失败会明确说是哪一类（长度不足 / CRC 不过 / LRC 不过 / hex 非法），"
+            "不会给出一个「看着像」的结论。"
+        ),
+    )
+    async def modbus_decode(frame: str = "", mode: str = "auto") -> str:
+        import re
+        try:
+            txt = str(frame or "").strip()
+            if not txt:
+                return _js({"ok": False, "error_code": "invalid-argument",
+                            "error": "frame 为空：给 hex 或 ASCII 帧内容",
+                            "example_args": {"frame": "01 03 02 12 34 B5 33"}})
+            lines = [ln for ln in re.split(r"[\r\n]+", txt) if ln.strip()] if "\n" in txt or "\r" in txt else [txt]
+            outs = []
+            for ln in lines:
+                s = ln.strip()
+                try:
+                    if s.startswith(":"):
+                        data = s.encode("ascii", "replace")
+                    else:
+                        data = _modbus.parse_hex(s)
+                except ValueError as e:
+                    outs.append({"input": s, "ok": False, "error": str(e),
+                                 "error_code": "modbus-bad-frame"})
+                    continue
+                p = _modbus.parse_frame(data, mode)
+                outs.append({"input": s, **p})
+            n_ok = sum(1 for o in outs if o.get("ok"))
+            n_bad = sum(1 for o in outs if not o.get("ok") and not o.get("is_exception"))
+            n_exc = sum(1 for o in outs if o.get("is_exception"))
+            out = {"ok": bool(outs) and n_bad == 0, "count": len(outs), "decoded": n_ok,
+                   "exception_frames": n_exc, "bad_frames": n_bad, "frames": outs}
+            if len(outs) == 1:
+                out.update({k: v for k, v in outs[0].items() if k != "frames"})
+            if n_exc:
+                out["hint"] = ("异常帧是**从站的正常应答**（它收到了、但拒绝了请求）："
+                               "按 exception_code 对号入座改地址/数量/取值，别当通信故障查")
+            elif n_bad:
+                out["hint"] = ("解析不了的帧：先核对串口参数（波特率/校验位/停止位）与帧是否被截断，"
+                               "再考虑它根本不是 Modbus——非规范协议请用 modbus_sniff 看原始帧")
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="modbus_scan",
+        title="扫描总线上在线的 Modbus 从站",
+        description=(
+            "对一段从站号范围逐个探测（默认发 03 读 1 个保持寄存器），把**有应答的从站**列出来："
+            "从站号、应答帧、是正常数据还是异常码。调试新设备最缺的就是「从站号到底是几、波特率对不对」——"
+            "它一次把这件事做完。"
+            "slaves 支持 \"1-16\" / \"1,3,5\" / \"1-8,20\"；默认只扫 1~16（Modbus 合法范围是 1~247）。"
+            "**范围超过 max_slaves（默认 64）会直接报错让你收窄**，而不是静默截断——"
+            "少扫了一批却报「扫描完成」比报错难查得多。"
+            "timeout_ms 是**每个从站**的等待时间（默认 120ms）：全范围扫描很慢，范围越大越要调小。"
+            "波特率/校验位不对时通常一个从站都扫不到，属正常结果：先确认 8E1/8N1 与速率。"
+            "本工具会往总线上发请求（会影响总线占用），但不改任何设备状态。"
+        ),
+    )
+    async def modbus_scan(slaves: str = "1-16", func: int = 3, addr: int = 0,
+                          count: int = 1, port: str = "", baud: int = 9600,
+                          serial_format: str = "", databits: int = 8,
+                          parity: str = "none", stopbits: float = 1, mode: str = "rtu",
+                          timeout_ms: int = 120, max_slaves: int = 64) -> str:
+        try:
+            try:
+                ids = _modbus.parse_slave_range(slaves)
+            except ValueError as e:
+                return _js({"ok": False, "error": str(e), "error_code": "invalid-argument"})
+            if len(ids) > int(max_slaves or 64):
+                return _js({"ok": False, "error_code": "invalid-argument",
+                            "error": "本次要扫 %d 个从站，超过上限 max_slaves=%d"
+                                     % (len(ids), int(max_slaves or 64)),
+                            "hint": "收窄 slaves（如 \"1-16\"）或把 max_slaves 调大；"
+                                    "每个从站要等 timeout_ms=%d ms，全范围 1-247 约需 %.1f 秒"
+                                    % (timeout_ms, 247 * float(timeout_ms) / 1000.0)})
+            sess, err = await _modbus_ready(port, baud, databits, parity, stopbits,
+                                            mode, timeout_ms * 2, serial_format)
+            if err:
+                return _js(err)
+            to = max(0.02, float(timeout_ms) / 1000.0)
+            found, silent, bad = [], 0, []
+            for sid in ids:
+                try:
+                    req = _modbus.make_request(sess.mode, sid, func, addr=addr, count=count)
+                except ValueError as e:
+                    return _js({"ok": False, "error": str(e), "error_code": "invalid-argument"})
+                res = sess.transact(req["request"], timeout_s=to,
+                                    expected_len=req["expected_len"])
+                if not res.get("ok"):
+                    silent += 1
+                    continue
+                p = res.get("response_parsed") or {}
+                if not p.get("ok"):
+                    bad.append({"slave": sid, "response_hex": res.get("response_hex"),
+                                "note": "有应答但不符合 Modbus 结构：%s"
+                                        % (p.get("error") or "校验/长度不符")})
+                    continue
+                ent = {"slave": sid, "response_hex": res.get("response_hex"),
+                       "func": p.get("func"), "func_name": p.get("func_name"),
+                       "elapsed_ms": res.get("elapsed_ms")}
+                if p.get("is_exception"):
+                    ent["is_exception"] = True
+                    ent["exception_code"] = p.get("exception_code")
+                    ent["exception_text"] = p.get("exception_text")
+                    ent["note"] = "从站在线，但拒绝了这个请求（换 addr/count 或功能码再试）"
+                else:
+                    ent["decode"] = p.get("decode")
+                found.append(ent)
+            out = {"ok": True, "port": sess.port, "mode": sess.mode,
+                   "scanned": len(ids), "slave_range": [ids[0], ids[-1]],
+                   "func": func, "addr": addr, "count": count,
+                   "timeout_ms_per_slave": timeout_ms,
+                   "found_count": len(found), "found": found,
+                   "no_response_count": silent, "malformed_count": len(bad)}
+            if bad:
+                out["malformed"] = bad
+            if found:
+                out["hint"] = ("在线从站数 %d；**异常码不等于不在线**——它说明从站收到了请求但拒绝了参数。"
+                               "接下来用 modbus_read 按 addr/count 细读" % len(found))
+            else:
+                out["hint"] = ("一个从站都没应答：依次核对 ①波特率/校验位（Modbus 常用 9600 8E1 或 19200 8N1）"
+                               "②A/B 线是否交叉、GND 是否共地、终端电阻 ③从站号是否真的在这个范围里"
+                               "（不确定就放大 slaves，但注意耗时）④总线是否有别的程序占着")
+            return _js(out)
+        except ValueError as e:
+            return _js({"ok": False, "error": str(e), "error_code": "invalid-argument"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="modbus_sniff",
+        title="旁听 Modbus/串口总线（被动收帧，不发一个字节）",
+        description=(
+            "在指定时长内**只收不发**，把总线上的字节按帧间静默切成帧后列出（hex / ascii / 能否按 Modbus 解）。"
+            "适用场景：①别人的主站在问什么、从站回了什么（协议逆向）②私有/非规范协议长什么样"
+            "③「到底有没有数据在总线跑」这种接线确认。"
+            "duration_ms 是收多久（默认 3000ms）；max_frames 上限（默认 200，满了提前返回并标 max_frames_reached）。"
+            "gap_ms 可手工指定切帧间隔（默认按波特率算 t3.5，>19200 波特固定 1.75ms）。"
+            "总线上没有主站请求时**一帧都收不到是正常结果**，不是故障——这时该做的是催主站发，"
+            "或用 modbus_scan 主动探测。本工具不发送任何字节，因此不会打扰总线。"
+        ),
+    )
+    async def modbus_sniff(duration_ms: int = 3000, max_frames: int = 200,
+                           gap_ms: float = 0, port: str = "", baud: int = 9600,
+                           serial_format: str = "", databits: int = 8,
+                           parity: str = "none", stopbits: float = 1,
+                           mode: str = "rtu") -> str:
+        try:
+            dur = max(0.05, min(float(duration_ms or 3000) / 1000.0, 120.0))
+            sess, err = await _modbus_ready(port, baud, databits, parity, stopbits,
+                                            mode, duration_ms, serial_format)
+            if err:
+                return _js(err)
+            res = sess.sniff(duration_s=dur, max_frames=max(1, int(max_frames or 200)),
+                             gap_s=(float(gap_ms) / 1000.0) if gap_ms else None)
+            if not res.get("ok"):
+                return _js(res)
+            res["ok"] = True
+            res["max_frames_reached"] = bool(res.get("frame_count") >= int(max_frames or 200))
+            if res["frame_count"] == 0:
+                res["hint"] = ("这段时间总线上一帧都没有：确认波特率/接线，并确认确实有人在发请求"
+                               "（从站不会自己开口，要等主站问）")
+            else:
+                modbus_like = sum(1 for f in res["frames"]
+                                  if (f.get("parsed") or {}).get("ok"))
+                res["modbus_like_frames"] = modbus_like
+                if modbus_like < res["frame_count"]:
+                    res["hint"] = ("%d/%d 段能按 Modbus 解——其余段是私有/非规范帧，"
+                                   "原始内容在 frames[].hex，本工具只给事实不给解释"
+                                   % (modbus_like, res["frame_count"]))
+            return _js(res)
+        except ValueError as e:
+            return _js({"ok": False, "error": str(e), "error_code": "invalid-argument"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="modbus_session",
+        title="Modbus 会话状态 / 打开 / 关闭端口",
+        description=(
+            "查看或管理 Modbus 会话占用的串口：action=status（当前口、波特率、串口格式、RTU/ASCII、"
+            "已持有多久、收发了多少帧/字节、帧间间隔）；action=close（**释放端口**，让 Keil 串口窗口、"
+            "其他串口工具或 serial_monitor_start 能用）；action=open（按 port/baud 参数预先开好口，"
+            "便于确认接线是否通）。"
+            "为什么要显式提供：串口是独占资源，Modbus 会话会一直持有直到显式关闭或空闲超时"
+            "（idle_release_s，默认 900 秒；进程退出也会自动释放）。"
+            "调完 Modbus 想接着看日志/用串口助手，先 action=close，不要让它一直占着。"
+            "会话未打开时 status 也返回 ok=true，不报错。"
+        ),
+    )
+    async def modbus_session(action: str = "status", port: str = "", baud: int = 9600,
+                             serial_format: str = "", databits: int = 8,
+                             parity: str = "none", stopbits: float = 1,
+                             mode: str = "rtu", timeout_ms: int = 1000) -> str:
+        try:
+            act = str(action or "status").strip().lower()
+            if act in ("status", "state", "show"):
+                st = _modbus.session_status()
+                st["action"] = "status"
+                return _js(st)
+            if act in ("close", "release", "stop"):
+                return _js(_modbus.close_session())
+            if act in ("open", "start"):
+                sess, err = await _modbus_ready(port, baud, databits, parity, stopbits,
+                                                mode, timeout_ms, serial_format)
+                if err:
+                    return _js(err)
+                # 直接展开会话状态：塞进 status 键会被外层信封的同名键盖掉（只剩「开了」）
+                out = {"ok": True, "action": "open", "note": "会话已就绪，后续同口同参数可省略 port"}
+                out.update(sess.status())
+                return _js(out)
+            return _js({"ok": False, "error_code": "invalid-argument",
+                        "error": "action 只支持 status / open / close，收到: %s" % action})
+        except ValueError as e:
+            return _js({"ok": False, "error": str(e), "error_code": "invalid-argument"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
     @server.tool(
         name="mdk_guide",
         title="环境自检与调试工作流引导",
@@ -7240,7 +7764,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "其余组用到时现装——这样上下文里只放当前真正用得上的工具描述，"
             "工具多的时候这是省上下文的主要手段。"
             "action=status 看当前暴露了哪些组、各组多少个、还差什么；"
-            "action=load 把 toolsets 指定的组装回来（例：toolsets=mem,trace，toolsets=all 一次全装 154 个）；"
+            "action=load 把 toolsets 指定的组装回来（例：toolsets=mem,trace，toolsets=all 一次全装 161 个）；"
             "action=unload 把某组收起来（例：toolsets=trace）。"
             "可用组与含义：core 调试核心/引导、mem 内存进阶、symbol 符号反汇编、"
             "build 编译烧录、serial 串口、advanced 异常/watch/SVD、"

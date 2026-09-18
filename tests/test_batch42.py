@@ -76,23 +76,24 @@ def group_ab():
         check("A3 默认不含未装载组的 %s" % t, t not in ns, "")
 
     st = call_sync(srv, "toolset", {"action": "status"})
-    check("A4 status 自述一致（core 已装载 / 收起 117 / 注册 154 / 来源 default）",
+    check("A4 status 自述一致（core 已装载 / 收起 124 / 注册 161 / 来源 default）",
           st.get("ok") and st.get("loaded_groups") == ["core"]
-          and st.get("hidden") == 117 and st.get("total_registered") == 154
+          and st.get("hidden") == 124 and st.get("total_registered") == 161
           and st.get("source") == "default", {k: st.get(k) for k in
                                               ("loaded_groups", "hidden", "total_registered", "source")})
     g = st.get("groups") or {}
     check("A5 status 列全 11 个组且各组规模正确",
           len(g) == 11 and g.get("core", {}).get("size") == 33
           and g.get("trace", {}).get("size") == 20 and g.get("ocd", {}).get("size") == 17
-          and g.get("rtos", {}).get("size") == 3, {k: v.get("size") for k, v in g.items()})
+          and g.get("rtos", {}).get("size") == 3
+          and g.get("serial", {}).get("size") == 14, {k: v.get("size") for k, v in g.items()})
     check("A6 status 给出隐藏工具清单与装回来的办法",
-          len(st.get("hidden_tools") or []) == 117 and "toolset" in (st.get("hint") or ""), "")
+          len(st.get("hidden_tools") or []) == 124 and "toolset" in (st.get("hint") or ""), "")
 
     cap = call_sync(srv, "capabilities", {})
     su = cap.get("tool_surface") or {}
     check("A7 capabilities 如实报注册总数 / 收起数 / 未装载组",
-          su.get("registered_total") == 154 and su.get("hidden") == 117
+          su.get("registered_total") == 161 and su.get("hidden") == 124
           and su.get("loaded_groups") == ["core"]
           and "trace" in (su.get("not_loaded_groups") or []), su)
     lt = call_sync(srv, "list_tools", {})
@@ -120,7 +121,7 @@ def group_ab():
           and len(r3.get("unloaded") or []) == 13, r3)
 
     r4 = call_sync(srv, "toolset", {"action": "load", "toolsets": "all"})
-    check("B6 toolsets=all 一次全装到 154", r4.get("ok") and r4.get("exposed") == 154, r4)
+    check("B6 toolsets=all 一次全装到 161", r4.get("ok") and r4.get("exposed") == 161, r4)
     srv_all = create_server(port=PORT_B, toolsets="all")
     check("B7 装卸若干轮后，工具顺序仍与全量面完全一致（不把工具甩到队尾）",
           order(srv) == order(srv_all), "本地 %d / 全量 %d" % (len(order(srv)), len(order(srv_all))))
@@ -162,10 +163,10 @@ def _run(code, env):
 def group_c():
     print("C. 显式配置")
     base = {k: v for k, v in os.environ.items() if k != "MDKDEBUG_TOOLSETS"}
-    for spec, want, label in (("all", "154", "MDKDEBUG_TOOLSETS=all 仍是全开"),
-                              ("serial", "11", "=serial 只留 7 串口 + 4 常驻"),
+    for spec, want, label in (("all", "161", "MDKDEBUG_TOOLSETS=all 仍是全开"),
+                              ("serial", "18", "=serial 只留 14 串口 + 4 常驻"),
                               ("core,mem", "47", "=core,mem 组合生效"),
-                              ("bogus", "154", "=bogus 组名认不出 → 不裁剪（宁可少裁不错杀）")):
+                              ("bogus", "161", "=bogus 组名认不出 → 不裁剪（宁可少裁不错杀）")):
         got, _ = _run(CODE, dict(base, MDKDEBUG_TOOLSETS=spec))
         check("C1 %s（期望 %s）" % (label, want), got.endswith(want), got)
     got, allout = _run(CODE, base)
@@ -173,8 +174,8 @@ def group_c():
     got, allout = _run(CODE, dict(base, MDKDEBUG_TOOLSETS="bogus"))
     check("C3 组名认不出时有告警（不静默）", "未知组名" in allout, allout[-300:])
     got, _ = _run(CODE_ARG, dict(base, MDKDEBUG_TOOLSETS="all"))
-    check("C4 create_server(toolsets=) 参数优先于环境变量（all + serial → 11）",
-          got.endswith("11"), got)
+    check("C4 create_server(toolsets=) 参数优先于环境变量（all + serial → 18）",
+          got.endswith("18"), got)
     got, _ = _run(CODE_SRC, dict(base, MDKDEBUG_TOOLSETS="all"))
     check("C5 显式参数时来源如实报 param（不误报 default）", "SRC param" in got, got)
 
@@ -202,7 +203,7 @@ def group_d(srv_all):
           "toolset" in AN.MUTATING and "toolset" not in AN.READONLY
           and "toolset" not in AN.DESTRUCTIVE, "")
     bad = AN.check_surface(full)
-    check("D8 annotate.check_surface 在 154 个工具上无问题", not bad, bad)
+    check("D8 annotate.check_surface 在 161 个工具上无问题", not bad, bad)
 
 # ======================================================================
 # E. 失败归类
