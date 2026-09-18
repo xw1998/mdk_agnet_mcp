@@ -19,13 +19,21 @@
  *   MDK_TRACE_BACKEND_ITM   Cortex-M SWO pin, needs an ITM capable probe
  *   MDK_TRACE_BACKEND_RTT   any core, host pokes RAM through the probe
  *   MDK_TRACE_BACKEND_UART  plain serial, host reads the COM port
+ *   MDK_TRACE_BACKEND_BUFF  RAM ring buffer only, host dumps it afterwards
  *   MDK_TRACE_BACKEND_NONE  compile but emit nowhere (useful for sizing)
+ *
+ * ITM / RTT / UART are *stream* backends: the event leaves the chip as it
+ * happens and the host has to keep up. BUFF is the *buff* backend: nothing
+ * leaves the chip, the core pays a few stores per event and the run keeps its
+ * real timing, then `trace_buff_dump` reads the whole window out. Pick stream
+ * to watch a live system, buff to find out what actually happened at speed.
  *
  * A generated mdk_trace_config.h only defines the one backend it selected, so
  * the ITM fallback must not fire when any backend was already chosen.
  */
 #if !defined(MDK_TRACE_BACKEND_ITM) && !defined(MDK_TRACE_BACKEND_RTT) && \
-    !defined(MDK_TRACE_BACKEND_UART) && !defined(MDK_TRACE_BACKEND_NONE)
+    !defined(MDK_TRACE_BACKEND_UART) && !defined(MDK_TRACE_BACKEND_BUFF) && \
+    !defined(MDK_TRACE_BACKEND_NONE)
 #  define MDK_TRACE_BACKEND_ITM 1
 #endif
 #ifndef MDK_TRACE_BACKEND_ITM
@@ -37,8 +45,51 @@
 #ifndef MDK_TRACE_BACKEND_UART
 #  define MDK_TRACE_BACKEND_UART 0
 #endif
+#ifndef MDK_TRACE_BACKEND_BUFF
+#  define MDK_TRACE_BACKEND_BUFF 0
+#endif
 #ifndef MDK_TRACE_BACKEND_NONE
 #  define MDK_TRACE_BACKEND_NONE 0
+#endif
+
+/* ---------------------------------------------------------------- buff mode
+ * Backend BUFF only. The ring lives in .bss and its address is fixed after
+ * linking, which is what lets the host find it from the symbol
+ * `mdk_trace_buff_blob` with no map file digging.
+ *
+ * A record is 12 bytes, so MDK_TRACE_BUFF_RECORDS * 12 is the RAM bill:
+ *   2048 records = 24 KB, at ~1000 events/s that is ~2 s of history.
+ * Size it for the window you need, not for the whole run - when the ring
+ * wraps the oldest records are gone and FLAG_WRAPPED says so.
+ */
+#ifndef MDK_TRACE_BUFF_RECORDS
+#  define MDK_TRACE_BUFF_RECORDS 2048
+#endif
+
+/* dt is stored as "cycles since the previous record" in 32 bits. Shift it
+ * right to widen the representable gap at the cost of resolution:
+ *   shift 0 -> 1 cycle resolution, max gap 2^32 cycles (51 s at 84 MHz)
+ *   shift 6 -> 64 cycle resolution (0.76 us at 84 MHz), max gap 55 min
+ * 0 is the right answer unless your events can be minutes apart. */
+#ifndef MDK_TRACE_BUFF_TS_SHIFT
+#  define MDK_TRACE_BUFF_TS_SHIFT 0
+#endif
+
+/* What mdk_trace_init() does to a buffer that already holds records.
+ *
+ * 0 (default) - keep them. After a watchdog bite or a fault-triggered reset
+ *               the records from *before* the reset are the only evidence
+ *               there is, and a startup path that calls mdk_trace_init()
+ *               again would otherwise erase exactly that. The host sees a
+ *               RESET record and a RESTARTED flag, and marks the hole rather
+ *               than pretending the timeline is continuous.
+ * 1           - clear on every init, i.e. each init starts a fresh history.
+ *               Use it when the buffer should only ever describe the current
+ *               session. Ask the host to clear instead (trace_buff_reset)
+ *               if you only need it occasionally.
+ */
+#ifndef MDK_TRACE_BUFF_CLEAR_ON_INIT
+#  define MDK_TRACE_BUFF_CLEAR_ON_INIT 0
 #endif
 
 /* ITM stimulus port used for frames. Port 0 is what `itm port 0 on` expects;
@@ -100,6 +151,14 @@
  * only produces samples while the target is halted or stepping. */
 #ifndef MDK_TRACE_DWT_PCSAMPLE
 #  define MDK_TRACE_DWT_PCSAMPLE 0
+#endif
+
+/* Capture the exception stack frame when a fault handler calls
+ * MDK_TRACE_FAULT_CAPTURE(). Without it the fault path still records the
+ * class and the fault status register, just not PC/LR/SP. Costs a little
+ * code, no RAM. */
+#ifndef MDK_TRACE_FAULT_FRAME
+#  define MDK_TRACE_FAULT_FRAME 1
 #endif
 
 /* Include the DWT cycle counter as a local timestamp on every event. */

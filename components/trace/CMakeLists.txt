@@ -18,7 +18,7 @@ project(mdk_trace C)
 
 # Every backend by default. Override from the parent project (or from the
 # generated mdk_trace_config.h) if you only need one.
-set(MDK_TRACE_BACKEND "itm" CACHE STRING "itm | rtt | uart | none")
+set(MDK_TRACE_BACKEND "itm" CACHE STRING "itm | rtt | uart | buff | none")
 
 add_library(mdk_trace STATIC
     mdk_trace.c
@@ -41,14 +41,17 @@ elseif(MDK_TRACE_BACKEND STREQUAL "rtt")
     target_compile_definitions(mdk_trace PRIVATE MDK_TRACE_BACKEND_RTT=1)
 elseif(MDK_TRACE_BACKEND STREQUAL "uart")
     target_compile_definitions(mdk_trace PRIVATE MDK_TRACE_BACKEND_UART=1)
+elseif(MDK_TRACE_BACKEND STREQUAL "buff")
+    target_compile_definitions(mdk_trace PRIVATE MDK_TRACE_BACKEND_BUFF=1)
 else()
     target_compile_definitions(mdk_trace PRIVATE MDK_TRACE_BACKEND_NONE=1)
 endif()
 
-# The RTT backend lives in its own translation unit. It compiles to nothing
-# unless MDK_TRACE_BACKEND_RTT is set, so listing it unconditionally costs
-# nothing and keeps the source list obvious to IDEs.
-target_sources(mdk_trace PRIVATE mdk_trace_rtt.c)
+# The RTT and buff backends live in their own translation units. Each compiles
+# to nothing unless its MDK_TRACE_BACKEND_* macro is set, so listing them
+# unconditionally costs nothing and keeps the source list obvious to IDEs.
+# (MDK_TRACE_BUFF_RECORDS * 12 bytes of .bss only appear with the buff backend.)
+target_sources(mdk_trace PRIVATE mdk_trace_rtt.c mdk_trace_buff.c)
 
 # If a generated config exists next to this file, expose it on the include path
 # so __has_include() finds it.

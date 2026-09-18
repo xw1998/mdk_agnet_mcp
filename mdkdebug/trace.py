@@ -1369,7 +1369,10 @@ def list_components() -> dict:
 def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
                      rtt_up: int = 2, rtt_down: int = 1, rtt_buf: int = 1024,
                      coreclk: int = 0, overwrite: bool = False,
-                     swo_baud: int = 2000000, dbgmcu_cr: int = 0xE0042004) -> dict:
+                     swo_baud: int = 2000000, dbgmcu_cr: int = 0xE0042004,
+                     buff_records: int = 2048, buff_ts_shift: int = 0,
+                     buff_clear_on_init: bool = False,
+                     fault_frame: bool = True) -> dict:
     """把插桩组件拷进工程，并生成 mdk_trace_config.h + 构建片段。"""
     if not target_dir:
         return {"ok": False, "error": "target_dir 不能为空"}
@@ -1395,7 +1398,10 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
             except OSError as e:
                 return {"ok": False, "error": "复制 %s 失败：%s" % (rel, e)}
     cfg = _gen_config_h(backend, itm_port, rtt_up, rtt_down, rtt_buf, coreclk,
-                        swo_baud, dbgmcu_cr)
+                        swo_baud, dbgmcu_cr, buff_records=buff_records,
+                        buff_ts_shift=buff_ts_shift,
+                        buff_clear_on_init=buff_clear_on_init,
+                        fault_frame=fault_frame)
     cfg_path = os.path.join(dst, "mdk_trace_config.h")
     if os.path.exists(cfg_path) and not overwrite:
         skipped.append("mdk_trace_config.h")
@@ -1409,21 +1415,37 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
         with open(mk_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(mk)
         copied.append("mdk_trace.mk")
+    b = (backend or "itm").strip().lower()
+    sources = ["mdk_trace.c"]
+    if b == "rtt":
+        sources.append("mdk_trace_rtt.c")
+    if b == "buff":
+        sources.append("mdk_trace_buff.c")
+    nxt = ["把 %s 加入工程编译" % " / ".join(sources),
+           "include mdk_trace.mk（Make）或 add_subdirectory（CMake）",
+           "在初始化处调 mdk_trace_init()；用 MDK_TRACE_SCOPE() 打点",
+           "在 HardFault / MemManage / BusFault / UsageFault handler 的**第一条**语句调 "
+           "MDK_TRACE_FAULT_CAPTURE()（越早越好，栈还可能没被破坏），再进你的死循环；"
+           "看门狗喂狗点、关键状态迁移用 MDK_TRACE_MARK()",
+           "任务 / 线程切换处调 MDK_TRACE_SCHED(from, to)"]
+    if b == "buff":
+        nxt += ["buff 模式：目标跑完或出事后 trace_buff_dump(elf=你的.axf) 一次性读回",
+                "buff 模式不需要 SWO 引脚、不需要主机实时跟读，但缓冲写满会覆盖最旧的"]
+    else:
+        nxt += ["SWO 通路：trace_swo_start + 目标侧 MDK_TRACE_BACKEND_ITM",
+                "RTT 通路：trace_rtt_attach(elf=你的.elf)"]
     return {"ok": True, "target_dir": dst, "copied": copied, "skipped": skipped,
-            "backend": backend, "itm_port": itm_port,
-            "next": ["把 mdk_trace.c / mdk_trace_rtt.c 加入工程编译",
-                     "include mdk_trace.mk（Make）或 add_subdirectory（CMake）",
-                     "在初始化处调 mdk_trace_init()；用 MDK_TRACE_SCOPE() 打点",
-                     "SWO 通路：trace_swo_start + 目标侧 MDK_TRACE_BACKEND_ITM",
-                     "RTT 通路：trace_rtt_attach(elf=你的.elf)"],
+            "backend": b, "itm_port": itm_port, "next": nxt,
             "skip_note": "已存在的文件默认不覆盖（overwrite=true 才覆盖）"}
 
 
 def _gen_config_h(backend: str, itm_port: int, rtt_up: int, rtt_down: int,
                   rtt_buf: int, coreclk: int, swo_baud: int = 2000000,
-                  dbgmcu_cr: int = 0xE0042004) -> str:
+                  dbgmcu_cr: int = 0xE0042004, buff_records: int = 2048,
+                  buff_ts_shift: int = 0, buff_clear_on_init: bool = False,
+                  fault_frame: bool = True) -> str:
     b = (backend or "itm").strip().lower()
-    if b not in ("itm", "rtt", "uart", "none"):
+    if b not in ("itm", "rtt", "uart", "none", "buff"):
         b = "itm"
     lines = [
         "#ifndef MDK_TRACE_CONFIG_H",
@@ -1440,6 +1462,16 @@ def _gen_config_h(backend: str, itm_port: int, rtt_up: int, rtt_down: int,
         "#define MDK_TRACE_CPU_HZ            %d" % int(coreclk or 0),
         "#define MDK_TRACE_SWO_BAUD          %d" % int(swo_baud or 2000000),
         "#define MDK_TRACE_DBGMCU_CR         0x%08Xu" % (int(dbgmcu_cr or 0) & 0xFFFFFFFF),
+        "/* buff 模式（MDK_TRACE_BACKEND_BUFF）：全速录、事后一次性读回 */",
+        "/* 记录数 × 12 字节就是静态 RAM 占用，按芯片余量调 */",
+        "#define MDK_TRACE_BUFF_RECORDS      %d" % int(buff_records),
+        "/* dt 的时间粒度：0 = 每 CPU 周期（最细），>0 = 右移这么多位 */",
+        "#define MDK_TRACE_BUFF_TS_SHIFT     %d" % int(buff_ts_shift),
+        "/* 0 = 复位后保留上一次运行的记录（看门狗/fault 复位时那才是唯一证据） */",
+        "#define MDK_TRACE_BUFF_CLEAR_ON_INIT %d" % (1 if buff_clear_on_init else 0),
+        "/* fault handler 里多存一份寄存器现场（PC/LR/SP/xPSR/HFSR/MMFAR/BFAR） */",
+        "#define MDK_TRACE_FAULT_FRAME       %d" % (1 if fault_frame else 0),
+        "",
         "/* 事件 ID 区间（主机侧按区间分派语义） */",
         "#define MDK_TRACE_ID_APP_BASE      0x1000",
         "#define MDK_TRACE_ID_ISR_BASE      0x2000",
@@ -1455,13 +1487,454 @@ def _gen_make_fragment() -> str:
         "# 由 mdkdebug 的 trace_instrument 生成：把插桩组件接进 Makefile",
         "# 用法：在你的 Makefile 里 `include path/to/mdk_trace.mk`",
         "MDK_TRACE_DIR ?= $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))",
+        "# 三个源文件都可无脑编：未选中的后端会编成空目标文件（内容裹在 #if 里）",
+        "# 只有 buff 模式会用 mdk_trace_buff.c，只有 rtt 模式会用 mdk_trace_rtt.c",
         "MDK_TRACE_SRCS := $(MDK_TRACE_DIR)/mdk_trace.c \\",
+        "                  $(MDK_TRACE_DIR)/mdk_trace_buff.c \\",
         "                  $(MDK_TRACE_DIR)/mdk_trace_rtt.c",
         "C_SOURCES  += $(MDK_TRACE_SRCS)",
         "C_INCLUDES += -I$(MDK_TRACE_DIR)",
         "",
     ])
 
+
+# ============================ buff 模式（全速录制，事后一次性读回）
+#
+# 与 stream（ITM / RTT / UART）相对：目标侧把事件写进 RAM 里的环形缓冲，
+# **一个字节都不出芯片**，内核不阻塞、不碰外设，所以能全速录；代价是容量有限
+# （写满后新记录覆盖最旧的）、文本帧放不进 12 字节记录（单独计数）、
+# 时间戳只存「与上一条的周期差」——绝对时刻由控制块里的 last_cycles 反推。
+#
+# 主机只做三件事：按符号定位 blob → 一次把记录区读回来 → 把 dt 累成时间轴。
+# 记录格式（小端 12 字节）：[0]type [1]kind [2..3]id [4..7]arg [8..11]dt
+
+_BUFF_MAGIC = b"MDKTBUF1"
+_BUFF_VERSION = 1
+_BUFF_REC_SIZE = 12
+_BUFF_CTRL_BYTES = 80
+_BUFF_SYMBOL = "mdk_trace_buff_blob"
+_BUFF_FLAG_ENABLED = 1 << 0
+_BUFF_FLAG_WRAPPED = 1 << 1
+_BUFF_FLAG_RESTARTED = 1 << 2
+_BUFF_RESET_REQ_OFF = 56
+
+_BUFF_TYPES = {0: "raw", 1: "text", 2: "event", 3: "counter", 4: "isr",
+               5: "mark", 6: "ts", 7: "kv", 8: "reset", 9: "fault",
+               10: "sched"}
+_BUFF_KINDS = {0: "enter", 1: "exit", 2: "point", 3: "abort"}
+_BUFF_FAULT_CLASS = {0: "hardfault", 1: "memmanage", 2: "busfault",
+                     3: "usagefault"}
+_BUFF_FAULT_REGS = {0xFF01: "pc", 0xFF02: "lr", 0xFF03: "sp",
+                    0xFF04: "hfsr", 0xFF05: "mmfar", 0xFF06: "bfar",
+                    0xFF07: "xpsr"}
+
+# CFSR 各状态位的名字。HardFault 现场只给一个 0x... 数字，读的人还得翻手册；
+# 拆成「哪一类、哪一位」是这份 dump 最有用的地方之一——不拆的话，
+# 一个 cfsr=0x00020000 到底是被谁打的，等于没说。
+_CFSR_BITS = [
+    (0x00000001, "IACCVIOL", "取指访问违规（MPU / XN）"),
+    (0x00000002, "DACCVIOL", "数据访问违规（MPU）"),
+    (0x00000008, "MUNSTKERR", "出栈时 MemManage"),
+    (0x00000010, "MSTKERR", "入栈时 MemManage"),
+    (0x00000080, "MMARVALID", "MMFAR 有效"),
+    (0x00000100, "IBUSERR", "取指总线错误"),
+    (0x00000200, "PRECISERR", "精确总线错误（BFAR 有效）"),
+    (0x00000400, "IMPRECISERR", "非精确总线错误（回写缓冲）"),
+    (0x00000800, "UNSTKERR", "出栈时 BusFault"),
+    (0x00001000, "STKERR", "入栈时 BusFault"),
+    (0x00008000, "BFARVALID", "BFAR 有效"),
+    (0x00010000, "UNDEFINSTR", "未定义指令"),
+    (0x00020000, "INVSTATE", "非法 EPSR / T 位（跳进了数据）"),
+    (0x00040000, "INVPC", "非法 PC 加载（EXC_RETURN 用错）"),
+    (0x00080000, "NOCP", "協处理器不可用（FPU 没使能）"),
+    (0x00100000, "UNALIGNED", "非对齐访问"),
+    (0x00200000, "DIVBYZERO", "除零"),
+]
+
+def _buff_cfsr_bits(cfsr: int) -> list:
+    return [{"bit": "0x%08X" % b, "name": nm, "desc": ds}
+            for b, nm, ds in _CFSR_BITS if cfsr & b]
+
+def _buff_parse_names(spec: str) -> dict:
+    """把 "0x10=switch,0x11=wait" 解成 {16: 'switch', 17: 'wait'}。
+
+    buff 记录里只有数字 id，语义在应用里。让调用方把 id 表直接写进参数，
+    比事后对着手册查要省事，也避免工具替应用“猜”名字。
+    """
+    out = {}
+    for part in re.split(r"[,;]", spec or ""):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not k or not v:
+            continue
+        try:
+            out[int(k, 0)] = v
+        except ValueError:
+            continue
+    return out
+
+def _buff_locate(elf: str = "", addr=""):
+    """定位控制块地址。只管地址，不读内容——校验魔数是读的人的责任。"""
+    if addr:
+        try:
+            a = int(str(addr), 16) if str(addr).lower().startswith("0x") else int(addr)
+            if a > 0:
+                return a, {"method": "explicit"}
+        except (TypeError, ValueError):
+            pass
+        return None, {"ok": False, "error_code": "invalid-argument",
+                      "error": "addr 不是合法地址：%r" % (addr,)}
+    e = elf or _session_axf()
+    if e:
+        a, sz = _elf_symbol(e, _BUFF_SYMBOL)
+        if a:
+            return a, {"method": "elf_symbol", "symbol": _BUFF_SYMBOL,
+                       "blob_bytes": sz, "elf": os.path.abspath(e)}
+        return None, {
+            "ok": False, "error_code": "buff-symbol-missing",
+            "error": "ELF 里找不到符号 %s" % _BUFF_SYMBOL,
+            "elf": os.path.abspath(e),
+            "hint": "① 固件是不是用 MDK_TRACE_BACKEND_BUFF 编的（stream 构建里根本没有这个符号）；"
+                    "② 符号被 --gc-sections 回收了？给它 KEEP 或让代码真的引用到它；"
+                    "③ 也可以直接用 addr=0x... 把 blob 地址喂进来"}
+    return None, {"ok": False, "error_code": "buff-locate-failed",
+                  "error": "既没给 addr 也没给 elf，无法定位 %s" % _BUFF_SYMBOL,
+                  "hint": "给 elf=你的.axf（首选），或 addr=0x... 的 blob 绝对地址；"
+                          "会话里已 set_symbol_file 过的话可以都不给"}
+
+def _buff_parse_ctrl(raw: bytes, meta: dict, addr: int):
+    """解析 80 字节控制块。魔数 / 版本 / 字段自洽性任一不过就报错，绝不硬解。"""
+    view = {"addr": "0x%X" % addr,
+            "read_confidence": (meta or {}).get("read_confidence"),
+            "while_running": (meta or {}).get("while_running")}
+    magic = raw[:8].split(b"\x00")[0].decode("ascii", "replace")
+    if raw[:8] != _BUFF_MAGIC:
+        deg = (meta or {}).get("degenerate")
+        allz = raw.count(0) == len(raw)
+        err = dict(view)
+        err["ok"] = False
+        err["magic"] = magic
+        if allz or deg:
+            err.update({
+                "error_code": "buff-read-degenerate",
+                "degenerate": deg or "all_zero",
+                "error": "控制块位置整片读回 0x00，不是 'MDKTBUF1'"
+                         "——**这不等于缓冲是空的**，是这次读不可信",
+                "hint": "目标全速运行时经 SWD 读 SRAM 可能整片读回 0（Keil 链路实测如此）："
+                        "① 先 stop（halt）目标再读——buff 模式的记录不会因停机丢失，缓存在 RAM 里；"
+                        "② 或换链路重试；"
+                        "③ 不要把这个 0 当成「没有事件」下结论。"})
+        else:
+            err.update({
+                "error_code": "buff-magic-mismatch",
+                "error": "这里不是 buff 控制块（读到魔数 %r，应为 'MDKTBUF1'）" % magic,
+                "hint": "地址错了？用 elf= 让工具按符号 %s 定位" % _BUFF_SYMBOL})
+        return None, err
+    try:
+        (version, rec_size, cap, recs_addr, head, total, lost, text_dropped,
+         ts_shift, cpu_hz, last_cycles, flags, _reset_req, seq) = \
+            struct.unpack_from("<14I", raw, 8)
+    except struct.error as e:
+        return None, dict(view, ok=False, error_code="buff-ctrl-truncated",
+                          error="控制块解不开：%s" % e)
+    if version != _BUFF_VERSION or rec_size != _BUFF_REC_SIZE:
+        return None, dict(view, ok=False, error_code="buff-version-mismatch",
+                          version=version, rec_size=rec_size,
+                          error="控制块版本/记录尺寸与主机不一致（目标 version=%d "
+                                "rec_size=%d，主机 support version=%d rec_size=%d）"
+                                % (version, rec_size, _BUFF_VERSION, _BUFF_REC_SIZE),
+                          hint="组件与主机不同版本：把 components/trace/ 和 mdkdebug/ "
+                               "一起更新，不要只换一边")
+    if cap == 0 or not recs_addr or cap * _BUFF_REC_SIZE > (1 << 22):
+        return None, dict(view, ok=False, error_code="buff-ctrl-inconsistent",
+                          error="控制块字段不合理（cap=%d recs_addr=0x%X）：地址大概不对"
+                                % (cap, recs_addr),
+                          hint="别按这个结果继续解析——先确认符号地址")
+    info = dict(view)
+    info.update({
+        "symbol": _BUFF_SYMBOL, "version": version, "rec_size": rec_size,
+        "cap": cap, "recs_addr": "0x%X" % recs_addr, "head": head,
+        "total": total, "lost": lost, "text_dropped": text_dropped,
+        "ts_shift": ts_shift, "cpu_hz": cpu_hz, "last_cycles": last_cycles,
+        "flags": flags, "enabled": bool(flags & _BUFF_FLAG_ENABLED),
+        "wrapped": bool(flags & _BUFF_FLAG_WRAPPED),
+        "restarted": bool(flags & _BUFF_FLAG_RESTARTED), "seq": seq,
+        "kept": cap if (flags & _BUFF_FLAG_WRAPPED) else head,
+        "fits_in_buffer": total <= cap,
+    })
+    return info, None
+
+def _buff_read_ctrl(addr: int, link: str = "auto"):
+    raw, meta = _read_mem_words(addr, _BUFF_CTRL_BYTES, link=link)
+    if raw is None:
+        return None, {"ok": False, "addr": "0x%X" % addr,
+                      "error_code": "buff-read-failed",
+                      "error": (meta or {}).get("error") or "读控制块失败",
+                      "link": (meta or {}).get("link")}
+    if len(raw) < _BUFF_CTRL_BYTES:
+        return None, {"ok": False, "addr": "0x%X" % addr,
+                      "error_code": "buff-read-failed",
+                      "error": "只读到 %d 字节（要 %d）：目标没响应或地址跨了不可读区"
+                               % (len(raw), _BUFF_CTRL_BYTES)}
+    return _buff_parse_ctrl(raw, meta or {}, addr)
+
+def _buff_read_recs(recs_addr: int, n_recs: int, link: str = "auto",
+                    chunk_recs: int = 256):
+    """把记录区一次性读回来（分块以防单次读太大）。读短了就报错，不补 0 充数。"""
+    out = bytearray()
+    meta = {}
+    done = 0
+    while done < n_recs:
+        take = min(chunk_recs, n_recs - done)
+        addr = recs_addr + done * _BUFF_REC_SIZE
+        want = take * _BUFF_REC_SIZE
+        d, m = _read_mem_words(addr, want, link=link)
+        if d is None:
+            return None, {"ok": False, "error_code": "buff-read-failed",
+                          "error": (m or {}).get("error") or "读记录区失败",
+                          "at": "0x%X" % addr,
+                          "records_read": done,
+                          "link": (m or {}).get("link")}
+        if len(d) < want:
+            return None, {"ok": False, "error_code": "buff-read-short",
+                          "error": "记录区读短了：0x%X 处读到 %d 字节，期望 %d"
+                                   % (addr, len(d), want),
+                          "records_read": done}
+        out += d
+        meta = m or meta
+        done += take
+    return bytes(out), meta
+
+def buff_status(elf: str = "", addr="", link: str = "auto") -> dict:
+    """只读控制块（80 字节）的健康快照：值得信、但便宜。"""
+    a, loc = _buff_locate(elf=elf, addr=addr)
+    if a is None:
+        return loc
+    info, err = _buff_read_ctrl(a, link=link)
+    if info is None:
+        return err
+    out = dict(info)
+    out["ok"] = True
+    out["locate"] = loc
+    out["next"] = ["trace_buff_dump 把记录解成时间线",
+                   "trace_buff_reset 让目标开一段新录制"]
+    if not out["cpu_hz"]:
+        out.setdefault("warnings", []).append(
+            "控制块里 cpu_hz=0：dt 只能给周期数，给不了微秒。"
+            "把 MDK_TRACE_CPU_HZ（或 trace_instrument 的 coreclk=）设成真实主频。")
+    if out["lost"] or out["text_dropped"]:
+        out.setdefault("warnings", []).append(
+            "lost=%d text_dropped=%d：这次录制不是完整的，时间线上有没记下来的东西"
+            % (out["lost"], out["text_dropped"]))
+    if out["wrapped"]:
+        out.setdefault("warnings", []).append(
+            "环形缓冲已回卷（total=%d > cap=%d）：现在看到的是一个窗口，不是全程"
+            % (out["total"], out["cap"]))
+    if out["restarted"]:
+        out.setdefault("warnings", []).append(
+            "目标在保留旧记录的情况下重启过（seq=%d）：时间轴在 RESET 记录处分段"
+            % out["seq"])
+    return out
+
+def _buff_decode(info: dict, recs: bytes, names: dict = None) -> dict:
+    """把定长记录解成带绝对时间的事件序列 + 统计 + 异常现场。"""
+    names = names or {}
+    cap = info["cap"]
+    # 只解码**真正读回来**的那几条（head 条或回卷后的 cap 条）。
+    # 不能按 cap 去翻 recs：没回卷时记录区后半截是上一次运行的残渣或 0，
+    # 把它们当记录解出来就是凭空多出一段假时间线。
+    n_have = len(recs) // _BUFF_REC_SIZE
+    raw_recs = []
+    for i in range(n_have):
+        b = recs[i * _BUFF_REC_SIZE:(i + 1) * _BUFF_REC_SIZE]
+        raw_recs.append({
+            "type": b[0], "kind": b[1],
+            "id": b[2] | (b[3] << 8),
+            "arg": struct.unpack_from("<I", b, 4)[0],
+            "dt": struct.unpack_from("<I", b, 8)[0],
+        })
+    # 回卷时最旧的一条在 head 处；没回卷时 0..head-1 就是全部。
+    order = (list(range(info["head"], cap)) + list(range(0, info["head"]))
+             if info["wrapped"] else list(range(0, info["head"])))
+    ts_shift = info["ts_shift"]
+    total_dt = 0
+    for idx in order:
+        total_dt += raw_recs[idx]["dt"] << ts_shift
+    cpu_hz = info["cpu_hz"]
+    # last_cycles 是**最新**记录的时刻；往前扣掉所有 dt 就是起点。
+    t0 = (info["last_cycles"] - total_dt) & 0xFFFFFFFF
+    events = []
+    t = t0
+    by_type, by_id, by_kind = {}, {}, {}
+    faults = []
+    cur_fault = None
+    for n, idx in enumerate(order):
+        r = raw_recs[idx]
+        t = (t + (r["dt"] << ts_shift)) & 0xFFFFFFFF
+        typ = _BUFF_TYPES.get(r["type"], "type%d" % r["type"])
+        ev = {"n": n, "type": typ, "id": r["id"], "arg": r["arg"],
+              "dt": r["dt"] << ts_shift, "t_cycles": t}
+        if typ in ("event", "isr"):
+            ev["kind"] = _BUFF_KINDS.get(r["kind"], "kind%d" % r["kind"])
+        if cpu_hz:
+            ev["t_us"] = round((t - t0) / float(cpu_hz) * 1e6, 3)
+        nm = names.get(r["id"])
+        if nm and typ in ("event", "isr", "counter", "sched"):
+            ev["id_name"] = nm
+        if typ == "fault":
+            ev["fault_class"] = _BUFF_FAULT_CLASS.get(r["id"], "class%d" % r["id"])
+            ev["cfsr"] = "0x%08X" % r["arg"]
+            ev["cfsr_bits"] = _buff_cfsr_bits(r["arg"])
+            cur_fault = {"n": len(faults), "t_us": ev.get("t_us"),
+                         "class": ev["fault_class"], "cfsr": ev["cfsr"],
+                         "cfsr_bits": ev["cfsr_bits"], "registers": {}}
+            faults.append(cur_fault)
+        elif typ == "sched":
+            ev["from"] = r["id"]
+            ev["to"] = r["arg"]
+        elif typ == "counter" and r["id"] in _BUFF_FAULT_REGS:
+            reg = _BUFF_FAULT_REGS[r["id"]]
+            ev["reg"] = reg
+            ev["value_hex"] = "0x%08X" % r["arg"]
+            if cur_fault is not None and reg not in cur_fault["registers"]:
+                cur_fault["registers"][reg] = "0x%08X" % r["arg"]
+        by_type[typ] = by_type.get(typ, 0) + 1
+        by_id[r["id"]] = by_id.get(r["id"], 0) + 1
+        if "kind" in ev:
+            by_kind[ev["kind"]] = by_kind.get(ev["kind"], 0) + 1
+        events.append(ev)
+    return {"events": events, "raw": raw_recs, "t0": t0,
+            "by_type": by_type, "by_id": by_id, "by_kind": by_kind,
+            "faults": faults}
+
+def buff_dump(elf: str = "", addr="", limit: int = 200, out_file: str = "",
+              names: str = "", link: str = "auto") -> dict:
+    """读回整个环形缓冲并解成时间线。返回最新 limit 条；全量可落 out_file。"""
+    a, loc = _buff_locate(elf=elf, addr=addr)
+    if a is None:
+        return loc
+    info, err = _buff_read_ctrl(a, link=link)
+    if info is None:
+        return err
+    n_recs = info["kept"]
+    if n_recs <= 0:
+        out = dict(info, ok=True, locate=loc, record_count=0, events=[],
+                   note="环形缓冲里还没有记录：固件调过 mdk_trace_init() 了吗？"
+                        "有没有真的触发过带插桩的代码路径？")
+        return out
+    recs, rmeta = _buff_read_recs(int(info["recs_addr"], 16), n_recs, link=link)
+    if recs is None:
+        return rmeta
+    dec = _buff_decode(info, recs, _buff_parse_names(names))
+    evs = dec["events"]
+    lim = max(1, int(limit or 200))
+    tail = evs[-lim:] if len(evs) > lim else evs
+    dts = [e["dt"] for e in evs if e["dt"]]
+    span_cycles = (evs[-1]["t_cycles"] - evs[0]["t_cycles"]) & 0xFFFFFFFF
+    out = dict(info)
+    out.update({
+        "ok": True, "locate": loc, "record_count": len(evs),
+        "buffer_window_truncated": bool(info["wrapped"]),
+        "counts_by_type": dec["by_type"], "counts_by_kind": dec["by_kind"],
+        "top_ids": sorted(({"id": k, "count": v} for k, v in dec["by_id"].items()),
+                          key=lambda x: -x["count"])[:20],
+        "span_cycles": span_cycles,
+        "span_us": round(span_cycles / float(info["cpu_hz"]) * 1e6, 3)
+                   if info["cpu_hz"] else None,
+        "dt_cycles": {"min": min(dts), "max": max(dts),
+                      "mean": round(sum(dts) / float(len(dts)), 1)} if dts else None,
+        "faults": dec["faults"],
+        "read_meta": {k: rmeta.get(k) for k in
+                      ("read_confidence", "while_running", "degenerate",
+                       "read_unstable", "reread_count")
+                      if k in rmeta},
+        "events": tail,
+        "truncated": len(evs) > lim,
+        "next": ["trace_buff_reset 让目标开一段新录制",
+                 "要看某个 id 的语义就把 id 表用 names=\"0x10=switch,0x11=wait\" 传进来"],
+    })
+    if out["lost"] or out["text_dropped"]:
+        out.setdefault("warnings", []).append(
+            "lost=%d text_dropped=%d：有记录没被记下来，这条时间线不完整"
+            % (info["lost"], info["text_dropped"]))
+    if info["restarted"]:
+        out.setdefault("warnings", []).append(
+            "目标重启过且保留了旧记录（seq=%d）：看到 reset 类型的事件处就是接缝，"
+            "那之前的时间轴属于上一次运行" % info["seq"])
+    if dec["faults"]:
+        out.setdefault("warnings", []).append(
+            "录到 %d 次异常（fault 类型），faults 字段里是异常的类别、CFSR 拆位与寄存器现场"
+            % len(dec["faults"]))
+    if info["wrapped"]:
+        out.setdefault("warnings", []).append(
+            "环形缓冲已回卷（total=%d > cap=%d）：现在看到的是一个窗口，不是全程——"
+            "想圈定一段完整过程就先把目标 halt 再 trace_buff_reset，然后重新跑一遍"
+            % (info["total"], info["cap"]))
+    if out_file:
+        try:
+            p = os.path.abspath(out_file)
+            d = os.path.dirname(p)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(p, "w") as f:
+                json.dump({"meta": {k: v for k, v in out.items()
+                                    if k not in ("events", "next", "locate")},
+                           "events": evs, "counts_by_type": dec["by_type"],
+                           "top_ids": out["top_ids"], "faults": dec["faults"]},
+                          f, ensure_ascii=False, default=str)
+            out["out_file"] = p
+            out["out_records"] = len(evs)
+        except OSError as e:
+            out.setdefault("warnings", []).append("写 out_file 失败：%s" % e)
+    return out
+
+def buff_reset(elf: str = "", addr="", wait: bool = True, link: str = "auto") -> dict:
+    """请目标开一段新录制：置控制块的 reset_req，目标在下一条记录写入时执行。"""
+    a, loc = _buff_locate(elf=elf, addr=addr)
+    if a is None:
+        return loc
+    info, err = _buff_read_ctrl(a, link=link)
+    if info is None:
+        return err
+    seq0 = info["seq"]
+    w = _write_mem(a + _BUFF_RESET_REQ_OFF, struct.pack("<I", 1))
+    out = {"ok": bool(w.get("ok")), "addr": "0x%X" % a, "locate": loc,
+           "wrote": "0x%X" % (a + _BUFF_RESET_REQ_OFF), "write_meta": w,
+           "seq_before": seq0}
+    if not w.get("ok"):
+        out["error_code"] = "buff-reset-write-failed"
+        out["error"] = w.get("error") or "写 reset_req 失败"
+        out["hint"] = ("目标全速运行时写 SRAM 可能不生效（Keil 链路尤其如此）："
+                       "先 halt（stop）目标再试；实在不行让固件自己调 "
+                       "mdk_trace_buff_reset()。")
+        return out
+    if not wait:
+        out["applied"] = False
+        out["note"] = "已请求，但 reset_req 只在下一条记录写入时被处理"
+        return out
+    info2, err2 = _buff_read_ctrl(a, link=link)
+    if info2 is None:
+        out["applied"] = False
+        out["pending"] = True
+        out["note"] = "写入成功，但控制块重读失败，无法确认是否已生效"
+        out["reread_error"] = err2.get("error") if err2 else None
+        return out
+    applied = info2["seq"] != seq0
+    out["seq_after"] = info2["seq"]
+    out["applied"] = applied
+    out["request_latched"] = None if applied else True
+    if applied:
+        out["note"] = "新录制已开始（seq %d -> %d）：现在缓存里是这一段的新记录" \
+                      % (seq0, info2["seq"])
+    else:
+        out["note"] = ("reset_req 已写进去但还没被执行（seq 仍是 %d）：它在下一条记录写入时"
+                       "才处理。目标若长期没有插桩事件，它会一直挂着——这不是失败，"
+                       "但也不能当成『已清空』。" % seq0)
+        out.setdefault("warnings", []).append(
+            "别把 pending 当成 applied：要看有没有生效就再读一次 trace_buff_status 看 seq。")
+    return out
 
 # ================================================================ MCP 注册
 
@@ -1484,7 +1957,12 @@ GUIDE = {
         "代价是**侵入式**（每次命中停下读寄存器再 resume）且同时布的断点数受 FPB 比较器"
         "数量限制（M0 4 / M3-M4 一般 6 / M7 一般 8），适合盯关键路径上的少数函数，"
         "不是全量录制；keil 链路需目标处于调试态（先 enter_debug）。"
-        "**指令级录制 SWD 两线做不到**，详见 topic=swd_limits。"
+        "**指令级录制 SWD 两线做不到**，详见 topic=swd_limits。\n"
+        "  目标侧插桩本身又分两种工作模式（events 什么时候离开芯片）："
+        "stream（ITM/RTT/UART，持续录持续读）与 buff（全速录、事后一次性读回）。"
+        "要最细的时间粒度 + 一段完整过程，选 buff——见 topic=instrument_modes。\n"
+        "  该往哪儿插桩、哪些点最值钱（HardFault 等异常 handler 排第一）见 topic=instrument_points；"
+        "这几次在真板上撞到的坑见 topic=lessons。"
     ),
     "links": (
         "trace 的内存通路有两条，观测类工具都带 link 参数（默认 auto，也可显式 keil / ocd）：\n"
@@ -1584,6 +2062,90 @@ GUIDE = {
         "做不到的是「全自动、无损、每跳都记」：那要么 SWO 引脚 + ITM，要么 ETM 的 4~5 根线，"
         "要么目标侧自建插桩。"
     ),
+    "instrument_modes": (
+        "插桩的两种工作模式——区别只在「事件什么时候离开芯片」：\n"
+        "  **stream**（持续录、持续读）：ITM / RTT / UART 三个后端\n"
+        "    · 事件一发生就立刻推出去，主机必须跟得上；\n"
+        "    · 带宽有限（SWO 常见 1~2 Mbit/s，RTT 受 SWD 与目标 RAM 带宽限制），"
+        "每秒上千次的事件很容易丢——返回里的 dropped/overflow 非零就是真丢了；\n"
+        "    · 每次读取都要占调试口 / 抢目标时间（RTT 读要把 RdOff 写回）；\n"
+        "    · 好处：能实时看、能长时间跑、不占目标 RAM。\n"
+        "    · 适合：跑着的系统上追一段时间线、printf 式日志、低频事件。\n"
+        "  **buff**（全速录、事后一次性读回）：MDK_TRACE_BACKEND_BUFF\n"
+        "    · 事件只写进 RAM 里的环形缓冲，**一个字节都不出芯片**：目标侧就几次 store，"
+        "不阻塞、不碰外设、不看主机脸色 → 可以全速跑；\n"
+        "    · 时间粒度可以开到**最小**（MDK_TRACE_BUFF_TS_SHIFT=0 = 每 CPU 周期，"
+        "84MHz 上 11.9ns），因为它不占用任何传输带宽；\n"
+        "    · 三条代价，都会如实报出、绝不静默：\n"
+        "        ① 容量有限（MDK_TRACE_BUFF_RECORDS × 12 字节），写满后新记录覆盖最旧的 → "
+        "wrapped=true 且 total/cap 都给你，「看到的是窗口不是全程」；\n"
+        "        ② 文本帧（printf）放不进 12 字节记录 → 单独计 text_dropped；\n"
+        "        ③ 时间戳只存「与上一条的周期差」→ 绝对时刻由控制块 last_cycles 反推；"
+        "单次间隔超过 2^32 周期（84MHz 上 51 秒）要把 TS_SHIFT 调大。\n"
+        "    · 读回三步：trace_buff_status（容量/丢没丢/回卷没）→ "
+        "trace_buff_dump（解成时间线）→ trace_buff_reset（开一段新录制）。\n"
+        "    · 适合：录一段「全速运行」的精确过程、还原切换/中断/异常现场、"
+        "以及**已经出事了**（HardFault / 看门狗复位）以后取现场。\n"
+        "  怎么选：\n"
+        "    · 要实时看 → stream；要最细粒度 + 一次完整过程 → buff。\n"
+        "    · 高频事件（>1000 次/秒）× 长时间 → 两者都不行（stream 会丢、buff 会回卷）："
+        "把插桩点收窄到真正关心的那几个，或把 TS_SHIFT 与记录数按需求配平。\n"
+        "    · 两套插桩点宏是同一份代码，只改 MDK_TRACE_BACKEND_* 重编切后端。"
+    ),
+    "instrument_points": (
+        "「桩插在哪儿」比「怎么读」更决定这次 trace 有没有用。按对排查的价值排序：\n"
+        "  1. **异常 handler：第一优先级，而且必须插在第一条语句**\n"
+        "     · HardFault / MemManage / BusFault / UsageFault / NMI：在 handler 开头调 "
+        "MDK_TRACE_FAULT_CAPTURE()（读 LR/MSP/PSP，再从异常栈帧取 PC/LR/xPSR，按 CFSR 分类）。\n"
+        "     · **越早越好**：栈（尤其 PSP）再被压一层、或你在 handler 里又调了函数，"
+        "现场就变了；有些芯片还可能在 fault 里二次异常。\n"
+        "     · 附带的寄存器转储（pc/lr/sp/xpsr/hfsr/mmfar/bfar）是 buff 模式最值钱的输出："
+        "一块「刚砌掉」的板子，第一个问题就是 PC 在哪。\n"
+        "     · 分类不要猜：CFSR 有具体字段就报具体类别，没有就如实报 HardFault。\n"
+        "  2. **看门狗喂狗点 + 复位原因：第二优先级**\n"
+        "     · 喂狗点用 MDK_TRACE_MARK()：喂狗停了，录到的最后一次喂狗与它前后的时间差"
+        "就是「卡了多久」的直接证据。\n"
+        "     · 复位后第一件事（main 里、外设初始化之前）打一个 MARK：配合 "
+        "MDK_TRACE_BUFF_CLEAR_ON_INIT=0（默认），上一次运行（含异常复位前）的记录会保留，"
+        "时间轴上以 reset 事件为接缝——这正是「复位循环」类问题唯一能用的证据。\n"
+        "  3. **任务 / 线程切换点：看调度是否按预期**\n"
+        "     · 每个切换点调 MDK_TRACE_SCHED(from, to)；同时给任务主体循环打一对 "
+        "SCOPE_BEGIN/END，任务级耗时与切换频率都能算出来。\n"
+        "     · 只在真正的阻塞原语里打 WAIT：漏了一两条阻塞路径，时间线上那段时间就是盲区。\n"
+        "  4. **关键状态迁移 / 协议节点**：状态机迁移、通信帧头尾、中断进出，用成对的 "
+        "SCOPE_BEGIN/SCOPE_END 夹住；ID 按自己的编号表定义，"
+        "主机侧用 names=\"0x10=switch,0x11=wait\" 把它译成名字。\n"
+        "  5. **不要插在的地方**\n"
+        "     · 高频内循环（每毫秒上千次）→ buff 会回卷、stream 会丢，插桩本身还会影响时序；\n"
+        "     · fault 之后还会继续执行、可能再次异常的代码路径；\n"
+        "     · 优先级高于你要观测的中断的地方（插桩是普通函数调用，不是原子操作）。\n"
+        "  一条硬规矩：插桩点只做「记一笔」，不要在里面调 printf 级别的重逻辑。"
+        "buff 模式一次记录就是十来个 store——这才是它敢全速录的前提。"
+    ),
+    "lessons": (
+        "这几次在真板上用 trace 撞出来的坑（完整版在 components/trace/README.md "
+        "与 docs/PITFALLS.md）：\n"
+        "  ① **目标全速运行时经 SWD 读 RAM，可能整片读回 0**（Keil 链路实测如此）。"
+        "这**不等于那片内存是 0**，更不等于「缓冲是空的」。工具会在这种时候报 "
+        "degenerate / read_confidence=low，buff 工具会直接报 buff-read-degenerate "
+        "并让你先 halt——不要把 0 当结论。要读 RAM 就先停目标；buff 的记录在 RAM 里，"
+        "停机不会丢。\n"
+        "  ② **halt→读→resume 的代价**：单次约 320~510ms，停机期间目标时间被冻结。"
+        "工具上报的 paused_ms 偏高（实测报 0.33~0.43s，按目标自身计数反算真实有效冻结"
+        "约 0.27~0.30s）——**要用目标侧的时间戳算，不要用主机时钟**。\n"
+        "  ③ **stop 之后第一次 read_mem 会读到全 0 脏帧**，重读才对。"
+        "别拿第一次的结果下结论（read_mem_verified 会复读，自己手搓内存读时尤其要注意）。\n"
+        "  ④ **不要用内核 tick 当时间戳**：500µs 的节拍会让大量相邻事件的 dt=0，"
+        "10µs 级的切片全退化成 0，时间线看着像坏了。用 DWT_CYCCNT（84MHz 上 11.9ns），"
+        "而且要先使能 DEMCR.TRCENA(1<<24)，否则计数不动。\n"
+        "  ⑤ **环形缓冲一定会溢出**：必须把 lost / wrapped 透出来。分块 dump + reset "
+        "拼时间线一定会留空洞（实测 8 块之间 7 段空洞、合计 4.1s），空洞要在图上画出来，"
+        "不要连成一条直线骗人。\n"
+        "  ⑥ **用 4bit 打包任务号，上限就是 14 个任务**（0x0F 要留给空闲）。"
+        "任务多了要么换字段宽度，要么先裁掉不关心的任务。\n"
+        "  ⑦ **只插了部分阻塞路径时，「任务 A 消失了 200ms」可能只是没插桩**，"
+        "不是它真的在跑——这是「没测不等于没有」的原型。"
+    ),
 }
 
 
@@ -1596,10 +2158,16 @@ def register(server, js=None) -> int:
         title="Trace 方案选型与接线指南（SWO / RTT / SWD 采样）",
         description=(
             "讲清楚各条 trace 通路的硬件要求与代价，以及接线、ITM、RTT 的注意点。"
-            "topic 可取：howto（总览与取舍）/ swd_limits（**只用 SWD 两线能做到什么、"
-            "做不到什么：变量 scope 与 DWT PC 采样能做，指令级录制做不到**）/ "
-            "swd_wiring（接线）/ links（Keil 链路 vs OpenOCD 链路：观测类工具都带 "
-            "link 参数，两条链路的取舍）/ rtt_notes / itm_notes / "
+            "topic 可取：howto（总览与取舍）/ instrument_modes（**插桩的两种工作模式："
+            "stream 持续录持续读 vs buff 全速录事后一次性读回，各自代价与选型**）/ "
+            "instrument_points（**该往哪儿插桩：HardFault 等异常 handler 排第一，"
+            "其次是看门狗喂狗点与任务切换点，以及哪些地方不该插**）/ "
+            "lessons（**这几次在真板上撞出来的 7 个坑：运行态读 RAM 读回 0、"
+            "halt 冻结与 paused_ms 偏高、stop 后首读脏帧、tick 当时间戳导致 dt=0、"
+            "环形缓冲溢出与空洞、4bit 任务号只有 14 个、没插桩不等于没发生**）/ "
+            "swd_limits（只用 SWD 两线能做到什么、做不到什么：变量 scope 与 DWT PC "
+            "采样能做，指令级录制做不到）/ swd_wiring（接线）/ links（Keil 链路 vs "
+            "OpenOCD 链路：观测类工具都带 link 参数）/ rtt_notes / itm_notes / "
             "when_unavailable（没数据时怎么排查）；留空返回全部。\n"
             "**没有 SWO 引脚并不等于不能 trace**：RTT 只要 SWD，采样剖析连缓冲都不要，MDK 原生 Event Recorder / Event Statistics 也只要 SWD（trace_eventrec 直接读它的缓冲），"
             "只是能拿到的东西不同——这份指南就是帮你按手头硬件选对路子。"
@@ -2036,7 +2604,14 @@ def register(server, js=None) -> int:
             "**为什么必须有目标侧组件**：SWO/RTT 只是通道，芯片不会自己往外说话——"
             "得有代码在关键点把事件写进 ITM/RTT 缓冲，主机才 trace 得到东西。"
             "安装完按返回的 next 步骤接进构建（CMake 用 add_subdirectory 或直接加源文件）。"
-            "target_dir 指定部署目录（如工程里的 components/trace）。"
+            "target_dir 指定部署目录（如工程里的 components/trace）。\n"
+            "**backend 四选一**：itm / rtt / uart（stream：事件立刻出芯片，主机实时跟读）/ "
+            "**buff（全速录：事件只写进 RAM 环形缓冲，事后用 trace_buff_dump 一次性读回，"
+            "时间粒度可以开到每 CPU 周期）**。buff 的旋钮：buff_records（记录数 × 12B = "
+            "静态 RAM）、buff_ts_shift（0 = 每周期，间隔可能超 51s 才需调大）、"
+            "buff_clear_on_init（默认 false = 复位后保留上一次运行的记录，看门狗/fault "
+            "复位时那是唯一证据）、fault_frame（异常 handler 里多存一份寄存器现场）。\n"
+            "该往哪儿插桩见 trace_guide(topic=\"instrument_points\")。"
         ),
     )
     async def trace_instrument(target_dir: str, backend: str = "itm",
@@ -2044,16 +2619,92 @@ def register(server, js=None) -> int:
                                rtt_down: int = 1, rtt_buf: int = 1024,
                                coreclk: int = 0, overwrite: bool = False,
                                swo_baud: int = 2000000,
-                               dbgmcu_cr: int = 0xE0042004) -> str:
+                               dbgmcu_cr: int = 0xE0042004,
+                               buff_records: int = 2048,
+                               buff_ts_shift: int = 0,
+                               buff_clear_on_init: bool = False,
+                               fault_frame: bool = True) -> str:
         try:
             return _js(deploy_component(target_dir, backend=backend,
                                         itm_port=int(itm_port), rtt_up=int(rtt_up),
                                         rtt_down=int(rtt_down), rtt_buf=int(rtt_buf),
                                         coreclk=int(coreclk), overwrite=bool(overwrite),
                                         swo_baud=int(swo_baud),
-                                        dbgmcu_cr=int(dbgmcu_cr)))
+                                        dbgmcu_cr=int(dbgmcu_cr),
+                                        buff_records=int(buff_records),
+                                        buff_ts_shift=int(buff_ts_shift),
+                                        buff_clear_on_init=bool(buff_clear_on_init),
+                                        fault_frame=bool(fault_frame)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "target_dir": target_dir, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_buff_status",
+        title="buff 模式：读控制块（容量 / 已录 / 丢了多少 / 是否回卷）",
+        description=(
+            "buff 模式（目标侧把事件写进 RAM 环形缓冲、一个字节不出芯片）的健康快照。"
+            "只需一次 80 字节内存读，很便宜。返回：cap/total/lost/text_dropped、"
+            "是否回卷（wrapped）、目标是否在保留旧记录的前提下重启过（restarted）、"
+            "ts_shift（时间粒度）、cpu_hz、记录的起始地址。\n"
+            "**定位**：默认按 ELF 符号 mdk_trace_buff_blob 找（elf= 或会话已 set_symbol_file 的可省），"
+            "也可以 addr=0x... 直接给。找不到符号会明确报 buff-symbol-missing，不会猜。\n"
+            "**读回整片 0 不等于缓冲是空的**：目标全速运行时经 SWD 读 RAM 可能整片读回 0，"
+            "这种情况会报 buff-read-degenerate 并让你先停下目标再读。"
+        ),
+    )
+    async def trace_buff_status(elf: str = "", addr: str = "",
+                                link: str = "auto") -> str:
+        try:
+            return _js(buff_status(elf=elf, addr=addr, link=link))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_buff_dump",
+        title="buff 模式：一次性读回整个环形缓冲并解成时间线",
+        description=(
+            "把目标 RAM 里的定长记录（12 字节：type/kind/id/arg/dt）全部读回来，"
+            "按 dt 累出绝对时间轴，并给出分类型/分 id 计数、周期统计、异常现场。\n"
+            "**这是「全速录制」的读取端**：目标侧不阻塞、不停机、不需要 SWO 引脚，"
+            "所以可以把时间粒度开到最小（MDK_TRACE_BUFF_TS_SHIFT=0，即每 CPU 周期）。"
+            "代价是缓冲写满后新记录覆盖最旧的（返回 wrapped=true 并给 total/cap）。\n"
+            "**异常（fault）会被展开**：类别 + CFSR 逐位拆解 + 寄存器现场"
+            "（pc/lr/sp/xpsr/hfsr/mmfar/bfar），这是插桩录制最有价值的输出之一。\n"
+            "limit 只控制**返回**给你的条数（默认 200，取最新的）；要看全量就传 out_file，"
+            "工具会把整个时间线写成 JSON 落盘并只回统计——几万条记录不要往对话里塞。\n"
+            "names 可把 id 译成名字（如 \"0x10=switch,0x11=wait\"），避免对着手册查。"
+        ),
+    )
+    async def trace_buff_dump(elf: str = "", addr: str = "", limit: int = 200,
+                              out_file: str = "", names: str = "",
+                              link: str = "auto") -> str:
+        try:
+            return _js(buff_dump(elf=elf, addr=addr, limit=int(limit),
+                                 out_file=out_file, names=names, link=link))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_buff_reset",
+        title="buff 模式：让目标开一段新录制",
+        description=(
+            "往控制块的 reset_req 写 1，目标在**下一条记录写入时**清空缓冲、seq 加一。\n"
+            "**必须知道的两件事**：① 它是延迟生效的——目标若长期没有插桩事件，"
+            "这个请求会一直挂着，返回里 request_latched/pending 就是这个意思，"
+            "不要把它当成「已清空」；② 目标全速运行时写 SRAM 可能不生效，"
+            "这种情况会如实报 buff-reset-write-failed 并建议先 halt。\n"
+            "生效与否以 seq 是否变化为准（wait=true 会重读控制块确认），而不是以「写成功」为准。"
+        ),
+    )
+    async def trace_buff_reset(elf: str = "", addr: str = "",
+                               wait: bool = True, link: str = "auto") -> str:
+        try:
+            return _js(buff_reset(elf=elf, addr=addr, wait=bool(wait), link=link))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
     n += 1
 
     return n

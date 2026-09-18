@@ -8,6 +8,13 @@
  *   RTT      - any core with a debug probe that can touch RAM. The host reads
  *              and writes a SEGGER-compatible control block directly in RAM.
  *   UART     - plain serial; the host reads the port instead of the probe.
+ *   BUFF     - nothing leaves the chip: events go into a RAM ring buffer and
+ *              the host dumps the whole window afterwards (mdk_trace_buff.h).
+ *
+ * The first three are *stream* modes (record and read continuously, at the
+ * cost of dropping under load). BUFF is *buff* mode (record flat out at full
+ * time resolution, read once, bounded by the buffer size). trace_guide with
+ * topic=instrument_modes explains when each one is the right answer.
  *
  * Frame format (MTF, kept in sync with host side mdkdebug/traceproto.py):
  *
@@ -73,6 +80,8 @@ extern "C" {
 #define MDK_TRACE_TYPE_TS       6u
 #define MDK_TRACE_TYPE_KV       7u
 #define MDK_TRACE_TYPE_RESET    8u
+#define MDK_TRACE_TYPE_FAULT    9u
+#define MDK_TRACE_TYPE_SCHED   10u
 
 /* Event / ISR sub kinds. Must match MTF_KINDS in traceproto.py. */
 #define MDK_TRACE_KIND_ENTER    0u
@@ -115,6 +124,46 @@ void mdk_trace_timestamp(void);
 /* Interrupt side. Kept separate from mdk_trace_event so the host can pair
  * enter/exit without relying on ids being globally unique. */
 void mdk_trace_isr(uint16_t id, uint8_t kind);
+
+/* ------------------------------------------------------------------ faults
+ * A fault is the one event you cannot afford to reconstruct after the fact,
+ * and the one where the interesting state (which stack, which PC, which fault
+ * status bit) disappears the moment you restart. These two calls exist so the
+ * first line of your fault handler is enough to preserve it.
+ *
+ * MDK_TRACE_FAULT_CAPTURE() must be the FIRST statement of the handler: it
+ * reads LR (EXC_RETURN), MSP and PSP, and from those it walks the exception
+ * stack frame to recover PC / LR / xPSR. Anything the handler does before the
+ * snapshot can destroy the very state we are here to record.
+ *
+ * It emits one FAULT record (class + CFSR) followed by counter records with
+ * ids 0xFF01.. (PC, LR, SP, HFSR, MMFAR, BFAR, xPSR). Both stream and buff
+ * backends carry it; in buff mode the history is still there after the chip
+ * has been reset, which is exactly the case that matters.
+ */
+void mdk_trace_fault(uint16_t cls, uint32_t cfsr);
+void mdk_trace_fault_capture(uint32_t exc_return, uint32_t msp, uint32_t psp);
+
+/* Context switch / scheduler hook. `from` and `to` are application task ids;
+ * record it wherever your scheduler actually performs the switch, so the
+ * trace shows ownership of the CPU rather than a guess derived from ISRs. */
+void mdk_trace_sched(uint16_t from, uint16_t to);
+
+#define MDK_TRACE_FAULT_CLASS_HARD      0u
+#define MDK_TRACE_FAULT_CLASS_MEMMANAGE 1u
+#define MDK_TRACE_FAULT_CLASS_BUS       2u
+#define MDK_TRACE_FAULT_CLASS_USAGE     3u
+
+/* Reserved ids for the register dump that follows a FAULT record. They are
+ * ordinary counter events so both backends carry them with no extra code, and
+ * the 0xFF00.. range is reserved: application ids must stay below 0xFE00. */
+#define MDK_TRACE_FAULT_REG_PC     0xFF01u
+#define MDK_TRACE_FAULT_REG_LR     0xFF02u
+#define MDK_TRACE_FAULT_REG_SP     0xFF03u
+#define MDK_TRACE_FAULT_REG_HFSR   0xFF04u
+#define MDK_TRACE_FAULT_REG_MMFAR  0xFF05u
+#define MDK_TRACE_FAULT_REG_BFAR   0xFF06u
+#define MDK_TRACE_FAULT_REG_XPSR   0xFF07u
 
 /* Time base in ticks (cycles). Returns 0 when no time base is available, e.g.
  * on a core without DWT and without a cycle CSR. */
@@ -159,6 +208,29 @@ unsigned mdk_trace_rtt_pending(void);   /* bytes waiting in the up channel   */
 
 #define MDK_TRACE_ISR_ENTER(id)  do { mdk_trace_isr((id), MDK_TRACE_KIND_ENTER); } while (0)
 #define MDK_TRACE_ISR_EXIT(id)   do { mdk_trace_isr((id), MDK_TRACE_KIND_EXIT);  } while (0)
+
+/* Context switch hook. Put it in the scheduler, right where the outgoing task
+ * is replaced by the incoming one - not in the tick handler, or the trace will
+ * claim a switch happened on every tick even when the same task continued. */
+#define MDK_TRACE_SCHED(from, to)  do { mdk_trace_sched((from), (to)); } while (0)
+
+/* Fault snapshot. GCC / Clang / ARMClang (AC6) read the registers inline;
+ * ARMCC 5 has no operand form for inline asm, so there the snapshot degrades
+ * to "class + CFSR only" instead of inventing values it cannot read. */
+#if defined(__CC_ARM) && !defined(__clang__)
+#  define MDK_TRACE_FAULT_CAPTURE()  mdk_trace_fault(0u, 0u)
+#elif defined(__arm__) || defined(__ARM_ARCH) || defined(__ARMCC_VERSION)
+#  define MDK_TRACE_FAULT_CAPTURE()                                           \
+    do {                                                                      \
+        uint32_t mdk_tr_lr_, mdk_tr_msp_, mdk_tr_psp_;                        \
+        __asm volatile ("MOV %0, LR"      : "=r" (mdk_tr_lr_));               \
+        __asm volatile ("MRS %0, MSP"     : "=r" (mdk_tr_msp_));              \
+        __asm volatile ("MRS %0, PSP"     : "=r" (mdk_tr_psp_));              \
+        mdk_trace_fault_capture(mdk_tr_lr_, mdk_tr_msp_, mdk_tr_psp_);        \
+    } while (0)
+#else
+#  define MDK_TRACE_FAULT_CAPTURE()  mdk_trace_fault(0u, 0u)
+#endif
 
 /* Instantaneous value probe: packed as a counter so the host can plot it. */
 #define MDK_TRACE_VALUE(id, v)   do { mdk_trace_counter((id), (uint32_t)(v)); } while (0)

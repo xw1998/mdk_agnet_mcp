@@ -60,6 +60,9 @@ READONLY = {
     "trace_guide", "trace_status", "trace_decode", "trace_events",
     # Event Recorder（批次53）：只读目标 RAM 缓冲 + 本地 .axf，不改目标状态、不占资源。
     "trace_eventrec",
+    # 目标侧静态环形缓冲（批次55）：只读目标 RAM + 本地 .axf。工具自身不 halt 目标，
+    # 也不搬数据（搬运由固件在运行时完成），纯粹「搬出来看」。
+    "trace_buff_status", "trace_buff_dump",
     "trace_rtt_find", "trace_swo_read",
     # 串口：只列端口与读日志
     "serial_list_ports", "serial_monitor_status", "serial_read",
@@ -143,6 +146,9 @@ MUTATING = {
     # 批次49：函数运行时线录制会下/撤硬件断点并 halt/resume 目标；
     # D-Cache 维护会写 SCB 的 DCCMVAC/DCIMVAC（不改用户数据，但确实写目标状态）。
     "trace_record", "dcache_maintain",
+    # 目标侧缓冲复位（批次55）：往目标 RAM 的控制块写 reset_req，确实改目标状态；
+    # 且是延迟生效（下一条记录才处理），重复写不等价于一次写。
+    "trace_buff_reset",
 }
 
 # 本服务面向**本机**的开发环境（Keil 进程、调试探针、本地工具链、本地文件），

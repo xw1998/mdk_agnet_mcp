@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 178 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 181 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的三条纪律
@@ -151,11 +151,52 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 38 个（`core` 34 个 + 4 个元工具），其余 140 个按需装载——
+- **工具面默认精简**：默认只暴露 38 个（`core` 34 个 + 4 个元工具），其余 143 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`。
 - **统一信封**：所有工具返回体都带 `status`（ok/error/…) 与 `next_actions`（下一步建议）；
   失败时还有 `error_code` 与 `error_hint`。
+
+### 插桩 trace 的两种工作模式：stream 与 buff
+
+内核/固件往往跑得比调试器读得快——**不插桩、靠轮询读 SRAM 看高频事件是走不通的**
+（全速跑时读回全 0，halt 读又把现象冻住）。正确做法是让目标自己攒证据：
+
+| | `backend="buff"`（全速录、事后搬） | `backend="rtt"` 等（持续录持续读） |
+|---|---|---|
+| 谁在搬 | 目标写静态环形缓冲，调试器只在 dump 时读一次 | 调试器按节奏持续读 |
+| 目标是否停 | **运行期间完全不停、不 halt** | 读的时候会 halt，目标被反复冻一下 |
+| 时间粒度 | 目标侧 DWT，可到 **10ns 级**（`buff_ts_shift=0`） | 受读取节奏限制 |
+| 适合 | 全速跑一段、事后离线分析（任务切换、异常现场） | 人在旁边盯着看的实时调试 |
+
+工作流：
+
+```
+trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0,
+                 buff_clear_on_init=false, fault_frame=true)   # 生成组件+配置，编烧
+  → 跑目标（跑多久都行，目标不停）
+  → trace_buff_status(elf=..., addr=...)     # 先看控制块：total/lost/wrapped/是否有新记录
+  → trace_buff_dump(elf=..., addr=..., out_file="trace.json", names="0x10=switch")
+  → trace_buff_reset(elf=..., addr=...)      # 下一轮前清空
+```
+
+硬规矩（都是真板上撞出来的，详见 [PITFALLS 第十七节](../docs/PITFALLS.md)）：
+
+- **读回全 0 不等于缓冲是空的**——目标全速跑时经调试器读 SRAM 一律返回 0，
+  工具会报 `buff-read-degenerate` 并要求先 `stop`。**`0` 的语义是「没读到」，不是「没有」。**
+- `stop` 后**第一次** `read_mem` 是脏帧，必须重读复核。
+- 用 `lost` / `wrapped` 判完整性：回卷时看到的是**一个窗口，不是全程**；
+  分块 dump 之间必有空洞，要连续记录只能**把缓冲开大**、一次读完。
+- 时间戳必须用 DWT_CYCCNT（组件已幂等使能 `DEMCR.TRCENA`）；拿内核节拍当时间戳会让
+  10µs 级切片全退化成 `dt=0`。
+- `trace_buff_reset` 是**延迟生效**的（目标在下一次写记录时才处理），
+  返回体用 `applied` / `request_latched` 区分「已清空」与「只落了请求」，别把后者当成功。
+- **「没插桩」不等于「没发生」**：`WAIT` 只覆盖 `wait/wait_period/block` 三条路径，
+  其余阻塞在这条时间线上不可见。桩点清单本身就是这份 trace 的可信边界。
+
+**桩该插在哪儿**（`trace_guide(topic="instrument_points")` 有完整版）：异常 handler 第一条指令
+（`MDK_TRACE_FAULT_CAPTURE()`，一次拿到 PC/LR/SP/xPSR + CFSR，性价比最高）→ 喂狗点与复位原因
+→ 任务/上下文切换点 → 状态迁移点。高频中断最内层、被内联的小函数、时间敏感临界区不要插。
 
 ## 六、出问题先看这几个工具
 
@@ -173,6 +214,8 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 | 双核 / 怕看的是另一个核 | `core_info`、`core_list`、`core_select`（Keil 链路只给"不支持 + 怎么办"，不假装切了核） |
 | 问能不能抓 ETM 指令级 trace | `trace_etm_probe`（给 `present` 与 `supported` 两个**分开**的答案，并给替代方案）；`trace_guide` 看这台机器上实际有哪些 trace 手段 |
 | 要改 .sct / 校验分散加载文件 | `scatter_read` → `scatter_check` → `scatter_edit`（改前备份、改后重解析校验，校验不过不落盘） |
+| 想看任务切换 / 上下文切换的完整过程 | `trace_instrument(backend="buff")` 插桩 → 跑 → `trace_buff_dump`（全速录不停目标、10ns 粒度）。读回全 0 是「没读到」不是「没有」，先 `stop` |
+| 想看异常为什么死 | 在 handler 第一条指令放 `MDK_TRACE_FAULT_CAPTURE()`，事后 `trace_buff_dump` 拿 PC/LR/SP/xPSR + CFSR 分位 |
 
 ## 七、一条总原则
 

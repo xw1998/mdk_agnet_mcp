@@ -11,6 +11,38 @@
 
 ---
 
+## 先看一个真板实测的结果
+
+![单核 RTOS 任务切换回放](docs/demo/trace-replay-canvas.png)
+
+上面这张图不是示意图，是 **STM32F401 上真跑一个 RTOS 的实测回放**：
+30,800 条记录、20,523 次上下文切换、10,277 次阻塞事件，**0 条丢失**，
+时间戳取目标侧 `DWT_CYCCNT`（11.9 ns/拍），所以 10 µs 级的切片也分辨得出来。
+
+**它是怎么拿到的**——这句最重要：**录制期间目标全程全速运行，一次都没停**。
+
+```
+trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0)
+  → （让目标全速跑，跑多久都行）
+  → trace_buff_status(...)   # total / lost / wrapped
+  → trace_buff_dump(..., out_file="trace.json", names="0x10=switch,0x11=wait")
+  → trace_buff_reset(...)
+```
+
+固件自己往静态环形缓冲里 memcpy（微秒级、不 halt、不改执行流向、不用 SWO/ETM），
+调试器只在**事后**把缓冲搬出来一次。这条路子把「想看清高频事件」和「不想扰动系统」这两件
+过去互斥的事同时做到了——**SWD 两线就够**，不需要 SWO 引脚、不需要 ETM。
+
+可交互版本（滚轮缩放 / 拖动平移 / 单击定位 / 逐次跳转切换 / 倍速回放）：
+[`docs/demo/trace-replay-singlecore.html`](docs/demo/trace-replay-singlecore.html)，
+页面刻意把「单核、同一时刻只有一个任务在跑」画在脸上：CPU 占用带同一时刻只有一种颜色，
+每个任务的运行电平**同一像素列里只会亮一条**——不把单核画成并行的泳道。
+详见 [docs/demo/README.md](docs/demo/README.md)。
+
+---
+
+## 功能特性
+
 ## 功能特性
 
 - **MCP Server**：以标准 `stdio` 或 `streamable HTTP` 传输方式暴露调试能力，AI 工具可直接调用；
@@ -76,10 +108,10 @@
   （先自检再动手、四条主线工作流、`session_state` 接续、三个输出控制旋钮、参数与工具面约定、出错先看谁），
   避免每次冷启动都从 `list_tools` 摸索；
 - **不依赖 Keil 的芯片也能调**：`toolchain_*` 自己探测 gcc/make/cmake 并跑构建、`target_*` 把接口与 trace 参数固化成 20 份档案、`ocd_*` 用 OpenOCD 做内存/寄存器/断点/烧录——RISC-V、ESP32 这类不用 MDK 的目标走这条链路，与 Keil 链路互不干扰；
-- **SWD/SWO 两条 trace 通路 + 目标侧插桩**：`trace_swo_*` 走 TPIU/ITM 单线输出，`trace_rtt_*` 主机侧自研读写 SEGGER 兼容环形缓冲（不依赖上位机），另有 SWD 采样剖析（明标侵入式）与 DWT 计数器；**观测类工具（RTT / 变量 scope / halt 采样 / DWT / PC 采样）在 Keil 与 OpenOCD 两条链路上通用**，用 `link=auto|keil|ocd` 选路：
+- **SWD/SWO 两条 trace 通路 + 目标侧插桩**：`trace_swo_*` 走 TPIU/ITM 单线输出，`trace_rtt_*` 主机侧自研读写 SEGGER 兼容环形缓冲（不依赖上位机），另有 SWD 采样剖析（明标侵入式）与 DWT 计数器。**插桩分两种工作模式**：`stream` 持续录持续读（要人在旁边盯着看），`buff` **全速录、事后搬**——固件自己往静态环形缓冲写，调试器只在 dump 那一下进来，时间粒度由目标侧 DWT 决定（可到 10 ns 级），**录制期间目标不停、不 halt、不占 SWO/ETM**；配套 `trace_buff_status` / `trace_buff_dump` / `trace_buff_reset`。**观测类工具（RTT / 变量 scope / halt 采样 / DWT / PC 采样）在 Keil 与 OpenOCD 两条链路上通用**，用 `link=auto|keil|ocd` 选路：
     - `auto` 哪条链路有活会话用哪条（两条都有时优先 Keil）；
     - 显式指定而那条不可用时**不拿另一条顶上**（那会读到另一个目标的现场），直接报错并带上两条链路各自的原因与起法；
-    - 读到的东西一定带 `read_confidence` / `while_running` / `degenerate`——**读到的 0 不等于数据是 0**；主机侧只能看到“目标愿意发出来的东西”，所以配套提供目标侧插桩组件 `components/trace/`（ITM/RTT/UART 三后端，只依赖 CMSIS），事件按带 CRC8 的 MTF 帧传出，丢包与坏帧**如实计数上报**；
+    - 读到的东西一定带 `read_confidence` / `while_running` / `degenerate`——**读到的 0 不等于数据是 0**；主机侧只能看到“目标愿意发出来的东西”，所以配套提供目标侧插桩组件 `components/trace/`（ITM/RTT/UART/**目标侧缓冲** 四后端，只依赖 CMSIS），事件按带 CRC8 的 MTF 帧传出，丢包与坏帧**如实计数上报**；
 - **随附模拟调试器**：无需硬件即可离线联调与跑测试（UVSOCK 与 OpenOCD 各一份）。
 
 ## 工作原理
@@ -186,9 +218,9 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 178 个工具定义
+│   └── server.py             # MCP Server 与 181 个工具定义
 ├── components/
-│   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
+│   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
 ├── skills/
 │   └── mdkdebug/SKILL.md     # 随附 companion 技能（工作流 / 参数约定 / 输出控制 / 排障入口）
@@ -235,10 +267,10 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **178** 个（**默认只暴露 38 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **181** 个（**默认只暴露 38 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
 - **MDK 族（110 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
-- **非 MDK 族（60 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**，26 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **非 MDK 族（64 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**，30 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 - **常驻元工具（4 个）**——`toolset`（工具面按需装载）/ `list_tools` / `capabilities` / `get_version`：**永不被裁**，否则 AI 连工具清单都问不出来、也装不回来。
 - **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
 
@@ -469,6 +501,9 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 
 | `trace_eventrec` | **读 CMSIS Event Recorder（MDK 原生、纯 SWD 可用的事件缓冲）**：数据通路是**调试器读目标 RAM**、不是 SWO 引脚（uVision 的 Event Recorder / Event Statistics 窗口读的就是这份数据）。`action`：`status`（协议版本/记录条数/缓冲地址/是否在记录/写指针/时间戳源与频率/EventStatus 签名校验）、`read`（最近 N 条事件，旧→新：目标侧时间戳、组件号、消息号、val1/val2、中断上下文、序号、首/末标记）、`stats`（EventStartX/EventStopX 成对的次数与耗时聚合，与 uVision 的 Event Statistics 同口径）。**三条如实披露**：目标是**必须插桩**（没链组件/没调 EventRecordXxx 就一条数据都没有，报 `eventrec-symbol-missing`）；事件名要靠工程里的 SCVD，工具只给 component/message 编号与槽位号；`level` 不随记录存储，只有 `component=0xEF` 那组能按 message 反推组别与槽位；读到写一半的记录会跳过并计数。定位默认用符号文件里的 `EventRecorderInfo`，也可 `info_addr` 直接指地址 | `action?`（`status`/`read`/`stats`）、`link?`、`elf?`、`info_addr?`、`limit?` |
 | `trace_record` | **函数运行时线录制（细粒度事件流）**：在选定函数的**入口**下断点，每次命中记一条事件（时间、PC、所属函数、调用者、LR/SP、DWT 周期数），并给出按函数统计、调用者分布与时间线。**MDK 与 OpenOCD 两条链路的抓取方式完全不同**（Keil 走 UVSOCK 的 `BS`/`BK` + `wait_breakpoint`，OpenOCD 走 telnet 的 `bp`/`rbp` + `wait_halt`，后者还要用「读得到核寄存器」当**硬证据**判是否真停），所以**分开实现**、由 `link=auto|keil|ocd` 选路，返回值写明这次实际用的链路。`funcs`/`pattern` **至少给一个**（全表下断点既不可能也没意义）；`max_breakpoints` 是愿意占用的槽位（默认 4，硬件断点一般 6 个、M0 只有 4 个），要监控的函数多于槽位时只布前 N 个，`armed`/`skipped` 如实说明。`watch_exit=true` 时命中入口后用 LR **动态补返回地址断点**拿 exit 事件（槽位不够就没有 exit，返回里说明，不编）。**录制的是事件流不是精确耗时**：`gap_cyc` 是相邻两次命中的 CYCCNT 差值（精确耗时用 `profile_function`），`depth_est` 由 SP 推算属估计值；命中不落在任何已知函数区间时标 `unknown` 并保留原 PC，**不硬塞函数名**——符号与板上固件不同源时正是这种「假符号」场景。`reloc_delta` 用于 App 重定位场景 | `action?`（`run`/`status`/`read`/`stop`）、`funcs?`、`pattern?`、`max_events?`、`max_ms?`、`max_breakpoints?`、`watch_exit?`、`kind?`、`func?`、`limit?`、`reloc_delta?`、`leave_halted?`、`link?` |
+| `trace_buff_status` | **看目标侧静态环形缓冲的现状**（`backend=buff` 的配套）：一次读出控制块里的 magic/版本/容量/**写指针**/**总条数**/**丢失数**、时间戳移位与 CPU 频率、是否已回卷、是否发生过复位重启。**读回全 0 一律按失败处理**（报 `buff-read-degenerate` 并提示先 halt）——目标全速运行时经调试器读 SRAM 返回的 0 是「没读到」，不是「缓冲是空的」 | `elf?`、`addr?`、`link?` |
+| `trace_buff_dump` | **把缓冲里的记录搬出来并解码时间线**：`[type][kind][id][arg][dt]` 定长 12 B 记录 → 结构化事件（切换/阻塞/ISR/异常现场/标记…），时间戳是**差值**，绝对时刻由控制块 `last_cycles` 向前回推。`names="0x10=switch,0x11=wait"` 给 id 起名；记录多时 `limit` 只截返回条数、`out_file` 全量落盘 JSON。**回卷会显式警告「看到的是一个窗口，不是全程」**，丢记录时明说「这条时间线不完整」 | `elf?`、`addr?`、`limit?`、`out_file?`、`names?`、`link?` |
+| `trace_buff_reset` | **复位目标侧缓冲**（往控制块写 `reset_req`）。**延迟生效**：目标在下一次写记录时才处理，所以用 `seq` 有没有变来区分 `applied`（已清空）与 `request_latched`（只落了请求）——写成功 ≠ 已清空 | `elf?`、`addr?`、`wait?`、`link?` |
 
 ### RTOS 任务感知（`rtos_*`，3 个）
 
@@ -517,14 +552,15 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 
 ### 目标侧插桩组件（`components/trace/`）
 
-trace 不能只靠主机侧「猜」目标行为，需要在被调试代码里插一小段组件把事件送出来。组件随仓库提供（源码注释为英文，避免旧版编译器中文注释乱码），支持 **ITM / RTT / UART** 三种后端，只依赖 CMSIS，不绑定 HAL：
+trace 不能只靠主机侧「猜」目标行为，需要在被调试代码里插一小段组件把事件送出来。组件随仓库提供（源码注释为英文，避免旧版编译器中文注释乱码），支持 **ITM / RTT / UART / BUFF** 四种后端，只依赖 CMSIS，不绑定 HAL：
 
 | 文件 | 说明 |
 |------|------|
 | `mdk_trace.h` | 组件主头：API + MTF 常量 + `MDK_TRACE_SCOPE()` / ISR 进出宏 |
-| `mdk_trace_config_default.h` | 全部 `#ifndef` 兜底：什么都不配也能编，且**只在四后端都没定义时才默认 ITM**，不会双后端打架 |
+| `mdk_trace_config_default.h` | 全部 `#ifndef` 兜底：什么都不配也能编，且**只在四个后端都没定义时才默认 ITM**，不会双后端打架 |
 | `mdk_trace.c` | DWT/`mcycle` 时间戳、MTF 组帧（CRC8）、三种后端的发送实现 |
 | `mdk_trace_rtt.c` / `.h` | SEGGER 兼容的 RTT 控制块与环形缓冲（**目标侧绝不写 RdOff**，由主机侧推进） |
+| `mdk_trace_buff.c` / `.h` | **目标侧静态环形缓冲后端**：控制块 80 B + 记录区（定长 12 B/条）放在**一个连续 blob** 里，主机只认一个符号 `mdk_trace_buff_blob`；暖启动保留复位前记录（看门狗咬/HardFault 复位后的唯一证据） |
 | `CMakeLists.txt` / `README.md` | 静态库 `mdk_trace` 的构建与使用说明 |
 
 典型用法（更多见组件内 README）：
@@ -545,13 +581,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-178 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 38 个**（`core` 组 34 个 + 4 个元工具），其余 140 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+181 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 38 个**（`core` 组 34 个 + 4 个元工具），其余 143 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 178 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 181 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -569,7 +605,7 @@ toolset(action="load",   toolsets="all")        # 一次全装 178 个（=full/*
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
 | `target` | 非 MDK：目标档案查询与自动识别、工程现场调试配置发现、多核目标列举与切换（7 个） |
 | `ocd` | 非 MDK：OpenOCD 会话 / 内存 / 寄存器 / 断点 / 烧录（17 个） |
-| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 函数运行时线录制 / 插桩组件部署 / 代码覆盖率 / ETM 能力探测（26 个） |
+| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 函数运行时线录制 / 插桩组件部署（含目标侧缓冲后端）/ 代码覆盖率 / ETM 能力探测（30 个） |
 | `rtos` | RTOS 任务感知：任务列表 / 栈水位 / 队列信号量（3 个；跨 Keil 与 OpenOCD 两条链路） |
 
 四条防翻车约定：**收起 ≠ 坏了**——收起只是不进工具清单，`load` 装回来立刻可用（返回值里的 `exposed` 是新暴露数）；**`list_tools` / `get_version` / `capabilities` / `toolset` 四个元工具永不被裁**（否则 AI 连工具清单都问不出来也装不回来），未归类的工具一律保留、组名写错时只告警不裁剪（宁可少裁不错杀）；**装完若客户端报「未知工具」**，多半是它缓存了旧的 tools/list——重新拉一次清单即可；**装载状态随时可核对**：`toolset(action="status")` 与 `capabilities.tool_surface` 都会报当前装载组、收起数与注册总数。

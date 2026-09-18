@@ -25,6 +25,9 @@
 #if MDK_TRACE_BACKEND_RTT
 #  include "mdk_trace_rtt.h"
 #endif
+#if MDK_TRACE_BACKEND_BUFF
+#  include "mdk_trace_buff.h"
+#endif
 
 /* A frame length field is one byte, so a payload above 255 would silently wrap
  * and produce garbage on the host. Fail at build time instead. */
@@ -224,6 +227,7 @@ static uint32_t _rv_cycles(void)
 
 /* ================================================================ CRC + MTF */
 
+#if !MDK_TRACE_BACKEND_BUFF
 /* CRC-8, poly 0x07, init 0x00, no reflection, no final xor.
  * Bit by bit on purpose: a table or nibble variant saves cycles this path does
  * not need, and this stays obviously identical to the host implementation. */
@@ -267,8 +271,79 @@ static void _raw_out(const uint8_t *p, uint32_t n)
 #endif
 }
 
+/* ------------------------------------------------------------------ buff
+ * In buff mode nothing is framed and nothing leaves the chip: the semantic
+ * fields are pulled straight out of the MTF payload the caller just built and
+ * stored as one 12 byte record.
+ *
+ * Decoding the payload here, rather than branching inside every mdk_trace_*()
+ * function, keeps the payload layout defined in exactly one place - a stream
+ * build and a buff build therefore cannot drift apart and start reporting
+ * different things for the same event.
+ */
+#endif /* !MDK_TRACE_BACKEND_BUFF */
+
+#if MDK_TRACE_BACKEND_BUFF
+static uint16_t _rd_u16(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t _rd_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void _buff_receive(uint8_t type, const uint8_t *payload, uint8_t len)
+{
+    switch (type) {
+    case MDK_TRACE_TYPE_EVENT:
+        if (len < 11u) { mdk_trace_buff_note_unsupported(); return; }
+        mdk_trace_buff_put(type, payload[2], _rd_u16(payload), _rd_u32(payload + 7));
+        break;
+    case MDK_TRACE_TYPE_ISR:
+        if (len < 7u) { mdk_trace_buff_note_unsupported(); return; }
+        mdk_trace_buff_put(type, payload[2], _rd_u16(payload), 0u);
+        break;
+    case MDK_TRACE_TYPE_COUNTER:
+    case MDK_TRACE_TYPE_KV:
+    case MDK_TRACE_TYPE_FAULT:
+    case MDK_TRACE_TYPE_SCHED:
+        if (len < 6u) { mdk_trace_buff_note_unsupported(); return; }
+        mdk_trace_buff_put(type, 0u, _rd_u16(payload), _rd_u32(payload + 2));
+        break;
+    case MDK_TRACE_TYPE_MARK:
+    case MDK_TRACE_TYPE_TS:
+        if (len < 4u) { mdk_trace_buff_note_unsupported(); return; }
+        mdk_trace_buff_put(type, 0u, 0u, _rd_u32(payload));
+        break;
+    case MDK_TRACE_TYPE_RESET:
+        /* The payload is a text banner ("init"). A 12 byte record cannot carry
+         * it, and storing the first four bytes as an integer would hand the
+         * host a number that looks like a tag but is really ASCII. The mere
+         * existence of the record is the signal; arg stays 0. */
+        mdk_trace_buff_put(type, 0u, 0u, 0u);
+        break;
+    default:
+        /* text / raw: a 12 byte record cannot carry a string. Counted rather
+         * than silently dropped - the host reports how many were lost. */
+        mdk_trace_buff_note_unsupported();
+        break;
+    }
+}
+#endif /* MDK_TRACE_BACKEND_BUFF */
+
 void mdk_trace_send(uint8_t type, const uint8_t *payload, uint8_t len)
 {
+#if MDK_TRACE_BACKEND_BUFF
+    if (!_ready) {
+        return;
+    }
+    _buff_receive(type, payload, len);
+    _stats.frames++;
+    _stats.bytes += MDK_TRACE_BUFF_REC_SIZE;
+#else
     uint8_t hdr[3];
     uint8_t crc;
 
@@ -294,6 +369,7 @@ void mdk_trace_send(uint8_t type, const uint8_t *payload, uint8_t len)
 
     _stats.frames++;
     _stats.bytes += 4u + (uint32_t)len;
+#endif /* MDK_TRACE_BACKEND_BUFF */
 }
 
 /* -------------------------------------------------------------- primitives */
@@ -517,6 +593,96 @@ void mdk_trace_isr(uint16_t id, uint8_t kind)
     mdk_trace_send((uint8_t)MDK_TRACE_TYPE_ISR, p, 7u);
 }
 
+/* ------------------------------------------------------------------ faults
+ * Everything below has to be safe to run inside a fault handler: no loops
+ * that can be long, no peripheral access, no calls that could fault again.
+ * Reading the exception frame is a handful of loads from a stack the core
+ * already wrote, so it is as close to "free" as this can get.
+ */
+void mdk_trace_fault(uint16_t cls, uint32_t cfsr)
+{
+    uint8_t p[6];
+
+    _put_u16(p, cls);
+    _put_u32(p + 2, cfsr);
+    mdk_trace_send((uint8_t)MDK_TRACE_TYPE_FAULT, p, 6u);
+}
+
+void mdk_trace_sched(uint16_t from, uint16_t to)
+{
+    uint8_t p[6];
+
+    _put_u16(p, from);
+    _put_u32(p + 2, (uint32_t)to);
+    mdk_trace_send((uint8_t)MDK_TRACE_TYPE_SCHED, p, 6u);
+}
+
+void mdk_trace_fault_capture(uint32_t exc_return, uint32_t msp, uint32_t psp)
+{
+#if MDK_TRACE_FAULT_FRAME && (MDK_TRACE_ARCH_ARM || MDK_TRACE_ARCH_RISCV)
+    /* Fault status registers. Addresses are architecturally fixed for the
+     * ARMv7-M / ARMv8-M System Control Space; on a core without them the read
+     * returns 0 and the host is told the field was not available. */
+    uint32_t cfsr  = *(volatile uint32_t *)(uintptr_t)0xE000ED28u;
+    uint32_t hfsr  = *(volatile uint32_t *)(uintptr_t)0xE000ED2Cu;
+    uint32_t mmfar = *(volatile uint32_t *)(uintptr_t)0xE000ED34u;
+    uint32_t bfar  = *(volatile uint32_t *)(uintptr_t)0xE000ED38u;
+    uint32_t sp    = msp;
+    uint32_t cls   = MDK_TRACE_FAULT_CLASS_HARD;
+
+    /* Which stack was in use when the fault happened. EXC_RETURN bit 2 tells
+     * us: 1 means the thread was on PSP (an RTOS task), 0 means MSP. Getting
+     * this wrong would make us read a live stack as if it were the frame,
+     * which produces a plausible but completely wrong PC. */
+#if defined(__arm__) || defined(__ARM_ARCH) || defined(__ARMCC_VERSION)
+    if ((exc_return & 0x4u) != 0u) {
+        sp = psp;
+    }
+#endif
+
+    /* Classify by which status field is non-zero. HardFault is the fallback,
+     * which is the honest answer when nothing more specific is set - the
+     * registers are then what tells you whether it was an escalated fault. */
+    if ((cfsr & 0x000000FFu) != 0u) {
+        cls = MDK_TRACE_FAULT_CLASS_MEMMANAGE;
+    } else if ((cfsr & 0x0000FF00u) != 0u) {
+        cls = MDK_TRACE_FAULT_CLASS_BUS;
+    } else if ((cfsr & 0x00FF0000u) != 0u) {
+        cls = MDK_TRACE_FAULT_CLASS_USAGE;
+    }
+
+    /* The exception frame is pushed by hardware in a fixed order:
+     *   sp[0..3] R0..R3, sp[4] R12, sp[5] LR, sp[6] PC, sp[7] xPSR
+     * ARMv7-M may stack the FP state as well, but it goes *after* these eight
+     * words, so the offsets below hold either way. */
+    mdk_trace_fault((uint16_t)cls, cfsr);
+
+    {
+        volatile uint32_t *frame = (volatile uint32_t *)(uintptr_t)sp;
+        uint32_t pc    = frame[6];
+        uint32_t lr    = frame[5];
+        uint32_t xpsr  = frame[7];
+
+        /* The order is deliberate: PC first, because that is the one number a
+         * reader looks for when a board has just bricked itself. */
+        mdk_trace_counter(MDK_TRACE_FAULT_REG_PC,    pc);
+        mdk_trace_counter(MDK_TRACE_FAULT_REG_LR,    lr);
+        mdk_trace_counter(MDK_TRACE_FAULT_REG_SP,    sp);
+        mdk_trace_counter(MDK_TRACE_FAULT_REG_XPSR,  xpsr);
+    }
+    mdk_trace_counter(MDK_TRACE_FAULT_REG_HFSR,  hfsr);
+    mdk_trace_counter(MDK_TRACE_FAULT_REG_MMFAR, mmfar);
+    mdk_trace_counter(MDK_TRACE_FAULT_REG_BFAR,  bfar);
+#else
+    /* No frame capture on this core / configuration: report the fault class
+     * without pretending to know registers we never read. */
+    (void)exc_return;
+    (void)msp;
+    (void)psp;
+    mdk_trace_fault(MDK_TRACE_FAULT_CLASS_HARD, 0u);
+#endif
+}
+
 /* ------------------------------------------------------------- timestamps */
 
 uint32_t mdk_trace_now(void)
@@ -545,6 +711,8 @@ const char *mdk_trace_backend_name(void)
     return "rtt";
 #elif MDK_TRACE_BACKEND_UART
     return "uart";
+#elif MDK_TRACE_BACKEND_BUFF
+    return "buff";
 #else
     return "none";
 #endif
@@ -571,6 +739,14 @@ void mdk_trace_init(void)
     _arm_tpiu_init((uint32_t)MDK_TRACE_CPU_HZ);
     _arm_itm_init();
 #  endif
+#endif
+
+#if MDK_TRACE_BACKEND_BUFF
+    /* After the time base is running, so the first record has a sane dt.
+     * buff_init() keeps the records from before a soft reset by default -
+     * after a watchdog bite or a fault-induced reset those are the only
+     * records that matter. See MDK_TRACE_BUFF_CLEAR_ON_INIT. */
+    mdk_trace_buff_init();
 #endif
 
     _ready = 1;
@@ -603,9 +779,20 @@ int mdk_trace_is_ready(void)
 
 void mdk_trace_get_stats(mdk_trace_stats_t *out)
 {
-    if (out != NULL) {
-        *out = _stats;
+    if (out == NULL) {
+        return;
     }
+    *out = _stats;
+#if MDK_TRACE_BACKEND_BUFF
+    /* In buff mode nothing is dropped for lack of transport bandwidth, so the
+     * only losses are the ones the backend counts: records with no usable
+     * time base, and frames the 12 byte record cannot represent. Reporting
+     * the transport numbers here would show a perfectly healthy trace that
+     * had in fact lost half its events. */
+    out->frames   = mdk_trace_buff_total();
+    out->bytes    = mdk_trace_buff_total() * MDK_TRACE_BUFF_REC_SIZE;
+    out->dropped  = mdk_trace_buff_lost();
+#endif
 }
 
 void mdk_trace_reset_stats(void)

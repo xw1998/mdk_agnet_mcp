@@ -122,6 +122,8 @@ TOOLSETS = {
         "trace_record",
         # CMSIS Event Recorder（批次53）：MDK 原生事件缓冲，走调试器读内存，不要 SWO。
         "trace_eventrec",
+        # 目标侧静态环形缓冲后端（批次55）：全速录、事后 dump，链路只需 SWD 两线。
+        "trace_buff_status", "trace_buff_dump", "trace_buff_reset",
     },
     # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组。
     "rtos": {
