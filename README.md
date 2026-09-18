@@ -39,7 +39,8 @@
 - **符号检索**：`find_symbol` 从 .axf ELF 符号表模糊检索函数/全局变量（地址+类型），AI 读任意符号不再靠猜名字；
 - **写寄存器 / 改 PC**：`set_register` 写 CPU 寄存器并读回验证，可修正现场、改返回值、改 PC 跳转执行；
 - **性能分析**：`dwt` 读 DWT 周期计数器（自动使能），配合两次采样测代码段执行时间；
-- **HardFault / 异常定位**：`fault_report` 读 SCB 寄存器判异常类型与原因，并从异常栈帧恢复现场（PC/LR/R0-R3），排查死机/跑飞/复位循环；
+- **HardFault / 异常定位**：`fault_report` 读 SCB 寄存器判异常类型与原因，并从异常栈帧恢复现场（PC/LR/R0-R3），排查死机/跑飞；
+- **复位循环识别**：`watch_reset` 按固定间隔读 `DHCSR.S_RESET_ST`（读即清），把「启动即死 / 喂狗超时 / 反复复位」这类没有单次停靠可抓的故障识别出来——间隔稳定即判复位循环，快过采样间隔时如实说「测不出周期」而不是编一个；由于该位读即清、且 Keil 在目标复位后会重新同步并自读一次 DHCSR，单靠它**会漏报**，所以还可传 `flags_addr` 指定芯片的复位标志寄存器（如 STM32 的 `RCC_CSR=0x40023874`）做交叉验证：窗口前后各读一次，报出被置起的位置，位含义照手册读、本工具不解释；
 - **条件断点**：`set_conditional_breakpoint` 设 C 表达式条件/命中次数断点，只在特定条件或第 N 次命中才停；
 - **外设寄存器一键读（SFR）**：`read_peripheral` 内置 STM32F4 常用外设寄存器表（RCC/GPIO/USART/SPI/I2C/TIM/ADC/PWR/FLASH/SysTick/SCB/NVIC/DWT/EXTI/SYSCFG），一键读指定外设全部寄存器当前值并解析关键位域（时钟使能/波特率/GPIO 模式/定时器计数），`list_peripherals` 列出可用外设——排查时钟没使能、GPIO 模式配置错、串口波特率不对等场景，**不依赖外部 SVD 文件、离线可用**；
 - **ITM / Debug(printf) Viewer trace**：`itm_trace` 检查 Trace 配置（DEMCR.TRCENA / ITM->TCR / ITM->TER）是否就绪，并经 UVSOCK 串口通道拉取 Debug(printf) Viewer 收到的 ITM 打印文本，再交给 `traceproto` 做**结构化解码**——按 ITM 报文给出 port / header / `data_text`，`overflow` 与半包（`leftover_bytes`）如实计数，连续拉取只喂新增字节，不把丢过包的时间线当完整证据；printf 走 SWO 输出时无需占用 UART，排查实时日志/运行状态；真实 ITM 输出需 Keil 已配置 Trace（Core Clock + Stimulus Port0）且调试器（ST-Link/J-Link）SWO 引脚已连接；
@@ -185,7 +186,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 161 个工具定义
+│   └── server.py             # MCP Server 与 162 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -234,7 +235,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **161** 个（**默认只暴露 37 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **162** 个（**默认只暴露 37 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
 - **MDK 族（107 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导 / **工具面按需装载**（`toolset`）（下表）。
 - **非 MDK 族（54 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案**（接口·速度·SWO·RTT 参数档案与自动识别 + 工程现场配置发现，4 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署，20 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
@@ -288,6 +289,7 @@ python run_server.py --transport http --http-port 8300
 | `profile_function` | 函数执行耗时分析：自动设入口断点 → 运行到入口记 DWT CYCCNT → step out 再记 → 差值，函数级性能分析 | `func`、`max_ms` |
 | `write_peripheral` | 写入外设单个寄存器并读回确认：置时钟使能 / 改 GPIO 模式 / 配波特率 / 改定时器 | `periph`、`reg`、`value` |
 | `wait_fault` | 运行至异常 / 断点并自动诊断：轮询等待停止，若停异常则读 ICSR/CFSR 判类型 + 收集现场，复现崩溃自动抓现场 | `timeout_ms` |
+| `watch_reset` | **复位循环 / 启动失败自动识别**：按固定间隔读 Cortex-M 的 `DHCSR.S_RESET_ST`（**读即清**的标准位，自上次读之后复位过则置位）——不需要目标已停、不需要地址或符号，跨芯片通用。返回 `pattern`/`verdict`/`resets`/`interval_stats`/`flags_seen`/`advice`，给了 `flags_addr` 时另有 `reset_flags`；`pattern` 取 `none`/`single`/`repeat`/`periodic`（**复位循环**，间隔稳定）/`irregular`/`too_fast`（**复位快过采样间隔，只能确定「一直在复位」，测不出周期**）/`flags-only`（**DHCSR 没抓到、但 `flags_addr` 标志寄存器有位置起 = 确实复位过，是前者漏报**）/`no-data`。`DHCSR.S_LOCKUP` 置位会单独点名（CPU 锁死 = 存在未处理异常）；`sample_pc=true` 时每次检测到复位后停一下读 PC 与符号落点（**会打断目标**，默认关闭）。**诚实边界**：Keil 链路上「谁在复位期间重同步」会抹掉读即清的 `S_RESET_ST`，`pattern=none` 只代表本次窗口没观测到；要坐实请给 `flags_addr`（粘滞位不受影响）。`flags_addr` 留空则完全跳过这个附加判据 | `duration_ms?`（默认 5000）、`interval_ms?`（默认 150）、`max_resets?`、`sample_pc?`、`settle_ms?`、`link?`（auto/keil/ocd）、`flags_addr?`（**复位标志寄存器地址**，如 `0x40023874`） |
 | `parse_build_errors` | 解析编译错误 / 警告为结构化列表（文件:行:列 + 消息），兼容 AC5 `path(line):` 与 AC6 `path:line:col:` 两种格式 | `errors_text` |
 | `parse_map` | 解析 .map 链接映射文件：Program Size / sections / symbols / 栈使用 / 未用段，检查 FLASH/RAM 占用与栈溢出风险 | — |
 | `explain_build_error` | **编译/命令报错知识库**：把 AC5/AC6 的编译诊断文本或 Keil 命令错误码翻成「含义 + 根因 + 修法」，如 `#20 identifier is undefined`、`error 57 illegal address`、`error 145` 断点已存在。**只收录真机实测过的条目**，未收录的一律 `confidence=unknown` + 通用排查路径，不编造含义 | `text?`、`code?` |
@@ -519,13 +521,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-161 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 37 个**（`core` 组 33 个 + 4 个元工具），其余 124 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+162 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 37 个**（`core` 组 33 个 + 4 个元工具），其余 125 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 161 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 162 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。

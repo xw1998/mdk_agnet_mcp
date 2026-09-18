@@ -67,6 +67,14 @@ class Link:
         """返回 (bytes|None, meta)。失败时 bytes 为 None，meta 里必有 error。"""
         raise NotImplementedError
 
+    def read_once(self, addr: int, n_bytes: int):
+        """单次读，**不做复读/重试**。给「读即清」的寄存器用（如 DHCSR 的 S_RESET_ST）。
+
+        默认就转调 read()；带复读判定的链路（Keil）必须覆写成本方法，
+        否则第二次读会把已经被自己清掉的位读成 0，事件当场丢掉。
+        """
+        return self.read(addr, n_bytes)
+
     def write(self, addr: int, data: bytes):
         """返回 (ok, meta)。"""
         raise NotImplementedError
@@ -153,6 +161,35 @@ class KeilLink(Link):
         # 所以不再要求先停；运行态读到的东西可不可信，改由读数自身的
         # while_running / read_confidence / read_unstable 如实交代。
         return False
+
+    def read_once(self, addr: int, n_bytes: int):
+        """单次读，不走 read_mem_verified 的复读判定。
+
+        read_mem_verified 在可疑时会复读比对，而 DHCSR 的 S_RESET_ST / S_RETIRE_ST
+        是**读一次清一次**：复读只会读到被自己清掉的 0，于是「刚才复位过」这件事
+        被第二次读抹掉。所以这类寄存器必须一次读一次算。
+        """
+        c = self.client
+        if c is None:
+            return None, {"link": self.name, "error": "没有 Keil 会话"}
+        try:
+            r = c.read_mem(int(addr), int(n_bytes))
+        except Exception as e:                                      # noqa: BLE001
+            return None, {"link": self.name, "error": "读内存失败：%s" % e}
+        if not r.get("ok"):
+            return None, {"link": self.name,
+                          "error": (r.get("status_text") or r.get("error")
+                                    or "Keil 读内存失败")}
+        try:
+            data = bytes.fromhex(r.get("data_hex") or "")
+        except ValueError:
+            return None, {"link": self.name,
+                          "error": "Keil 返回的内存内容不是合法十六进制：%r"
+                                   % (r.get("data_hex"),)}
+        if len(data) < int(n_bytes):
+            return None, {"link": self.name,
+                          "error": "读回长度不足（%d/%d）" % (len(data), int(n_bytes))}
+        return data, {"link": self.name, "read_mode": "single"}
 
     def read(self, addr: int, n_bytes: int):
         c = self.client

@@ -54,6 +54,9 @@ READONLY = {
     "modbus_decode",
     # RTOS 任务感知：只读目标内存 + 本地 .axf，不改目标状态
     "rtos_info", "rtos_tasks", "rtos_objects",
+    # 复位观测：只读 DHCSR（+ 可选读一个复位标志寄存器），不停目标、不改状态。
+    # sample_pc=true 时会短暂停一下再恢复，属瞬时副作用（与 wait_breakpoint 同口径）。
+    "watch_reset",
 }
 
 # ----------------------------------------------------------------------

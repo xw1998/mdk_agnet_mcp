@@ -50,6 +50,7 @@ from . import rtos as _rtos
 from . import toolbox as _toolbox
 from . import traceproto as _traceproto
 from . import modbus as _modbus
+from . import resetwatch as _resetwatch
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -7961,7 +7962,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     _extra_counts = {}
     for _mod_name, _mod in (("toolchain", _toolchain), ("targets", _targets),
                             ("ocd", _ocd), ("trace", _trace),
-                            ("workspace", _workspace), ("rtos", _rtos)):
+                            ("workspace", _workspace), ("rtos", _rtos),
+                            ("resetwatch", _resetwatch)):
         try:
             _extra_counts[_mod_name] = _mod.register(server, _js)
         except Exception as _e:  # noqa: BLE001

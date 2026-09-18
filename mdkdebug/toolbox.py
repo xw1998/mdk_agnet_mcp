@@ -72,7 +72,8 @@ TOOLSETS = {
         "modbus_scan", "modbus_sniff", "modbus_session",
     },
     "advanced": {
-        "clear_faults", "fault_report", "wait_fault", "dwt", "profile_function",
+        "clear_faults", "fault_report", "wait_fault", "watch_reset", "dwt",
+        "profile_function",
         "profile_sampling", "itm_trace", "list_peripherals", "read_peripheral",
         "write_peripheral", "query_memory_map", "svd_list", "svd_decode",
         "watchdog_freeze", "watch", "set_watchpoint", "clear_watchpoint",

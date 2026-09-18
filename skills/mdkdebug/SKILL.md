@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 161 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 162 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的三条纪律
@@ -47,6 +47,7 @@ keil_health → get_status → diagnose         # 通道通不通、现在什么
 snapshot → 改配置 → snapshot_diff           # 内存/寄存器快照对比
 query_memory_map / read_peripheral / svd_decode   # 地址属于哪块、外设寄存器什么值
 fault_report / wait_fault                   # 异常与硬件错误现场
+watch_reset                                 # 反复复位/启动即死：按间隔读 DHCSR.S_RESET_ST（可传 flags_addr 交叉验证）
 ```
 
 ### 3. 串口日志（宿主机侧，不经 Keil）
@@ -145,7 +146,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 37 个（`core` 33 个 + 4 个元工具），其余 117 个按需装载——
+- **工具面默认精简**：默认只暴露 37 个（`core` 33 个 + 4 个元工具），其余 125 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`。
 - **统一信封**：所有工具返回体都带 `status`（ok/error/…) 与 `next_actions`（下一步建议）；
@@ -162,6 +163,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 | 外设寄存器值看不懂 | `svd_list` / `svd_decode`（自动按工程器件推断 SVD） |
 | 读到的内存值可疑 | `cache_info`（H7 D-Cache 直读可能是旧值）、`snapshot_diff` 对比 |
 | Keil 弹了模态框卡住 | `dismiss_dialog`、`keil_health` |
+| 烧进去跑不起来 / 反复复位 | `watch_reset`（复位循环识别，`flags_addr` 给出芯片复位标志寄存器可坐实有没有复位）、`watchdog_freeze`（先冻住看门狗再复现）。注意 Keil 的 `reset` 命令**不产生真实复位**（DWT CYCCNT 不归零、`RCC_CSR` 不置新标志），用它复现复位现象会白测 |
 
 ## 七、一条总原则
 
