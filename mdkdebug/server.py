@@ -48,10 +48,120 @@ from . import trace as _trace
 from . import workspace as _workspace
 from . import rtos as _rtos
 from . import toolbox as _toolbox
+from . import traceproto as _traceproto
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
 logger = logging.getLogger("mdkdebug.server")
+
+# itm_trace 的增量解码状态（Keil 的 Debug(printf) Viewer 缓冲是「拉一次给一坨」，
+# 分片拉取时半包必须留到下次，否则 ITM 解码会整段错位）。
+_ITM_VIEW = {"state": {}, "prev_hex": "", "prev_len": 0, "pulls": 0,
+             "fed_bytes": 0, "overflow": 0, "buffer_resets": 0}
+
+
+def _itm_looks_text(raw: bytes) -> bool:
+    """启发式：像纯文本就按文本解，否则按 ITM 报文解。
+
+    依据：可打印 ASCII（含 \\r\\n\\t）占比 >= 90%。Keil 的 Debug(printf) Viewer 缓冲
+    通常是**已经解好的显示文本**；若目标把原始 SWO 流灌进来，则走 ITM 解码。
+    判不出来时把判据一起返回（decided_by=heuristic），不假装是权威结论。
+    """
+    if not raw:
+        return True
+    printable = 0
+    for b in raw:
+        if b in (9, 10, 13) or 32 <= b <= 126:
+            printable += 1
+    return printable >= len(raw) * 0.9
+
+
+def _itm_packet_json(p: dict) -> dict:
+    """报文里的 data 是 bytes，JSON 化前转成 text/hex（避免 json.dumps 直接炸）。"""
+    q = dict(p)
+    d = q.get("data")
+    if isinstance(d, (bytes, bytearray)):
+        q["data_hex"] = bytes(d).hex()
+        q["data_text"] = bytes(d).decode("utf-8", "replace")
+        q.pop("data", None)
+    return q
+
+
+def _decode_itm_view(raw: bytes, mode: str = "auto", reset: bool = False,
+                     port_filter: int = -1) -> dict:
+    """把 itm_trace 拉到的缓冲结构化（增量喂给 traceproto.decode_itm_stream）。
+
+    增量判据：上次缓冲是本次的前缀 → 只喂新增字节；否则整段重喂并如实标
+    buffer_reset（Keil 缓冲每拉一次清空的话，这属于正常，计数会持续增长）。
+    """
+    st = _ITM_VIEW
+    if reset:
+        st["state"] = {}
+        st["prev_hex"] = ""
+        st["prev_len"] = 0
+        st["pulls"] = 0
+        st["fed_bytes"] = 0
+        st["overflow"] = 0
+        st["buffer_resets"] = 0
+    m = (mode or "auto").strip().lower()
+    if m not in ("auto", "itm", "text"):
+        return {"ok": False, "error": "decode 只能是 auto / itm / text",
+                "error_code": "bad-decode-mode"}
+    st["pulls"] += 1
+    if m == "auto":
+        use = "text" if _itm_looks_text(raw) else "itm"
+        decided = "heuristic"
+    else:
+        use = m
+        decided = "explicit"
+    if use == "text":
+        st["prev_hex"] = raw.hex()
+        st["prev_len"] = len(raw)
+        return {"ok": True, "mode": "text", "decided_by": decided,
+                "bytes": len(raw),
+                "text": raw.decode("utf-8", "replace"),
+                "note": "按文本解（Keil Debug(printf) Viewer 缓冲通常是已解好的显示文本）；"
+                        "要看 ITM 报文结构请显式传 decode=\"itm\""}
+    prev = bytes.fromhex(st["prev_hex"]) if st["prev_hex"] else b""
+    probe = min(len(prev), 64)
+    appended = bool(prev) and len(raw) > len(prev) and raw[:probe] == prev[:probe]
+    delta = raw[len(prev):] if appended else raw
+    if not appended and st["pulls"] > 1:
+        st["buffer_resets"] += 1
+    st["prev_hex"] = raw.hex()
+    st["prev_len"] = len(raw)
+    pk = _traceproto.decode_itm_stream(st["state"], delta)
+    st["fed_bytes"] += len(delta)
+    st["overflow"] = int(st["state"].get("overflow") or 0)
+    packets = [_itm_packet_json(p) for p in (pk.get("packets") or [])]
+    if int(port_filter) >= 0:
+        packets = [p for p in packets if p.get("port") == int(port_filter)]
+    txt = "".join(p.get("data_text") or "" for p in packets
+                 if p.get("kind") == "instrumentation")
+    warns = []
+    if int(pk.get("overflow") or 0) > 0:
+        warns.append("本次有 %d 个 ITM Overflow 报文（ITM FIFO 溢出）：此处之后有报文丢失，"
+                     "事件时间线不完整" % int(pk["overflow"]))
+    if not appended and st["pulls"] > 1:
+        warns.append("本次不是增量（上次缓冲不是本次的前缀）：按整段重喂。Keil 缓冲每拉一次"
+                     "就清空的话这属于正常；若它保留历史内容，说明是滚动窗口（老字节被挤掉），"
+                     "累计计数会偏高——所以要看计数增减，不要只看绝对值")
+    if st["state"].get("leftover"):
+        warns.append("有 %d 字节未凑齐整包，已留到下次拉取接着解"
+                     % len(st["state"]["leftover"]))
+    return {"ok": True, "mode": "itm", "decided_by": decided,
+            "raw_bytes": len(raw), "fed_bytes": len(delta), "delta": appended,
+            "overflow": int(pk.get("overflow") or 0),
+            "overflow_total": st["overflow"],
+            "leftover_bytes": len(st["state"].get("leftover") or b""),
+            "packets": packets[:80], "packets_total": len(packets),
+            "truncated": len(packets) > 80,
+            "text": txt,
+            "summary": _traceproto.summarize(packets),
+            "state": {"pulls": st["pulls"], "fed_bytes": st["fed_bytes"],
+                      "overflow_total": st["overflow"],
+                      "buffer_resets": st["buffer_resets"]},
+            "warnings": warns}
 
 
 def _csv_tokens(value, sep_extra=";|"):
@@ -3673,14 +3783,27 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "读取 Cortex-M ITM（Instrumentation Trace Macrocell）经 SWO 输出的调试打印数据，"
             "即 Keil 的 Debug(printf) Viewer 缓冲内容，并检查 Trace 配置是否就绪。"
-            "参数 port=串口窗口编号（Debug(printf) Viewer 对应其中一个，默认 0）、"
-            "size=最多读取字节数(默认4096)。返回 {config, trace}：config 给出 DEMCR.TRCENA / "
-            "ITM->TCR / ITM->TER 的 Trace 使能诊断（判断为何收不到 ITM 打印）；trace 为拉取到的"
-            "缓冲文本。需已进入调试；真实 ITM 输出还要求 Keil 已配置 Trace(Core Clock + "
-            "Stimulus Port0) 且调试器(ST-Link/J-Link) SWO 引脚已连接。注意：真实 ITM 输出需 Keil 已配置 Trace(Core Clock + Stimulus Port0) 且调试器 SWO 引脚已连接，缺任一都收不到数据（config 会给出诊断）；仅依赖 ITM 缓冲，非全量 trace。"
+            "参数：port=**Keil 串口窗口编号**（Debug(printf) Viewer 对应其中一个，默认 0；"
+            "注意它不是 ITM stimulus port）、size=最多读取字节数(默认4096)、"
+            "decode=解码方式 auto/itm/text（默认 auto：像文本就按文本，否则按 ITM 报文）、"
+            "port_filter=只看某个 ITM stimulus port（-1 表示不过滤）、"
+            "reset=true 清掉增量解码状态重来。\n"
+            "返回 {config, trace, decode}：config 给出 DEMCR.TRCENA / ITM->TCR / ITM->TER 的 "
+            "Trace 使能诊断（判断为何收不到 ITM 打印）；trace 是拉取到的原始缓冲（含 data_hex）；"
+            "decode 是结构化结果——packets（instrumentation 打印 / hardware 源包 / overflow / "
+            "sync 等，含 header、port、data_text/data_hex）、summary（各类报文计数、涉及 port、"
+            "PC 采样数）、overflow 计数、leftover_bytes（未凑齐半包的尾字节，留到下次）、"
+            "warnings（丢包/非增量/半包）与增量记账 state。\n"
+            "**增量语义**：连续拉取时只喂新增字节（上次缓冲是本次前缀时判为追加）；"
+            "否则整段重喂并标 delta=false，不会假装没重复。\n"
+            "需已进入调试；真实 ITM 输出还要求 Keil 已配置 Trace(Core Clock + "
+            "Stimulus Port0) 且调试器(ST-Link/J-Link) SWO 引脚已连接，缺任一都收不到数据"
+            "（config 会给出诊断）；仅依赖 ITM 缓冲，非全量 trace。"
         ),
     )
-    async def itm_trace(port: int = 0, size: int = 4096) -> str:
+    async def itm_trace(port: int = 0, size: int = 4096,
+                        decode: str = "auto", port_filter: int = -1,
+                        reset: bool = False) -> str:
         try:
             client = _get_client()
             demcr = _read_u32(client, _ITM_DEMCR)
@@ -3705,6 +3828,23 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             out = {"ok": trace.get("ok"), "config": cfg, "trace": trace}
             if trace.get("ok"):
                 out["text"] = trace.get("ascii", "")
+            # ---- 结构化解码（增量；半包留到下次）----
+            raw = b""
+            if trace.get("ok"):
+                try:
+                    raw = bytes.fromhex(trace.get("data_hex") or "")
+                except ValueError:
+                    out["decode"] = {"ok": False,
+                                     "error": "serial_get 返回的 data_hex 不是合法十六进制",
+                                     "error_code": "bad-hex"}
+                    raw = None
+            if raw is not None:
+                out["decode"] = _decode_itm_view(raw, mode=decode,
+                                                 reset=bool(reset),
+                                                 port_filter=int(port_filter))
+            if not cfg["ready"]:
+                out["hint"] = ("Trace 未就绪时拉不到真实 ITM 输出；先按 config.note 把 "
+                               "Core Clock / Stimulus Port0 / SWO 接线补齐")
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})

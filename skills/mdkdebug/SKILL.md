@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 99 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 154 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的三条纪律
@@ -100,6 +100,17 @@ session_state(action="load", apply=true)            # 开工接续：只恢复�
 也可以用环境变量 `MDKDEBUG_COMPACT=1`、`MDKDEBUG_MAX_LINES=200` 设全局默认。
 
 ## 五、参数与工具面的约定
+
+### trace / 观测类工具的 `link` 参数
+
+RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具在 Keil 与 OpenOCD 两条链路上通用，都接受 `link=auto|keil|ocd`（默认 `auto`）：
+
+- `auto`：哪条链路有活会话用哪条（两条都有时优先 Keil）；
+- Keil 侧先 `enter_debug`，非 MDK 侧先 `ocd_start`；
+- **显式指定而那条不可用时不换另一条顶上**，直接报错并给出两条链路各自的原因与起法；
+- 读回来的数据带 `read_confidence`/`while_running`/`degenerate`：**读到的 0 不等于数据是 0**，可疑时先看这些字段再下结论。
+
+只有 SWO（`trace_swo_*`）本身依赖 OpenOCD（TPIU 配置与落盘在那里）；Keil 用户做printf trace 用 `itm_trace`（读 Keil 的 Trace 缓冲，已带 ITM 结构化解码）。
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。

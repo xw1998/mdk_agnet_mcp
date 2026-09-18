@@ -33,6 +33,7 @@ import struct
 import time
 
 from . import traceproto as _tp
+from . import linkio as _link
 
 __all__ = ["state", "reset_state", "register"]
 
@@ -256,7 +257,11 @@ def swo_start(file: str = "", coreclk: int = 0, baud: int = 0, ports="0,1",
     s = _ocd.get_session()
     if not s.running():
         return {"ok": False, "error": "OpenOCD 没在运行",
-                "hint": "trace 依赖 OpenOCD 会话：先 ocd_start(profile=\"stm32f401\")"}
+                "reason": "swo-needs-openocd",
+                "hint": "SWO 的 TPIU 配置与原始流落盘由 OpenOCD 做：先 "
+                        "ocd_start(profile=\"stm32f401\")。**Keil 链路不走这条**——"
+                        "Keil 用户用 itm_trace（读 Keil 的 Trace 窗口缓冲，"
+                        "同样解成 ITM 事件），或 trace_scope/trace_rtt（两条链路通用）"}
     spec = {}
     if profile:
         g = _targets.get_profile(profile)
@@ -593,44 +598,36 @@ def rtt_parse_cb(raw: bytes) -> dict:
             "up": up, "down": down}
 
 
-def _read_mem_words(addr: int, n_bytes: int, timeout: float = 10.0):
-    from . import ocd as _ocd
-    s = _ocd.get_session()
-    if not s.running():
-        return None, {"ok": False, "error": "OpenOCD 没在运行",
-                      "hint": "先 ocd_start；RTT 的读写都要经 OpenOCD 访问目标内存"}
-    count = (n_bytes + 3) // 4
-    r = s.cmd("mdw 0x%X %d" % (addr, count), timeout=timeout)
-    if not r.get("ok"):
-        return None, r
-    p = _ocd._parse_mem(r.get("output") or "", addr, count, 32)
-    if not p["complete"]:
-        return None, {"ok": False, "error": "内存读取不完整（%d/%d 字）：目标没停住？"
-                      % (p["got"], count), "raw": r.get("output")}
-    return _ocd._mem_to_bytes(p["words"], 32, n_bytes), {"ok": True}
+def _read_mem_words(addr: int, n_bytes: int, timeout: float = 10.0, link="auto"):
+    """读目标内存：走链路原语层，Keil(UVSOCK) / OpenOCD 谁活着用谁。
+
+    返回 (bytes|None, meta)。meta 里带读置信度与「目标当时在不在跑」——
+    上层要如实披露，**读到的 0 不等于数据是 0**。
+    """
+    lk, err = _link.pick(link, who="读目标内存")
+    if lk is None:
+        return None, err
+    return lk.read(int(addr), int(n_bytes))
 
 
-def _write_mem(addr: int, data: bytes, timeout: float = 10.0):
-    from . import ocd as _ocd
-    s = _ocd.get_session()
-    vals = []
-    step = 4
-    for i in range(0, len(data), step):
-        chunk = data[i:i + step]
-        if len(chunk) < step:
-            chunk = chunk + b"\x00" * (step - len(chunk))
-        vals.append(int.from_bytes(chunk, "little"))
-    if not vals:
-        return {"ok": True, "count": 0}
-    parts = ["mww 0x%X 0x%X" % (addr + i * step, v) for i, v in enumerate(vals)]
-    r = s.cmd("; ".join(parts), timeout=timeout)
-    r["count"] = len(vals)
-    return r
+def _write_mem(addr: int, data: bytes, timeout: float = 10.0, link="auto"):
+    """写目标内存（RTT 推进 RdOff 要用）：同样是链路无关的。"""
+    lk, err = _link.pick(link, who="写目标内存")
+    if lk is None:
+        return dict(err, ok=False)
+    ok, meta = lk.write(int(addr), bytes(data))
+    out = dict(meta)
+    out["ok"] = bool(ok)
+    out["count"] = meta.get("written")
+    if not ok:
+        out.setdefault("error", "写目标内存失败")
+    return out
 
 
 def rtt_find(elf: str = "", ranges=None, id_str: str = "SEGGER RTT",
-             chunk: int = 0x1000, max_scan: int = 0x40000) -> dict:
-    """定位 RTT 控制块：先查 ELF 符号，再在 RAM 里扫魔数。"""
+             chunk: int = 0x1000, max_scan: int = 0x40000,
+             link: str = "auto") -> dict:
+    """定位 RTT 控制块：先查 ELF 符号，再在 RAM 里扫魔数。两条链路通用。"""
     if elf:
         a = elf_symbol_addr(elf, ["_SEGGER_RTT", "SEGGER_RTT", "_SEGGER_RTT_CB",
                                   "segger_rtt_cb"])
@@ -655,10 +652,11 @@ def rtt_find(elf: str = "", ranges=None, id_str: str = "SEGGER RTT",
         addr = lo
         while addr < hi and scanned < max_scan:
             n = min(chunk, hi - addr)
-            data, err = _read_mem_words(addr, n)
+            data, err = _read_mem_words(addr, n, link=link)
             if data is None:
                 return {"ok": False, "error": err.get("error"),
-                        "addr": "0x%X" % addr, "scanned": scanned}
+                        "addr": "0x%X" % addr, "scanned": scanned,
+                        "link": err.get("link")}
             idx = data.find(magic)
             if idx >= 0:
                 return {"ok": True, "addr": addr + idx,
@@ -673,15 +671,18 @@ def rtt_find(elf: str = "", ranges=None, id_str: str = "SEGGER RTT",
 
 
 def rtt_attach(addr: int = 0, size: int = 0, elf: str = "", id_str: str = "SEGGER RTT",
-               channel_names: bool = True) -> dict:
-    """读控制块 → 记住通道信息。之后 rtt_read/rtt_write 直接用。"""
+               channel_names: bool = True, link: str = "auto") -> dict:
+    """读控制块 → 记住通道信息（含用哪条链路）。之后 rtt_read/rtt_write 直接用。"""
     if not addr:
-        f = rtt_find(elf=elf, id_str=id_str)
+        f = rtt_find(elf=elf, id_str=id_str, link=link)
         if not f.get("ok"):
             return f
         addr = f["addr"]
+    lk, lerr = _link.pick(link, who="读 RTT 控制块")
+    if lk is None:
+        return dict(lerr)
     cb_size = int(size or 0) or 512
-    raw, err = _read_mem_words(addr, cb_size)
+    raw, err = _read_mem_words(addr, cb_size, link=lk.name)
     if raw is None:
         return {"ok": False, "addr": "0x%X" % addr, "error": err.get("error"),
                 "hint": "目标可能没在跑 / 地址不对；也可加大 size 再试"}
@@ -697,15 +698,17 @@ def rtt_attach(addr: int = 0, size: int = 0, elf: str = "", id_str: str = "SEGGE
             if not np:
                 ch["name"] = ""
                 continue
-            nm, e2 = _read_mem_words(np, 32)
+            nm, e2 = _read_mem_words(np, 32, link=lk.name)
             if nm is not None:
                 ch["name"] = nm.split(b"\x00")[0].decode("utf-8", "replace")
     _T["rtt"] = {"addr": addr, "cb": cb, "attached_at": time.time(),
+                 "link": lk.name,
                  "reads": 0, "bytes_read": 0, "bytes_written": 0}
     if _T["mode"] is None:
         _T["mode"] = "rtt"
         _T["started_at"] = time.time()
     return {"ok": True, "addr": "0x%X" % addr, "id": cb["id"],
+            "link": lk.name, "link_label": lk.label,
             "up_channels": len(cb["up"]), "down_channels": len(cb["down"]),
             "channels": [{"dir": c["dir"], "index": c["index"],
                           "name": c.get("name", ""), "size": c["size"],
@@ -725,12 +728,18 @@ def rtt_read(channel: int = 0, max_bytes: int = 1024, timeout: float = 10.0) -> 
                 "available": [c["index"] for c in st["cb"]["up"]]}
     ch = chs[0]
     # 重新读一次控制块头部，拿最新的 wr/rd（目标在跑，wr 一直变）
-    hdr, err = _read_mem_words(st["addr"], 24)
+    lk, lerr = _link.pick(st.get("link") or "auto", who="读 RTT 控制块")
+    if lk is None:
+        out = dict(lerr)
+        out["hint"] = ("RTT 是在 %s 链路上挂的，那条链路现在不可用了；"
+                       "重新 trace_rtt_attach 一次" % (st.get("link") or "auto"))
+        return out
+    hdr, err = _read_mem_words(st["addr"], 24, link=lk.name)
     if hdr is None:
         return {"ok": False, "error": err.get("error")}
     _, nup, ndown = struct.unpack(_RTT_CB_FMT, hdr[:24])
     off = 24 + int(channel) * _RTT_CH_SIZE
-    raw_ch, err = _read_mem_words(st["addr"] + off, _RTT_CH_SIZE)
+    raw_ch, err = _read_mem_words(st["addr"] + off, _RTT_CH_SIZE, link=lk.name)
     if raw_ch is None:
         return {"ok": False, "error": err.get("error")}
     name_p, buf_p, size, wr, rd, flags = struct.unpack("<IIIIII", raw_ch)
@@ -747,13 +756,15 @@ def rtt_read(channel: int = 0, max_bytes: int = 1024, timeout: float = 10.0) -> 
     for piece_off, piece_len in ((rd, first), (0, n - first)):
         if piece_len <= 0:
             continue
-        d, err = _read_mem_words(buf_p + piece_off, piece_len, timeout=timeout)
+        d, err = _read_mem_words(buf_p + piece_off, piece_len, timeout=timeout,
+                                 link=lk.name)
         if d is None:
             return {"ok": False, "error": err.get("error"),
                     "hint": "读缓冲失败：目标可能在跑并改写了控制块，重试一次通常就好"}
         data += d[:piece_len]
     new_rd = (rd + n) % size
-    w = _write_mem(st["addr"] + off + 16, struct.pack("<I", new_rd), timeout=timeout)
+    w = _write_mem(st["addr"] + off + 16, struct.pack("<I", new_rd),
+                   timeout=timeout, link=lk.name)
     st["reads"] += 1
     st["bytes_read"] += len(data)
     # 顺手把 MTF 帧解进事件缓冲：trace_events / trace_profile 才能看到内容。
@@ -787,8 +798,14 @@ def rtt_write(channel: int = 0, data: str = "", hex_data: str = "",
         payload = str(data).encode("utf-8")
     else:
         return {"ok": False, "error": "data 与 hex_data 至少要给一个"}
+    lk, lerr = _link.pick(st.get("link") or "auto", who="读 RTT 控制块")
+    if lk is None:
+        out = dict(lerr)
+        out["hint"] = ("RTT 是在 %s 链路上挂的，那条链路现在不可用了；"
+                       "重新 trace_rtt_attach 一次" % (st.get("link") or "auto"))
+        return out
     off = 24 + (len(st["cb"]["up"]) + int(channel)) * _RTT_CH_SIZE
-    raw_ch, err = _read_mem_words(st["addr"] + off, _RTT_CH_SIZE)
+    raw_ch, err = _read_mem_words(st["addr"] + off, _RTT_CH_SIZE, link=lk.name)
     if raw_ch is None:
         return {"ok": False, "error": err.get("error")}
     name_p, buf_p, size, wr, rd, flags = struct.unpack("<IIIIII", raw_ch)
@@ -799,11 +816,12 @@ def rtt_write(channel: int = 0, data: str = "", hex_data: str = "",
     n = min(len(payload), free)
     first = min(n, size - wr)
     if first > 0:
-        _write_mem(buf_p + wr, payload[:first], timeout=timeout)
+        _write_mem(buf_p + wr, payload[:first], timeout=timeout, link=lk.name)
     if n - first > 0:
-        _write_mem(buf_p, payload[first:n], timeout=timeout)
+        _write_mem(buf_p, payload[first:n], timeout=timeout, link=lk.name)
     new_wr = (wr + n) % size
-    _write_mem(st["addr"] + off + 12, struct.pack("<I", new_wr), timeout=timeout)
+    _write_mem(st["addr"] + off + 12, struct.pack("<I", new_wr),
+               timeout=timeout, link=lk.name)
     st["bytes_written"] += n
     return {"ok": n == len(payload), "channel": channel, "written": n,
             "requested": len(payload), "dropped": len(payload) - n,
@@ -824,29 +842,29 @@ def rtt_detach() -> dict:
 # ================================================================ SWD 采样
 
 def profile_samples(samples: int = 200, elf: str = "", interval_ms: float = 0,
-                    top: int = 15, timeout: float = 20.0) -> dict:
-    """halt → 读 PC → resume 的采样剖析（侵入式，明确标注）。"""
-    from . import ocd as _ocd
-    s = _ocd.get_session()
-    if not s.running():
-        return {"ok": False, "error": "OpenOCD 没在运行", "hint": "先 ocd_start"}
+                    top: int = 15, timeout: float = 20.0,
+                    link: str = "auto") -> dict:
+    """halt → 读 PC → resume 的采样剖析（侵入式，明确标注）。两条链路通用。"""
+    lk, lerr = _link.pick(link, who="halt 采样")
+    if lk is None:
+        return dict(lerr)
     n = max(1, int(samples))
     pcs, fails = [], 0
     t0 = time.time()
     was_running = True
     for _ in range(n):
-        r = s.cmd("halt", timeout=5)
+        r = lk.halt()
         if not r.get("ok"):
             was_running = False
-        rr = s.cmd("reg pc", timeout=5)
-        m = re.search(r"(0x[0-9a-fA-F]{6,})", rr.get("output") or "")
-        if m:
-            pc = int(m.group(1), 16) & ~1
+        rr = lk.regs(("pc",))
+        pc = rr.get("pc") if rr.get("ok") else None
+        if isinstance(pc, int):
+            pc &= ~1
             pcs.append(pc)
             _push({"kind": "pc_sample", "source": "swd", "pc": pc})
         else:
             fails += 1
-        s.cmd("resume", timeout=5)
+        lk.resume()
         if interval_ms and interval_ms > 0:
             time.sleep(min(float(interval_ms) / 1000.0, 0.2))
         if time.time() - t0 > float(timeout):
@@ -860,7 +878,8 @@ def profile_samples(samples: int = 200, elf: str = "", interval_ms: float = 0,
         fn = func_of(pc, funcs) if funcs else ("0x%X" % pc)
         by_func[fn] = by_func.get(fn, 0) + c
     top_list = sorted(by_func.items(), key=lambda kv: -kv[1])[:max(1, int(top))]
-    return {"ok": bool(pcs), "samples": len(pcs), "failed": fails,
+    return {"ok": bool(pcs), "link": lk.name,
+            "samples": len(pcs), "failed": fails,
             "requested": n, "duration_s": round(time.time() - t0, 2),
             "intrusive": True,
             "warning": "每条样本都做了 halt+resume，会显著扰动实时性；"
@@ -874,21 +893,34 @@ def profile_samples(samples: int = 200, elf: str = "", interval_ms: float = 0,
             "resumed": was_running}
 
 
-def dwt_counters() -> dict:
-    """读 DWT 计数器（CYCCNT/CPICNT/EXCCNT/SLEEPCNT/LSUCNT/FOLDCNT）。"""
-    from . import ocd as _ocd
-    s = _ocd.get_session()
-    if not s.running():
-        return {"ok": False, "error": "OpenOCD 没在运行", "hint": "先 ocd_start"}
+def dwt_counters(link: str = "auto") -> dict:
+    """读 DWT 计数器（CYCCNT/CPICNT/EXCCNT/SLEEPCNT/LSUCNT/FOLDCNT）。
+
+    DWT 是内存映射寄存器，两条链路都能读；读不到时如实报「哪条链路、为什么」，
+    不返回一份看着像样的 0。
+    """
+    lk, lerr = _link.pick(link, who="读 DWT 计数器")
+    if lk is None:
+        return dict(lerr)
     base = 0xE0001000
     names = ["CTRL", "CYCCNT", "CPICNT", "EXCCNT", "SLEEPCNT", "LSUCNT", "FOLDCNT"]
-    r = s.cmd("mdw 0x%X %d" % (base, len(names)), timeout=8)
-    if not r.get("ok"):
-        return r
-    p = _ocd._parse_mem(r.get("output") or "", base, len(names), 32)
-    vals = {names[i]: p["words"][i] for i in range(min(len(names), len(p["words"])))}
+    data, meta = lk.read(base, 4 * len(names))
+    if data is None or len(data) < 4 * len(names):
+        out = {"ok": False, "link": lk.name,
+               "error": (meta.get("error") if data is None
+                         else "DWT 区读回 %d 字节（要 %d）" % (len(data), 4 * len(names))),
+               "dwt_base": "0xE0001000",
+               "hint": "DWT 只在 Cortex-M3 以上存在；RISC-V/Xtensa 用 mcycle CSR。"
+                       "另确认目标已连上（Keil：enter_debug；OpenOCD：ocd_start）"}
+        for k in ("read_confidence", "while_running", "degenerate"):
+            if k in meta:
+                out[k] = meta[k]
+        return out
+    words = [int.from_bytes(data[i:i + 4], "little")
+             for i in range(0, 4 * len(names), 4)]
+    vals = {names[i]: words[i] for i in range(min(len(names), len(words)))}
     ctrl = vals.get("CTRL", 0)
-    return {"ok": p["complete"], "dwt": vals,
+    return {"ok": True, "link": lk.name, "dwt": vals,
             "dwt_hex": {k: "0x%X" % v for k, v in vals.items()},
             "cyccnt_ena": bool(ctrl & (1 << 0)),
             "note": "DWT 只在 Cortex-M3 以上存在；CYCCNT 使能位是 CTRL[0]。"
@@ -907,7 +939,8 @@ def dwt_counters() -> dict:
 # 两者都**不 halt 目标**，但都有代价（采样率受 SWD 带宽 / 采样器速率限制，会丢窗口），
 # 所以返回里一定带真实速率、丢点次数与“样本不代表全时域”的披露。
 
-_SCOPE_LOCK_HINT = "先 ocd_start；变量 scope 靠 DAP 读目标 RAM"
+_SCOPE_LOCK_HINT = ("Keil 侧先 enter_debug、非 MDK 侧先 ocd_start；"
+                     "变量 scope 靠调试口读目标 RAM，两条链路都行")
 
 
 def _elf_symbol(elf: str, name: str):
@@ -1000,30 +1033,34 @@ def _halt_like(err: str) -> bool:
         or ("cannot read memory" in t and "halt" in t)
 
 
-def _read_var(s, addr: int, size: int, timeout: float = 5.0) -> dict:
-    """读一个变量（不 halt 目标）。返回 {ok, value} 或 {ok:False, error}。"""
-    from . import ocd as _ocd
-    n = max(1, (int(size) + 3) // 4)
-    r = s.cmd("mdw 0x%X %d" % (int(addr), n), timeout=timeout)
-    if not r.get("ok"):
+def _read_var(lk, addr: int, size: int, timeout: float = 5.0) -> dict:
+    """读一个变量（不 halt 目标）。返回 {ok, value, meta} 或 {ok:False, error}。"""
+    data, meta = lk.read(int(addr), max(1, int(size)))
+    if data is None:
+        return {"ok": False, "error": (meta.get("error") or "读失败"), "meta": meta}
+    if len(data) < int(size):
         return {"ok": False,
-                "error": (r.get("error") or r.get("output") or "mdw 失败").strip()[:200]}
-    pq = _ocd._parse_mem(r.get("output") or "", int(addr), n, 32)
-    if not pq["complete"]:
-        return {"ok": False, "error": "读取不完整（%d/%d 字）" % (pq["got"], n)}
-    b = _ocd._mem_to_bytes(pq["words"], 32, int(size))
-    return {"ok": True, "value": int.from_bytes(b[:int(size)], "little")}
+                "error": "读取不完整（%d/%d 字节）" % (len(data), int(size)),
+                "meta": meta}
+    return {"ok": True, "value": int.from_bytes(data[:int(size)], "little"),
+            "meta": meta}
 
 
 def scope_start(vars: str, elf: str = "", period_ms: float = 100.0,
                 max_samples: int = 2000, duration_s: float = 0.0,
-                timeout: float = 5.0) -> dict:
-    """启动非 halt 的变量 scope（后台线程轮询 DAP 读 RAM）。"""
+                timeout: float = 5.0, link: str = "auto") -> dict:
+    """启动非 halt 的变量 scope（后台线程轮询调试口读 RAM）。
+
+    两条链路通用：Keil 侧走 UVSOCK 的带脏读判定的内存读（read_mem_verified），
+    非 MDK 侧走 OpenOCD 的 mdw。目标在全速跑时读内存，Keil 侧可能错位——
+    返回里会如实给出 link 与丢点统计，不假装是干净样本。
+    """
     import threading
-    from . import ocd as _ocd
-    s = _ocd.get_session()
-    if not s.running():
-        return {"ok": False, "error": "OpenOCD 没在运行", "hint": _SCOPE_LOCK_HINT}
+    lk, lerr = _link.pick(link, who="轮询目标内存")
+    if lk is None:
+        out = dict(lerr)
+        out["hint"] = (out.get("hint") or "") + "；" + _SCOPE_LOCK_HINT
+        return out
     cur = _T.get("scope")
     if cur and cur.get("thread") and cur["thread"].is_alive():
         return {"ok": False, "error": "已有一个变量 scope 在跑",
@@ -1035,6 +1072,7 @@ def scope_start(vars: str, elf: str = "", period_ms: float = 100.0,
                 "hint": "写法：name@0x20000000:4 / 0x20000000:4 / name（名字靠 elf 查）；"
                         "按逗号分隔"}
     st = {"vars": p["items"], "invalid": p["invalid"], "elf": elf or None,
+          "link": lk.name, "link_label": lk.label,
           "period_ms": float(period_ms), "max_samples": int(max_samples),
           "duration_s": float(duration_s), "samples": [],
           "reads": 0, "misses": 0, "last_error": None, "require_halt": False,
@@ -1053,7 +1091,7 @@ def scope_start(vars: str, elf: str = "", period_ms: float = 100.0,
                 break
             row = {"t": round(time.time() - t0, 4)}
             for it in p["items"]:
-                rv = _read_var(s, it["addr"], it["size"], timeout=timeout)
+                rv = _read_var(lk, it["addr"], it["size"], timeout=timeout)
                 if not rv.get("ok"):
                     st["misses"] += 1
                     st["last_error"] = rv.get("error")
@@ -1104,7 +1142,8 @@ def scope_read(limit: int = 200) -> dict:
     sam = st["samples"]
     running = bool(st.get("thread") and st["thread"].is_alive())
     dur = ((st.get("stopped_at") or time.time()) - st["started_at"]) or 1e-9
-    return {"ok": True, "running": running, "vars": st["vars"],
+    return {"ok": True, "running": running, "link": st.get("link"),
+            "vars": st["vars"],
             "samples": len(sam), "shown": min(lm, len(sam)),
             "elapsed_s": round(dur, 3),
             "effective_hz": round(len(sam) / dur, 2),
@@ -1139,7 +1178,8 @@ def scope_stop() -> dict:
     _T["mode"] = None
     sam = st["samples"]
     dur = ((st.get("stopped_at") or time.time()) - st["started_at"]) or 1e-9
-    return {"ok": True, "stopped": True, "vars": st["vars"],
+    return {"ok": True, "stopped": True, "link": st.get("link"),
+            "vars": st["vars"],
             "samples": len(sam), "elapsed_s": round(dur, 3),
             "effective_hz": round(len(sam) / dur, 2),
             "reads": st["reads"], "misses": st["misses"],
@@ -1152,7 +1192,7 @@ def scope_stop() -> dict:
 
 def pc_sample(samples: int = 500, interval_ms: float = 10.0, elf: str = "",
               top: int = 15, enable_dwt: bool = True, restore: bool = True,
-              timeout: float = 20.0) -> dict:
+              timeout: float = 20.0, link: str = "auto") -> dict:
     """非 halt 的 PC 采样：开 DWT 硬件 PC 采样器，主机只轮询 DWT_PCSR。
 
     与 trace_profile（halt→读 PC→resume）的区别：**全程不停核**，
@@ -1160,22 +1200,20 @@ def pc_sample(samples: int = 500, interval_ms: float = 10.0, elf: str = "",
     而且部分芯片修订版上 PC 采样器根本不工作——那种情况会明确报
     `sampler_inactive` 而不是给一份看着像样的分布。
     """
-    from . import ocd as _ocd
-    s = _ocd.get_session()
-    if not s.running():
-        return {"ok": False, "error": "OpenOCD 没在运行", "hint": "先 ocd_start"}
+    lk, lerr = _link.pick(link, who="读 DWT 寄存器")
+    if lk is None:
+        return dict(lerr)
     DEMCR, DWT_CTRL, DWT_PCSR = 0xE000EDFC, 0xE0001000, 0xE000101C
 
     def rd(addr):
-        r = s.cmd("mdw 0x%X 1" % addr, timeout=5)
-        if not r.get("ok"):
+        data, _meta = lk.read(int(addr), 4)
+        if data is None or len(data) < 4:
             return None
-        p = _ocd._parse_mem(r.get("output") or "", addr, 1, 32)
-        return p["words"][0] if p["complete"] and p["words"] else None
+        return int.from_bytes(data[:4], "little")
 
     def wr(addr, val):
-        r = s.cmd("mww 0x%X 0x%X" % (addr, val), timeout=5)
-        return bool(r.get("ok"))
+        ok, _meta = lk.write(int(addr), int(val).to_bytes(4, "little"))
+        return bool(ok)
 
     demcr0 = rd(DEMCR)
     ctrl0 = rd(DWT_CTRL)
@@ -1222,7 +1260,8 @@ def pc_sample(samples: int = 500, interval_ms: float = 10.0, elf: str = "",
         if demcr0 is not None:
             wr(DEMCR, demcr0)
     dur = time.time() - t0
-    out = {"ok": bool(pcs) and sampler_ok, "samples": len(pcs), "fails": fails,
+    out = {"ok": bool(pcs) and sampler_ok, "link": lk.name,
+           "samples": len(pcs), "fails": fails,
            "requested": n, "duration_s": round(dur, 3),
            "effective_hz": round(len(pcs) / (dur or 1e-9), 2),
            "distinct_pcs": len(distinct), "intrusive": False,
@@ -1411,6 +1450,17 @@ GUIDE = {
         "不 halt）与 DWT 硬件 PC 采样（trace_pcsample，不 halt）。"
         "**指令级录制 SWD 两线做不到**，详见 topic=swd_limits。"
     ),
+    "links": (
+        "trace 的内存通路有两条，观测类工具都带 link 参数（默认 auto，也可显式 keil / ocd）：\n"
+        "  keil —— Keil 调试会话（UVSOCK）；先 enter_debug 再调 trace 工具。读内存走带脏读判定的"
+        "read_mem_verified，慢一点但不会把脏帧当真值。\n"
+        "  ocd  —— OpenOCD；先 ocd_start。读内存走 mdw。\n"
+        "  auto —— 哪条在跑用哪条；两条都可用时优先 keil。**显式指定而那条不可用时报错，"
+        "不会悄悄换成另一条顶上**（避免读到另一个目标的现场）。\n"
+        "通用性：变量 scope、RTT、halt 采样、DWT 计数、PC 采样两条链路通用；"
+        "**SWO（trace_swo_start）只走 OpenOCD**，Keil 用户请用 trace_rtt_* 或 trace_scope/trace_pcsample。\n"
+        "ITM 结构化解码（trace_decode）与 itm 报文读取两条链路通用。"
+    ),
     "swd_wiring": (
         "SWD 最少四根：SWCLK / SWDIO / GND / 3V3(参考电平)。"
         "目标独立供电时别把调试器的 3V3 当电源用（供电不足是「连不上」的头号原因）。"
@@ -1468,7 +1518,8 @@ def register(server, js=None) -> int:
             "讲清楚各条 trace 通路的硬件要求与代价，以及接线、ITM、RTT 的注意点。"
             "topic 可取：howto（总览与取舍）/ swd_limits（**只用 SWD 两线能做到什么、"
             "做不到什么：变量 scope 与 DWT PC 采样能做，指令级录制做不到**）/ "
-            "swd_wiring（接线）/ rtt_notes / itm_notes / "
+            "swd_wiring（接线）/ links（Keil 链路 vs OpenOCD 链路：观测类工具都带 "
+            "link 参数，两条链路的取舍）/ rtt_notes / itm_notes / "
             "when_unavailable（没数据时怎么排查）；留空返回全部。\n"
             "**没有 SWO 引脚并不等于不能 trace**：RTT 只要 SWD，采样剖析连缓冲都不要，"
             "只是能拿到的东西不同——这份指南就是帮你按手头硬件选对路子。"
@@ -1500,6 +1551,8 @@ def register(server, js=None) -> int:
     async def trace_status() -> str:
         try:
             out = {"ok": True, "mode": _T["mode"],
+                   "link": ((_T.get("rtt") or {}).get("link")
+                            or (_T.get("scope") or {}).get("link")),
                    "started_at": _T["started_at"] or None,
                    "uptime_s": round(time.time() - _T["started_at"], 2)
                    if _T["started_at"] else 0,
@@ -1675,13 +1728,16 @@ def register(server, js=None) -> int:
             "回收时会找不到）；\n"
             "  2. 给 ranges（如 \"0x20000000-0x20010000\"）—— 主机分块读 RAM 扫 "
             "'SEGGER RTT' 魔数（需要目标已 halt，扫 256KB 也就几十次内存读）。\n"
-            "找到后喂给 trace_rtt_attach。"
+            "找到后喂给 trace_rtt_attach。\n"
+            "link 选内存通路：auto（默认，哪条在跑用哪条）/ keil / ocd。"
         ),
     )
     async def trace_rtt_find(elf: str = "", ranges: str = "",
-                             id_str: str = "SEGGER RTT") -> str:
+                             id_str: str = "SEGGER RTT",
+                             link: str = "auto") -> str:
         try:
-            return _js(rtt_find(elf=elf, ranges=ranges, id_str=id_str))
+            return _js(rtt_find(elf=elf, ranges=ranges, id_str=id_str,
+                                link=link))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1
@@ -1694,16 +1750,18 @@ def register(server, js=None) -> int:
             "直接用。addr 省略时自动按 elf 符号或 RAM 扫描定位。\n"
             "返回 up（目标→主机，日志/事件）与 down（主机→目标，命令）通道列表，"
             "含缓冲大小与当前读写指针。**只依赖内存读写**，不依赖 OpenOCD 的 rtt 命令"
-            "——RISC-V/Xtensa 目标上这条路照样通。"
+            "——RISC-V/Xtensa 目标上这条路照样通。\n"
+            "link 选内存通路：auto（默认）/ keil / ocd；挂上后 rtt_read/rtt_write 沿用这条链路。"
         ),
     )
     async def trace_rtt_attach(addr: str = "", size: int = 0, elf: str = "",
-                               id_str: str = "SEGGER RTT") -> str:
+                               id_str: str = "SEGGER RTT",
+                               link: str = "auto") -> str:
         try:
             a = int(addr, 16) if str(addr).lower().startswith("0x") else (
                 int(addr) if str(addr).strip().isdigit() else 0)
             return _js(rtt_attach(addr=a, size=int(size or 0), elf=elf,
-                                  id_str=id_str))
+                                  id_str=id_str, link=link))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "addr": addr, "error": str(e)})
     n += 1
@@ -1766,19 +1824,22 @@ def register(server, js=None) -> int:
             "**它做不到什么必须说清楚**：轮询是有间隔的，两次采样之间的跳变看不到；"
             "采样率是主机轮询率而非目标周期；目标在跑时若 OpenOCD 拒绝读内存"
             "（require_halt=true），就必须改用 RTT/ITM 让目标自己推数据。\n"
-            "指令级 CPU 录制（每一跳都记下来）需要 ETM 并行 trace 口，**SWD 两线做不到**。"
+            "指令级 CPU 录制（每一跳都记下来）需要 ETM 并行 trace 口，**SWD 两线做不到**。\n"
+            "**这条两条链路通用**：Keil 侧先在调试会话里 enter_debug，OpenOCD 侧先 ocd_start；"
+            "link 可显式指定 auto/keil/ocd。"
         ),
     )
     async def trace_scope_start(vars: str = "", elf: str = "",
                                 period_ms: float = 100.0,
                                 max_samples: int = 2000,
                                 duration_s: float = 0.0,
-                                timeout: float = 5.0) -> str:
+                                timeout: float = 5.0,
+                                link: str = "auto") -> str:
         try:
             return _js(scope_start(vars=vars, elf=elf, period_ms=float(period_ms),
                                    max_samples=int(max_samples),
                                    duration_s=float(duration_s),
-                                   timeout=float(timeout)))
+                                   timeout=float(timeout), link=link))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1
@@ -1829,12 +1890,14 @@ def register(server, js=None) -> int:
     async def trace_pcsample(samples: int = 500, interval_ms: float = 10.0,
                              elf: str = "", top: int = 15,
                              enable_dwt: bool = True, restore: bool = True,
-                             timeout: float = 20.0) -> str:
+                             timeout: float = 20.0,
+                             link: str = "auto") -> str:
         try:
             return _js(pc_sample(samples=int(samples),
                                  interval_ms=float(interval_ms), elf=elf,
                                  top=int(top), enable_dwt=bool(enable_dwt),
-                                 restore=bool(restore), timeout=float(timeout)))
+                                 restore=bool(restore), timeout=float(timeout),
+                                 link=link))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1
@@ -1854,11 +1917,13 @@ def register(server, js=None) -> int:
     )
     async def trace_profile(samples: int = 200, elf: str = "",
                             interval_ms: float = 0, top: int = 15,
-                            timeout: float = 20.0) -> str:
+                            timeout: float = 20.0,
+                            link: str = "auto") -> str:
         try:
             return _js(profile_samples(samples=int(samples), elf=elf,
                                        interval_ms=float(interval_ms),
-                                       top=int(top), timeout=float(timeout)))
+                                       top=int(top), timeout=float(timeout),
+                                       link=link))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1
@@ -1874,9 +1939,9 @@ def register(server, js=None) -> int:
             "仅 Cortex-M3 及以上有 DWT；RISC-V/Xtensa 上读不到，用它们的 mcycle CSR。"
         ),
     )
-    async def trace_dwt_counters() -> str:
+    async def trace_dwt_counters(link: str = "auto") -> str:
         try:
-            return _js(dwt_counters())
+            return _js(dwt_counters(link=link))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

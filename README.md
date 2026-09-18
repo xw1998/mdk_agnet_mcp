@@ -42,7 +42,7 @@
 - **HardFault / 异常定位**：`fault_report` 读 SCB 寄存器判异常类型与原因，并从异常栈帧恢复现场（PC/LR/R0-R3），排查死机/跑飞/复位循环；
 - **条件断点**：`set_conditional_breakpoint` 设 C 表达式条件/命中次数断点，只在特定条件或第 N 次命中才停；
 - **外设寄存器一键读（SFR）**：`read_peripheral` 内置 STM32F4 常用外设寄存器表（RCC/GPIO/USART/SPI/I2C/TIM/ADC/PWR/FLASH/SysTick/SCB/NVIC/DWT/EXTI/SYSCFG），一键读指定外设全部寄存器当前值并解析关键位域（时钟使能/波特率/GPIO 模式/定时器计数），`list_peripherals` 列出可用外设——排查时钟没使能、GPIO 模式配置错、串口波特率不对等场景，**不依赖外部 SVD 文件、离线可用**；
-- **ITM / Debug(printf) Viewer trace**：`itm_trace` 检查 Trace 配置（DEMCR.TRCENA / ITM->TCR / ITM->TER）是否就绪，并经 UVSOCK 串口通道拉取 Debug(printf) Viewer 收到的 ITM 打印文本——printf 走 SWO 输出时无需占用 UART，排查实时日志/运行状态；真实 ITM 输出需 Keil 已配置 Trace（Core Clock + Stimulus Port0）且调试器（ST-Link/J-Link）SWO 引脚已连接；
+- **ITM / Debug(printf) Viewer trace**：`itm_trace` 检查 Trace 配置（DEMCR.TRCENA / ITM->TCR / ITM->TER）是否就绪，并经 UVSOCK 串口通道拉取 Debug(printf) Viewer 收到的 ITM 打印文本，再交给 `traceproto` 做**结构化解码**——按 ITM 报文给出 port / header / `data_text`，`overflow` 与半包（`leftover_bytes`）如实计数，连续拉取只喂新增字节，不把丢过包的时间线当完整证据；printf 走 SWO 输出时无需占用 UART，排查实时日志/运行状态；真实 ITM 输出需 Keil 已配置 Trace（Core Clock + Stimulus Port0）且调试器（ST-Link/J-Link）SWO 引脚已连接；
 - **自动进出调试模式**：`enter_debug` / `exit_debug`，支持 AI 驱动"进入 → 设断点 → 运行到断点 → 读变量 → 退出"完整闭环；
 - **编译 / 烧录闭环**：基于 Keil 官方 `UV4.exe` 命令行，提供 `build_project`（编译）、`rebuild_project`（重编译）、`flash_download`（烧录）、`build_and_flash`（编译成功后自动烧录），支持 AI 自主"改代码 → 编译 → 烧录 → 上板"全流程闭环；
 - **后台静默编译**：编译 / 烧录以隐藏窗口方式启动 UV4，**不会闪现新的 Keil 界面**，用户已打开的实例不受打扰；
@@ -74,7 +74,10 @@
   （先自检再动手、四条主线工作流、`session_state` 接续、三个输出控制旋钮、参数与工具面约定、出错先看谁），
   避免每次冷启动都从 `list_tools` 摸索；
 - **不依赖 Keil 的芯片也能调**：`toolchain_*` 自己探测 gcc/make/cmake 并跑构建、`target_*` 把接口与 trace 参数固化成 20 份档案、`ocd_*` 用 OpenOCD 做内存/寄存器/断点/烧录——RISC-V、ESP32 这类不用 MDK 的目标走这条链路，与 Keil 链路互不干扰；
-- **SWD/SWO 两条 trace 通路 + 目标侧插桩**：`trace_swo_*` 走 TPIU/ITM 单线输出，`trace_rtt_*` 主机侧自研读写 SEGGER 兼容环形缓冲（不依赖上位机），另有 SWD 采样剖析（明标侵入式）与 DWT 计数器；主机侧只能看到“目标愿意发出来的东西”，所以配套提供目标侧插桩组件 `components/trace/`（ITM/RTT/UART 三后端，只依赖 CMSIS），事件按带 CRC8 的 MTF 帧传出，丢包与坏帧**如实计数上报**；
+- **SWD/SWO 两条 trace 通路 + 目标侧插桩**：`trace_swo_*` 走 TPIU/ITM 单线输出，`trace_rtt_*` 主机侧自研读写 SEGGER 兼容环形缓冲（不依赖上位机），另有 SWD 采样剖析（明标侵入式）与 DWT 计数器；**观测类工具（RTT / 变量 scope / halt 采样 / DWT / PC 采样）在 Keil 与 OpenOCD 两条链路上通用**，用 `link=auto|keil|ocd` 选路：
+    - `auto` 哪条链路有活会话用哪条（两条都有时优先 Keil）；
+    - 显式指定而那条不可用时**不拿另一条顶上**（那会读到另一个目标的现场），直接报错并带上两条链路各自的原因与起法；
+    - 读到的东西一定带 `read_confidence` / `while_running` / `degenerate`——**读到的 0 不等于数据是 0**；主机侧只能看到“目标愿意发出来的东西”，所以配套提供目标侧插桩组件 `components/trace/`（ITM/RTT/UART 三后端，只依赖 CMSIS），事件按带 CRC8 的 MTF 帧传出，丢包与坏帧**如实计数上报**；
 - **随附模拟调试器**：无需硬件即可离线联调与跑测试（UVSOCK 与 OpenOCD 各一份）。
 
 ## 工作原理
@@ -178,8 +181,9 @@ mdk_agent/
 │   ├── toolchain.py          # 非 MDK：gcc/make/cmake 探测、构建、ELF/size/objcopy、编译错误解析
 │   ├── targets.py            # 非 MDK：目标档案（接口/速度/SWO/RTT 参数）与按名称、ELF 自动识别
 │   ├── ocd.py                # 非 MDK：OpenOCD telnet 会话与内存/寄存器/断点/烧录操作
+│   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
-│   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署
+│   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
 │   └── server.py             # MCP Server 与 154 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
@@ -275,7 +279,7 @@ python run_server.py --transport http --http-port 8300
 | `svd_decode` | **按 SVD 解寄存器位域 / 按地址反查外设**：给 `peripheral`+`register` 或**只给 `address`**（自动反查，配合 `read_mem` 拿到的值最省事），把值拆成位域并给枚举含义（如 `MODER3=2 (Alternate function mode)`）。反查有 `matched_by` 标可信度：`addressBlock`（SVD 里有真实地址块，最准）或 `nearest_base`（退化的最近前缀，需核对）；结果里透出 `svd_device`/`svd_file`，避免「看的是别的芯片的手册」而不自知。本工具**只解释不写寄存器** | `peripheral?`、`register?`、`value?`、`address?`、`svd_file?`、`device?` |
 | `read_peripheral` | 外设寄存器一键读：内置 STM32F4 外设表（RCC/GPIO/USART/SPI/I2C/TIM/...），读指定外设寄存器并解析关键位域；`regs` 只取指定寄存器（如 `MODER,OTYPER`，裸名/前缀名都可，**也接受字符串数组 `["MODER","ODR"]`**）、`fields=off` 关位域解读，避免整表输出撑爆上下文 | `periph`、`regs?`、`fields?` |
 | `list_peripherals` | 列出内置外设寄存器表（外设名+基址+说明） | — |
-| `itm_trace` | ITM/Debug(printf) Viewer trace：检查 Trace 配置(DEMCR/ITM->TCR/TER)是否就绪 + 拉取串口窗口缓冲中的 ITM 打印文本 | `port`、`size` |
+| `itm_trace` | ITM/Debug(printf) Viewer trace：检查 Trace 配置(DEMCR/ITM->TCR/TER)是否就绪 + 拉取串口窗口缓冲，并做**结构化解码**（ITM 报文 port/header/`data_text`、`overflow` 与半包计数、增量喂字节）。`port` 是 **Keil 串口窗口编号**，不是 ITM stimulus port（后者用 `port_filter`） | `port?`、`size?`、`decode?`、`port_filter?`、`reset?` |
 | `query_memory_map` | 内存区域地图：FLASH/SRAM/外设/ITM/DWT/SCS 地址范围，可标注某地址落在哪个区域，防止把外设区当 RAM 读 | `addr`（可选） |
 | `search_mem` | 在内存范围内扫描字节序列，返回所有命中地址（分块读、块间重叠防跨块漏匹配），找魔数 / 定位被越界写坏的缓冲 | `start`、`end`、`pattern_hex`、`pattern_text`（直接搜文本，如 `appstat`，免手工转十六进制） |
 | `fill_mem` | 批量填充 / 清零内存：连续写入 count 个相同字节，清零大块缓冲 / 初始化 SRAM | `addr`、`byte`、`count` |
@@ -407,27 +411,29 @@ python run_server.py --transport http --http-port 8300
 
 三条通路：**SWO/ITM**（经 TPIU 单线输出）、**RTT**（目标内存环形缓冲，主机侧自研读写，不依赖 SEGGER 上位机）、**SWD 采样**（`halt` 采 PC，明确标注侵入式）。三条通路解码出的事件（含 MTF 帧）汇入同一缓冲区，由 `trace_events` 统一取。
 
+**两条链路**：除 SWO 本身依赖 OpenOCD（TPIU 配置与落盘在那里）外，RTT、变量 scope、halt 采样、DWT 计数、PC 采样**在 Keil(UVSOCK) 与 OpenOCD 上通用**，都接受 `link` 参数（`auto`/`keil`/`ocd`，默认 `auto`）：Keil 侧先 `enter_debug`，非 MDK 侧先 `ocd_start`。选路由 `linkio` 统一负责——**不猜、不换链路顶上**；Keil 侧读内存走带脏读判定的 `read_mem_verified`，返回值带 `read_confidence`/`while_running`，可疑就如实标注而不是给一个像样的数。
+
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
-| `trace_guide` | 主题式使用引导（接线、SWO 速率怎么定、RTT 集成、采样剖析代价…），不认识的方法名会列出可选主题而不是给空 | `topic?` |
-| `trace_status` | trace 紧凑状态：模式、事件**计数**、各后端状态、解码器统计（不是把事件全倒出来） | — |
+| `trace_guide` | 主题式使用引导（接线、SWO 速率怎么定、RTT 集成、采样剖析代价、两条链路怎么选…），不认识的方法名会列出可选主题而不是给空 | `topic?` |
+| `trace_status` | trace 紧凑状态：模式、**当前用的链路**、事件**计数**、各后端状态、解码器统计（不是把事件全倒出来） | — |
 | `trace_swo_start` | 配 TPIU + 开 ITM 端口（`coreclk`/`baud` 缺省从档案取），开始把 SWO 数据落到文件 | `file?`、`coreclk?`、`baud?`、`ports?`、`profile?` |
 | `trace_swo_read` | **增量读** SWO 文件（每批只给新增事件，不重复倒）；返回事件、解码器统计与后端状态 | `max_events?`、`ports?` |
 | `trace_swo_stop` | 关 ITM 端口、停采集 | — |
 | `trace_decode` | 离线复解：把一段 hex 或一个文件按 ITM+MTF 解成事件（不接硬件也能查问题） | `data_hex?`、`file?`、`ports?`、`limit?` |
 | `trace_events` | 取事件缓冲（可按 `kind`/`channel` 过滤），回 `total_matched`/`buffer_total`/`counts` | `limit?`、`kind?`、`channel?` |
 | `trace_clear` | 清空事件缓冲（`reset=true` 连解码器一起复位） | `reset?` |
-| `trace_rtt_find` | **在 RAM 里扫 SEGGER RTT 控制块**（按魔数扫描，扫描范围可指定成 `0x…-0x…`）；扫不到就如实说没找到，**不硬猜一个地址** | `elf?`、`ranges?`、`id_str?` |
-| `trace_rtt_attach` | 按地址挂 RTT，读出上下行通道数与通道名；**先校验 `SEGGER RTT` 魔数**，地址不对时明确报「不是 RTT 控制块」（不让全 0 RAM 冒充合法块） | `addr`、`size?`、`elf?`、`id_str?` |
+| `trace_rtt_find` | **在 RAM 里扫 SEGGER RTT 控制块**（按魔数扫描，扫描范围可指定成 `0x…-0x…`）；扫不到就如实说没找到，**不硬猜一个地址** | `elf?`、`ranges?`、`id_str?`、`link?` |
+| `trace_rtt_attach` | 按地址挂 RTT，读出上下行通道数与通道名；**先校验 `SEGGER RTT` 魔数**，地址不对时明确报「不是 RTT 控制块」（不让全 0 RAM 冒充合法块） | `addr`、`size?`、`elf?`、`id_str?`、`link?` |
 | `trace_rtt_read` | 读上行通道（读后自动把 RdOff 写回目标，否则目标以为没被消费、数据会堆死） | `channel?`、`max_bytes?`、`timeout?` |
 | `trace_rtt_write` | 写下行通道（文本或 `hex_data` 二进制），给目标下发命令 | `channel?`、`data?`、`hex_data?` |
 | `trace_rtt_detach` | 解除挂接并回本次统计 | — |
-| `trace_profile` | **采样剖析**：周期性 `halt` 采 PC 再 `resume`，按函数聚合出热点；返回 `intrusive: true` 与 `warning`，明说会扰动时序 | `samples?`、`elf?`、`interval_ms?`、`top?`、`timeout?` |
-| `trace_dwt_counters` | 读 DWT 六个计数器（CYCCNT/CPICNT/EXCCNT/SLEEPCNT/LSUCNT/FOLDCNT）与 CYCCNT 使能位 | — |
-| `trace_scope_start` | **变量 scope（只用 SWD 两线、不 halt 目标）**：主机侧按周期用 DAP 读 RAM，把变量连成时间线。`vars` 写法 `g_cnt@0x20000000:4` / `0x20000010:4` / `name`（靠 ELF 查地址与大小，解析不了的条目会列出来而不是静默跳过）。**做不到什么也说清楚**：轮询有间隔、两次采样之间的跳变看不到；目标在跑时若 OpenOCD 拒绝读内存会置 `require_halt=true` 并让你改用 RTT/ITM | `vars`、`elf?`、`period_ms?`、`max_samples?`、`duration_s?`、`timeout?` |
+| `trace_profile` | **采样剖析**：周期性 `halt` 采 PC 再 `resume`，按函数聚合出热点；返回 `intrusive: true` 与 `warning`，明说会扰动时序 | `samples?`、`elf?`、`interval_ms?`、`top?`、`timeout?`、`link?` |
+| `trace_dwt_counters` | 读 DWT 六个计数器（CYCCNT/CPICNT/EXCCNT/SLEEPCNT/LSUCNT/FOLDCNT）与 CYCCNT 使能位 | `link?` |
+| `trace_scope_start` | **变量 scope（只用 SWD 两线、不 halt 目标）**：主机侧按周期用 DAP 读 RAM，把变量连成时间线。`vars` 写法 `g_cnt@0x20000000:4` / `0x20000010:4` / `name`（靠 ELF 查地址与大小，解析不了的条目会列出来而不是静默跳过）。**做不到什么也说清楚**：轮询有间隔、两次采样之间的跳变看不到；目标在跑时若 OpenOCD 拒绝读内存会置 `require_halt=true` 并让你改用 RTT/ITM。**两条链路通用**（Keil 侧先 `enter_debug`） | `vars`、`elf?`、`period_ms?`、`max_samples?`、`duration_s?`、`timeout?`、`link?` |
 | `trace_scope_read` | 看 scope 现状：每变量 min/max/最后值/变化次数、真实生效采样率、丢点次数；只回最近 `limit` 条样本，不把上万条塞回上下文 | `limit?` |
 | `trace_scope_stop` | 停掉后台轮询线程并汇总（忘了停会一直占 SWD 带宽） | — |
-| `trace_pcsample` | **DWT 硬件 PC 采样（同样不 halt 目标）**：开 `DEMCR.TRCENA`+`DWT_CTRL.PCSAMPLENA`，主机只轮询 `DWT_PCSR`，按函数聚合。与 `trace_profile` 的本质区别是**不停核、不扰动实时性**。采样器不工作（部分芯片 errata）或采样值几乎不变时会**明确报错**，不给一份看着像样的分布；默认结束恢复 `DEMCR`/`DWT_CTRL` 原值 | `samples?`、`interval_ms?`、`elf?`、`top?`、`enable_dwt?`、`restore?`、`timeout?` |
+| `trace_pcsample` | **DWT 硬件 PC 采样（同样不 halt 目标）**：开 `DEMCR.TRCENA`+`DWT_CTRL.PCSAMPLENA`，主机只轮询 `DWT_PCSR`，按函数聚合。与 `trace_profile` 的本质区别是**不停核、不扰动实时性**。采样器不工作（部分芯片 errata）或采样值几乎不变时会**明确报错**，不给一份看着像样的分布；默认结束恢复 `DEMCR`/`DWT_CTRL` 原值 | `samples?`、`interval_ms?`、`elf?`、`top?`、`enable_dwt?`、`restore?`、`timeout?`、`link?` |
 | `trace_instrument` | **把目标侧插桩组件部署进你的工程**（见下）：按 `backend` 生成配置、拷贝组件源码与 `.mk`，已有文件默认 SKIP 不覆盖 | `target_dir`、`backend?`、`itm_port?`、`rtt_up?`、`rtt_down?`、`rtt_buf?`、`coreclk?`、`overwrite?`、`swo_baud?`、`dbgmcu_cr?` |
 
 ### RTOS 任务感知（`rtos_*`，3 个）
