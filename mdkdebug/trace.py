@@ -638,7 +638,8 @@ def rtt_find(elf: str = "", ranges=None, id_str: str = "SEGGER RTT",
             return {"ok": True, "addr": a, "addr_hex": "0x%X" % a,
                     "method": "elf_symbol", "elf": os.path.abspath(elf)}
     if not ranges:
-        return {"ok": False, "error": "没给 elf 也没给 ranges，无法定位控制块",
+        return {"ok": False, "error_code": "invalid-argument",
+                "error": "没给 elf 也没给 ranges，无法定位控制块",
                 "hint": "给 elf（里面有 _SEGGER_RTT 符号最省事），或用 "
                         "ranges=\"0x20000000-0x20010000\" 让主机扫 RAM；"
                         "扫 RAM 需要目标已 halt"}

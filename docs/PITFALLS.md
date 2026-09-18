@@ -17,6 +17,7 @@
 - [十一、非 MDK 链路（工具链 / OpenOCD / trace）](#十一非-mdk-链路工具链--openocd--trace)
 - [十二、Keil 窗口复用 / 惰性符号 / 写入与回显（本轮真机实测）](#十二keil-窗口复用--惰性符号--写入与回显本轮真机实测)
 - [十三、全量真机测试（批次37-38，F401 + Keil UVSOCK 实测）](#十三全量真机测试批次37-38f401--keil-uvsock-实测)
+- [十四、OpenOCD 控制台的「无前缀失败回包」（批次39，F401 + DAPLink 实测）](#十四openocd-控制台的无前缀失败回包批次39f401--daplink-实测)
 
 ## 一、真实 Keil 实测要点
 
@@ -648,9 +649,12 @@ RTT 控制块靠字符串 `SEGGER RTT\0` 标识。若 `rtt_parse_cb` 直接按�
 ### 11.6 元教训：这五条为什么能在 mock 阶段就被抓住
 
 写 `tests/mock_openocd.py` 时只做了一个决定——**应答格式照抄真机，不做美化**：
-`targets` 用列对齐、`flash banks` 带 `(driver) at ...` 与 `size`、`reg` 带 `(0) (/32) (dirty)`、
-提示符带尾空格、未映射地址回 `Error: Failed to read memory at 0x...`、未知命令回
-`Error: invalid command name "xxx"` 并附一段 Jim-Tcl 栈。
+——`targets` 用列对齐、`flash banks` 带 `(driver) at ...` 与 `size`、`reg` 带 `(0) (/32) (dirty)`、
+提示符带尾空格。
+
+> **这批描述后来被批次39 纠正过**：未映射地址的原文是裸的 `Failed to read memory at 0x...`、
+> 未知命令是裸的 `invalid command name "xxx"`（后面跟一段 Jim-Tcl 栈），**都没有 `Error: ` 前缀**。
+> mock 当时多加了前缀，反而让「只认 `Error:` 就够」的漏判在 mock 阶段一直看不出来——详见[十四.4](#144-元教训mock-的美化正是漏洞的藏身处)。
 
 如果 mock 用"自己觉得合理"的格式应答，这五条一个也暴露不出来，会全部留到真机——
 而真机只给一句报错，定位成本比改 mock 高出几个量级。
@@ -955,6 +959,67 @@ mock 的 `UV_DBG_STATUS` 过去**退出调试后仍回成功**，于是 `run`/`s
   `uvprojx_edit`（四个 action，副本上进行）、`serial_expect`（命中分支）。
 - 单窗口约束：全程核对 `list_uvision_instances`，发现同工程开过两个窗口时用
   `close_uvision(keep="oldest")` 收敛（持 4823 端口的是**最早**的实例，不能按「留最新」关）。
+
+## 十四、OpenOCD 控制台的「无前缀失败回包」（批次39，F401 + DAPLink 实测）
+
+来源：回答「gcc 的调试链试了吗？」时把 GCC/OpenOCD 链路整条在真机上重跑了一遍，
+顺手发现 `ocd_cmd` 会把**根本没执行的命令**报成 `ok=true`。
+
+### 14.1 现象与真机取证
+
+`ocd_cmd("monitor targets")` 返回 `ok=true`，而 `output` 是 `invalid command name "monitor"`。
+继续横扫一批坏命令（原文逐字抄自 OpenOCD 0.12.0 控制台）：
+
+| 命令 | 真机回包 | 修复前 | 修复后 |
+|---|---|---|---|
+| `monitor targets` | `invalid command name "monitor"` | ok=true | ok=false |
+| `definitely_no_such_cmd_xyz` | `invalid command name "..."` | ok=true | ok=false |
+| `wp 0x20000000` | `wp [address length [('r'\|'w'\|'a') [value [mask]]]]` | ok=true | ok=false |
+| `read_memory 0xZZZZ 4` | `read_memory address width count ['phys']` | ok=true | ok=false |
+| `reset nonsense_mode` | `cortex_m reset_config [...]` 等一串命令列表 | ok=true | ok=false |
+| `reg no_such_reg_xyz` | `register X not found in current target` | ok=true | ok=false |
+| `mdw 0x20000000 99999` | `Failed to read memory at 0x20018004` | ok=true | ok=false |
+
+**这些回包全都不带 `Error: ` 前缀**，而失败判定当时只认 `Error\s*:` 与
+`couldn't open|no flash bank|** ... Failed **`，于是整批漏判。
+（`couldn't open` 那条正是上一轮 `ocd_flash` 踩过的同一个坑——只补了一个样例，没补这一类。）
+
+### 14.2 修法：两类新标记 + 一条「用法行」判定
+
+1. `_FAIL_RE` 增补真机取证过的原文：`invalid command name`、`not found in current target`、
+   `Failed to read memory`；
+2. 新增 `_USAGE_RE` + `_looks_like_usage(command, lines)`：Jim-Tcl 参数不足时会把**该命令的
+   用法说明**打回来。判定收紧为「某行以**本命令的第一个词**开头，且带占位符（`<...>` 或 `[...]`）」——
+   这样 `wp [...]` 算失败，而 `program <filename> [...]` 出现在 `wp` 的回包里不算（A11 用例守住这条）。
+   加这一层的必要性：用法回包是**任意文本**，纯靠字符串黑名单永远补不全。
+
+### 14.3 连带修复：越界读内存不再退化成裸回包
+
+真机越界读（`mdw 0x2001FFF0 16`，F401 只有 96KB RAM）回包就是一行
+`Failed to read memory at 0x2001fff4`、**0 行数据**。原先的写法是「命令失败就原样返回」，
+结果是调用方拿不到 `got_bytes`/`complete`，错误码还掉进 `unknown-error`，
+`next_actions` 反而指向「去读 output/raw」——方向完全反了。
+
+改为：**命令失败也要继续走结构化回答**，输出 `ok=false` + `complete=false` +
+`got_bytes=0/expected_bytes=64` + `openocd_error` 原文 + `error_code=invalid-argument`。
+正常读、正常烧录不受影响（同一次真机复核里一并确认）。
+
+### 14.4 元教训：mock 的「美化」正是漏洞的藏身处
+
+`tests/mock_openocd.py` 里两处回包**比真机多加了 `Error: ` 前缀**：
+
+```python
+return ['Error: invalid command name "%s"' % cmd, ...]      # 真机其实没有前缀
+return ["Error: Failed to read memory at 0x%08X" % a]       # 真机也没有
+```
+
+于是「只要有 `Error:` 就算失败」这条**假的安全感**在 mock 阶段一路全绿，
+两次真机取证（批次37 的 `ocd_flash`、批次39 的 `ocd_cmd`）踩的都是同一类。
+mock 已按真机原文改正。
+
+> 与[十一.6](#116-元教训这五条为什么能在-mock-阶段就被抓住) 是同一个道理的反面注脚：
+> mock 的价值在「照抄外部系统的怪癖」，**任何美化（补前缀、补字段、补格式）都等于替被测代码
+> 掩盖一条真实路径**。改 mock 的原则是——不确定就去看真机原文，别自己觉得「这样更合理」。
 
 ## 九、历次改进留档（按批次）
 

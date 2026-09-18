@@ -54,8 +54,35 @@ _STACK_RE = re.compile(r"^\s*(?:in procedure|at file|called at file|while execut
 _FAIL_RE = re.compile(
     r"(?:couldn't open|cannot open|can't open|unable to open|"
     r"no flash bank|not enough space|"
-    r"\*\*[^*]*Failed[^*]*\*\*)",
+    r"\*\*[^*]*Failed[^*]*\*\*|"
+    # Jim-Tcl 的失败回包有不带 `Error:` 前缀的一类，真机取证（F401/0.12.0）：
+    #   `invalid command name "monitor"`（GDB 命令误投控制台 / 拼错命令）
+    #   `register no_such_reg_xyz not found in current target`
+    #   `Failed to read memory at 0x20018004`（越界读，之前会被判成读成功）
+    r"invalid command name|"
+    r"not found in current target|"
+    r"Failed to read memory)",
     re.I)
+
+# 参数不足时 Jim 会把该命令的**用法说明**打回来（不带 `Error:`）：
+#   wp 0x20000000      -> `wp [address length [('r'|'w'|'a') [value [mask]]]]`
+#   read_memory 0xZ 4  -> `read_memory address width count ['phys']`
+#   reset nonsense     -> `reset [run|halt|init]` 等一串命令列表
+# 判定：某行以「本命令的第一个词」开头且带占位符（<...> 或 [...]）。
+_USAGE_RE = re.compile(r"^\s*(?P<w>[A-Za-z_][A-Za-z_0-9]*)\s+[^\n]*[<\[]")
+
+def _looks_like_usage(command: str, lines) -> bool:
+    """回包里出现「命令名 + 占位符」的用法行，说明是参数错而不是执行成功。"""
+    first = (command or "").split()
+    if not first:
+        return False
+    first = first[0]
+    for ln in lines or []:
+        m = _USAGE_RE.match(ln or "")
+        if m and m.group("w") == first and ("<" in ln or "[" in ln):
+            return True
+    return False
+
 
 
 # ================================================================ telnet 客户端
@@ -341,6 +368,10 @@ def _shape(command: str, raw: str) -> dict:
     text = "\n".join(kept).strip("\n")
     errs = [ln.strip() for ln in kept
             if _ERR_RE.search(ln) or _FAIL_RE.search(ln)]
+    # 参数不足时 Jim 回的是用法说明（真机取证，见 _USAGE_RE 注释），必须算失败，
+    # 否则 ocd_cmd 会把「命令根本没执行」报成 ok=true。
+    if not errs and _looks_like_usage(command, kept):
+        errs = ["参数不合法：OpenOCD 回的是该命令的用法说明"]
     # `Warn :` 不算失败（OpenOCD 大量正常路径会告警，例如 flash 保护位）
     warns = [ln.strip() for ln in kept if ln.strip().startswith(("Warn :", "warn :"))]
     res = {"ok": not errs, "command": command, "output": text,
@@ -1026,9 +1057,11 @@ def register(server, js=None) -> int:
             tgt = ("%s " % target.strip()) if target.strip() else ""
             s = get_session()
             r = s.cmd("%s%s 0x%X %d" % (tgt, cmd_name, a, count), timeout=float(timeout))
-            if not r.get("ok"):
-                return _js(r)
             p = _parse_mem(r.get("output") or "", a, count, w)
+            # 注意：即使命令整体失败（真机越界读就是 0 行数据 + `Failed to
+            # read memory at 0x...`），也**不要**退回原始 telnet 回包——
+            # 那样调用方拿不到 got_bytes/complete，归类还会掉进 unknown-error。
+            # 继续走下面的结构化回答，把 OpenOCD 的原文一起带上。
             data = _mem_to_bytes(p["words"], w, nb)
             out = {"ok": p["complete"], "addr": "0x%X" % a, "n_bytes": nb,
                    "width": w, "words": ["0x%X" % x for x in p["words"]],
@@ -1039,6 +1072,9 @@ def register(server, js=None) -> int:
                 out["error"] = ("只读到 %d/%d 字节：目标没停住、地址非法或该区域"
                                 "不可读" % (len(data), nb))
                 out["hint"] = "先 ocd_control(action=\"halt\")，再确认地址在有效区间"
+                if not r.get("ok"):
+                    out["openocd_error"] = r.get("error") or r.get("output")
+                    out["error_code"] = "invalid-argument"
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "addr": addr, "error": str(e)})

@@ -299,7 +299,11 @@ class MockOpenOCD(object):
             pass
 
     def _err(self, cmd):
-        return ['Error: invalid command name "%s"' % cmd,
+        # 真机（OpenOCD 0.12.0 + F401，2026-09-18）取证：Jim-Tcl 对未知命令
+        # **不带 `Error: ` 前缀**，原文就是 `invalid command name "monitor"`。
+        # 早期 mock 自作主张加了前缀，正好让客户端「按 `Error:` 判定失败」的
+        # 漏洞躲过测试——真机上 ocd_cmd 因此把失败报成 ok=true。
+        return ['invalid command name "%s"' % cmd,
                 "in procedure '%s' " % cmd,
                 "in procedure 'unknown' "]
 
@@ -496,7 +500,10 @@ class MockOpenOCD(object):
             return ['Error: invalid count "%s"' % args[1]]
         step = width // 8
         if not self.target.mapped(a, n * step):
-            return ["Error: Failed to read memory at 0x%08X" % a]
+            # 真机（0.12.0 + F401）取证：控制台上就是裸的 `Failed to read memory
+            # at 0x20018004`，**没有 `Error: ` 前缀**。带前缀会让客户端误以为
+            # 「有前缀才算失败」是安全的，掩盖漏判。
+            return ["Failed to read memory at 0x%08X" % a]
         per = {8: 16, 16: 8, 32: 4}[width]
         digits = {8: 2, 16: 4, 32: 8}[width]
         rows, i = [], 0
