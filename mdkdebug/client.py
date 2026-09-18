@@ -104,6 +104,10 @@ class UVClient:
         # 「观察到目标处于停止态」的时间。前者晚于后者 → 当前停止是那次运行的结果。
         self._exec_ts = 0.0
         self._last_stop_obs_ts = 0.0
+        # 批次45：运行态读取用的「目标在不在跑」1 秒 TTL 缓存——轮询采样时每次都
+        # 打一轮 UV_DBG_STATUS 太亏，但读数要不要复读确认恰恰取决于它
+        self._run_cache = None
+        self._run_cache_at = 0.0
         self._last_used = 0.0
         self.phy = UVInterface(host=host, port=port)
         # 批次29：跨进程互斥闸门（多个 mdkdebug 实例抢同一 UVSOCK 时，命令会互相
@@ -434,6 +438,27 @@ class UVClient:
             return "all_ff"
         return ""
 
+    def running_cached(self, ttl: float = 1.0, fresh: bool = False):
+        """目标在不在全速跑，带 TTL 缓存。返回 True / False / None（判不出，不猜）。
+
+        批次45：运行态读取要把「这次读是不是在全速运行时做的」如实告诉调用者，
+        而每次读都打一轮 UV_DBG_STATUS 会让轮询采样变慢，所以默认 1 秒内复用上一次结果。
+        """
+        now = time.time()
+        if not fresh and now - self._run_cache_at < max(0.0, float(ttl)):
+            return self._run_cache
+        try:
+            st = self.get_status()
+        except Exception:  # noqa: BLE001
+            st = {"ok": False}
+        if not st.get("ok") or st.get("debugging") is False:
+            v = None
+        else:
+            v = st.get("running")
+        self._run_cache = v if isinstance(v, bool) else None
+        self._run_cache_at = now
+        return self._run_cache
+
     def read_mem_verified(self, addr: int, n_bytes: int, verify: str = "auto") -> dict:
         """带「脏读防护」的内存读取。
 
@@ -449,9 +474,16 @@ class UVClient:
         - verify=true 总是复读（对某次结果不放心时强制确认）；
           verify=false 完全关闭（大块搬运/读只读区时省时间）。
 
-        在原 read_mem 结果上补：read_confidence(high/low)、reread_count、
-        reread_consistent、degenerate、since_stop_s，以及 warning /
-        first_read_hex / degenerate_note（视情况）。
+        在原 read_mem 结果上补：read_confidence(high/low/medium)、reread_count、
+        reread_consistent、degenerate、since_stop_s、while_running，以及 warning /
+        first_read_hex / read_unstable / degenerate_note（视情况）。
+
+        批次45（运行态读取）：目标全速运行时也能读（真机实测 SRAM 与外设寄存器都读得到），
+        但运转中的目标随时可能在改内存，所以运行态一律多复读一轮：
+        - 两次一致 → 按正常结果给（read_confidence=high）；
+        - 两次不一致 → read_confidence=medium + read_unstable=true，并把「可能是变量本身
+          在变」与「可能是读被打断」两种解释都写进 warning，让调用者自己判断，
+          而不是替它选一个。
         """
         mode = str(verify if verify is not None else "auto").strip().lower()
         if mode in ("0", "no", "off", "never"):
@@ -474,6 +506,13 @@ class UVClient:
         if self._last_stop_obs_ts:
             since_stop = round(time.time() - self._last_stop_obs_ts, 3)
         out["since_stop_s"] = since_stop
+        # 批次45：这次读是不是在目标全速运行时做的——Keil 链路实测**可以**运行态读内存
+        #（含外设寄存器），但读到的可能落在「读的中途被 CPU 改写」的裂缝里，调用者得知道
+        # 才能自己决定要不要停-读-走。放在 since_stop 之后算：get_status 本身会刷新
+        # 「最近观察到停止」的时间线，先算 since_stop 才不会被它自己影响。
+        run = self.running_cached()
+        if run is not None:
+            out["while_running"] = bool(run)
         flash_like = 0x08000000 <= addr < 0x20000000
         # Flash 区段读出全 0xFF 是「已擦除」的**预期内容**，不是脏读——
         # 真机实测读已擦除的 0x08022000 得到全 FF，若也判 low confidence 会造成误报。
@@ -492,8 +531,11 @@ class UVClient:
                 out["degenerate_note"] = (
                     "整帧读出全 %s：整片同值通常不是真实内容，而是读取失败或该区域未初始化。"
                     % ("0x00" if degenerate == "all_zero" else "0xFF"))
+        # 目标在跑时一律复读：运行态读最典型的坏结果不是「整帧退化」，而是读的中途
+        # 被 CPU 改写（逐字节撕裂）——这种脏值不会退化，只有复读比对才看得出来
         need = (mode == "true" or bool(degenerate)
-                or (since_stop is not None and since_stop < 1.0))
+                or (since_stop is not None and since_stop < 1.0)
+                or run is True)
         if mode == "false" or not need:
             if degenerate:
                 out["read_confidence"] = "low"
@@ -536,6 +578,22 @@ class UVClient:
                             % (i + 1, degenerate))
                 else:
                     out["read_confidence"] = "high"
+                return out
+            if run is True:
+                # 目标在全速跑，两次读之间内容变了。两种解释都成立且分不开：
+                # 该地址本来就在被 CPU 改写（正常），或本次读被打断（不可信）。
+                # 所以既不断言「这就是最新值」，也不断言「读数坏了」——如实标出来。
+                out["read_confidence"] = "medium"
+                out["reread_consistent"] = False
+                out["read_unstable"] = True
+                out["first_read_hex"] = prev.hex()
+                out["data_hex"] = nxt.get("data_hex", out.get("data_hex"))
+                out["ascii"] = nxt.get("ascii", out.get("ascii"))
+                out["warning"] = (
+                    "目标正在全速运行，连续两次读到的内容不同：可能是该地址本来就在被 CPU"
+                    "改写（变量本身在变，属正常），也可能是这次读被运行中的目标打断了。"
+                    "要取某一瞬间的一致快照，改用 running=\"halt\" 做停-读-走；"
+                    "若该地址本该是静态的，那这个读数不可信，先 stop 再读。")
                 return out
             prev = cur
             last = nxt
@@ -1832,6 +1890,8 @@ class UVClient:
             elif cmd_code == uvsock.UV_DBG_STOP_EXECUTION:
                 # 我们主动暂停：这次停止算「已消化」，之后的停止需再有 run/step 才算新
                 self._last_stop_obs_ts = _now
+            # 运行状态刚被我们改过，缓存立即失效（别让后续读取拿过期的结论）
+            self._run_cache_at = 0.0
         out = {"status": status, "ok": ok,
                "status_text": status_text(status), "action": label}
         if extra:

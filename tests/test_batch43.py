@@ -269,8 +269,8 @@ def main():
           meta.get("read_confidence") == "high", meta)
     check("B4 meta 带「目标当时在不在跑」while_running=True",
           meta.get("while_running") is True, meta)
-    check("B5 Keil 侧如实声明「读内存要求目标已停」",
-          kl.need_halt_for_read() is True, None)
+    check("B5 不再声明「读内存要求目标已停」（批次45 真机复核：运行态读得到）",
+          kl.need_halt_for_read() is False, None)
     c2 = FakeKeilClient(read_ok=False)
     d2, m2 = L.KeilLink(c2).read(0x20000000, 4)
     check("B6 读失败返回 (None, meta)，meta 里有 error 与 error 文案",

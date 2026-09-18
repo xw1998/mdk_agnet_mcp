@@ -324,6 +324,56 @@ def _ram_region(addr) -> bool:
     """地址是否落在 SRAM（0x2000_0000~0x3FFF_FFFF）：只有这里才和 D-Cache 打交道。"""
     return isinstance(addr, int) and (0x20000000 <= addr < 0x40000000)
 
+def _halt_guard(client):
+    """需要「目标停下来给我一个确定的窗口」时用：暂停→等真停→返回恢复闭包。
+
+    返回 {was_running, pause(), resume(), stopped}。调用方负责在 finally 里 resume（），
+    否则目标会一直停在那里——这是有副作用的操作，不能默默吞掉。
+    """
+    try:
+        st = client.get_status()
+    except Exception as e:  # noqa: BLE001
+        st = {"ok": False, "error": str(e)}
+    was_running = bool(st.get("debugging") and st.get("running"))
+    info = {"was_running": was_running, "stop_ok": None, "stop_error": None,
+            "resumed": None, "resume_error": None}
+    if not was_running:
+        return info
+    s = client.stop()
+    info["stop_ok"] = bool(s.get("ok"))
+    if not info["stop_ok"]:
+        info["stop_error"] = s.get("status_text") or s.get("error") or "暂停目标失败"
+        return info
+    client.wait_until_stopped(timeout=1.0)
+    return info
+
+
+def _resume_after_halt(client, info: dict) -> dict:
+    """把 _halt_guard 暂停过的目标恢复运行，并把结果如实写回 info。"""
+    if not info.get("was_running") or info.get("stop_ok") is not True:
+        return info
+    r = client.run()
+    info["resumed"] = bool(r.get("ok"))
+    if not info["resumed"]:
+        info["resume_error"] = r.get("status_text") or r.get("error") or "恢复运行失败"
+    return info
+
+
+def _halt_note(info: dict, paused_ms) -> list:
+    """把停-读-走这件事的副作用写成给用户看的句子（有副作用就必须说出来）。"""
+    notes = []
+    if not info.get("was_running"):
+        return notes
+    if info.get("stop_ok") is not True:
+        notes.append("暂停目标失败（%s），本次未能拿到停机快照" % info.get("stop_error"))
+        return notes
+    notes.append("本次操作把目标暂停了 %s ms 再恢复运行（running=\"halt\" 的正常代价）"
+                 % paused_ms)
+    if info.get("resumed") is False:
+        notes.append("**恢复运行失败，目标仍停在停止态**：%s" % info.get("resume_error"))
+    return notes
+
+
 def _cache_advisory(client, addr, op: str, ttl: float = 5.0):
     """D-Cache 已使能且目标地址在 SRAM 时，给出「DAP 直读/直写不可全信」的提示。
 
@@ -2314,16 +2364,27 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "首帧是脏值时用 first_read_hex 留证、data_hex 换成可靠值并给 warning。"
             "verify=true 总是复读（强制确认），verify=false 关闭（大块搬运省时间）；"
             "verify 可传字符串也可传 JSON 布尔（true/false 等价于 \"true\"/\"false\"）。"
-            "**看到 read_confidence=\"low\" 或 degenerate 时不要据此下结论（例如「读到 0 就判定变量被清零」），"
-            "先 get_status 确认目标已停止再重读。**"
-            "注意：需目标暂停——目标运行期间 UVSOCK 推送异步消息会堆积，导致读取响应错位（典型报错 AMEM 响应数据过短），务必先 stop 再读。勿越界读外设保留区，可先 query_memory_map 确认范围。"
+            "**运行态读取（running，默认 \"live\"）：目标全速运行时也能读**（真机实测 SRAM 与外设"
+            "寄存器都读得到，不必先 stop）；运行态一律多复读一轮，两次不一致时给"
+            "read_confidence=medium + read_unstable=true + while_running，并把「该地址本来就在被 CPU"
+            "改写」与「这次读被运行中的目标打断了」两种可能都写明（不替你选一个）。"
+            "要取某一瞬间的一致快照，用 running=\"halt\"（停-读-走）：会暂停目标再恢复，返回"
+            "paused_ms / was_running / resumed / halt_note 如实交代代价，恢复失败会告警。"
+            "**看到 read_confidence=\"low\"/\"medium\" 或 degenerate 时不要据此下结论（例如「读到 0 就判定变量被清零」）。**"
+            "勿越界读外设保留区，可先 query_memory_map 确认范围。"
         ),
     )
     async def read_mem(addr: str | int, n_bytes: int = 0, length: int = 0,
-                       reloc_delta: str = "", verify: str | bool = "auto") -> str:
+                       reloc_delta: str = "", verify: str | bool = "auto",
+                       running: str = "live") -> str:
         addr = _addr_arg(addr)
         # verify 同时接受 "auto"/"true"/"false" 与 JSON 布尔 true/false
         verify = _norm_tristate(verify)
+        run_mode = str(running or "live").strip().lower()
+        if run_mode not in ("live", "halt"):
+            return _js({"ok": False, "error_code": "invalid-argument",
+                        "error": "running 只支持 live（不打断目标）/ halt（停-读-走），收到: %s"
+                                 % running})
         try:
             client = _get_client()
             n = int(n_bytes or 0) or int(length or 0)
@@ -2332,7 +2393,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                             "error": "参数不足：必须指定读取字节数 n_bytes（别名 length），应为正整数"})
             delta, _dnote = _eff_reloc_delta(reloc_delta)
             a, note = _resolve_addr_with_reloc(addr, client, delta)
-            out = client.read_mem_verified(a, n, verify=verify)
+            halt_info = None
+            paused_ms = 0
+            if run_mode == "halt":
+                t0 = time.time()
+                halt_info = _halt_guard(client)
+                try:
+                    out = client.read_mem_verified(a, n, verify=verify)
+                finally:
+                    # 无论读成不成，都要把目标恢复回去（有副作用就得收尾）
+                    paused_ms = int((time.time() - t0) * 1000)
+                    _resume_after_halt(client, halt_info)
+            else:
+                out = client.read_mem_verified(a, n, verify=verify)
             ca = _cache_advisory(client, a, "read")
             if ca and isinstance(out, dict):
                 out = dict(out)
@@ -2341,6 +2414,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 out = dict(out)
                 out["addr"] = hex(a)
                 out["addr_note"] = note
+            if halt_info is not None:
+                out = dict(out)
+                out["sampling"] = "halt" if halt_info.get("stop_ok") else "halt_failed"
+                out["was_running"] = halt_info.get("was_running")
+                out["paused_ms"] = paused_ms
+                if halt_info.get("was_running"):
+                    out["resumed"] = halt_info.get("resumed")
+                hn = _halt_note(halt_info, paused_ms)
+                if hn:
+                    out["halt_note"] = "；".join(hn)
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "addr": str(addr), "error": str(e)})
@@ -2354,11 +2437,21 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "并默认做**写后回读校验**（verify=true，返回 verified/readback_hex）："
             "并发写入、目标运行中、或写只读/未擦写区域时，写入可能被静默忽略——"
             "verified=false 即明确告诉你「写下去了但没生效」，不要据此推断目标行为"
-            "（如误判为看门狗复位）。addr 支持十六进制/十进制/符号名。注意：需目标暂停，运行中写入会失败/错位（回读校验会报 verified=false）。写外设寄存器/关键内存有副作用，写入前确认地址与值正确（可先 read_mem 备份）。"
+            "（如误判为看门狗复位）。addr 支持十六进制/十进制/符号名。"
+            "**运行态写入（running，默认 \"live\"）**：目标全速运行时也能写（回读校验会告诉你有没有落地），"
+            "但写入可能被 CPU 后续改写或缓存回行覆盖；要确保写进去就生效，用 running=\"halt\""
+            "（停-写-回读-走，返回 paused_ms / was_running / resumed / halt_note）。"
+            "写外设寄存器/关键内存有副作用，写入前确认地址与值正确（可先 read_mem 备份）。"
         ),
     )
-    async def write_mem(addr: str | int, data_hex: str, verify: bool = True) -> str:
+    async def write_mem(addr: str | int, data_hex: str, verify: bool = True,
+                        running: str = "live") -> str:
         addr = _addr_arg(addr)
+        run_mode = str(running or "live").strip().lower()
+        if run_mode not in ("live", "halt"):
+            return _js({"ok": False, "error_code": "invalid-argument",
+                        "error": "running 只支持 live（不打断目标）/ halt（停-写-回读-走），收到: %s"
+                                 % running})
         try:
             client = _get_client()
             a, note = _resolve_addr_arg(addr, client)
@@ -2367,20 +2460,39 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 return _js({"ok": False, "addr": str(addr),
                             "error": "data_hex 非法: %s" % herr,
                             "hint": "传十六进制字节串：deadbeef / de ad be ef / 0x11223344"})
-            out = dict(client.write_mem(a, payload))
+            halt_info = None
+            paused_ms = 0
+            t0 = time.time()
+            if run_mode == "halt":
+                halt_info = _halt_guard(client)
+            try:
+                out = dict(client.write_mem(a, payload))
+                # 批次29：写后回读校验——把「写入被静默吞掉」变成显式 verified=false
+                if verify and out.get("ok"):
+                    out.update(_verify_write(client, a, payload))
+                    if out.get("verified") is False:
+                        out["warning"] = out.get("verify_note")
+                elif not verify:
+                    out["verified"] = None
+                    out["verify_note"] = "已按 verify=false 跳过回读校验（无法确认写入是否落地）"
+            finally:
+                if halt_info is not None:
+                    paused_ms = int((time.time() - t0) * 1000)
+                    _resume_after_halt(client, halt_info)
             ca = _cache_advisory(client, a, "write")
             if ca:
                 out["cache"] = ca
             if note:
                 out["addr_note"] = note
-            # 批次29：写后回读校验——把「写入被静默吞掉」变成显式 verified=false
-            if verify and out.get("ok"):
-                out.update(_verify_write(client, a, payload))
-                if out.get("verified") is False:
-                    out["warning"] = out.get("verify_note")
-            elif not verify:
-                out["verified"] = None
-                out["verify_note"] = "已按 verify=false 跳过回读校验（无法确认写入是否落地）"
+            if halt_info is not None:
+                out["sampling"] = "halt" if halt_info.get("stop_ok") else "halt_failed"
+                out["was_running"] = halt_info.get("was_running")
+                out["paused_ms"] = paused_ms
+                if halt_info.get("was_running"):
+                    out["resumed"] = halt_info.get("resumed")
+                hn = _halt_note(halt_info, paused_ms)
+                if hn:
+                    out["halt_note"] = "；".join(hn)
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "addr": str(addr), "error": str(e)})

@@ -13,6 +13,9 @@
 * 读回来的数据一定带 `meta`：可疑就读成脏值（`degenerate`）、置信度
   （`read_confidence`）、复读次数、目标当时是否在全速跑（`while_running`）——
   让上层能如实披露，而不是把「读到 0」当结论。
+* **运行态也能读**（批次45 真机复核）：Keil 链路在目标全速运行时读得到内存，
+  不必先停；运行态读数是否可信由 `while_running`/`read_confidence`/`read_unstable`
+  交代，需要「某一瞬间的一致快照」时才走 `running="halt"` 的停-读-走。
 * 链路对象**不缓存跨调用状态**：每次 `pick()` 现查会话，会话没了立刻反映出来；
   只有「目标是否在跑」做了 1 秒 TTL 缓存，免得轮询时每个采样点都多打一次状态查询。
 
@@ -86,7 +89,11 @@ class Link:
                 "error": "%s 链路不支持 resume" % self.label}
 
     def need_halt_for_read(self) -> bool:
-        """读内存是否要求目标已停。Keil 在跑时读可能错位 → True。"""
+        """读内存是否**要求**目标已停（两条链路的答案都是否：运行态读得到）。
+
+        真正需要「停机快照」的场合（读数要求是某一瞬间的一致值）由上层显式
+        走 running="halt" 的停-读-走，而不是在这里一刀切要求先停。
+        """
         return False
 
     # -- 内部：状态查询 1 秒 TTL ---------------------------------------
@@ -141,9 +148,11 @@ class KeilLink(Link):
         return st.get("running")
 
     def need_halt_for_read(self) -> bool:
-        # Keil 侧目标全速跑时读内存可能错位（UVSOCK 的固有性质），
-        # 所以「在跑」时读要不要改走 halt 由上层决定，这里如实声明。
-        return True
+        # 批次45 更正：此前据「运行态读会错位」判为 True，真机复核发现 Keil 链路
+        # 在目标全速运行时**读得到**（SRAM 与外设寄存器都读得到、256B 大块也稳），
+        # 所以不再要求先停；运行态读到的东西可不可信，改由读数自身的
+        # while_running / read_confidence / read_unstable 如实交代。
+        return False
 
     def read(self, addr: int, n_bytes: int):
         c = self.client

@@ -136,6 +136,13 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 只有 SWO（`trace_swo_*`）本身依赖 OpenOCD（TPIU 配置与落盘在那里）；Keil 用户做printf trace 用 `itm_trace`（读 Keil 的 Trace 缓冲，已带 ITM 结构化解码）。
 
+### 运行态读写内存：`running=live|halt`
+
+`read_mem` / `write_mem` 的 `running` 默认 `live`——**不要求目标已停**（Keil 链路真机实测：全速跑时读 SRAM / 外设 / 256 B 大块均成功，连读 `SysTick->VAL` 能拿到真实的递减值）。
+
+- `live`：直接读 / 写，结果附 `while_running`。运行态读数会自动复读比对，两次不一致时给 `read_confidence=medium` + `read_unstable`，并**同时列出两种解释**（地址本来就在被 CPU 改写 / 读的中途被运行中的目标打断），不替调用者下结论。
+- `halt`：**停-读-走**（或停-写-校验-走）快照——自动 `stop` → 操作 → `run`，返回 `sampling` / `was_running` / `paused_ms` / `resumed` / `halt_note`；**会打断目标、改变现场，属有副作用操作**，只在确实需要「某一瞬间的一致快照」时显式使用。
+
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
 - **工具面默认精简**：默认只暴露 37 个（`core` 33 个 + 4 个元工具），其余 117 个按需装载——
