@@ -55,6 +55,7 @@ from . import coverage as _coverage
 from . import scatter as _scatter
 from . import cores as _cores
 from . import etm as _etm
+from . import reloc as _reloc
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -416,6 +417,93 @@ def _cache_advisory(client, addr, op: str, ttl: float = 5.0):
             "（且写入本身仍报成功）。改内存变量/标志位时请留意，"
             "必要时先让目标 clean/invalidate 再写，或写后隔一会儿重读复核。" % ccr)
     return out
+
+# ---------------- DWT 数据观察点槽位（批次48） ----------------
+# DWT_COMP0 @0xE0001020 / DWT_MASK0 @0xE0001024 / DWT_FUNCTION0 @0xE0001028，
+# 每个比较器占 0x10 字节，Cortex-M3/M4 上共 4 个槽。
+# 用户真实踩到：clear_all_watchpoints 只清了 Keil 断点表，**硬件比较器还武装着**，
+# 于是「run 即停」的鬼魂断点，最后只能手写 DWT_FUNCTION3=0 才解开。
+_DWT_COMP0 = 0xE0001020
+_DWT_SLOT_STRIDE = 0x10
+_DWT_SLOT_COUNT = 4
+# FUNCTIONn 的 bit[3:0] 是功能字段：0 = 该比较器未启用。真机实测 F429 上
+# FUNCTION1 读回 0x200（落在字段之外、写 0 也改不掉），只看整字非 0 会误报武装。
+_DWT_FN_FIELD_MASK = 0x0F
+
+def _dwt_slot_addrs(slot: int) -> dict:
+    base = _DWT_COMP0 + _DWT_SLOT_STRIDE * int(slot)
+    return {"comp": base, "mask": base + 4, "function": base + 8}
+
+def _mem_read_u32(client, addr: int):
+    """读 32 位（小端）；读不到返回 None（区别于 0）。"""
+    try:
+        r = client.read_mem(int(addr), 4)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(r, dict) or not r.get("ok"):
+        return None
+    try:
+        b = bytes.fromhex(r.get("data_hex") or "")
+    except ValueError:
+        return None
+    return int.from_bytes(b[:4], "little") if len(b) >= 4 else None
+
+def _mem_write_u32(client, addr: int, val) -> bool:
+    try:
+        r = client.write_mem(int(addr), struct.pack("<I", int(val) & 0xFFFFFFFF))
+        return bool(isinstance(r, dict) and r.get("ok"))
+    except Exception:  # noqa: BLE001
+        return False
+
+def _dwt_watch_slots(client, slots: int = _DWT_SLOT_COUNT):
+    """回读 DWT 比较器槽位。function != 0 即「已武装」（正在比较，会触发暂停）。"""
+    out = []
+    for n in range(int(slots)):
+        a = _dwt_slot_addrs(n)
+        fn = _mem_read_u32(client, a["function"])
+        comp = _mem_read_u32(client, a["comp"])
+        mask = _mem_read_u32(client, a["mask"])
+        out.append({"slot": n,
+                    "function": None if fn is None else "0x%08X" % fn,
+                    "comp": None if comp is None else "0x%08X" % comp,
+                    "mask": None if mask is None else "0x%08X" % mask,
+                    "function_raw": fn, "comp_raw": comp,
+                    "function_field": (None if fn is None
+                                       else fn & _DWT_FN_FIELD_MASK),
+                    "function_extra": (None if fn is None
+                                       else fn & ~_DWT_FN_FIELD_MASK),
+                    "function_addr": "0x%08X" % a["function"],
+                    "comp_addr": "0x%08X" % a["comp"],
+                    "readable": fn is not None,
+                    "armed": (fn is not None
+                              and (fn & _DWT_FN_FIELD_MASK) != 0)})
+    return out
+
+def _dwt_clear_watch_slots(client, slots: int = _DWT_SLOT_COUNT) -> dict:
+    """清 DWT 数据观察点槽位：先关比较（FUNCTIONn=0）再清 COMPn/MASKn，**回读复核**。
+
+    只关不核等于自欺——这整条链路的教训就是「说清了其实没清」。
+    """
+    before = _dwt_watch_slots(client, slots)
+    written = []
+    for n in range(int(slots)):
+        a = _dwt_slot_addrs(n)
+        written.append({"slot": n,
+                        "function_cleared": _mem_write_u32(client, a["function"], 0),
+                        "comp_cleared": _mem_write_u32(client, a["comp"], 0),
+                        "mask_cleared": _mem_write_u32(client, a["mask"], 0)})
+    after = _dwt_watch_slots(client, slots)
+    armed_after = [x["slot"] for x in after if x.get("armed")]
+    readable = all(x.get("readable") for x in after)
+    return {"before": before, "written": written, "after": after,
+            "armed_before": [x["slot"] for x in before if x.get("armed")],
+            "armed_after": armed_after,
+            "readable": readable,
+            "cleared": (not armed_after) if readable else None,
+            "note": ("DWT 比较器 0..%d 已回读确认全部关闭（FUNCTION 字段=0）" % (int(slots) - 1)
+                     if readable and not armed_after else
+                     ("回读仍有槽位武装：%s" % armed_after) if readable else
+                     "DWT 寄存器读不到（未进入调试 / 目标在运行），无法确认是否真的清干净")}
 
 def _auto_freeze_watchdogs(client):
     """halt/进调试后自动置位 DBGMCU 的 IWDG/WWDG 冻结位（失败只报信息，不影响主流程）。
@@ -1288,20 +1376,34 @@ def _resolve_map() -> str:
 
 def _parse_target(locator, target: str):
     """把目标字符串解析为地址。支持 0x地址 或 文件:行号（如 main.c:77）。"""
+    return _parse_target_ex(locator, target)["addr"]
+
+def _parse_target_ex(locator, target: str):
+    """目标解析的**带证据版**（批次48）。
+
+    旧实现只回一个地址，行号解析撞了同名文件也看不出来。这里把匹配证据一并返回，
+    供 run_to_line 在触发前拦截可疑目标（详见 locator.line_to_addr_ex）。
+    """
     t = (target or "").strip()
     if t.lower().startswith("0x"):
         try:
-            return int(t, 16)
+            return {"addr": int(t, 16), "kind": "address", "explicit": True}
         except ValueError:
-            return None
+            return {"addr": None, "kind": "address", "explicit": True,
+                    "reason": "0x 地址解析失败：%r" % t}
     if ":" in t:
         file, line = t.rsplit(":", 1)
         try:
             ln = int(line.strip())
         except ValueError:
-            return None
-        return locator.line_to_addr(file.strip(), ln)
-    return None
+            return {"addr": None, "kind": "line", "explicit": False,
+                    "reason": "行号不是整数：%r" % line}
+        ex = locator.line_to_addr_ex(file.strip(), ln)
+        ex["kind"] = "line"
+        ex["explicit"] = False
+        return ex
+    return {"addr": None, "kind": "unknown", "explicit": False,
+            "reason": "无法识别的目标写法：需为 0x地址 或 文件:行号（如 main.c:77）"}
 
 # 编译/烧录后的调试通道自愈需要丢弃旧 UVSOCK 连接；builder 不反向依赖 server，
 # 在此注入钩子（工具内部先 keil_health 快照，编译后按需自动恢复，省掉一轮 restart_keil 往返）。
@@ -1816,6 +1918,17 @@ def _read_variable_reloc(client, name, count, read_memory, delta, dnote):
         return out
     data = bytes.fromhex(mem.get("data_hex") or "")
     out["ok"] = True
+    # 批次48：偏移错了不会报错，只会读到「全 0」——用户真实踩到，差点被引向
+    # 「变量被清零」的错误结论。退化读数必须响亮告警，并指明下一步是校验偏移。
+    if data and (data.count(0) == len(data) or data.count(0xFF) == len(data)):
+        deg = "全 0x00（可能是 .bss/未初始化，也可能是偏移错了）" if data.count(0) == len(data) \
+            else "全 0xFF（擦除态/未编程，通常是偏移错了）"
+        out["value_suspect"] = True
+        out["value_warning"] = (
+            "运行地址 0x%X 读回整帧 %s：**不要**据此判定「变量被清零」。"
+            "reloc_delta=0x%X 是跨编译会变的——请先 reloc_check（或 reloc_check 的 "
+            "derive 结果）确认偏移与实际布局相符，再解读本值。" % (run, deg, delta))
+        out["next_action"] = "调 reloc_check(elf=当前 .axf) 校验/反推正确偏移"
     if read_memory:
         out["memory_hex"] = mem.get("data_hex")
         out["ascii"] = mem.get("ascii")
@@ -1844,6 +1957,175 @@ def _read_variable_reloc(client, name, count, read_memory, delta, dnote):
                          "结构体/字符串看 memory_hex")
     return out
 
+
+def _guard_reject_payload(problems, ev, allow_suspect):
+    # 没有问题时必须放行：此前 problems 为空仍去取 problems[0]，把「一切正常」的
+    # 目标写成了 IndexError: list index out of range（拿不到 PC 的那条路径必踩）。
+    if allow_suspect or not problems:
+        return None
+    first = problems[0]
+    return {"ok": False, "error_code": first["error_code"], "error": first["error"],
+            "problems": problems, "evidence": ev, "rejected": True,
+            "note": ("已在触发前拦下：下列证据表明解析结果不可信，直接下断点只会白费一次触发。"
+                     "确有把握时传 allow_suspect=true 强行执行。"),
+            "hints": [p.get("hint") for p in problems if p.get("hint")]}
+
+def _run_to_line_guard(client, loc, ex, addr, allow_suspect=False, max_fuzz=200):
+    """run_to_line 触发前的目标一致性校验（批次48）。返回 (拒绝载荷 或 None, 证据)。
+
+    真机踩到：``task_algo.c:719`` 被解析到 ``0x80c952c``（比当前 PC 还小，物理上不可能），
+    断点永不命中，白白浪费一次触发。这里动手前把四类可疑目标拦下来——**默认拒绝并给证据**，
+    因为「多问一句」远比「白跑一次 + 被引向错误结论」便宜：
+
+    * ``ambiguous-line``    同名文件撞行号（basename 相同、路径不同的多个文件都匹配）
+    * ``line-fuzzy``        命中的行比目标行早太多（> max_fuzz，说明该行编译不出独立地址）
+    * ``not-in-symbols``    地址不落在任何符号区间（伪地址）
+    * ``suspicious-target`` 与当前 PC 不在同一函数、且比当前函数入口还早
+                            （run_to_line 只能往前走，这种目标到不了，几乎必是解析错了）
+
+    allow_suspect=true 放行（返回 (None, 证据)）。目标运行态拿不到 PC 时跳过 PC 校验，
+    并在证据里注明 skipped——不冒充「校验过」。
+    """
+    ev = {"target_kind": ex.get("kind"), "addr": hex(addr),
+          "matched_file": ex.get("matched_file"), "matched_line": ex.get("matched_line"),
+          "fuzz": ex.get("fuzz"), "ambiguous": ex.get("ambiguous"),
+          "files": ex.get("files"), "candidates": ex.get("candidates")}
+    problems = []
+    if ex.get("kind") == "line":
+        if ex.get("ambiguous"):
+            files = ex.get("files") or []
+            problems.append({
+                "error_code": "ambiguous-line",
+                "error": ("行号解析撞到同名文件：%s:%s 在行号表里匹配到 %d 个文件（%s）"
+                          % (ex.get("file"), ex.get("line"), len(files),
+                             "、".join(files[:4]))),
+                "hint": ("用更完整的路径写法重试（如 Core/Src/%s:%s）；"
+                         "或先 address_for_line 看候选再传 0x 地址"
+                         % (os.path.basename(str(ex.get("file") or "")), ex.get("line")))})
+        fz = ex.get("fuzz")
+        if isinstance(fz, int) and fz > int(max_fuzz):
+            problems.append({
+                "error_code": "line-fuzzy",
+                "error": ("该文件里 <= %s 行最近的地址条目是第 %s 行（早了 %d 行，超过上限 %d）："
+                          "目标行很可能编译不出独立地址，解析结果不可信"
+                          % (ex.get("line"), ex.get("matched_line"), fz, int(max_fuzz))),
+                "hint": ("换一个确实有代码的行；或先 address_for_line 核对。"
+                         "max_fuzz=0 可放宽该限制")})
+    if not loc.is_covered(addr):
+        problems.append({
+            "error_code": "not-in-symbols",
+            "error": "解析出的地址 0x%X 不落在当前 .axf 的任何符号区间内" % addr,
+            "hint": "该行很可能没有可执行代码（宏/注释/声明）；换成有代码的行"})
+    # PC 一致性校验
+    pc = None
+    try:
+        st = client.get_status()
+        if isinstance(st, dict) and st.get("running") is False:
+            regs = client.read_cpu_registers_stable()
+            if isinstance(regs, dict) and isinstance(regs.get("pc"), int):
+                pc = int(regs["pc"]) & ~1
+    except Exception:  # noqa: BLE001
+        pc = None
+    if pc is None:
+        ev["pc_check"] = "skipped"
+        ev["pc_check_note"] = ("拿不到当前 PC（目标在运行 / 未进入调试），"
+                               "本次未做函数边界一致性校验")
+        return _guard_reject_payload(problems, ev, allow_suspect), ev
+    ev["pc"] = hex(pc)
+    pf = loc.func_at(pc)
+    tf = loc.func_at(addr)
+    ev["pc_check"] = "done"
+    ev["pc_function"] = (pf or {}).get("name")
+    ev["target_function"] = (tf or {}).get("name")
+    if pf and addr < pf["start"] and not (tf and tf["start"] == pf["start"]):
+        problems.append({
+            "error_code": "suspicious-target",
+            "error": ("目标 0x%X 比当前 PC 所在函数 %s（入口 0x%X）还早，且不在同一函数："
+                      "run_to_line 只能往**前**跑，这种目标物理上到不了，"
+                      "几乎必是行号/符号解析错了" % (addr, pf["name"], pf["start"])),
+            "hint": ("先用 get_current_location 看当前停在哪，再 address_for_line 核对目标地址；"
+                     "确要强行执行可传 allow_suspect=true")})
+    return _guard_reject_payload(problems, ev, allow_suspect), ev
+
+def _read_variable_via_elf(client, name, count=0, read_memory=True, delta=0, dnote=""):
+    """符号解析双轨打通（批次48）：Keil 表达式读不到时，改走 .axf 符号表 + read_mem。
+
+    背景：`read_variable` 走 Keil 表达式（`&name`），而 static/被优化掉/停在别处时
+    表达式会失败；同一时刻 `find_symbol` 走 ELF 却能查到地址（用户实测的双轨不通）。
+    这里把第二条轨道直接接上，失败原因保留在 ``fallback_reason`` 里。
+
+    只处理**纯符号名**（含 '.'/'['/'->' 的成员/下标表达式交给 Keil 表达式那一侧）。
+    拿不到定位器、符号不存在、读不到内存时返回 None——不猜值。
+    """
+    nm = str(name or "").strip()
+    if not nm or any(t in nm for t in (".", "[", "->", " ")):
+        return None
+    loc = _get_locator()
+    if loc is None or not loc.is_ready():
+        return None
+    try:
+        hit = loc.symbol_addr(nm)
+    except Exception:  # noqa: BLE001
+        hit = None
+    if not hit:
+        return None
+    link = int(hit["addr"])
+    run = (link + int(delta)) & 0xFFFFFFFF if delta else link
+    size = int(hit.get("size") or 0)
+    nb = size if 0 < size <= 1024 else 4
+    out = {"ok": False, "name": nm, "address": hex(run),
+           "link_address": hex(link), "run_address": hex(run),
+           "size_bytes": nb, "symbol_kind": hit.get("type"),
+           "address_source": ".axf 符号表（ELF .symtab）",
+           "fallback": ".axf 符号表 + read_mem"}
+    if delta:
+        out["reloc_delta"] = "0x%X" % int(delta)
+        out["reloc_note"] = dnote
+    try:
+        mem = client.read_mem(run, nb)
+    except Exception as e:  # noqa: BLE001
+        out["error"] = "读取运行地址失败: %s" % e
+        return out
+    if not mem.get("ok"):
+        out["error"] = "读取地址 0x%X 失败: %s" % (run, mem)
+        return out
+    data = bytes.fromhex(mem.get("data_hex") or "")
+    if not data:
+        out["error"] = "地址 0x%X 读回空数据" % run
+        return out
+    out["ok"] = True
+    if read_memory:
+        out["memory_hex"] = mem.get("data_hex")
+        out["ascii"] = mem.get("ascii")
+    out["value"] = int.from_bytes(data[:min(nb, 8)], "little")
+    if nb == 4 and len(data) >= 4:
+        out["value_as_float"] = struct.unpack("<f", data[:4])[0]
+    if data.count(0) == len(data) or data.count(0xFF) == len(data):
+        out["value_suspect"] = True
+        out["value_warning"] = ("该地址读回整帧退化值（全 0x00/全 0xFF），"
+                                "可能确实是空/擦除态，也可能是偏移或符号已漂移；"
+                                "不要仅凭此判定「变量被清零」")
+    if count and int(count) > 0:
+        cnt = int(count)
+        elem = (size // cnt) if (size and size % cnt == 0) else 4
+        elems = []
+        for i in range(cnt):
+            try:
+                m = client.read_mem(run + i * elem, elem)
+            except Exception as e:  # noqa: BLE001
+                elems.append({"index": i, "error": str(e)})
+                break
+            if not m.get("ok"):
+                elems.append({"index": i, "error": "读取失败"})
+                break
+            d = bytes.fromhex(m.get("data_hex") or "")
+            elems.append({"index": i,
+                          "value": int.from_bytes(d[:elem], "little") if d else None})
+        out["elements"] = elems
+        out["elem_size"] = elem
+    out["value_note"] = ("value 按小端整数解析；浮点看 value_as_float，"
+                         "结构体/字符串看 memory_hex")
+    return out
 
 def _batch_alias_args(tool: str, args: dict) -> dict:
     """batch 历史别名兼容：addr/address、n_bytes/size 等旧写法仍可用。"""
@@ -2328,12 +2610,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "set_reloc_delta 设一次全局偏移：工具会把符号的链接地址 + 偏移当作运行地址去读，"
             "返回 link_address / run_address，不必再手工换算（此时 value 按小端整数解析内存，"
             "浮点看 value_as_float）。"
+            "**符号解析双轨（批次48）**：Keil 表达式这条路读不到时（static 变量、符号漂移、"
+            "停在不相关位置），会自动改走 .axf 符号表地址 + read_mem 兜底，返回 "
+            "fallback=\".axf 符号表 + read_mem\" 与 fallback_reason 说明为什么换了轨道；"
+            "两条都不通就如实报错，不会给一个像样的假值。"
+            "若返回 value_suspect/value_warning（读回整帧全 0x00/全 0xFF），"
+            "**不要**据此判定「变量被清零」——先用 reloc_check 校验 reloc_delta 是否与实际布局相符。"
             "适合先查地址/数组内容，再配合 read_mem/write_mem 进一步读写。注意：需目标暂停（运行中读取会失败/错位）；依赖 .axf 调试符号。刚停止瞬间取值可能读到脏值。"
         ),
     )
     async def read_variable(name: str, count: int = 0, read_memory: bool = True,
                             reloc_delta: str = "") -> str:
         client = None
+        delta, dnote = 0, ""
         try:
             client = _get_client()
             delta, dnote = _eff_reloc_delta(reloc_delta)
@@ -2345,6 +2634,30 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                                 delta, dnote))
         except Exception as e:  # noqa: BLE001
             out = {"ok": False, "name": str(name), "error": str(e)}
+        # 批次48：把两条符号解析轨道接起来——Keil 表达式读不到时改走 .axf 符号表，
+        # 换轨原因保留在 fallback_reason，原轨道的失败信息留在 keil_path（可追溯）。
+        if client is not None and ((not out.get("ok"))
+                                   or (out.get("address") and out.get("value") is None)):
+            try:
+                fb = _read_variable_via_elf(client, name, count=count,
+                                            read_memory=read_memory, delta=delta,
+                                            dnote=dnote)
+            except Exception as e:  # noqa: BLE001
+                fb = {"ok": False, "error": "ELF 兜底读取异常: %s" % e}
+            if fb and fb.get("ok"):
+                reason = out.get("error") or (
+                    "Keil 表达式路径取到了地址但没取到值" if out.get("ok")
+                    else "Keil 表达式路径失败")
+                fb["fallback_reason"] = (
+                    "Keil 表达式读 '%s' 未成功（%s），已自动改用 .axf 符号表地址 + read_mem"
+                    % (name, reason))
+                fb["keil_path"] = {k: out.get(k) for k in
+                                   ("ok", "error", "value", "address") if k in out}
+                out = fb
+            elif fb and not fb.get("ok"):
+                out.setdefault("elf_fallback", {
+                    "ok": False, "error": fb.get("error"),
+                    "note": "两条符号轨道（Keil 表达式 / .axf 符号表）都没读到"})
         if not out.get("ok"):
             hint = _symbol_stale_hint(client)
             if hint:
@@ -2873,9 +3186,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="清除数据断点",
         description=("清除指定数据断点。expr 传变量名/0x 地址，或直接用 bp_id。实现上先解析 Keil 真实断点编号再"
                      "`BK <number>`（真机实测：数据观察点按地址清除会报 error 72 invalid item number，看似成功其实没清掉）。"
-                     "返回 cleared_by 表示实际用的方式；若真实断点表里找不到会明确报 ok=false 并给出原因。"),
+                     "返回 cleared_by 表示实际用的方式；若真实断点表里找不到会明确报 ok=false 并给出原因。"
+                     "**dwt（默认 true）**：清完回读 DWT 硬件比较器（FUNCTION0..3）；"
+                     "若内部记录已空但比较器仍武装，说明留下了「run 即停」的鬼魂断点，"
+                     "会一并清掉并报 ghost_slots_cleared；dwt=false 则只做 Keil 侧清除。"),
     )
-    async def clear_watchpoint(expr: str | int = "", bp_id: int | None = None) -> str:
+    async def clear_watchpoint(expr: str | int = "", bp_id: int | None = None,
+                               dwt: bool = True) -> str:
         expr = _addr_arg(expr)
         try:
             client = _get_client()
@@ -2924,6 +3241,28 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             else:
                 out["note"] = ("数据断点依赖硬件 DWT（可同时生效 2-4 个），清除后相关触发槽位应已释放；"
                                "本次%s。" % (r.get("note") or "已清除"))
+            # 批次48：Keil 断点表与 DWT 硬件比较器是两处状态，清完必须回读复核，
+            # 否则「说清了其实没清」——真机上就表现为 run 之后立刻又停下。
+            if dwt:
+                try:
+                    slots = _dwt_watch_slots(client)
+                    armed = [x["slot"] for x in slots if x.get("armed")]
+                    out["dwt_slots_after"] = slots
+                    out["dwt_armed_after"] = armed
+                    if not _watchpoints and armed:
+                        res = _dwt_clear_watch_slots(client)
+                        out["ghost_slots_cleared"] = res
+                        out["ghost_note"] = (
+                            "内部数据断点记录已空、但 DWT 比较器 %s 仍武装——这就是"
+                            "「run 之后立刻又停下」的鬼魂断点来源，已一并清除并回读确认。"
+                            % armed)
+                    elif not success and armed:
+                        out["dwt_warning"] = (
+                            "Keil 侧未确认清除，且 DWT 比较器 %s 仍武装：若有「run 即停」"
+                            "现象，用 clear_all_watchpoints(hard=true) 或直接写 "
+                            "DWT_FUNCTIONn=0 彻底释放。" % armed)
+                except Exception as e:  # noqa: BLE001
+                    out["dwt_warning"] = "回读 DWT 比较器失败：%s" % e
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "expr": expr, "bp_id": bp_id, "error": str(e)})
@@ -3242,9 +3581,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "hard=true 时用 `BK *` 一次性清空 Keil 侧全部断点（含 .uvoptx 持久断点），"
             "代价是也会清掉非本服务设置的代码断点；用于顽固残留。"
             "返回 real_after 给出清理后 Keil 真实断点数，便于确认是否真的清干净。"
+            "**dwt（默认 true）：同时清 DWT 硬件比较器槽位（FUNCTION0..3，回读复核）。**"
+            "只清 Keil 断点表是不够的——真机踩到「清完 run 又立刻停下」的鬼魂断点，"
+            "根因就是断点表清了、硬件比较器还武装着（当时只能手写 DWT_FUNCTION3=0 才解开）。"
+            "若清理前内部记录已空但比较器仍武装，会额外报 ghost_slots 指出这就是鬼魂来源；"
+            "dwt=false 则完全不碰 DWT（有外部工具在用比较器时用）。"
         ),
     )
-    async def clear_all_watchpoints(hard: bool = False) -> str:
+    async def clear_all_watchpoints(hard: bool = False, dwt: bool = True) -> str:
         try:
             client = _get_client()
             cleared = []
@@ -3277,6 +3621,39 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 out["error"] = "有 %d 个数据断点未确认清除" % len(failed)
                 out["diagnosis"] = ("可按 Keil 真实编号清除：先用 list_breakpoints 看 real 字段拿到编号，"
                                     "再 BK <编号>；顽固残留用 hard=true（BK * 一次性清空 Keil 侧断点）。")
+            # 批次48：DWT 比较器必须一起清。Keil 断点表与硬件比较器是两处状态，
+            # 只清前者就会留下「run 即停」的鬼魂断点（用户真机踩到并手工解过）。
+            if dwt:
+                try:
+                    slots_before = _dwt_watch_slots(client)
+                    armed_before = [x["slot"] for x in slots_before if x.get("armed")]
+                    res = _dwt_clear_watch_slots(client)
+                    out["dwt"] = res
+                    out["dwt_armed_before"] = armed_before
+                    if armed_before:
+                        out["ghost_slots"] = armed_before
+                        out["ghost_note"] = (
+                            "清理前 DWT 比较器 %s 仍处于武装状态（内部数据断点记录已空）——"
+                            "这正是「run 之后立刻又停下」的鬼魂断点来源，本次已一并清除。"
+                            % armed_before)
+                    cleared_ok = res.get("cleared")
+                    if cleared_ok is False:
+                        out["ok"] = False
+                        out["error_code"] = "dwt-not-cleared"
+                        out["error"] = ("DWT 比较器回读仍在武装（槽位 %s）：硬件断点未真正释放，"
+                                        "run 可能立刻又被拦停"
+                                        % res.get("armed_after"))
+                        out["diagnosis"] = ("可用 set_register 直接写 DWT_FUNCTIONn=0"
+                                            "（n=0..3，地址 0xE0001028+0x10n）后重试；"
+                                            "若写不进，确认目标处于停止且 DEMCR.TRCENA 未被清。")
+                    elif cleared_ok is None:
+                        out["dwt_warning"] = res.get("note")
+                except Exception as e:  # noqa: BLE001
+                    out["dwt"] = {"error": str(e)}
+                    out["dwt_warning"] = "清理 DWT 比较器时出错：%s（Keil 侧断点已按上面结果处理）" % e
+            else:
+                out["dwt"] = {"skipped": True,
+                              "note": "dwt=false：本次未动 DWT 硬件比较器（可能仍有鬼魂断点）"}
             # 复查 Keil 真实断点数，避免「说清了其实没清」
             try:
                 real = client.list_breakpoints_real()
@@ -4299,24 +4676,40 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "已执行过的地址断点不会命中：此时如实返回 ok=false(error_code=run-to-target-timeout) "
             "并把目标停下（旧实现会把「还在跑」报成「停在第 N 行」）。"
             "timeout_s 控制等待命中的超时，默认 10s。"
+            "**触发前一致性校验（批次48）**：文件:行号会拿匹配证据先验一遍——"
+            "同名文件撞行号（ambiguous-line）、命中行比目标行早太多（line-fuzzy）、"
+            "地址不在任何符号区间（not-in-symbols）、目标比当前 PC 所在函数入口还早且不同函数"
+            "（suspicious-target）这四类**默认直接拒绝并给出证据**，不浪费一次触发；"
+            "返回 target_check 记录本次校验（拿不到 PC 时会注明 skipped，不冒充已校验）。"
+            "确有把握时可传 allow_suspect=true 强行执行；max_fuzz 调整行号容差（默认 200）。"
             "需已进入调试状态且配置了 .axf 调试符号。注意：实现为临时断点→run→清除。run 到断点停止时返回的 status 是 22(断点已创建) 而非 0；刚停止瞬间读 PC 可能为脏值（本工具已用稳定读取修复）。需已进入调试且配置 .axf。"
         ),
     )
-    async def run_to_line(target: str | int, timeout_s: float = 10.0) -> str:
+    async def run_to_line(target: str | int, timeout_s: float = 10.0,
+                          allow_suspect: bool = False, max_fuzz: int = 200) -> str:
         target = _addr_arg(target)
         try:
             loc = _get_locator()
             if not loc or not loc.is_ready():
                 return _js({"ok": False, "error": "符号定位未就绪（缺少 .axf 调试符号）"})
-            addr = _parse_target(loc, target)
+            ex = _parse_target_ex(loc, target)
+            addr = ex.get("addr")
             if addr is None:
                 return _js({"ok": False, "target": target,
-                            "error": "无法解析目标：需为 0x地址 或 文件:行号（如 main.c:77）"})
+                            "error": ex.get("reason")
+                                     or "无法解析目标：需为 0x地址 或 文件:行号（如 main.c:77）",
+                            "target_parse": ex,
+                            "hint": "行号写法尽量带上目录（如 Core/Src/main.c:77），避免同名文件撞行号"})
+            addr = int(addr) & ~1
             client = _get_client()
+            guard, gev = _run_to_line_guard(client, loc, ex, addr,
+                                            allow_suspect=allow_suspect, max_fuzz=max_fuzz)
+            if guard:
+                return _js(guard)
             bp = client.set_breakpoint(hex(addr))
             if not bp.get("ok"):
                 return _js({"ok": False, "target": target, "addr": hex(addr),
-                            "error": f"设置临时断点失败: {bp}"})
+                            "error": f"设置临时断点失败: {bp}", "target_check": gev})
             try:
                 tm = float(timeout_s)
             except Exception:  # noqa: BLE001
@@ -4356,6 +4749,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     stop_note = ("已发送 stop，但未能确认目标已停止（stop 异步生效）；"
                                  "请用 get_status 核实后再操作目标")
                 return _js({"ok": False, "target": target, "addr": hex(addr),
+                            "target_check": gev,
                             "error_code": "run-to-target-timeout",
                             "error": f"运行 {tm:g}s 未停在 {hex(addr)}：断点未命中"
                                      "（目标没走到该处，或该地址已经执行过了）",
@@ -4387,9 +4781,79 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     src = loc.read_source(stop["file"], stop["line"], context=3)
                     if src:
                         out["stopped_source"] = src["source"]
+            out["target_check"] = gev
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "target": target, "error": str(e)})
+
+    @server.tool(
+        name="reloc_check",
+        title="校验/推导符号重定位偏移",
+        description=(
+            "校验 reloc_delta（App 运行期重定位偏移：**运行地址 = .axf 链接地址 + delta**）"
+            "是否与实际布局相符，并可从当前 PC 反推正确偏移。"
+            "**为什么必须有**：delta 跨编译会变，偏移错了不会报错，只会读到「全 0」——"
+            "极易被误判成「变量被清零」，是真机上被静默带沟里的一种失败。"
+            "做法一（verify）：从 .axf 可加载段挑若干**非退化**的字节块当内容指纹"
+            "（全 0x00/全 0xFF 的块在哪儿都长得一样，不能当指纹），按「链接地址 + delta」"
+            "到目标读回来逐字节比对，给出 verdict："
+            "delta-confirmed（全中）/ delta-likely-wrong（一条都没中）/ "
+            "delta-uncertain（部分中）/ unreadable（读不到）/ no-sample（没有可用指纹）。"
+            "做法二（derive）：读当前 PC 处的代码字节，回到 .axf 里反查这段代码的链接地址，"
+            "直接算出 delta；匹配到多处或一处都匹配不上时**如实说定不了，不猜**。"
+            "delta 省略时用全局 set_reloc_delta 的值；elf 省略时用当前调试的 .axf。"
+            "返回 confirmed 明确表示偏移是否**被证实**（注意 ok 只表示检查跑完了，"
+            "这两件事分开，免得把「跑完了」读成「没问题」）。"
+            "需目标暂停（运行中读内存会失败/错位）。"
+        ),
+    )
+    async def reloc_check(delta: str = "", elf: str = "", samples: int = 8) -> str:
+        try:
+            client = _get_client()
+            path = (elf or "").strip() or (_symbol_cfg.get("axf") or "")
+            if not path or not os.path.isfile(path):
+                return _js({"ok": False, "error_code": "elf-missing",
+                            "error": "未找到可用于比对的 .axf：请传 elf= 指定，"
+                                     "或先用 set_symbol_file 设置当前调试符号",
+                            "elf": path or None})
+            d, dnote = _eff_reloc_delta(delta)
+            try:
+                want = max(1, min(64, int(samples or 8)))
+            except (TypeError, ValueError):
+                want = 8
+            ver = _reloc.verify(client, path, d, samples=want)
+            out = {"ok": bool(ver.get("ok")), "elf": os.path.abspath(path),
+                   "delta": "0x%X" % d, "delta_note": dnote,
+                   "verify": ver, "confirmed": bool(ver.get("confirmed"))}
+            der = _reloc.derive_from_pc(client, path)
+            out["derive"] = der
+            if ver.get("verdict") == "delta-confirmed":
+                out["conclusion"] = ("reloc_delta=0x%X 与实际布局相符（%d 个内容指纹全部命中），"
+                                     "可以放心按该偏移解读变量值" % (d, ver.get("samples")))
+            elif ver.get("verdict") == "delta-likely-wrong":
+                out["conclusion"] = ("reloc_delta=0x%X **与实际布局不符**（内容指纹一条都没对上）："
+                                     "**不要**把读到的全 0 当成「变量被清零」"
+                                     % d)
+            elif ver.get("verdict") in ("unreadable", "no-sample"):
+                out["conclusion"] = ("本次无法验证该偏移（%s）——请如实当作「未验证」，"
+                                     "不要据此下任何结论" % ver.get("reason"))
+            else:
+                out["conclusion"] = ("偏移 %s 部分命中（%d/%d），既不能确认也不能否定"
+                                     % (out["delta"], ver.get("matched"), ver.get("samples")))
+            sd = der.get("delta_int") if isinstance(der, dict) else None
+            if sd is not None and int(sd) != int(d):
+                out["suggested_delta"] = der.get("delta")
+                out["suggested_delta_int"] = int(sd)
+                out["action"] = ("从当前 PC 反推出的偏移是 %s（与传入的 %s 不同）："
+                                 "可 set_reloc_delta(%s) 设为全局，或本次调用传 "
+                                 "reloc_delta=\"%s\""
+                                 % (der.get("delta"), out["delta"], der.get("delta"),
+                                    der.get("delta")))
+            elif isinstance(der, dict) and der.get("reason"):
+                out["derive_note"] = der.get("reason")
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
 
     # ---------------- 运行控制 ----------------
     @server.tool(

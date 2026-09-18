@@ -29,12 +29,24 @@
    让调用方以为「这就是全部」。
 2. **不碰真值**：只删「空值字段」「重复字段」「说明性长文本」，绝不修改任何数值、
    绝不截断 line/text/value/bytes/data 这类**内容字段**；列表元素本身也不会被改写。
+
+第三件事：编译/烧录日志的摘录（批次48）
+--------------------------------------
+``flash_debug`` / ``build_*`` 这类工具的返回体里塞着 UV4 的**全量日志**（几万字），
+而调用方要的结论只有几行（用户原话：「全量 build 输出几万字，关键结论 5 行」）。
+故这组工具**默认**就把日志字段摘成「头 N 行 + 尾 M 行」，并把 error/warning/体积/耗时
+这类关键行抽到 ``output.log_key_lines``；要全量传 ``full=true``。
+
+这是本文件里**唯一**一处「默认行为与以前不同」的地方——默认不精简就等于没修这个硬伤，
+故如实在此声明，并且摘录幅度与 ``log_truncated`` / ``log_total_chars`` /
+``log_kept_chars`` / ``log_key_lines`` / ``log_full_hint`` 一并写进返回体，绝不静默丢数据。
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 
 logger = logging.getLogger("mdkdebug.outctl")
 
@@ -50,7 +62,31 @@ HIGH_OUTPUT = {
     "serial_read", "serial_monitor_status", "uvprojx_read", "project_targets",
     "svd_list", "list_symbol_projects",
     "session_state",
+    # 编译/烧录系列（批次48）：返回体里塞着 UV4 全量日志，属典型高输出工具
+    "flash_debug", "build_project", "rebuild_project", "clean_project",
+    "flash_download", "build_and_flash",
 }
+
+#: 日志类工具（批次48）：**默认**摘录日志字段（唯一改变默认行为的地方，理由见模块 docstring）
+LOG_TOOLS = {
+    "flash_debug", "build_project", "rebuild_project", "clean_project",
+    "flash_download", "build_and_flash",
+}
+
+#: 会被摘录的日志字段名（按字段名小写匹配，任意层级）
+LOG_KEYS = {"output", "log", "stdout", "stderr", "build_log", "raw_output"}
+
+#: 摘录参数：超过 LOG_TRIGGER_CHARS 才动手；保留头 LOG_HEAD_LINES / 尾 LOG_TAIL_LINES 行；
+#: 最终不超 LOG_KEEP_CHARS 字符
+LOG_HEAD_LINES = 40
+LOG_TAIL_LINES = 25
+LOG_TRIGGER_CHARS = 3000
+LOG_KEEP_CHARS = 6000
+
+#: 从日志里抽「关键行」：编译错误/警告 + 体积/耗时汇总
+_LOG_KEY_RE = re.compile(
+    r"(build target|program size|error\(s\)|warning\(s\)|build time|"
+    r"error\s*[#:]|warning\s*[#:]|\berror\b|\bwarning\b)", re.I)
 
 #: 三个控制参数的名字（顺序即文档顺序）
 OUT_PARAMS = ("compact", "max_lines", "full")
@@ -246,6 +282,69 @@ def _trim_lists(obj, max_lines):
     return walk(obj, ""), trimmed
 
 
+def _key_lines(text, limit=10):
+    """从日志里挑出「关键行」（错误/警告/体积/耗时），给调用方省掉翻几万字。"""
+    out = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or len(s) > 300:
+            continue
+        if _LOG_KEY_RE.search(s):
+            out.append(s)
+            if len(out) >= limit:
+                break
+    return out
+
+def _excerpt_text(text, head=LOG_HEAD_LINES, tail=LOG_TAIL_LINES):
+    """头 head 行 + 尾 tail 行 + 省略说明；必要时再按字符上限硬截。"""
+    lines = text.splitlines()
+    if len(lines) > head + tail:
+        omitted = len(lines) - head - tail
+        kept = ("\n".join(lines[:head])
+                + "\n… [mdkdebug 已摘录日志：共 %d 行 / %d 字符，省略中间 %d 行；"
+                  "要全量请传 full=true] …\n" % (len(lines), len(text), omitted)
+                + "\n".join(lines[-tail:]))
+    else:
+        kept = text
+    if len(kept) > LOG_KEEP_CHARS:
+        kept = (kept[:LOG_KEEP_CHARS]
+                + "\n… [mdkdebug 已按字符上限截断：原文共 %d 字符；要全量请传 full=true]"
+                  % len(text))
+    return kept
+
+def _excerpt_logs(obj, head=LOG_HEAD_LINES, tail=LOG_TAIL_LINES):
+    """把日志字段摘成「头+尾」，并把关键行抽出来。
+
+    返回 ``(新对象, 摘录记录列表, 关键行列表)``。**非日志字段一律不动**——
+    这是「不碰真值」底线的延伸：我们只动明确叫 output/log/stdout/stderr 的长字符串。
+    """
+    recs = []
+    keys = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            out = {}
+            for k, v in node.items():
+                p = "%s.%s" % (path, k) if path else str(k)
+                if (isinstance(v, str) and k.lower() in LOG_KEYS
+                        and len(v) > LOG_TRIGGER_CHARS):
+                    kept = _excerpt_text(v, head, tail)
+                    out[k] = kept
+                    recs.append({"path": p, "total_chars": len(v),
+                                 "kept_chars": len(kept),
+                                 "total_lines": len(v.splitlines())})
+                    for ln in _key_lines(v):
+                        if ln not in keys:
+                            keys.append(ln)
+                else:
+                    out[k] = walk(v, p)
+            return out
+        if isinstance(node, list):
+            return [walk(v, "%s[%d]" % (path, i)) for i, v in enumerate(node)]
+        return node
+
+    return walk(obj, ""), recs, keys
+
 def apply(tool, payload, compact=None, max_lines=None, full=False):
     """对已解析的结果对象做输出控制。
 
@@ -255,12 +354,34 @@ def apply(tool, payload, compact=None, max_lines=None, full=False):
     if not isinstance(payload, dict):
         return payload, None
     c, m, f, active = resolve(compact=compact, max_lines=max_lines, full=full)
-    if not active:
+    # 日志类工具默认摘录（full=true 时不摘，即「我要全量」）；其余工具行为完全不变
+    log_mode = (tool in LOG_TOOLS) and not f
+    if not active and not log_mode:
         return payload, None
 
     out = payload
     mode = "+".join([x for x in (("compact" if c else ""), ("max_lines" if m > 0 else "")) if x])
+    if log_mode:
+        mode = (mode + "+log") if mode else "log"
     meta = {"mode": mode, "tool": tool, "truncated": False, "dropped": 0}
+    if log_mode:
+        out, log_recs, log_keys = _excerpt_logs(out)
+        if log_recs:
+            meta["log_excerpted"] = log_recs
+            meta["log_truncated"] = True
+            meta["log_total_chars"] = sum(r["total_chars"] for r in log_recs)
+            meta["log_kept_chars"] = sum(r["kept_chars"] for r in log_recs)
+            meta["log_full_hint"] = ("日志已摘录（头 %d 行 + 尾 %d 行）："
+                                     "要全量请传 full=true" % (LOG_HEAD_LINES, LOG_TAIL_LINES))
+            if log_keys:
+                meta["log_key_lines"] = log_keys[:10]
+            meta["log_note"] = ("注意 log_key_lines 只是从日志里挑出的**关键行**，"
+                                "不是完整结论；下结论前若需上下文请 full=true 取全量")
+            meta["truncated"] = True
+    # 日志没长到需要摘、又没有别的控制生效时，一个字段都不加——
+    # 「默认行为完全不变」对短日志同样成立（日志类工具只在**真的摘了**的时候才发声）。
+    if not active and not meta.get("log_excerpted"):
+        return payload, None
     if c:
         out, removed = _strip_empty(out)
         out, shared = _hoist_shared(out)
@@ -287,12 +408,25 @@ def apply(tool, payload, compact=None, max_lines=None, full=False):
         if meta.get("text_truncated"):
             hints.append("部分说明性长文本被截断到 %d 字符（见 output.text_truncated，不涉及数值/内容字段）："
                          "要原文请 full=true" % TEXT_LIMIT)
+        if meta.get("log_excerpted"):
+            hints.append("编译/烧录日志已摘录为头 %d 行 + 尾 %d 行（共 %d 字符 -> %d 字符，"
+                         "关键行见 log_key_lines）：要全量请 full=true"
+                         % (LOG_HEAD_LINES, LOG_TAIL_LINES, meta["log_total_chars"],
+                            meta["log_kept_chars"]))
     elif c:
         hints.append("本次仅做精简（去空值/提公共字段），未丢弃任何条目")
+    elif meta.get("log_excerpted"):
+        hints.append("编译/烧录日志已摘录为头 %d 行 + 尾 %d 行（共 %d 字符 -> %d 字符，"
+                     "关键行见 log_key_lines）：要全量请 full=true"
+                     % (LOG_HEAD_LINES, LOG_TAIL_LINES, meta["log_total_chars"],
+                        meta["log_kept_chars"]))
     if hints:
         meta["hint"] = "；".join(hints)
     out = dict(out)
-    out["output"] = meta
+    # 编译类工具本身就有 output（UV4 日志）字段，不能再被 meta 顶掉
+    meta_key = "output" if "output" not in out else "output_control"
+    meta["meta_key"] = meta_key
+    out[meta_key] = meta
     return out, meta
 
 
@@ -375,6 +509,11 @@ def summary() -> dict:
     env = env_defaults()
     return {
         "controlled_tools": len(HIGH_OUTPUT),
+        "log_tools": sorted(LOG_TOOLS),
+        "log_excerpt": {"head_lines": LOG_HEAD_LINES, "tail_lines": LOG_TAIL_LINES,
+                        "trigger_chars": LOG_TRIGGER_CHARS, "keep_chars": LOG_KEEP_CHARS,
+                        "note": "这类工具默认摘录日志（用户反馈「关键结论 5 行、日志几万字」），"
+                                "full=true 取全量；摘录情况会在 output.log_* 字段如实上报。"},
         "params": list(OUT_PARAMS),
         "text_limit": TEXT_LIMIT,
         "env": {"MDKDEBUG_COMPACT": os.environ.get("MDKDEBUG_COMPACT", ""),

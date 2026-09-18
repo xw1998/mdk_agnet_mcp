@@ -257,12 +257,33 @@ class Locator:
 
     def line_to_addr(self, file: str, line: int):
         """源文件:行号 -> 地址（反向最近匹配）。file 可按 basename 或路径匹配。"""
+        return self.line_to_addr_ex(file, line)["addr"]
+
+    def line_to_addr_ex(self, file: str, line: int):
+        """源文件:行号 -> 地址，**连证据一起给**（批次48）。
+
+        旧实现只回一个地址，于是「同名文件撞行号」这类错误匹配无从察觉：真机实测
+        ``task_algo.c:719`` 被解析到一个比当前 PC 还小的地址（物理上不可能），
+        白白浪费一次触发。这里把匹配过程一并返回：
+
+        - ``addr``          选中的地址（None 表示没匹配上）
+        - ``matched_file``  实际匹配到的文件（basename 相同但路径不同的**另一个**文件时就露馅了）
+        - ``matched_line`` / ``fuzz``  命中的行号与「比目标行早了多少行」
+        - ``files``         所有参与匹配的不同文件（>1 即同名歧义）
+        - ``candidates``    最接近的若干候选（带地址/文件/行）
+        - ``ambiguous``     同名歧义标志
+        - ``reason``        没匹配上时的原因
+        """
         self._ensure_loaded()
+        out = {"addr": None, "file": file, "line": line, "matched_file": None,
+               "matched_line": None, "fuzz": None, "candidates": [],
+               "ambiguous": False, "files": [], "reason": None}
         if not self._rows:
-            return None
+            out["reason"] = "行号表为空（该 .axf 无 DWARF 行号信息）"
+            return out
         want_base = os.path.basename(file.replace("\\", "/")).lower()
         want_norm = os.path.normpath(file.replace("\\", "/")).lower()
-        best = None  # (距离, 地址)
+        rows = []
         for a, f, l in self._rows:
             if l > line:
                 continue
@@ -276,9 +297,79 @@ class Locator:
                     or os.path.normpath(f_low.replace("\\", "/")).lower() == want_norm
                     or f_low.endswith(want_norm)):
                 continue
-            if best is None or (line - l) < best[0]:
-                best = ((line - l), a)
-        return best[1] if best else None
+            rows.append((a, f, l))
+        if not rows:
+            out["reason"] = ("该文件在行号表里没有 <= %d 行的地址条目（文件没参与编译？"
+                             "路径写错？）" % line)
+            return out
+        best_fuzz = min(line - l for _a, _f, l in rows)
+        best = [(a, f, l) for a, f, l in rows if (line - l) == best_fuzz]
+        files = sorted({f for _a, f, _l in rows})
+        addrs = sorted({a for a, _f, _l in best})
+        out["addr"] = addrs[0]
+        out["matched_file"] = best[0][1]
+        out["matched_line"] = best[0][2]
+        out["fuzz"] = best_fuzz
+        out["files"] = files[:8]
+        out["ambiguous"] = len(files) > 1
+        ranked = sorted(rows, key=lambda r: (line - r[2], r[2]))
+        out["candidates"] = [{"addr": "0x%08x" % a, "file": f, "line": l,
+                              "fuzz": line - l} for a, f, l in ranked[:8]]
+        return out
+
+    def _load_func_ranges(self):
+        """函数符号的 (start, end, name) 区间表（按 start 排序），供 func_at 用。"""
+        if getattr(self, "_func_ranges", None) is not None:
+            return self._func_ranges
+        raw = []
+        try:
+            with open(self.axf_path, "rb") as f:
+                elf = ELFFile(f)
+                sec = elf.get_section_by_name(".symtab") or elf.get_section_by_name(".dynsym")
+                if sec is not None:
+                    for sym in sec.iter_symbols():
+                        if not sym.name:
+                            continue
+                        st = sym.entry["st_info"]
+                        if str(st["type"]).replace("STT_", "").lower() != "func":
+                            continue
+                        a = sym.entry["st_value"] & ~1
+                        sz = sym.entry.get("st_size", 0) or 0
+                        if a and sz > 0:
+                            raw.append((a, a + sz, sym.name))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("读取函数区间失败: %s", e)
+        raw.sort()
+        self._func_ranges = raw
+        return raw
+
+    def func_at(self, addr: int):
+        """地址反查所在的函数（批次48）。返回 {name, start, end, offset, ...} 或 None。
+
+        用于「目标地址与当前 PC 是否在同一函数」这类一致性校验——run_to_line 靠它
+        识破「行号解析撞到别处」的乌龙。
+        """
+        self._ensure_loaded()
+        a = int(addr) & ~1
+        ranges = self._load_func_ranges()
+        if not ranges:
+            return None
+        starts = [r[0] for r in ranges]
+        i = bisect.bisect_right(starts, a) - 1
+        best = None
+        # 符号允许嵌套/别名，往后多探几个候选，取**最内层**（区间最短）的
+        for j in range(i, max(-1, i - 8), -1):
+            if j < 0:
+                break
+            s, e, nm = ranges[j]
+            if s <= a < e and (best is None or (e - s) < (best[1] - best[0])):
+                best = (s, e, nm)
+        if best is None:
+            return None
+        s, e, nm = best
+        return {"name": nm, "start": s, "end": e, "offset": a - s,
+                "start_hex": "0x%08x" % s, "end_hex": "0x%08x" % e,
+                "size": e - s}
 
     def resolve_source_path(self, file: str):
         """把 DWARF 相对路径（如 ../Core/Src/main.c）定位到实际源文件。"""

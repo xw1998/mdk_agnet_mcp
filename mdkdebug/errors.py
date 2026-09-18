@@ -260,6 +260,16 @@ ERROR_CODES = {
             "目标已停下（本工具已发 stop），要它继续跑请调 run",
         ],
     },
+    # 批次48：DWT 比较器回读仍在武装时落过 unknown-error，next_actions 指向
+    # keil_health / 读日志——而真正该做的是直接写 DWT_FUNCTIONn=0，方向完全不同。
+    "dwt-not-cleared": {
+        "text": "DWT 数据观察点比较器未能关闭（Keil 断点表已清，硬件比较器还在）",
+        "next_actions": [
+            "用 set_register 直接写 DWT_FUNCTION0..3=0（地址 0xE0001028+0x10n）后重读一次",
+            "确认目标处于停止状态再写：运行中写 DWT 寄存器不生效（先 stop）",
+            "确认 DEMCR.TRCENA 未被清；若整片 DWT 都读不到，说明当前不在调试态",
+        ],
+    },
     # 真机阶段7 实测：wait_state 超时（matched=False + timeout_kind）过去没有对应码，
     # 落进 unknown-error → next_actions 指 keil_health，而真正该做的是看 observed 现场。
     "wait-state-timeout": {

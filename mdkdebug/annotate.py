@@ -34,6 +34,8 @@ READONLY = {
     "list_uvision_instances", "project_targets", "read_project_config", "target_info",
     "query_memory_map", "search_mem", "disassemble", "fault_report", "diagnose",
     "breakpoint_stats", "cache_info", "address_for_line", "parse_map",
+    # 重定位偏移校验：只读 ELF + 读目标内存，不改任何状态。
+    "reloc_check",
     "parse_build_errors", "explain_build_error", "snapshot_diff", "wait_breakpoint",
     "wait_state", "mdk_guide", "capabilities", "list_tools",
     "list_peripherals", "svd_list", "svd_decode", "uvprojx_read",

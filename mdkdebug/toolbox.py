@@ -56,6 +56,8 @@ TOOLSETS = {
     "symbol": {
         "set_symbol_file", "list_symbol_projects", "find_symbol", "address_for_line",
         "get_current_location", "run_to_line", "disassemble", "parse_map",
+        # 重定位偏移校验/推导（批次48）：符号地址与实际运行地址之间的 delta 是否还对得上
+        "reloc_check",
     },
     "build": {
         "build_project", "rebuild_project", "clean_project", "flash_download",
