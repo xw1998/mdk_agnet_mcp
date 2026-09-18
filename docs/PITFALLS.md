@@ -18,6 +18,7 @@
 - [十二、Keil 窗口复用 / 惰性符号 / 写入与回显（本轮真机实测）](#十二keil-窗口复用--惰性符号--写入与回显本轮真机实测)
 - [十三、全量真机测试（批次37-38，F401 + Keil UVSOCK 实测）](#十三全量真机测试批次37-38f401--keil-uvsock-实测)
 - [十四、OpenOCD 控制台的「无前缀失败回包」（批次39，F401 + DAPLink 实测）](#十四openocd-控制台的无前缀失败回包批次39f401--daplink-实测)
+- [十五、RTOS 任务感知（批次40-41，F401 + DAPLink 实测）](#十五rtos-任务感知批次40-41f401--daplink-实测)
 
 ## 一、真实 Keil 实测要点
 
@@ -1020,6 +1021,82 @@ mock 已按真机原文改正。
 > 与[十一.6](#116-元教训这五条为什么能在-mock-阶段就被抓住) 是同一个道理的反面注脚：
 > mock 的价值在「照抄外部系统的怪癖」，**任何美化（补前缀、补字段、补格式）都等于替被测代码
 > 掩盖一条真实路径**。改 mock 的原则是——不确定就去看真机原文，别自己觉得「这样更合理」。
+
+## 十五、RTOS 任务感知（批次40-41，F401 + DAPLink 实测）
+
+目标：`rtos_info` / `rtos_tasks` / `rtos_objects` 三个只读工具，纯主机侧读内存 + 解析 `.axf` 的
+DWARF，不做目标侧配合。验证固件 `example_gcc_project/freertos_probe/`（FreeRTOS V11.1.0，
+7 个任务 + 队列/计数信号量/互斥量，故意打开 `configUSE_TRACE_FACILITY` / `configUSE_MUTEXES` /
+`configRECORD_STACK_HIGH_ADDRESS` 来逼「偏移取自 DWARF」这条路）。
+
+**验收证据**：8 个任务全列出（`count == kernel_task_count == 8`），6 个任务的
+`stack_free_words` 与固件里内核自报的 `uxTaskGetStackHighWaterMark` **逐项一致**
+（105/62/97/71/103/223）；队列注册表 3 个对象的名字/`uxLength`/`uxItemSize` 全对。
+
+### 15.1 FreeRTOS 的结构体在 DWARF 里不叫 `TCB_t`
+
+- 源码是 `typedef struct tskTaskControlBlock {...} TCB_t;`，DWARF 里的**真名**是
+  `tskTaskControlBlock` / `xLIST` / `xLIST_ITEM` / `QueueDefinition`。按 `TCB_t` 查类型表必然查不到。
+- 而且 typedef 会**两跳**：`TCB_t -> tskTCB -> tskTaskControlBlock`、
+  `Queue_t -> xQUEUE -> QueueDefinition`。只映射一跳仍然拿不到。
+- **教训**：任何「按类型名取字段偏移」的取值函数都必须走完整的 typedef 链。本批就栽在这儿——
+  `struct()` 走了链、`field()` 却直接查字典，于是 `_owner()` 恒返回 `None`，
+  真机表现是「任务列表只剩 `pxCurrentTCB` 一个（IDLE），内核说 8 个」。
+  这种错**不报错**，只少数据，最容易被当成「工具就这水平」放过去。
+
+### 15.2 DWARF 里的前向声明会挡住真定义
+
+- `struct tskTaskControlBlock;` 这类前向声明也会生成一个同名 DIE，**成员为空**。
+  用 `setdefault` 登记结构体时，先遇到谁谁占位——真定义（有成员的那个）反而被挡在外面，
+  结果是 `struct('TCB_t')` 返回 `{size: None, fields: {}}`。
+- **修法**：只收有成员的 DIE，同名字段更多者胜出。
+
+### 15.3 队列注册表的步长必须按 `QUEUE_REGISTRY_ITEM` 算
+
+- `xQueueRegistry` 的元素是 `QUEUE_REGISTRY_ITEM_t{const char *pcQueueName; QueueHandle_t xHandle;}`
+  （8 字节），而 `Queue_t` 是 80 字节。步长写成 `Queue_t` 的大小会跳到毫不相干的地址上，
+  真机表现是**读出 7 个对象**：第一个是对的，后面全是 `@\x18` / `0xA5A5A5A5` 这类垃圾，
+  还带着 `uxLength=536983554` 这种一眼假的数字。
+- **教训**：相邻的十个字段里只要有一个「看着合理」，垃圾结果就可能被信。枚举类工具必须
+  与「登记条数」和「未登记槽位是 0」两条一起对，才对得上真机的 3 个对象。
+
+### 15.4 `portMAX_DELAY` 阻塞和 `vTaskSuspend` 在同一个链表上
+
+- FreeRTOS V11 的 `prvAddCurrentTaskToDelayedList()` 把 `xTicksToWait == portMAX_DELAY` 的任务
+  **放进 `xSuspendedTaskList`**，内核自己的 `eTaskState()` 也一律报 `eSuspended`。
+- 主机侧能分：看 `xEventListItem.pxContainer` 是否非空——还挂在某个内核对象的等待链表上就是
+  「无限阻塞」，空才是真被挂起。真机上 7 个任务里正好两种都有，分类结果与固件代码一致。
+  返回里附 `state_note` 把这个内核 quirk 讲清楚，免得调用方以为工具在瞎猜。
+
+### 15.5 `pxEndOfStack` 是「对齐取整后」的栈顶
+
+- 真机上：`256` 字的栈报 `stack_size_words=255`，`128` 字的报 `127`。原因不是差一错误，
+  而是 FreeRTOS 建栈时算完 `pxStack + (N-1)` 后**按 `portBYTE_ALIGNMENT` 向下取整**，
+  再把这个地址记进 `pxEndOfStack`（8 字节对齐、栈深为偶数时正好少 1 个 word）。
+- 所以 `pxStack`→`pxEndOfStack` 换算出来的「总大小」天生带 1~2 个 word 的偏差。
+  **栈余量（`stack_free_words`）不受影响**（它就是与内核逐项对上的那个数）；
+  `stack_used_pct` 由余量换算，偏差 1 个 word 级。结果里出一处 `stack_size_note` 说清，
+  不把估算值当精确值卖。
+
+### 15.6 归因别套模板：裸机固件不等于「内核没开注册表」
+
+- 裸机 `.axf` 同样没有 `xQueueRegistry`。最初 `rtos_objects` 直接按「内核在
+  `configQUEUE_REGISTRY_SIZE==0` 时根本不定义它」报错——文字没错，但方向错了：
+  对一个根本没有 FreeRTOS 的固件谈注册表配置，等于把调用方引到 `FreeRTOSConfig.h` 去。
+- 现在先 `detect()` 探一遍，没有内核就说「没探测到 FreeRTOS 符号」，两种失败给两种下一步。
+  同时这三条错误路径都带上结构化 `reason`，由统一信封归成 `rtos-not-present` /
+  `rtos-no-queue-registry` / `rtos-no-mem-link`，不再掉进 `unknown-error`（它会把下一步指向
+  `keil_health`，方向完全不对）。
+
+### 15.7 排障插曲：同一根 DAP 被两个 OpenOCD 抢时，「读内存」会给出会骗人的结果
+
+真机验证中途一度以为解析器坏了：同一地址连读两次，第一次是对的、第二次变成 `0x40000000`，
+任务链表走到第 3 项就断。实际原因是上一轮脚本异常退出后**残留了一个 OpenOCD 进程**，
+新起的实例仍然「启动成功」（日志里甚至有 `Examination succeed`），却无法真正复位目标，
+读回来的是 0 字节或垃圾。两个实例同时 LISTENING 4444/3333 是这个状态的标志。
+
+**教训**：真机脚本要用 try/finally 收尾；怀疑读数时先 `netstat -ano | grep :4444`
+看清有几个实例，**不要拿一个可能被抢占的会话去反推自己的代码有问题**。
 
 ## 九、历次改进留档（按批次）
 

@@ -48,6 +48,8 @@ READONLY = {
     "trace_rtt_find", "trace_swo_read",
     # 串口：只列端口与读日志
     "serial_list_ports", "serial_monitor_status", "serial_read",
+    # RTOS 任务感知：只读目标内存 + 本地 .axf，不改目标状态
+    "rtos_info", "rtos_tasks", "rtos_objects",
 }
 
 # ----------------------------------------------------------------------

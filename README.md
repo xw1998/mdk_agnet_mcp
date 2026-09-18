@@ -180,7 +180,7 @@ mdk_agent/
 │   ├── ocd.py                # 非 MDK：OpenOCD telnet 会话与内存/寄存器/断点/烧录操作
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署
-│   └── server.py             # MCP Server 与 150 个工具定义
+│   └── server.py             # MCP Server 与 153 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -229,10 +229,11 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **150** 个，分两大块：
+共 **153** 个，分两大块：
 
 - **MDK 族（99 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件受控编辑** / Keil 生命周期管理 / **宿主机串口日志与命令应答** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
-- **非 MDK 族（51 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案**（接口·速度·SWO·RTT 参数档案与自动识别 + 工程现场配置发现，4 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署，20 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **非 MDK 族（54 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案**（接口·速度·SWO·RTT 参数档案与自动识别 + 工程现场配置发现，4 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署，20 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
 
 下表为 MDK 族工具：
 
@@ -429,6 +430,51 @@ python run_server.py --transport http --http-port 8300
 | `trace_pcsample` | **DWT 硬件 PC 采样（同样不 halt 目标）**：开 `DEMCR.TRCENA`+`DWT_CTRL.PCSAMPLENA`，主机只轮询 `DWT_PCSR`，按函数聚合。与 `trace_profile` 的本质区别是**不停核、不扰动实时性**。采样器不工作（部分芯片 errata）或采样值几乎不变时会**明确报错**，不给一份看着像样的分布；默认结束恢复 `DEMCR`/`DWT_CTRL` 原值 | `samples?`、`interval_ms?`、`elf?`、`top?`、`enable_dwt?`、`restore?`、`timeout?` |
 | `trace_instrument` | **把目标侧插桩组件部署进你的工程**（见下）：按 `backend` 生成配置、拷贝组件源码与 `.mk`，已有文件默认 SKIP 不覆盖 | `target_dir`、`backend?`、`itm_port?`、`rtt_up?`、`rtt_down?`、`rtt_buf?`、`coreclk?`、`overwrite?`、`swo_baud?`、`dbgmcu_cr?` |
 
+### RTOS 任务感知（`rtos_*`，3 个）
+
+针对「多任务卡死 / 谁把栈吃爆了 / 消息发不进去」这类高频排查。**不依赖任何目标侧配合**（不需要
+打桩、不需要开 trace），纯主机侧读内存 + 解析 `.axf` 的 DWARF。
+
+| 工具 | 说明 | 主要参数 |
+|------|------|----------|
+| `rtos_info` | 按符号存在性探测 RTOS 类型（FreeRTOS / RT-Thread），并**从 DWARF 反推内核配置**：`pxReadyTasksLists` 的数组长度就是 `configMAX_PRIORITIES`、`xQueueRegistry` 的长度就是 `configQUEUE_REGISTRY_SIZE`、`TCB_t` 里有哪些可选字段（`pxEndOfStack`/`uxTCBNumber`/`uxBasePriority`…）。**这些是可观测量，比让 AI 去翻 `FreeRTOSConfig.h` 可靠**；没探测到就如实说「裸机工程，没有任务可列」 | `axf?` |
+| `rtos_tasks` | 任务列表：名字、状态、优先级、`uxTCBNumber`、运行计数、**栈水位**。状态是把 ready（逐优先级）/ delayed / suspended / pending / terminated 几条内核链表都走一遍、再叠上 `pxCurrentTCB` 标 running **推出来的**；与内核自报的 `uxCurrentNumberOfTasks` 对不上时给 `count_mismatch` 警告 | `axf?`、`link?`、`include_stack?`、`stack_scan_cap?`、`limit?` |
+| `rtos_objects` | 队列 / 信号量 / 互斥量：名字、句柄、当前排队数与 `uxItemSize`（`==0` 即信号量/互斥量，这是内核的实现约定）。走内核的 `xQueueRegistry` | `axf?`、`link?` |
+
+三条硬约定（都是踩过坑之后定的）：
+
+1. **结构体偏移一律取自 `.axf` 的 DWARF，绝不写死**。FreeRTOS 的 `TCB_t` 成员随
+   `configUSE_TRACE_FACILITY` / `configUSE_MUTEXES` / `configRECORD_STACK_HIGH_ADDRESS` 等宏增删，
+   写死偏移在别人的工程上必然**安静地读出垃圾**；缺哪个字段会明确列出来。
+2. **栈水位算法与 FreeRTOS 自带的 `uxTaskGetStackHighWaterMark` 完全一致**：建栈时整片栈被填成
+   `0xA5`，从 `pxStack`（最低地址）向上数连续 `0xA5` 的字节数就是**历史最深余量**。所以它读的是
+   「历史最深用量」，**对正在运行的任务同样有效**（`pxTopOfStack` 那个值只有切出时才更新，会滞后）。
+   栈底第一个字节就不是 `0xA5` 的任务（静态栈 / 自定义分配）会带 `stack_note`，明说**它的水位不可信**。
+3. **拿不到就报错，不给半真半假的结果**。`configQUEUE_REGISTRY_SIZE==0` 时内核根本不定义
+   `xQueueRegistry`，主机侧**物理上无法枚举队列**——此时返回 `ok=false` 并说明「这是内核的限制、
+   不是本工具没做」，而不是回一个空列表让人误以为没有队列。RT-Thread 路径同理：没有真机固件可验证，
+   就带 `verified:false` 明确拒绝输出，绝不把「看着像真的」的结构解析端上来。
+
+`link` 默认 `auto`：有活着的 Keil（UVSOCK）会话就走 Keil，否则走 OpenOCD；两条都没有会同时报出
+各自的缺失原因与启动方法。`axf` 可省略，默认用当前符号文件（`set_symbol_file` 设过的那个）。
+
+**真机验证**（F401 + DAPLink，2026-09-18，验证固件 `example_gcc_project/freertos_probe/`）：
+
+- **OpenOCD 链路（TCB 语义级）**：8 个任务全部列出（`count == kernel_task_count == 8`），
+  6 个任务的 `stack_free_words` 与**固件里内核自报的 `uxTaskGetStackHighWaterMark` 逐项一致**
+  （105 / 62 / 97 / 71 / 103 / 223）；`portMAX_DELAY` 无限阻塞的任务被从「真挂起」里分了出来；
+  队列注册表里 3 个对象（队列 / 计数信号量 / 互斥量）的名字、`uxLength`、`uxItemSize` 全对。
+- **Keil 链路（取数正确性）**：`_keil_reader` 读到的 Flash 向量表 32 字节与 `.axf` 里 `ER_IROM1`
+  的镜像**逐字节一致**，并与 Keil 自己 `read_variable` 的求值同值（两条独立的 UVSOCK 取值路径互证）。
+  本机的 Keil 示例工程是裸机、没有对应的 FreeRTOS 版本，所以 **TCB 语义级验证是在 OpenOCD 链路上
+  做的**；两条链路共用同一套解析代码，差异只在读取适配层，这一层按上述方式单独验过。
+- 把裸机 `.axf` 喂给 RTOS 工具会得到 `rtos-not-present`（而不是编出一堆任务），
+  下一步指向「核对 `.axf` 是不是目标板上正在跑的那个固件」。
+- `stack_size_words` 由 `pxStack`→`pxEndOfStack` 换算，而 FreeRTOS 建栈时会把栈顶按
+  `portBYTE_ALIGNMENT` 向下取整后才记进 `pxEndOfStack`，所以它可能比实际分配少 1~2 个 word
+  （8 字节对齐时实测少 1：256 字的栈报 255）——**绝对量看 `stack_free_words`，它是准的**，
+  `stack_used_pct` 有 1 个 word 级偏差，结果里附 `stack_size_note` 说清这件事。
+
 ### 目标侧插桩组件（`components/trace/`）
 
 trace 不能只靠主机侧「猜」目标行为，需要在被调试代码里插一小段组件把事件送出来。组件随仓库提供（源码注释为英文，避免旧版编译器中文注释乱码），支持 **ITM / RTT / UART** 三种后端，只依赖 CMSIS，不绑定 HAL：
@@ -473,6 +519,7 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 | `target` | 非 MDK：目标档案查询与自动识别、工程现场调试配置发现（4 个） |
 | `ocd` | 非 MDK：OpenOCD 会话 / 内存 / 寄存器 / 断点 / 烧录（17 个） |
 | `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 插桩组件部署（20 个） |
+| `rtos` | RTOS 任务感知：任务列表 / 栈水位 / 队列信号量（3 个；跨 Keil 与 OpenOCD 两条链路） |
 
 三条防翻车约定：**不设环境变量时行为完全不变**（默认全开）；**未归类的工具一律保留**（宁可少裁不错杀，组名写错时也不裁剪只给告警）；`list_tools` / `get_version` / `capabilities` 三个元工具**永不被裁**（否则 AI 连工具清单都问不出来）。裁剪结果会记入 `capabilities.tool_surface`，随时可核对。
 

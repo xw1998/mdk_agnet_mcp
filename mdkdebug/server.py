@@ -46,6 +46,7 @@ from . import targets as _targets
 from . import ocd as _ocd
 from . import trace as _trace
 from . import workspace as _workspace
+from . import rtos as _rtos
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -1767,6 +1768,11 @@ _TOOLSETS = {
         "trace_rtt_detach", "trace_profile", "trace_dwt_counters",
         "trace_instrument", "trace_scope_start", "trace_scope_read",
         "trace_scope_stop", "trace_pcsample",
+    },
+    # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组，
+    # 靠 MDKDEBUG_TOOLSETS=rtos 也能单独开出来。
+    "rtos": {
+        "rtos_info", "rtos_tasks", "rtos_objects",
     },
 }
 
@@ -7240,7 +7246,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     _extra_counts = {}
     for _mod_name, _mod in (("toolchain", _toolchain), ("targets", _targets),
                             ("ocd", _ocd), ("trace", _trace),
-                            ("workspace", _workspace)):
+                            ("workspace", _workspace), ("rtos", _rtos)):
         try:
             _extra_counts[_mod_name] = _mod.register(server, _js)
         except Exception as _e:  # noqa: BLE001

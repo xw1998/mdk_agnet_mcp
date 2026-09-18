@@ -211,6 +211,33 @@ ERROR_CODES = {
             "确认目标在跑（wait_state(running)）后再重试，必要时调大 max_ms",
         ],
     },
+    # RTOS 工具族（批次41）。三条都对应真机/裸机实测过的路径：
+    # 传了裸机 .axf（rtos_tasks）、内核没开队列注册表（rtos_objects）、
+    # Keil 与 OpenOCD 两条链路都没有活着的会话。
+    "rtos-not-present": {
+        "text": "这个 .axf 里没有 RTOS 符号：固件是裸机，或传错了 .axf",
+        "next_actions": [
+            "确认 axf 就是目标板上正在跑的那个固件（rtos_info 先看探测结果）",
+            "裸机工程没有任务可列，这是正常结论不是错误；要列任务得先编进 RTOS 内核",
+            "用的是 Zephyr / ThreadX / osek 等其它 RTOS 的话目前不支持——说明用哪个再补",
+        ],
+    },
+    "rtos-no-queue-registry": {
+        "text": "FreeRTOS 内核没有维护队列注册表，主机侧无法枚举队列/信号量",
+        "next_actions": [
+            "这不是工具缺陷而是内核限制：configQUEUE_REGISTRY_SIZE 为 0 时 FreeRTOS 根本不定义 xQueueRegistry",
+            "要枚举队列/信号量：把 configQUEUE_REGISTRY_SIZE 设为 ≥ 队列数，并在创建后调用 vQueueAddToRegistry()",
+            "不想改固件就换手段：对某个已知句柄用 read_struct 直接看 Queue_t（需先 find_symbol 拿地址）",
+        ],
+    },
+    "rtos-no-mem-link": {
+        "text": "Keil(UVSOCK) 与 OpenOCD 两条链路都没有活着的调试会话，读不到目标内存",
+        "next_actions": [
+            "Keil 目标：launch_uvision + enter_debug 先把 UVSOCK 会话跑起来",
+            "非 MDK 目标：ocd_start(profile=...) + ocd_control(action=\"halt\") 后重试",
+            "也可以直接用 link=\"keil\" 或 link=\"ocd\" 指定链路，报错里会分别给出两条链路的缺失原因",
+        ],
+    },
     "invalid-argument": {
         "text": "参数不合法或缺失",
         "next_actions": ["用 list_tools(keyword=...) 查该工具的参数签名与最小调用示例 example_args", "参数名/类型都做了容忍，仍报错请按规范名传参"],
@@ -504,6 +531,16 @@ def _classify_structured(obj: dict) -> str:
         return "ocd-write-verify-read-failed"
     if isinstance(obj.get("parsed_banks"), list) and not obj.get("parsed_banks"):
         return "ocd-no-flash-bank"
+    # RTOS 工具（批次41）：工具自己带 reason，直接定码，不去猜中文措辞。
+    # 没有这一步时「传给 rtos_tasks 的是裸机 .axf」会落进 unknown-error，
+    # 下一步指向 keil_health/读日志——方向完全不对。
+    _rr = obj.get("reason")
+    if _rr == "no-rtos-symbols":
+        return "rtos-not-present"
+    if _rr == "no-queue-registry":
+        return "rtos-no-queue-registry"
+    if _rr == "no-mem-link":
+        return "rtos-no-mem-link"
     return ""
 
 # 非 MDK 工具名前缀：这些工具用不到 Keil 侧的下一步动作（keil_health / UVSOCK 那套）

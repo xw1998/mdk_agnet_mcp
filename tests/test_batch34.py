@@ -285,7 +285,7 @@ async def group_e_surface(server):
 
     tools = await server.list_tools()
     names = sorted(t.name for t in tools)
-    check("E1 工具总数 150（批次36 再 +46）", len(names) == 150, len(names))
+    check("E1 工具总数 153（批次36 再 +46，批次40 +3）", len(names) == 153, len(names))
     check("E2 session_state 已注册", "session_state" in names, names)
     by = {t.name: t for t in tools}
     props = (by["list_tools"].input_schema or {}).get("properties") or {}
@@ -302,7 +302,7 @@ async def group_e_surface(server):
 
     t5 = await call(server, "list_tools", {"max_lines": 5})
     check("E7 直调 max_lines：列表 5 条而 count 仍是全量（并说明计数字段口径）",
-          len(t5.get("tools") or []) == 5 and t5.get("count") == 150 and
+          len(t5.get("tools") or []) == 5 and t5.get("count") == 153 and
           (t5.get("output") or {}).get("truncated") is True and
           "全量" in (t5.get("output") or {}).get("hint", ""), t5.get("output"))
 
@@ -314,8 +314,8 @@ async def group_e_surface(server):
           (comp_len, full_len))
 
     big = await call(server, "list_tools", {"compact": True, "max_lines": 5, "full": True})
-    check("E9 full=true 直调取回全量 150 条且无 output",
-          big.get("count") == 150 and len(big.get("tools") or []) == 150 and "output" not in big,
+    check("E9 full=true 直调取回全量 153 条且无 output",
+          big.get("count") == 153 and len(big.get("tools") or []) == 153 and "output" not in big,
           big.get("count"))
 
     bad = await call(server, "list_tools", {"max_line": 5})
