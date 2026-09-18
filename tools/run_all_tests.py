@@ -36,11 +36,13 @@ BATCHES = [
     "test_batch15", "test_batch16", "test_batch18", "test_batch25",
     "test_batch26", "test_batch28", "test_batch29", "test_batch30",
     "test_batch31", "test_batch32", "test_batch33", "test_batch34",
-    "test_batch35", "test_batch36",
+    "test_batch35", "test_batch36", "test_batch37",
+    "test_batch38",
 ]
 
 # --fast：改一两个模块时先跑这几批（覆盖协议层/统一信封/非 MDK 链路），全绿再跑全量
-FAST_SET = ["test_e2e", "test_mcp", "test_batch33", "test_batch35", "test_batch36"]
+FAST_SET = ["test_e2e", "test_mcp", "test_batch33", "test_batch35", "test_batch36",
+            "test_batch37", "test_batch38"]
 
 # 并发禁区：这些模块共用同一个「守卫端口」，同时跑会互相干扰（真检查过端口占用）：
 #   test_batch29 断言 14999 没在监听，test_batch35 的子进程会去 bind 14999

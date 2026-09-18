@@ -105,6 +105,15 @@ ERROR_CODES = {
         "text": "调试会话的符号已过期（编译/烧录后 .axf 已重生成，旧会话求值会报解析错误）",
         "next_actions": ["exit_debug 后重新 enter_debug 刷新符号", "或按返回值里的 symbol_stale_warning 提示处理"],
     },
+    "enter-debug-not-ready": {
+        "text": "进入了调试流程但未确认调试态，后续命令可能全部报「未处于调试状态」",
+        "next_actions": [
+            "用 keil_health 看 Keil 是否有模态框阻塞、UVSOCK 是否已就绪",
+            "若该实例残留过命令脚本（进完调试又自己退出）：close_uvision(force=true) → "
+            "launch_uvision → enter_debug，用干净实例重进",
+            "确认目标板与调试器连接正常（target_info 看 IDCODE/DEV_ID）后重试",
+        ],
+    },
     "debug-info-missing": {
         "text": "当前 PC 所在函数没有可用的局部变量调试信息（不是『调试通道坏了』）",
         "next_actions": [
@@ -167,6 +176,40 @@ ERROR_CODES = {
     "timeout": {
         "text": "操作超时",
         "next_actions": ["调 keil_health 看 Keil 侧是否被模态框阻塞 / 端口是否还在监听", "确认目标是否在运行、命令是否本就耗时较长（可调大超时参数）"],
+    },
+    # 批次38 真机实测：run_to_line 到「已执行过的地址」时断点永不命中，
+    # 旧实现拿陈旧 PC 报成功（假成功）。现在如实失败并给出这条路该怎么走。
+    "run-to-target-timeout": {
+        "text": "运行到目标位置超时：临时断点未命中（目标没走到该处，或该地址已执行过）",
+        "next_actions": [
+            "想让程序回到起点再跑：先 reset(run_after=false)，再 run_to_line / run",
+            "想确认某函数是否被调用：set_breakpoint(expr=\"函数名\") + run + wait_breakpoint",
+            "确认地址/行号是否真的可达：get_current_location 看当前停在哪，"
+            "disassemble 核对地址处是否可执行",
+            "目标已停下（本工具已发 stop），要它继续跑请调 run",
+        ],
+    },
+    # 真机阶段7 实测：wait_state 超时（matched=False + timeout_kind）过去没有对应码，
+    # 落进 unknown-error → next_actions 指 keil_health，而真正该做的是看 observed 现场。
+    "wait-state-timeout": {
+        "text": "等待超时：在 timeout_s 内没等到目标状态（工具本身没坏）",
+        "next_actions": [
+            "看返回的 observed：observed=running 说明目标没停到你等的状态，"
+            "先判断是不是断点/条件没命中（要等断点命中请改用 wait_breakpoint）",
+            "确认调试态还在：get_status；目标可能已跑飞或被看门狗复位（fault_report）",
+            "确认目标确实会走到该状态后，把 timeout_s 调大重试",
+        ],
+    },
+    # 真机阶段7 实测：profile_function 报「运行 800ms 未到达函数入口」时落 unknown-error，
+    # 调用方拿到的下一步是「读 OpenOCD/Keil 输出」——与真实原因（函数没被调用/跑过了）不搭。
+    "function-not-reached": {
+        "text": "运行到超时仍未命中函数入口断点（函数没被调用，或入口地址不对）",
+        "next_actions": [
+            "确认该函数真会被执行到：先用 run_to_line / 断点验证调用路径",
+            "若程序已经跑过它，先 reset 再 run（断点只在设置之后命中）",
+            "核对符号：find_symbol 查入口地址，注意内联/优化后符号可能不可用",
+            "确认目标在跑（wait_state(running)）后再重试，必要时调大 max_ms",
+        ],
     },
     "invalid-argument": {
         "text": "参数不合法或缺失",
@@ -370,6 +413,10 @@ _RULES = (
     (r"未定位到 UV4|UV4\.exe.*(不存在|找不到)|找不到 UV4", "uv4-not-found"),
     # 「正则编译失败」含「编译失败」子串，必须先于 build-failed 规则，否则会被误判成编译挂了
     (r"正则编译失败|正则.*(无效|不合法)|pattern.*(无效|不合法)", "invalid-argument"),
+    # 真机阶段7 实测：set_register(register="r99") 报「不支持的寄存器名: r99」，
+    # 旧规则全不命中 → unknown-error（next_actions 指 keil_health），其实是纯参数错。
+    (r"不支持的寄存器名|无法解析数值|不支持的寄存器", "invalid-argument"),
+    (r"未到达函数入口", "function-not-reached"),
     (r"一个字节都没有新增", "serial-expect-timeout-no-data"),
     (r"行但都不匹配", "serial-expect-timeout-no-match"),
     (r"没有串口监听在运行", "serial-not-monitoring"),
@@ -439,6 +486,15 @@ def _classify_structured(obj: dict) -> str:
     if obj.get("timeout") is True and "timeout_kind" in obj:
         return ("serial-expect-timeout-no-data" if obj.get("timeout_kind") == "no-data"
                 else "serial-expect-timeout-no-match")
+    # wait_state 超时：工具自带 matched=False + timeout_kind + observed 现场，
+    # 用结构化字段定码比猜中文 hint 准（真机阶段7 实测踩到 unknown-error）。
+    if obj.get("matched") is False and "timeout_kind" in obj and "observed" in obj:
+        _tk = obj.get("timeout_kind")
+        if _tk == "unreachable":
+            return "uvsock-unavailable"
+        if _tk == "never_debugging":
+            return "not-debugging"
+        return "wait-state-timeout"
     # 非 MDK：工具自带的结构化结论优先
     if obj.get("complete") is False and "expected_bytes" in obj:
         return "ocd-read-short"

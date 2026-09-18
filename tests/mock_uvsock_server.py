@@ -113,6 +113,16 @@ class MockUVSOCKServer:
         # >0 时：enter_debug 后仍需 N 次 STATUS 查询才报"已进入调试态"（模拟异步就绪）
         self.enter_ready_delay = 0
         self._enter_pending = 0
+        # 批次37：模拟「就绪后又自己退出调试」的假就绪——真机见到 Keil 实例里残留命令
+        # 脚本（以 EXIT/LOG OFF 结尾的 .ini）时，进完调试约 1s 会自己 Stopping target →
+        # Exited debug mode。>0 表示本次 enter 后，再过 N 次 STATUS 查询就丢掉调试态；
+        # 只发生一次（残留脚本只执行一遍），第二次 enter 即稳定。
+        self.lose_debug_after = 0
+        self._lose_countdown = 0
+        # True 时 lose_debug_after 每次 enter 都生效（模拟持续性问题）；
+        # False 时只发生一次（残留脚本执行过一遍就没有了）
+        self.lose_debug_repeat = False
+        self._force_not_debug = False
         # True 时模拟真机 BS 行为：奇数地址（Thumb 位 bit0=1）报 *** error 57: illegal address
         self.bs_odd_addr_error = False
         # 非 None 时：BS 一律失败，并把该文本当命令窗口报错推送（供诊断字段测试）
@@ -297,12 +307,22 @@ class MockUVSOCKServer:
             return uvsock.UV_STATUS_SUCCESS, b"V5.2.0"
 
         if cmd == uvsock.UV_DBG_STATUS:
+            if self._lose_countdown > 0 and self.debugging:
+                self._lose_countdown -= 1
+                if self._lose_countdown == 0:
+                    # 模拟真实 Keil：调试态自己没了，STATUS 回到 "Target is not in debug mode"
+                    self.debugging = False
+                    self.running = False
+                    self._force_not_debug = True
             if self._enter_pending > 0:
                 # 模拟真实 Keil：enter_debug 是异步的，未就绪时 STATUS 返回
                 # r_status=6 + "Target is not in debug mode"
                 self._enter_pending -= 1
                 if self._enter_pending == 0:
                     self.debugging = True
+            # 批次38：调试态不在了（初始 / exit_debug 后）也要如实回 status=6，
+            # 否则「退出调试后查状态」会拿到 debugging=true 这个假答案。
+            if self._enter_pending > 0 or self._force_not_debug or not self.debugging:
                 body = b"Target is not in debug mode\x00"
                 return uvsock.UV_STATUS_NOT_DEBUGGING, struct.pack('<i', len(body)) + body
             if self.running and self.auto_stop_reads is not None:
@@ -363,6 +383,12 @@ class MockUVSOCKServer:
             else:
                 self.debugging = True
             self.running = False
+            self._force_not_debug = False
+            if self.lose_debug_after > 0:
+                self._lose_countdown = self.lose_debug_after
+                if not self.lose_debug_repeat:
+                    # 默认只发生一次：残留脚本执行过一遍后就不再有队列
+                    self.lose_debug_after = 0
             return uvsock.UV_STATUS_SUCCESS, b""
 
         if cmd == uvsock.UV_DBG_EXIT:

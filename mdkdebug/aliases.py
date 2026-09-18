@@ -57,7 +57,8 @@ _SPEC = {
                         "address": _ADDRESS,
                         "timeout_s": ["timeout", "seconds"],
                         "poll_ms": ["poll", "interval_ms", "poll_interval_ms"]},
-    "run_to_line": {"target": _LOCATE + _ADDRESS + ["line", "file_line"]},
+    "run_to_line": {"target": _LOCATE + _ADDRESS + ["line", "file_line"],
+                    "timeout_s": ["timeout", "seconds", "timeout_ms", "wait_s"]},
     "profile_function": {"func": _LOCATE + _ADDRESS,
                          "max_ms": ["timeout_ms", "max", "duration_ms", "timeout"]},
     # ---- 内存 / 外设 ----

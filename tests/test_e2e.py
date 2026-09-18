@@ -56,7 +56,9 @@ def main():
         check("write->read 回读一致",
               r["ok"] and r["data_hex"] == "deadbeefcafef00d", r)
 
-        # 6. 运行控制
+        # 6. 运行控制（真机语义：run/stop/step 都要先在调试态）
+        r = client.enter_debug()
+        check("enter_debug(运行控制前置)", r["ok"], r)
         r = client.run()
         check("run", r["ok"], r)
         r = client.get_status()

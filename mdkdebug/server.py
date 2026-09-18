@@ -2448,6 +2448,22 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                         "② 工程是否已编译出 .axf（缺失/过旧时 Keil 无法加载符号，可先 build_project 或 flash_debug）；"
                         "③ 是否已在调试态（重复 enter 会被拒）。若 Keil 弹出需人工确认的窗口，请在界面处理。"
                     )
+            # ready=False 时不许再报成功：真机踩到过「enter_debug 报成功、随后每条命令
+            # 都返回 status=6」的假就绪（Keil 实例里残留命令脚本，进完调试又自己
+            # Exited debug mode）。工具要么确认已进入调试态，要么如实报失败——
+            # 不能给一个让调用方以为可以继续下命令的错答案。
+            if out.get("ok") and out.get("ready") is False:
+                out["ok"] = False
+                out["error"] = (out.get("warning")
+                                or "已发出进入调试命令，但未确认进入调试态")
+                out["error_code"] = "enter-debug-not-ready"
+                out["diagnosis"] = (
+                    "已发出进入调试命令但未确认进入调试态。请依次排查："
+                    "① 目标板/调试器连接是否正常（target_info 可看 IDCODE/DEV_ID）；"
+                    "② Keil 是否弹了需人工确认的窗口（keil_health 的 modal_dialogs）；"
+                    "③ 该实例是否残留命令脚本（进完调试又自己退出）："
+                    "close_uvision(force=true) 后 launch_uvision + enter_debug 重开一个干净实例。"
+                )
             if out.get("ok"):
                 # 批次29：记录本次调试会话加载的符号基线（.axf 路径 + 时间戳），
                 # 之后 .axf 被重编/重烧即可判定「会话符号已过期」。
@@ -3609,12 +3625,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 reg = aliases[reg]
             if reg not in ("R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7",
                            "R8", "R9", "R10", "R11", "R12", "SP", "LR", "PC", "xPSR"):
-                return _js({"ok": False, "register": register, "error": f"不支持的寄存器名: {register}"})
+                return _js({"ok": False, "register": register, "error_code": "invalid-argument",
+                            "error": f"不支持的寄存器名: {register}",
+                            "available": ["R0-R12", "SP", "LR", "PC", "xPSR"]})
             vs = (value or "").strip()
             try:
                 num = int(vs, 0) if vs.lower().startswith(("0x", "-0x")) else int(vs, 10)
             except ValueError:
-                return _js({"ok": False, "register": reg, "error": f"无法解析数值: {value}"})
+                return _js({"ok": False, "register": reg, "error_code": "invalid-argument",
+                            "error": f"无法解析数值: {value}",
+                            "hint": "value 支持 0x 十六进制或十进制整数"})
             # Keil Watch 表达式赋值（R0 = 0x...），走 CALC_EXPRESSION 求值器
             r = client.calc_expression(f"{reg} = {num}")
             if not r.get("ok"):
@@ -4118,11 +4138,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="运行到指定行",
         description=(
             "让目标运行到指定位置后停止（run to cursor）。target 可为 十六进制地址(0x...) 或"
-            "文件:行号（如 main.c:77）。实现为：临时断点->运行->清除断点。"
+            "文件:行号（如 main.c:77）。实现为：临时断点->运行->**校验真命中**->清除断点。"
+            "已执行过的地址断点不会命中：此时如实返回 ok=false(error_code=run-to-target-timeout) "
+            "并把目标停下（旧实现会把「还在跑」报成「停在第 N 行」）。"
+            "timeout_s 控制等待命中的超时，默认 10s。"
             "需已进入调试状态且配置了 .axf 调试符号。注意：实现为临时断点→run→清除。run 到断点停止时返回的 status 是 22(断点已创建) 而非 0；刚停止瞬间读 PC 可能为脏值（本工具已用稳定读取修复）。需已进入调试且配置 .axf。"
         ),
     )
-    async def run_to_line(target: str | int) -> str:
+    async def run_to_line(target: str | int, timeout_s: float = 10.0) -> str:
         target = _addr_arg(target)
         try:
             loc = _get_locator()
@@ -4137,19 +4160,68 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if not bp.get("ok"):
                 return _js({"ok": False, "target": target, "addr": hex(addr),
                             "error": f"设置临时断点失败: {bp}"})
-            r = client.run()
-            # UVSOCK 的 run(START_EXECUTION) 在运行到断点停止时会返回 BP_CREATED(22) 而非 0，
-            # 视为"已运行并停在断点"，据此判定运行成功
-            run_ok = r.get("ok") or r.get("status") == 22
-            client.clear_breakpoint(hex(addr))
-            _breakpoints[:] = [b for b in _breakpoints
-                               if b.get("address") != hex(addr)]
-            if not run_ok:
+            try:
+                tm = float(timeout_s)
+            except Exception:  # noqa: BLE001
+                tm = 10.0
+            tm = max(0.5, min(600.0, tm))
+            try:
+                r = client.run()
+                # UVSOCK 的 run(START_EXECUTION) 在运行到断点停止时会返回 BP_CREATED(22) 而非 0，
+                # 据此判「命令已生效」；是否真停在目标地址由下面的 wait_breakpoint 校验
+                run_ok = r.get("ok") or r.get("status") == 22
+                if not run_ok:
+                    return _js({"ok": False, "target": target, "addr": hex(addr),
+                                "error_code": "run-failed",
+                                "error": f"运行失败: {r}"})
+                # 批次38 真机实测（假成功）：目标早已跑过该地址时断点永不命中，旧实现
+                # 仍拿陈旧 PC 报「ok=true + 停在第 N 行」，而 get_status 显示目标在跑。
+                # 改为等一个真正的命中事件（wait_breakpoint 内含「新停止」三条证据判定）。
+                hit = client.wait_breakpoint([addr], timeout_s=tm)
+            finally:
+                client.clear_breakpoint(hex(addr))
+                _breakpoints[:] = [b for b in _breakpoints
+                                   if b.get("address") != hex(addr)]
+            if not (hit.get("ok") and hit.get("hit")):
+                observed = "stopped-elsewhere" if isinstance(
+                    (hit.get("registers") or {}).get("pc"), int) else "running"
+                stop_verified = False
+                try:
+                    client.stop()
+                    # stop 是异步生效的（真机实测：发完立刻 get_status 仍是执行中），
+                    # 所以「已停止」必须轮询确认后才敢写进返回值。
+                    stop_verified = await _wait_stopped(client, timeout=1.5)
+                except Exception:  # noqa: BLE001
+                    pass
+                if stop_verified:
+                    stop_note = "已发送 stop 并确认目标已停止，临时断点已清除"
+                else:
+                    stop_note = ("已发送 stop，但未能确认目标已停止（stop 异步生效）；"
+                                 "请用 get_status 核实后再操作目标")
                 return _js({"ok": False, "target": target, "addr": hex(addr),
-                            "error": f"运行失败: {r}"})
+                            "error_code": "run-to-target-timeout",
+                            "error": f"运行 {tm:g}s 未停在 {hex(addr)}：断点未命中"
+                                     "（目标没走到该处，或该地址已经执行过了）",
+                            "observed": observed,
+                            "waited_ms": hit.get("waited_ms"),
+                            "polls": hit.get("polls"),
+                            "ran_during_wait": hit.get("ran_during_wait"),
+                            "candidates": hit.get("candidates"),
+                            "stop_verified": stop_verified,
+                            "note": stop_note + "；需要它继续跑请调 run",
+                            "hint": "run_to_line 只能停在「尚未执行到」的位置："
+                                    "想让程序回到起点先 reset(run_after=false)；"
+                                    "想确认某函数是否被调用请用 set_breakpoint + run"})
             # run 刚停止时 PC 可能是脏值(实测=1)，用稳定读取跳过脏值得到真实停靠位置
-            regs = client.read_cpu_registers_stable()
-            out = {"ok": True, "target": target, "addr": hex(addr)}
+            regs = hit.get("registers") if isinstance(hit.get("registers"), dict) else None
+            if not regs or not isinstance(regs.get("pc"), int):
+                regs = client.read_cpu_registers_stable()
+            out = {"ok": True, "target": target, "addr": hex(addr),
+                   "hit_address": hit.get("hit_address"),
+                   "waited_ms": hit.get("waited_ms"),
+                   "new_stop_basis": hit.get("new_stop_basis"),
+                   "hit_confidence": hit.get("hit_confidence"),
+                   "pc_confidence": hit.get("pc_confidence")}
             if regs.get("ok") and isinstance(regs.get("pc"), int):
                 stop = loc.addr_to_location(regs["pc"])
                 if stop:
@@ -5051,14 +5123,21 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 bf = builder.build_and_flash(uv4, p, target.strip() or None)
                 flash_plan = "explicit_flash"
             if not bf.get("ok"):
+                stg = "编译" if auto_dl else "编译烧录"
+                err = (bf.get("error") or (bf.get("build") or {}).get("error")
+                       or (bf.get("flash") or {}).get("error")
+                       or bf.get("status_text") or ("%s未通过" % stg))
                 return _js({
                     "ok": False, "action": "flash_debug",
-                    "stage": "编译" if auto_dl else "编译烧录",
+                    "stage": stg,
                     "flash_plan": flash_plan,
                     "close_uvision": close, "build_flash": bf,
                     "serial_release": serial_release,
-                    "status_text": ("编译未通过，未重开工程进入调试" if auto_dl
-                                    else "编译/烧录未通过，未重开工程进入调试"),
+                    # 与成功/进调试失败两条路径一致：顶层直接给原因与错误码，
+                    # 不让调用方去 build_flash 子字段里翻（真机实测踩到）
+                    "error": err,
+                    "error_code": _errors.classify_error(err),
+                    "status_text": "%s未通过，未重开工程进入调试" % stg,
                 })
             # 3) 重新打开本工程（干净实例，加载新固件符号）
             launch = builder.launch_uvision(uv4, p)
@@ -5081,7 +5160,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if enter.get("ok"):
                 _note_firmware_event("flash_debug")
                 _mark_debug_session("flash_debug")   # 新会话＝新固件符号，重新记基线
-            return _js({
+            payload = {
                 "ok": enter.get("ok", False),
                 "action": "flash_debug", "stage": "调试",
                 "close_uvision": close,
@@ -5094,9 +5173,25 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 "build": bf if auto_dl else bf.get("build"),
                 "flash": None if auto_dl else bf.get("flash"),
                 "launch_uvision": launch, "enter_debug": enter,
+                # 披露窗口处置：复用还是新开、新实例 pid 是多少——调用方据此判断要不要收敛窗口
+                "launch_reused": bool(launch.get("reused")) if isinstance(launch, dict) else None,
+                "launch_pid": launch.get("pid") if isinstance(launch, dict) else None,
+                "uvision_instances": launch.get("instances") if isinstance(launch, dict) else None,
                 "status_text": ("已重新打开工程并进入调试" if enter.get("ok")
                                 else "已重新打开工程，但进入调试失败，请检查 UVSOCK 是否开启"),
-            })
+            }
+            if not enter.get("ok"):
+                # 失败原因原本只写在 enter_debug 子字段里，顶层只有一个 ok=false → 调用方
+                # 无法直接知道为什么失败、下一步做什么（真机实测踩到）。这里把原因提到顶层，
+                # 并按统一错误码字典给可执行的下一步。
+                err = (enter.get("error") or enter.get("last_error")
+                       or "已重新打开工程，但进入调试失败（UVSOCK 未就绪或目标无响应）")
+                payload["error"] = err
+                payload["error_code"] = _errors.classify_error(err)
+                acts = [a for a in _errors.code_actions("flash_debug", payload["error_code"])]
+                acts.append("新固件已编译完成，修好调试通道后直接 enter_debug 即可，不必重复编译烧录")
+                payload["next_actions"] = acts
+            return _js(payload)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -5405,7 +5500,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 if ar.get("ok") and isinstance(ar.get("value"), int):
                     addr = ar["value"]
             if addr is None:
-                return _js({"ok": False, "error": f"无法解析函数入口地址: {f}"})
+                return _js({"ok": False, "error_code": "invalid-argument",
+                            "error": f"无法解析函数入口地址: {f}"})
             if not _dwt_enable(client):
                 return _js({"ok": False, "error": "无法使能 DWT CYCCNT"})
             bp_expr = hex(addr)
@@ -5419,7 +5515,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if not await _wait_stopped(client, max_ms / 1000.0):
                 client.stop()
                 client.clear_breakpoint(bp_expr)
-                return _js({"ok": False, "error": f"运行 {max_ms}ms 未到达函数入口（函数可能未被调用）"})
+                return _js({"ok": False, "error_code": "function-not-reached",
+                            "function": f, "entry": hex(addr),
+                            "error": f"运行 {max_ms}ms 未到达函数入口（函数可能未被调用）"})
             t0 = _dwt_read_u32(client, _DWT_CYCCNT) or 0
             client.clear_breakpoint(bp_expr)
             # 清断点同样触发“断点删除”异步消息，立即 step 会与响应错位
@@ -6698,7 +6796,17 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if a == "remove_files":
                 if not (pattern or "").strip():
                     return _js({"ok": False, "action": a, "error": "pattern（正则）不能为空"})
-                return _js(_uvprojx.remove_files(p, pattern, backup=bk))
+                res = _uvprojx.remove_files(p, pattern, backup=bk)
+                # 真机阶段7 实测：pattern 是正则且作用于 FilePath，写 "stm32f4xx_hal"
+                # 会一次命中二十多个文件——不提示就很容易在真工程上「一删一片」。
+                _rm = res.get("removed") or []
+                if len(_rm) >= 5:
+                    res["warning"] = (
+                        "pattern 命中了 %d 个文件：它是正则且作用于 FilePath，没锚定时很容易"
+                        "吃一大片，请逐条核对 removed 清单；改动前的工程已备份到 backup，"
+                        "确认无误前不要删备份。建议把正则收紧，例如 /Src/mdk_.* 这类带目录前缀的写法。"
+                        % len(_rm))
+                return _js(res)
             return _js({"ok": False, "action": action,
                         "error": "未知 action %s" % action,
                         "available": ["add_include_path", "del_include_path",

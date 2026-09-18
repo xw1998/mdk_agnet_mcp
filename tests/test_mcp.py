@@ -98,6 +98,9 @@ async def main():
         r = await call(server, "write_mem", {"addr": "0x20002000", "data_hex": "a1b2c3d4"})
         check("MCP write_mem", '"written": 4' in r, r)
 
+        # 真机语义：run/stop/step 都要先在调试态
+        r = await call(server, "enter_debug", {})
+        check("MCP enter_debug(运行控制前置)", '"ok": true' in r, r)
         r = await call(server, "run", {})
         check("MCP run", '"ok": true' in r, r)
         r = await call(server, "get_status", {})

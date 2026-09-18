@@ -636,13 +636,45 @@ class UVClient:
     # ------------------------------------------------------------------
     # 调试会话控制（进入/退出）
     # ------------------------------------------------------------------
-    def enter_debug(self, wait_ready: float = 6.0) -> dict:
+    def debug_session_alive(self, settle: float = 0.6) -> str:
+        """就绪复核：短暂停留后调试态还在不在。
+
+        真机实测（批次37）：`enter_debug` 的 status 已报就绪、get_status 也返回
+        debugging=True，但约 1s 后 Keil **自己**把目标停了并退出调试——
+        异步消息里能看到 `Stopping target...` → `Exited debug mode`。
+        根因是那个 Keil 实例里残留了命令脚本（Keil 命令窗口的 Include/宏脚本，
+        例如以 `EXIT` / `LOG OFF` 结尾的 .ini）：脚本排在队列里，等我们进完调试才执行。
+        此时「只确认一次」的 ready 是**假就绪**，调用方随后每条命令都返回 status=6
+        却完全看不到原因。所以这里多看一眼，把结论如实透出。
+
+        返回 "ok"（仍在调试态）/ "lost"（调试态消失）/ "unknown"（查不了，不下结论）。
+        """
+        time.sleep(max(0.0, settle))
+        try:
+            st = self.get_status()
+        except Exception:  # noqa: BLE001
+            return "unknown"
+        if isinstance(st, dict) and st.get("debugging"):
+            return "ok"
+        return "lost"
+
+    def _debug_lost_note(self) -> str:
+        return ("进入调试后调试态随即消失（Keil 异步消息里通常有 Stopping target... → "
+                "Exited debug mode）。常见原因是该 Keil 实例里残留了命令脚本"
+                "（如以 EXIT / LOG OFF 结尾的 .ini）或调试被外部终止；"
+                "重开一个干净实例可解：close_uvision(force=true) → launch_uvision → enter_debug。")
+
+    def enter_debug(self, wait_ready: float = 6.0, verify_stable: bool = True) -> dict:
         """进入调试模式（UV_DBG_ENTER）。受工程的 Load/Flash/Run-to-main 设置影响。
 
         真机实测：进入调试是**异步**的——命令返回 status=0 时目标尚未挂载完成，
         约 0.6~0.7s 后才真正进入调试态；在这之前紧接的状态查询/读内存/表达式
         会返回 status=6（Target is not in debug mode），断点命令也可能落空。
         故命令成功后轮询 get_status 直到 debugging 为真（最多等 wait_ready 秒）。
+
+        verify_stable=True 时再做一次**就绪复核**（见 debug_session_alive）：
+        真机见过「报就绪后又自己退出调试」的假就绪，此时会重发一次 UV_DBG_ENTER；
+        仍不稳则 ready=False + warning 如实汇报，绝不让调用方以为已经进了调试。
         """
         r = self._control(uvsock.UV_DBG_ENTER, "进入调试")
         if not r.get("ok"):
@@ -654,8 +686,34 @@ class UVClient:
             return r
         r["ready"] = bool(w.get("debugging"))
         r["ready_waited_ms"] = w.get("waited_ms", 0)
+        if r["ready"] and verify_stable:
+            verdict = self.debug_session_alive()
+            r["ready_stable"] = verdict
+            if verdict == "lost":
+                # 重试一次：残留脚本通常只执行一遍，第二次进入往往能站稳
+                r["ready_retry"] = True
+                r2 = self._control(uvsock.UV_DBG_ENTER, "重试进入调试")
+                ok2 = False
+                if r2.get("ok"):
+                    try:
+                        w2 = self.wait_debugging(timeout=wait_ready)
+                    except Exception:  # noqa: BLE001
+                        w2 = {}
+                    ok2 = bool(w2.get("debugging"))
+                    r["ready_waited_ms"] = w2.get("waited_ms", r["ready_waited_ms"])
+                if ok2:
+                    # 重试同样要复核：只确认一次又可能落进同一个假就绪
+                    ok2 = self.debug_session_alive() == "ok"
+                r["ready"] = ok2
+                r["ready_stable"] = "ok" if ok2 else "lost"
+                if ok2:
+                    r["note"] = ("首次进入调试后调试态曾消失，已自动重试一次并确认稳定。"
+                                 "该 Keil 实例里可能有残留命令脚本，建议收尾后重开实例。")
+                else:
+                    r["retry_status_text"] = r2.get("status_text")
+                    r["warning"] = self._debug_lost_note()
         if not r["ready"]:
-            r["warning"] = (
+            r["warning"] = r.get("warning") or (
                 "enter_debug 已发出但 %.1fs 内未确认进入调试态（get_status 仍报未调试）；"
                 "后续读内存/表达式可能返回 status=6，请检查目标板连接或 Keil 是否弹窗待确认。"
                 % wait_ready)

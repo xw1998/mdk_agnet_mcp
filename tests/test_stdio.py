@@ -56,6 +56,10 @@ async def main():
                 txt = "".join(c.text or "" for c in r.content)
                 check("stdio write_mem", '"written": 4' in txt, txt)
 
+                # 真机语义：run/stop/step 都要先在调试态
+                r = await session.call_tool("enter_debug", {})
+                txt = "".join(c.text or "" for c in r.content)
+                check("stdio enter_debug(运行控制前置)", '"ok": true' in txt, txt)
                 r = await session.call_tool("run", {})
                 txt = "".join(c.text or "" for c in r.content)
                 check("stdio run", '"ok": true' in txt, txt)

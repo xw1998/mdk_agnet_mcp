@@ -16,6 +16,7 @@
 - [九、历次改进留档（按批次）](#九历次改进留档按批次)
 - [十一、非 MDK 链路（工具链 / OpenOCD / trace）](#十一非-mdk-链路工具链--openocd--trace)
 - [十二、Keil 窗口复用 / 惰性符号 / 写入与回显（本轮真机实测）](#十二keil-窗口复用--惰性符号--写入与回显本轮真机实测)
+- [十三、全量真机测试（批次37-38，F401 + Keil UVSOCK 实测）](#十三全量真机测试批次37-38f401--keil-uvsock-实测)
 
 ## 一、真实 Keil 实测要点
 
@@ -881,6 +882,79 @@ RTT 通路闭环时 `trace_rtt_read` 明明读回了 `boot: mdkdebug rtt probe` 
 真机顺手试 `read_registers(regs=["pc"])` 直接被拒（参数名不被接受）。修法：加 `names`
 （`"pc"` / `"pc,sp,lr"`，也接受 `r13/r14/r15`），并把 `regs/reg/registers/only/filter` 纳入别名层；
 不认识的名单放进 `unknown_names` + 回 `supported_names`，**不静默忽略**。
+
+## 十三、全量真机测试（批次37-38，F401 + Keil UVSOCK 实测）
+
+这一轮的出发点不是某个具体反馈，而是「把 150 个工具在真机上逐个跑一遍」。跑出来的问题集中在一类：
+**返回了一个看起来权威、实际不成立的答案**。以下每条都有真机现场。
+
+### 1. `enter_debug` 报「已进入调试」，约 1 秒后 Keil 自己退出了调试
+
+现场：`enter_debug` 回 `ok=true / ready=true`，紧接着的命令全报 `status=6 未处于调试状态`。
+排查顺序（都不是原因）：不是 `read_registers` 引起的（对照实验）、不是 GetStatus 误报（用
+`read_registers` 做功能真值）、Keil 确有可见窗口（ctypes 枚举窗口标题，排除隐藏批处理进程）。
+定位：Keil 命令窗口里残留了本工具早前写的初始化脚本（`Include ...init.ini`、`LOG >>trace.log`、
+`EXIT`、`LOG OFF`）——调试会话一建立就被自己的 `EXIT` 关掉了。用 `close_uvision(force)` →
+`launch_uvision` 拿全新实例后不再出现。
+修法（治标且更稳，不依赖用户去清实例）：`client.enter_debug(verify_stable=True)` 在就绪后
+**复核**调试态（三态 `ok/lost/unknown`，查不了就不下结论），`lost` 时自动重发 `UV_DBG_ENTER`
+一次再复核；两次都丢则如实报 `ok=false` + `error_code=enter-debug-not-ready`（server 层也
+不再把 `ready=False` 报成 `ok=True`），诊断里给出 `close_uvision(force) → launch_uvision → enter_debug`。
+
+### 2. `run_to_line` 的假成功（最隐蔽的一条）
+
+现场：先 `run` 到 main 死循环（早已越过 `SystemInit`），再 `run_to_line("0x08002D60")` →
+返回 **`ok=true` + `stopped_file=system_stm32f4xx.c` + `stopped_line=171`**，而紧接着的
+`get_status` 是 `running=true`——目标根本没停。
+根因：旧实现是「设临时断点 → run → 清断点 → 读 PC」，**不校验断点是否命中**；断点永不命中时
+读到的是陈旧 PC（恰好等于刚设的断点地址），于是把「还在跑」报成「停在第 171 行」。
+修法：改用 `client.wait_breakpoint([addr], timeout_s)` 等一个**真正的**命中事件（它内置「这次
+停止是新发生的」三条证据与 PC 可信度），没等到就如实失败：`error_code=run-to-target-timeout`、
+带 `observed` / `waited_ms` / `polls` 现场、**`stop()` 后用 `_wait_stopped` 确认**再回报
+（`stop_verified`，stop 是异步生效的，发出去不等于停了），并清掉临时断点。新增 `timeout_s`
+参数（别名 `timeout`）。
+真机复核：同一序列现在回 `ok=false / run-to-target-timeout / observed=running / stop_verified=true`。
+
+> 推广：任何「我让它走到 X」的语义，都必须以「观察到确实停在 X」为成功判据。
+
+### 3. 三处错误归类把调用方指向错误方向
+
+| 真机现象 | 旧归类 | 下一步（错） | 现归类 |
+|---|---|---|---|
+| `set_register(register="r99")` 不支持的寄存器名 | `unknown-error` | 去查 keil_health | `invalid-argument` + 可用寄存器候选 |
+| `wait_state("stopped", timeout_s=3)` 超时 | `unknown-error` | 去查 keil_health | `wait-state-timeout`（看 `observed` 现场）；一直不在调试态 → `not-debugging` |
+| `profile_function("main")` 未达函数入口 | `unknown-error` | 去读 Keil 输出 | `function-not-reached`（先 reset 再 run / 核对符号） |
+
+做法沿用既有原则：**结构化字段优先**（工具直接给 `error_code`；`wait_state` 走
+`matched=False + timeout_kind` 的结构化判定），文本规则只作兜底。
+
+### 4. mock 也在给「假答案」
+
+mock 的 `UV_DBG_STATUS` 过去**退出调试后仍回成功**，于是 `run`/`stop`/`get_status` 在「没进调试」
+的情况下也能跑通——三个端到端用例（`test_e2e` / `test_mcp` / `test_stdio`）把这个不可能发生的
+场景当成了正常路径。改成按真机语义回报（未在调试态回 `r_status=6`）后，三个用例补上了
+`enter_debug` 前置。
+
+### 5. `uvprojx_edit(remove_files)` 的宽正则会「一删一片」
+
+真机实测（工程副本上）：`pattern="stm32f4xx_hal"` 一次命中二十多个文件（正则按 FilePath 匹配，
+未锚定就吃一片）。行为本身合乎文档，但不提示很容易在真工程上误伤：现在一次命中 ≥5 个文件时
+返回 `warning`，提醒逐条核对 `removed` 清单、备份仍在（可回滚），并建议收紧正则。
+
+### 6. 本轮真机覆盖（F401RCTx + DAPLink，COM9）
+
+- MDK/Keil 链路：进入调试、寄存器读写、内存读写、符号定位、断点/观察点、单步/运行/等待、
+  snapshot/diagnose/反汇编、外设与 SVD、watch/struct、DWT、故障报告、ITM、内存地图/搜索/填充、
+  工具族查询、会话状态、窗口管理（`launch/close/list` + `keil_health`）、命令窗口、
+  编译/清理/重建/烧录/批量脚本（阶段 1-6）。
+- 串口（COM9）：`serial_list_ports/start/status/read/write/expect/stop`；命中分支用固件命令口验证
+  （心跳 `hb <n>` 606ms 命中；`send="help"` + 期望命令表 50ms 命中）。
+- 非 MDK 链路：`gcc/make/cmake` 工具链、OpenOCD 全族、RTT、`trace_profile/scope`、DWT PCSR 采样。
+- 阶段 7 补测：`set_register`（含非法名）、`run_to_line`（命中 / 未命中两条路径）、
+  `wait_state`、`profile_function`、`profile_sampling`、`wait_fault`、`session_state`（save/show/load+apply）、
+  `uvprojx_edit`（四个 action，副本上进行）、`serial_expect`（命中分支）。
+- 单窗口约束：全程核对 `list_uvision_instances`，发现同工程开过两个窗口时用
+  `close_uvision(keep="oldest")` 收敛（持 4823 端口的是**最早**的实例，不能按「留最新」关）。
 
 ## 九、历次改进留档（按批次）
 
