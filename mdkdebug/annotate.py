@@ -36,6 +36,8 @@ READONLY = {
     "breakpoint_stats", "cache_info", "address_for_line", "parse_map",
     # 重定位偏移校验：只读 ELF + 读目标内存，不改任何状态。
     "reloc_check",
+    # 环境一致性体检：只读 DEV_ID/CPUID/Flash 指纹/寄存器，不起停目标、不下断点。
+    "env_check",
     "parse_build_errors", "explain_build_error", "snapshot_diff", "wait_breakpoint",
     "wait_state", "mdk_guide", "capabilities", "list_tools",
     "list_peripherals", "svd_list", "svd_decode", "uvprojx_read",
@@ -136,6 +138,9 @@ MUTATING = {
     "uvprojx_edit", "wait_fault",
     "scatter_edit", "core_select",
     "watchdog_freeze", "write_mem", "write_peripheral",
+    # 批次49：函数运行时线录制会下/撤硬件断点并 halt/resume 目标；
+    # D-Cache 维护会写 SCB 的 DCCMVAC/DCIMVAC（不改用户数据，但确实写目标状态）。
+    "trace_record", "dcache_maintain",
 }
 
 # 本服务面向**本机**的开发环境（Keil 进程、调试探针、本地工具链、本地文件），

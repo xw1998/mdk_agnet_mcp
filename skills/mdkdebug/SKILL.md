@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 174 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 177 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的三条纪律
@@ -117,7 +117,7 @@ session_state(action="load", apply=true)            # 开工接续：只恢复�
 
 ## 四、省上下文的三个旋钮（高输出工具通用）
 
-`list_tools`、`snapshot`、`read_mem_multi`、`batch`、`parse_map` 等 36 个工具的返回体
+`list_tools`、`snapshot`、`read_mem_multi`、`batch`、`parse_map` 等一批高输出工具的返回体
 可能很大，它们都接受：
 
 - `max_lines=N` —— 列表最多返回 N 条；
@@ -150,7 +150,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 37 个（`core` 33 个 + 4 个元工具），其余 137 个按需装载——
+- **工具面默认精简**：默认只暴露 38 个（`core` 34 个 + 4 个元工具），其余 139 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`。
 - **统一信封**：所有工具返回体都带 `status`（ok/error/…) 与 `next_actions`（下一步建议）；

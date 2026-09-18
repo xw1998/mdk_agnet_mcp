@@ -56,6 +56,9 @@ from . import scatter as _scatter
 from . import cores as _cores
 from . import etm as _etm
 from . import reloc as _reloc
+from . import chipid as _chipid
+from . import rtrecord as _rtr
+from . import rtrace as _rtrace
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -602,6 +605,10 @@ _SYMBOL_PROJECTS: list = _builtin_symbol_projects()
 _last_project: str = ""  # 本次会话最近一次通过工具参数指定的 .uvprojx（惰性符号定位优先用它）
 _breakpoints: list = []  # 内部断点记录（id/expr/address/file/line），因 BL 输出不经 socket 回传
 _bp_counter: int = 0  # 断点/数据断点 id 自增
+# 内置寄存器表（periph.py）覆盖的器件系列：它是硬编码的 STM32F4 布局。
+# 批次49 起，外设级工具要拿它和**实测芯片**比对，不一致就拒绝执行。
+_BUILTIN_REG_SERIES = "STM32F4"
+
 _watchpoints: list = []  # 内部数据断点（watchpoint）记录
 _snapshot_baseline: dict | None = None  # snapshot_diff 对比基线
 
@@ -1040,6 +1047,171 @@ def _note_firmware_event(reason: str) -> None:
     _firmware_events.append({"reason": reason, "ts": time.time(),
                              "time_text": _file_mtime_text(time.time())})
     del _firmware_events[:-5]
+
+
+# 最近一次「烧上去的固件」：工程 + .axf + 时间。跨工程调试的防呆基础——
+# 真机踩过：flash_download 烧的是 special 工程，enter_debug 加载的却是当前打开的
+# 主固件工程的 .axf，两套固件函数地址错位，PC 全被解析成**假符号**（停在 special 的
+# map 里早被链接器裁掉的函数上），纯误导。工具必须先记住「刚烧的是什么」，
+# 才有资格核对符号与板上固件是否同源。
+_fw_cfg = {"project": None, "target": None, "axf": None, "reason": None,
+           "ts": None, "time_text": None}
+
+def _record_flashed_firmware(project: str, target: str = "", reason: str = "") -> dict:
+    """记下刚烧上去的固件（工程 + 由该工程推出来的 .axf）。"""
+    axf = ""
+    try:
+        axf = _resolve_axf(project) or ""
+    except Exception:  # noqa: BLE001
+        axf = ""
+    _fw_cfg.update({"project": os.path.abspath(project) if project else None,
+                    "target": target or None, "axf": axf or None,
+                    "reason": reason or "", "ts": time.time(),
+                    "time_text": _file_mtime_text(time.time())})
+    _chip_probe["ts"] = 0.0        # 换固件了：芯片探测缓存作废
+    return dict(_fw_cfg)
+
+def _same_file(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    try:
+        return os.path.samefile(os.path.abspath(a), os.path.abspath(b))
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+def _symbol_source_check(client=None, axf: str = "", deep: str = "auto") -> dict:
+    """核对「当前符号 .axf」与「最近一次烧录的固件」是否同源。
+
+    判据分两层，**先证据后推断**：
+      1. 文件同一性：符号就是刚烧的那份 .axf -> 直接可信，不做额外读取；
+      2. 内容指纹（deep）：用 reloc.verify 拿 .axf 的 Flash 指纹与板上内存逐块比对——
+         这条能识破「文件名不同但其实是同一份代码」，也能识破「Keil 加载的符号
+         不是板上固件」，是唯一不依赖文件名的硬证据。
+
+    无法判断时如实给 unknown / no-flash-record，**不拿推断当结论**。
+    """
+    cur = axf or (_symbol_cfg or {}).get("axf") or ""
+    fw = dict(_fw_cfg or {})
+    flashed = fw.get("axf") or ""
+    out = {"flashed": {"project": fw.get("project"), "axf": flashed or None,
+                       "reason": fw.get("reason"), "time": fw.get("time_text")},
+           "symbol_axf": cur or None,
+           "symbol_source": (_symbol_cfg or {}).get("source_type")}
+    if not cur and not flashed:
+        out["verdict"] = "unknown"
+        out["note"] = "本进程既没加载符号、也没有烧录记录，无法核对符号与固件是否同源。"
+        return out
+    if cur and flashed and _same_file(cur, flashed):
+        out["verdict"] = "same"
+        out["note"] = "当前符号就是刚烧录的那份 .axf：符号可信。"
+        return out
+    if cur and flashed:
+        out["verdict"] = "different"
+    elif flashed:
+        out["verdict"] = "no-symbols"
+    else:
+        out["verdict"] = "no-flash-record"
+
+    ref = cur or flashed
+    want_deep = str(deep).lower() not in ("false", "0", "no", "off")
+    cv = None
+    if want_deep and client is not None and ref:
+        try:
+            delta, dnote = _eff_reloc_delta()
+            m = _chipid.firmware_match(client, ref, delta)
+            cc = {"axf": ref, "delta": "0x%X" % delta, "delta_note": dnote,
+                  "verdict": m.get("verdict"), "note": m.get("note")}
+            if m.get("suggested_delta"):
+                cc["suggested_delta"] = m["suggested_delta"]
+            out["content_check"] = cc
+            cv = m.get("verdict")
+        except Exception as e:  # noqa: BLE001
+            out["content_check"] = {"error": str(e)}
+
+    if cv == "firmware-confirmed":
+        out["verdict"] = "content-confirmed"
+        out["note"] = ("文件名/记录与符号源不同，但板上内存与 %s 的 Flash 指纹一致："
+                       "内容同源，符号可用（多为同一份代码重新编译过）。"
+                       % os.path.basename(ref or "?"))
+        return out
+    if cv == "firmware-mismatch":
+        out["verdict"] = "content-mismatch"
+        out["warning"] = (
+            "**当前 .axf 很可能不是板上跑的那份固件**（Flash 指纹一条都没中，连按当前 PC "
+            "反推的偏移也对不上）。这种情况下断点停下后解析出的函数名/行号都可能是不存在的"
+            "「假符号」——真机踩过：PC 显示停在 rt_mq_send_wait，而该函数在板上固件的 map 里"
+            "早被链接器裁掉了，会把人带偏。请先确认刚烧的是哪个工程，再 set_symbol_file 切到"
+            "与它对应的 .axf。")
+        out["next_actions"] = [
+            "set_symbol_file 切到与刚烧录固件同源的 .axf",
+            "flash_debug 走「关旧Keil→编烧→开新→进调试」闭环，避免符号与固件不同源",
+            "env_check 一键体检环境一致性（芯片 / SVD / 固件 / 符号 / D-Cache）",
+        ]
+        return out
+    if not cur:
+        out["verdict"] = "no-symbols"
+        if cv == "firmware-confirmed":
+            out["note"] = ("板上固件与刚烧录的 %s 指纹一致；但本会话尚未加载符号文件，"
+                           "解析位置前请先 set_symbol_file 指到这份 .axf。"
+                           % os.path.basename(flashed or "?"))
+            out["warning"] = ("本会话未加载符号：断点/PC 的函数名解析将依赖 Keil 自己加载的"
+                              "符号，可能与板上固件不同源（跨工程调试时必踩）。建议先 "
+                              "set_symbol_file 指到刚烧的那份 .axf。")
+        else:
+            out["note"] = ("本会话尚未加载符号文件（%s）；请 set_symbol_file 指到刚烧录的 "
+                           ".axf，否则函数名/行号解析可能来自别的工程。"
+                           % (out.get("content_check", {}).get("note") or "未能核对板上固件"))
+        return out
+    if out["verdict"] == "different":
+        out["warning"] = (
+            "当前符号 %s **不是**刚烧录的那份 %s（也不能证明内容同源）：跨工程调试时"
+            "PC/断点会被解析成别套固件的符号——「符号表里早被裁剪掉的函数」就是这么冒出来的。"
+            "请用 set_symbol_file 切到与板上固件对应的 .axf。"
+            % (os.path.basename(cur or "?"), os.path.basename(flashed or "?")))
+        out["next_actions"] = [
+            "set_symbol_file 切到与刚烧录固件同源的 .axf",
+            "env_check 做一次完整体检",
+        ]
+        return out
+    out["note"] = ("本进程没有见过烧录记录（未用 flash_download / build_and_flash / "
+                   "flash_debug）：无法核对符号 %s 是否对应板上固件；若刚用 Keil 手工烧过，"
+                   "建议跑一次 env_check 做内容级核对。"
+                   % (os.path.basename(cur or "?") if cur else "（未加载）"))
+    return out
+
+# 芯片探测缓存：外设级工具每次都要核对器件，但 IDCODE 不会变——缓存 5s 免得
+# 每读一个寄存器就打一串内存读取。（烧录/换工程时由 _record_flashed_firmware 作废。）
+_chip_probe = {"ts": 0.0, "client": None, "value": None}
+
+def _probe_chip_cached(client, ttl: float = 5.0) -> dict:
+    now = time.time()
+    if (_chip_probe.get("client") is client and _chip_probe.get("value") is not None
+            and now - float(_chip_probe.get("ts") or 0.0) <= ttl):
+        return dict(_chip_probe["value"])
+    v = _chipid.probe_chip(client)
+    _chip_probe.update({"ts": now, "client": client, "value": v})
+    return dict(v)
+
+def _periph_device_guard(client, configured_name: str, allow_mismatch: bool = False,
+                         what: str = "读外设寄存器") -> dict:
+    """外设级操作前的环境校验（配置型号 vs 实测芯片）。
+
+    真机踩过：SVD/内置表是 STM32F4 的，芯片是 H743——read_peripheral 返回 F4 的
+    RCC base 0x40023800、读出 0xAAAAAAAA，还查不到 H7 才有的 APB1LENR。这跟「没有数据」
+    完全不是一回事：是**看着像样却完全错的答案**。所以不匹配时默认拒绝执行。
+    """
+    try:
+        chip = _probe_chip_cached(client)
+    except Exception as e:  # noqa: BLE001
+        return {"allowed": True, "verdict": "unknown",
+                "reason": "芯片探测失败：%s" % e, "configured": configured_name}
+    try:
+        return _chipid.guard_configured_device(client, configured_name,
+                                               allow_mismatch=allow_mismatch,
+                                               what=what, chip=chip)
+    except Exception as e:  # noqa: BLE001
+        return {"allowed": True, "verdict": "unknown",
+                "reason": "环境校验失败：%s" % e, "configured": configured_name}
 
 
 # CFSR/HFSR 是**粘滞位**（sticky）：写 1 清除或复位才归零，不会因为异常处理完自动清。
@@ -2908,6 +3080,17 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 # 批次29：记录本次调试会话加载的符号基线（.axf 路径 + 时间戳），
                 # 之后 .axf 被重编/重烧即可判定「会话符号已过期」。
                 out["symbol_session"] = _mark_debug_session("enter_debug")
+                # 批次49：跨工程符号绑定防呆——「刚烧的固件」与「当前符号」是不是同一份。
+                # 真机踩过：烧的是 special 工程，加载的却是主固件工程的 .axf，
+                # PC 全解析成假符号；工具不校验就等于默认它们一致，跨仓库调试必踩。
+                try:
+                    sc = _symbol_source_check(client=_get_client())
+                    if sc:
+                        out["symbol_source"] = sc
+                        if sc.get("warning"):
+                            out["symbol_source_warning"] = sc["warning"]
+                except Exception:  # noqa: BLE001
+                    pass
             if freeze_watchdogs and out.get("ok"):
                 out["watchdog_freeze"] = _auto_freeze_watchdogs(_get_client())
             return _js(out)
@@ -4786,6 +4969,398 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "target": target, "error": str(e)})
 
+    # ---------------- 批次49：函数时间线录制 / 环境体检 / D-Cache ----------------
+    _trace_rec = {"report": None, "at": None}
+
+    @server.tool(
+        name="trace_record",
+        title="函数运行时线录制（MDK/OpenOCD 双链路）",
+        description=(
+            "录制「函数运行状态」这一类细粒度事件：在选定函数的**入口**下断点，每次命中就"
+            "记一条事件（时间、PC、所属函数、调用者、LR/SP、DWT 周期数），并给出按函数的统计、"
+            "调用者分布与时间线。**MDK 与 OpenOCD 两条链路的抓取方式完全不同**（Keil 走 "
+            "UVSOCK 的 BS/BK + wait_breakpoint，OpenOCD 走 telnet 的 bp/rbp + wait_halt），"
+            "所以是分开实现、由 link=auto|keil|ocd 选路；返回值写明这次实际用的链路。\n"
+            "funcs=\"task_a,task_b\" 精确选函数；pattern=\"rt_*,os*\" 用通配符选（二者可同用）。"
+            "**必须至少给一个**——把整份符号表全下断点既不可能也没意义。"
+            "max_breakpoints 是愿意占用的断点槽位（默认 4，硬件断点一般 6 个、M0 只有 4 个）；"
+            "要监控的函数多于槽位时只布前 N 个，armed/skipped 如实说明。"
+            "watch_exit=true 时会在命中入口后用 LR 动态补返回地址断点，从而拿到 exit 事件"
+            "（槽位不够就没有 exit，返回里会说明，不编）。\n"
+            "**录制的是事件流，不是精确耗时**：gap_cyc 是相邻两次命中的 CYCCNT 差值，"
+            "精确耗时请用 profile_function；depth_est 由 SP 推断，是估计值。"
+            "命中不落在任何已知函数区间时标 unknown 并保留原 PC，**不硬塞函数名**"
+            "（符号与板上固件不同源时正是这种「假符号」场景）。\n"
+            "action：run（默认，录一次并返回报告）/ status（上次报告摘要）/ "
+            "read（带 kind/func/limit 过滤的时间线）/ stop（停目标并清掉残留断点）。"
+            "reloc_delta 用于 App 重定位场景（运行地址 = 链接地址 + delta）。"
+        ),
+    )
+    async def trace_record(action: str = "run", link: str = "auto", funcs: str = "",
+                           pattern: str = "", max_events: int = 2000,
+                           max_ms: int = 3000, max_breakpoints: int = 4,
+                           watch_exit: bool = True, kind: str = "", func: str = "",
+                           limit: int = 200, reloc_delta: str = "",
+                           leave_halted: bool = True,
+                           check_symbols: bool = True) -> str:
+        try:
+            a = (action or "run").strip().lower()
+            if a in ("read", "status", "report"):
+                rep = (_trace_rec or {}).get("report")
+                if not rep:
+                    return _js({"ok": False, "action": a,
+                                "error": "本进程还没有录制过（先 trace_record(action=\"run\")）"})
+                if a == "status":
+                    out = {k: v for k, v in rep.items() if k != "timeline"}
+                    out["action"] = "status"
+                    out["timeline_hint"] = "用 trace_record(action=\"read\") 取时间线"
+                    return _js(out)
+                out = dict(rep)
+                out["action"] = "read"
+                # 过滤是在**已保留窗口**上做的（环形缓冲本身有上限），如实说明
+                tl = list(rep.get("timeline") or [])
+                if kind:
+                    tl = [e for e in tl if e.get("kind") == kind]
+                if func:
+                    tl = [e for e in tl if e.get("func") == func]
+                tl = tl[-max(1, int(limit or 200)):]
+                out["timeline"] = tl
+                out["timeline_note"] = ("过滤作用于已保留的 %d 条窗口（events_kept），"
+                                        "不是全量；events_total/events_dropped 见报告"
+                                        % int(rep.get("events_kept") or 0))
+                return _js(out)
+            if a in ("stop", "halt"):
+                be, err = _rtrace.pick(link, who="停止录制目标")
+                if be is None:
+                    return _js(err)
+                h = be.halt()
+                out = {"ok": bool(h.get("ok")), "action": "stop", "link": be.name,
+                       "halt": {"ok": bool(h.get("ok")),
+                                "error": h.get("error") or h.get("status_text")}}
+                rep = (_trace_rec or {}).get("report") or {}
+                cleared, still = [], []
+                for x in list(rep.get("breakpoints_left") or []):
+                    try:
+                        ok, _info = be.clear_bp(int(x, 16))
+                    except Exception:  # noqa: BLE001
+                        ok = False
+                    (cleared if ok else still).append(x)
+                out["breakpoints_cleared"] = cleared
+                out["breakpoints_left"] = still
+                return _js(out)
+            if a not in ("run", "start", "record"):
+                return _js({"ok": False, "action": action,
+                            "error": "未知 action",
+                            "available": ["run", "status", "read", "stop"]})
+            loc = _ensure_locator()
+            if loc is None:
+                return _js({"ok": False, "action": a,
+                            "error": "符号定位未就绪，无法把函数名解析成入口地址",
+                            "hint": ("先 set_symbol_file 指到与板上固件同源的 .axf；"
+                                     "若不确定是哪份，先跑 env_check 核对符号与固件是否同源")})
+            try:
+                ranges = loc._load_func_ranges()
+            except Exception as e:  # noqa: BLE001
+                ranges = []
+                out_err = str(e)
+            else:
+                out_err = ""
+            if not ranges:
+                return _js({"ok": False, "action": a,
+                            "error": ("当前符号源里没有函数区间（%s）：trace_record 需要 .axf"
+                                      "（.map 只有名字、没有区间）"
+                                      % (out_err or "空符号表")),
+                            "symbol_axf": (_symbol_cfg or {}).get("axf"),
+                            "symbol_source": (_symbol_cfg or {}).get("source_type")})
+            delta, dnote = _eff_reloc_delta(reloc_delta)
+            want = [x.strip() for x in str(funcs or "").split(",") if x.strip()]
+            pats = [x.strip() for x in str(pattern or "").split(",") if x.strip()]
+            if not want and not pats:
+                return _js({"ok": False, "action": a,
+                            "error": "没有指定要监控的函数（funcs 与 pattern 都为空）",
+                            "func_count": len(ranges),
+                            "examples": [nm for (_s, _e, nm) in ranges[:6]],
+                            "hint": "funcs=\"task_a,task_b\" 精确选；pattern=\"rt_*,os*\" 通配选"})
+            from fnmatch import fnmatch as _fnm
+            sel, unknown = [], []
+            if want:
+                low = {nm.lower(): (nm, st, en) for (st, en, nm) in ranges}
+                for w in want:
+                    hit = low.get(w.lower())
+                    if hit:
+                        sel.append(hit)
+                    else:
+                        unknown.append(w)
+            if pats:
+                for (st, en, nm) in ranges:
+                    if any(_fnm(nm, p) for p in pats):
+                        sel.append((nm, st, en))
+            seen, sel2 = set(), []
+            for nm, st, en in sel:
+                if nm in seen:
+                    continue
+                seen.add(nm)
+                sel2.append((nm, st, en))
+            sel = sel2
+            if not sel:
+                return _js({"ok": False, "action": a,
+                            "error": "按 funcs/pattern 没匹配到任何函数",
+                            "unknown_names": unknown[:20],
+                            "hint": "用 find_symbol 搜一下确切函数名（注意编译器可能内联/改名）"})
+            if unknown:
+                out_unknown = unknown[:20]
+            else:
+                out_unknown = []
+            be, err = _rtrace.pick(link, who="录制函数时间线")
+            if be is None:
+                return _js(err)
+            client = None
+            if be.name == "keil":
+                try:
+                    client = _get_client()
+                except Exception:  # noqa: BLE001
+                    client = None
+            index = _rtr.make_func_index([(st + delta, en + delta, nm)
+                                          for (st, en, nm) in ranges])
+            rep = _rtrace.record(index,
+                                 [st + delta for (nm, st, en) in sel],
+                                 exits=(), backend=be,
+                                 max_events=int(max_events or 2000),
+                                 max_ms=float(max_ms or 3000),
+                                 max_breakpoints=int(max_breakpoints or 4),
+                                 watch_exit=bool(watch_exit),
+                                 leave_halted=bool(leave_halted),
+                                 limit=int(limit or 200),
+                                 label="trace_record")
+            rep["action"] = "run"
+            rep["symbol_axf"] = (_symbol_cfg or {}).get("axf")
+            rep["symbol_source"] = (_symbol_cfg or {}).get("source_type")
+            rep["reloc_delta"] = "0x%X" % delta
+            rep["reloc_note"] = dnote
+            rep["selected"] = ["%s@0x%X" % (nm, st + delta) for (nm, st, en) in sel]
+            if out_unknown:
+                rep["unknown_names"] = out_unknown
+            rep["symbol_note"] = ("事件里的函数名来自当前符号源；若它与板上固件不同源，"
+                                  "名字会是「假符号」——先 env_check 核对")
+            if check_symbols:
+                try:
+                    sc = _symbol_source_check(client=client)
+                    if sc:
+                        rep["symbol_check"] = sc
+                        if sc.get("warning"):
+                            rep["symbol_check_warning"] = sc["warning"]
+                except Exception:  # noqa: BLE001
+                    pass
+            _trace_rec.update({"report": rep, "at": time.time()})
+            return _js(rep)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "action": action, "error": str(e)})
+
+    @server.tool(
+        name="env_check",
+        title="环境一致性体检（芯片 / SVD / 固件 / 符号 / D-Cache）",
+        description=(
+            "一键核对「工程与工具以为的目标」和「板上真实的目标」是否一致——跨仓库/跨板调试"
+            "最毒的两类问题都在这里设防：①符号与板上固件不同源（PC 被解析成假符号）；"
+            "②SVD/内置寄存器表选错芯片（读出别的芯片布局下「看着像样」的值）。\n"
+            "输出包含：chip（实测 DBGMCU_IDCODE + CPUID 推出的型号/系列/置信度）、"
+            "configured（工程 <Device> / 内置寄存器表 / 已加载 SVD 各自的系列，以及逐项 "
+            "matched/mismatched/unknown 判定）、firmware_symbol（符号与板上固件的内容指纹"
+            "比对）、dcache（D-Cache 是否使能）、last_flashed（本进程最近一次烧录的工程与 "
+            ".axf）、problems / next_actions。\n"
+            "**判据一律拿目标说话**：读不到 IDCODE 就说 unknown，不拿工程配置冒充实测结果；"
+            "allow_mismatch 只影响「后续外设工具要不要放行」，不改变这里的判定。"
+        ),
+    )
+    async def env_check(project: str = "", link: str = "auto",
+                        content_check: bool = True) -> str:
+        try:
+            out = {"ok": True, "action": "env_check"}
+            be, berr = _rtrace.pick(link, who="环境体检")
+            client = None
+            if be is not None and be.name == "keil":
+                try:
+                    client = _get_client()
+                except Exception:  # noqa: BLE001
+                    client = None
+            out["link"] = be.name if be is not None else None
+            if be is None:
+                out["link_error"] = (berr or {}).get("error")
+            # 1) 实测芯片
+            if client is not None:
+                try:
+                    chip = _probe_chip_cached(client)
+                except Exception as e:  # noqa: BLE001
+                    chip = {"confidence": "none", "reason": "探测失败：%s" % e}
+            else:
+                chip = {"confidence": "none",
+                        "reason": ("本工具当前只在 Keil/UVSOCK 链路上读 DBGMCU_IDCODE；"
+                                   "OpenOCD 链路可用 ocd_reg(name=\"r0\")+ocd_read_mem 读 "
+                                   "0xE0042000 / 0x5C001000，或 ocd_probe 看目标信息")}
+            out["chip"] = chip
+            # 2) 各处「配置里写的型号」
+            cfg = {}
+            proj = ""
+            try:
+                proj = (project or "").strip() or (_last_project or "")
+            except Exception:  # noqa: BLE001
+                proj = ""
+            if not proj:
+                try:
+                    proj = (_builder_cfg or {}).get("default_project") or ""
+                except Exception:  # noqa: BLE001
+                    proj = ""
+            if proj and os.path.isfile(proj):
+                cfg["project"] = proj
+                try:
+                    cfg["project_device"] = str(
+                        (_uvprojx.read_config(proj) or {}).get("device") or "")
+                except Exception as e:  # noqa: BLE001
+                    cfg["project_device_error"] = str(e)
+            else:
+                cfg["project"] = proj or None
+                cfg["project_note"] = "没有可用的工程路径（传 project= 或配置 --default-project）"
+            cfg["builtin_regmap"] = _BUILTIN_REG_SERIES
+            if _svd.loaded():
+                cfg["svd_device"] = _svd.device()
+                cfg["svd_file"] = _svd._CACHE.get("path")
+            else:
+                auto = _svd_autodevice()
+                cfg["svd_device"] = auto or None
+                if not auto:
+                    cfg["svd_note"] = ("尚未加载 .svd：svd_list(device=\"STM32H743xx\") 或设 "
+                                       "MDKDEBUG_SVD 指定一份")
+            out["configured"] = cfg
+            # 3) 逐项比对
+            checks = []
+            for what, name in (("project_device", cfg.get("project_device")),
+                               ("builtin_regmap", cfg.get("builtin_regmap")),
+                               ("svd_device", cfg.get("svd_device"))):
+                if not name:
+                    continue
+                m = _chipid.series_match(name, chip)
+                m["what"] = what
+                checks.append(m)
+            out["checks"] = checks
+            # 4) 符号 vs 板上固件
+            try:
+                out["firmware_symbol"] = _symbol_source_check(
+                    client=client, deep=("auto" if content_check else "false"))
+            except Exception as e:  # noqa: BLE001
+                out["firmware_symbol"] = {"verdict": "unknown", "error": str(e)}
+            # 5) D-Cache
+            if client is not None:
+                try:
+                    out["dcache"] = client.dcache_status()
+                except Exception as e:  # noqa: BLE001
+                    out["dcache"] = {"ok": False, "error": str(e)}
+            # 6) 最近一次烧录
+            out["last_flashed"] = dict(_fw_cfg or {})
+            # 7) 汇总
+            problems, actions = [], []
+            for m in checks:
+                if m.get("verdict") == "mismatched":
+                    problems.append({"what": m.get("what"), "detail": m.get("reason"),
+                                     "error_code": "svd-device-mismatch"})
+                    actions.append("按实测系列换寄存器表/SVD：%s" % (m.get("reason") or ""))
+            fs = out.get("firmware_symbol") or {}
+            if fs.get("warning"):
+                problems.append({"what": "symbol-as-firmware",
+                                 "detail": fs.get("warning")})
+                actions.extend(fs.get("next_actions") or [])
+            if not chip.get("series"):
+                problems.append({"what": "chip-identity", "detail": chip.get("reason"),
+                                 "error_code": "chip-unknown"})
+                actions.append("确认目标已进入调试（Keil: enter_debug / OCD: ocd_start→halt）"
+                               "后重跑 env_check")
+            out["problems"] = problems
+            out["next_actions"] = list(dict.fromkeys(actions))
+            if problems:
+                out["verdict"] = "mismatch"
+            elif not chip.get("series"):
+                out["verdict"] = "unverified"
+            else:
+                out["verdict"] = "consistent"
+            out["note"] = ("verdict=consistent 只代表**本次能核对的项**都一致；"
+                           "unverified 表示关键证据（芯片 IDCODE）没读到，"
+                           "别把「没发现问题」当成「一定没问题」。")
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "action": "env_check", "error": str(e)})
+
+    @server.tool(
+        name="dcache_maintain",
+        title="D-Cache 一致性维护（状态 / 按地址 clean+invalidate）",
+        description=(
+            "Cortex-M7 一类带 D-Cache 的核上，调试器直读 RAM 走的是 AHB 旁路：命中的可能是"
+            "**尚未回写的 cache 行**或**陈旧的 DRAM 副本**，于是读到「连续全 0」——"
+            "真机反馈里读线程栈（0x2400FB00 一类 AXI SRAM）就是这么被误导的。\n"
+            "action=status：读 SCB->CCR（0xE000ED14）的 DC/IC 位，说明 D-Cache 到底有没有开"
+            "（读不到就说读不到，不猜）。action=clean_invalidate：对 addr 所在的 cache 行先 "
+            "DCCMVAC（clean，脏行写回）再 DCIMVAC（invalidate）——**顺序不能反**，直接 "
+            "invalidate 会把还没回写的脏数据丢掉。维护前后各读一遍并对比，值变了就说明"
+            "之前那次读确实取到了陈旧副本。\n"
+            "read_mem 在 RAM 区遇到「整帧退化」且 D-Cache 使能时已会自动做同样的维护，"
+            "本工具用于手动确认/指定地址处理。写 SCB 寄存器需目标处于停止态。"
+        ),
+    )
+    async def dcache_maintain(action: str = "status", addr: str = "",
+                              n_bytes: int = 32) -> str:
+        try:
+            client = _get_client()
+            a = (action or "status").strip().lower()
+            if a in ("status", "info"):
+                st = client.dcache_status()
+                if st.get("ok"):
+                    st["action"] = "status"
+                    st["hint"] = ("dcache=true 时，调试器直读 RAM 可能取到陈旧/未回写的内容；"
+                                  "读到可疑的整帧退化解，用 "
+                                  "dcache_maintain(action=\"clean_invalidate\", addr=…) 维护后重读")
+                    if client.running_cached():
+                        st["target_running"] = True
+                        st["running_note"] = ("目标当前在全速运行，维护 SCB 寄存器需要先 stop；"
+                                              "读数本身可读，但一致性不保证")
+                return _js(st)
+            if a in ("clean_invalidate", "clean", "invalidate", "maintain"):
+                if not str(addr or "").strip():
+                    return _js({"ok": False, "action": a,
+                                "error": "addr 必填：要维护哪一条 cache 行（按地址定位）"})
+                try:
+                    ad = _parse_addr(str(addr).strip())
+                except Exception:  # noqa: BLE001
+                    return _js({"ok": False, "action": a, "addr": addr,
+                                "error": "addr 解析失败，支持 0x 前缀或十进制"})
+                n = max(4, min(int(n_bytes or 32), 256))
+                run = client.running_cached()
+                before = client.read_mem(ad, n)
+                ci = client.cache_clean_invalidate(ad)
+                after = client.read_mem(ad, n)
+                bhex = (before.get("data_hex") or "").lower() if before.get("ok") else None
+                ahex = (after.get("data_hex") or "").lower() if after.get("ok") else None
+                out = {"ok": bool(ci.get("ok")), "action": "clean_invalidate",
+                       "addr": "0x%X" % ad, "n_bytes": n,
+                       "ops": ci.get("ops"), "ops_ok": bool(ci.get("ok")),
+                       "before_hex": bhex, "after_hex": ahex,
+                       "changed": (bhex != ahex) if (bhex is not None and ahex is not None) else None,
+                       "source": ci}
+                if run:
+                    out["target_running"] = True
+                    out["warning"] = ("目标当时在全速运行：写 SCB 寄存器可能未生效，"
+                                      "先 stop 再重试才能保证维护动作真的做了")
+                if out["changed"] is True:
+                    out["note"] = ("维护后读到的内容变了：此前那次读确实取到了未回写的"
+                                   "陈旧副本（D-Cache 直读的典型表现）")
+                elif out["changed"] is False:
+                    out["note"] = ("维护前后内容一致：倾向于该地址在 RAM 里就是这些值，"
+                                   "不是缓存陈旧造成的")
+                elif not ci.get("ok"):
+                    out["note"] = "维护动作未全部成功，上面的 before/after 仅供参照，别当成结论"
+                return _js(out)
+            return _js({"ok": False, "action": action, "error": "未知 action",
+                        "available": ["status", "clean_invalidate"]})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "action": action, "error": str(e)})
+
     @server.tool(
         name="reloc_check",
         title="校验/推导符号重定位偏移",
@@ -5659,6 +6234,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             out = dict(builder.flash_download(_builder_cfg["uv4"], p, target.strip() or None, t,
                                               ensure_debug_channel=ensure_debug_channel))
             _note_firmware_event("flash_download")
+            if out.get("ok", True):
+                _record_flashed_firmware(p, target.strip() or "", "flash_download")
             # 批次29：烧录后旧调试会话的符号已过期——处理它（默认自动退出），
             # 避免调用方拿着旧符号求值却得到一堆 status 13 解析错误。
             try:
@@ -5697,6 +6274,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                                target.strip() or None, bt, ft,
                                                ensure_debug_channel=ensure_debug_channel))
             _note_firmware_event("build_and_flash")
+            if out.get("ok", True):
+                _record_flashed_firmware(p, target.strip() or "", "build_and_flash")
             try:
                 out["debug_session"] = _post_flash_debug_state(_get_client(),
                                                                do_exit=bool(exit_debug_after))
@@ -5781,6 +6360,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             if enter.get("ok"):
                 _note_firmware_event("flash_debug")
                 _mark_debug_session("flash_debug")   # 新会话＝新固件符号，重新记基线
+                _record_flashed_firmware(p, "", "flash_debug")
             payload = {
                 "ok": enter.get("ok", False),
                 "action": "flash_debug", "stage": "调试",
@@ -5833,7 +6413,20 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def list_peripherals() -> str:
-        return _js({"ok": True, "count": len(_periph_list()), "peripherals": _periph_list()})
+        out = {"ok": True, "count": len(_periph_list()), "peripherals": _periph_list(),
+               "builtin_regmap_series": _BUILTIN_REG_SERIES}
+        # 能读到芯片就说实话：内置表只对 STM32F4 的布局负责。读不到就静默带过
+        # （本工具常用于没进调试时先看清单，不该因此变成失败）。
+        try:
+            g = _periph_device_guard(_get_client(), _BUILTIN_REG_SERIES)
+            if g.get("verdict") not in (None, "matched"):
+                out["device_guard"] = g
+                out["warning"] = ("内置寄存器表是 %s 的布局；本次实测/比对结果见 device_guard，"
+                                  "对不上时请改用 svd_list/svd_decode（按真实器件加载 .svd）。"
+                                  % _BUILTIN_REG_SERIES)
+        except Exception:  # noqa: BLE001
+            pass
+        return _js(out)
 
     @server.tool(
         name="read_peripheral",
@@ -5852,13 +6445,25 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def read_peripheral(periph: str, regs: str | list = "",
-                              fields: str | list = "auto") -> str:
+                              fields: str | list = "auto",
+                              allow_mismatch: bool = False) -> str:
         try:
             client = _get_client()
             p = _periph_get(periph)
             if not p:
                 avail = ", ".join(x["name"] for x in _periph_list())
                 return _js({"ok": False, "error": f"未知外设 {periph}，可用: {avail}"})
+            # 批次49：内置表是 STM32F4 的硬编码布局；实测芯片不是 F4 时必须拒绝——
+            # 否则会给出「看着像样却完全是别的芯片布局」的读数（真机：H743 上返回
+            # F4 的 RCC base 0x40023800、读出 0xAAAAAAAA）。
+            guard = _periph_device_guard(client, _BUILTIN_REG_SERIES,
+                                         allow_mismatch=allow_mismatch,
+                                         what="读外设寄存器")
+            if not guard.get("allowed", True):
+                out = dict(guard)
+                out["peripheral"] = p["name"]
+                out["builtin_regmap_series"] = _BUILTIN_REG_SERIES
+                return _js(out)
             # regs：按名筛选（全名或裸名，大小写不敏感），留空 = 全部。
             # 兼容数组写法（regs=["MODER","ODR"]）——用户反馈直接传列表会崩。
             want = [x.upper() for x in _csv_tokens(regs)]
@@ -5911,6 +6516,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 out_regs.append(entry)
             out = {"ok": True, "peripheral": p["name"], "base": f"0x{p['base']:08X}",
                    "desc": p["desc"], "reg_count": len(out_regs), "regs": out_regs}
+            if guard.get("verdict") != "matched":
+                out["device_guard"] = guard
             if want:
                 out["reg_filter"] = want
                 miss = [w for w in want
@@ -5963,14 +6570,33 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         description=(
             "返回目标 STM32 的内存布局（FLASH/SRAM1/2/APB1/APB2/AHB1/AHB2/ITM/DWT/SCS 地址范围），"
             "可用 addr 参数标注某地址落在哪个区域。在 read_mem/write_mem/fill_mem 前调用，"
-            "避免把外设区当 RAM 读或把越界地址当合法地址。addr 为空返回全部区域。注意：返回的是 STM32F4 的典型内存布局；其他内核/系列（如 M0/M7、G/L 系列）地址范围可能不同，请勿对非 F4 目标直接套用。"
+            "避免把外设区当 RAM 读或把越界地址当合法地址。addr 为空返回全部区域。"
+            "**这张表是内置的 STM32F4 布局**：能读到目标时会先核对实际芯片系列，"
+            "不是 F4 就拒绝返回（否则会拿 F4 的地址范围去解释 H7 的地址，看着像样却完全错）；"
+            "读不到目标（未进调试）时按纯查表返回，并在返回值里注明这是未核对的布局。"
+            "确需在别的系列上强查，传 allow_mismatch=true。"
         ),
     )
-    async def query_memory_map(addr: str | int = "") -> str:
+    async def query_memory_map(addr: str | int = "", allow_mismatch: bool = False) -> str:
         addr = _addr_arg(addr)
         try:
             a = _parse_addr(addr) if addr else None
-            return _js(_query_memory_map(a))
+            out = _query_memory_map(a)
+            # 批次49：内置内存地图与内置外设表一样是**写死的 STM32F4 布局**，
+            # 只在 description 里写「请勿套用」等于把核对责任推给调用者，必须自己核对。
+            guard = None
+            try:
+                guard = _periph_device_guard(_get_client(), _BUILTIN_REG_SERIES,
+                                             allow_mismatch=allow_mismatch,
+                                             what="按内置 STM32F4 布局解读内存地图")
+            except Exception:  # noqa: BLE001
+                guard = None
+            if guard and not guard.get("allowed", True):
+                return _js(guard)
+            out["builtin_regmap_series"] = _BUILTIN_REG_SERIES
+            if guard and guard.get("verdict") != "matched":
+                out["device_guard"] = guard
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -6290,13 +6916,23 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "需已进入调试。periph 为外设名，reg 为寄存器名（大小写不敏感）。注意：仅适配 STM32F4 寄存器布局；需目标暂停。写关键寄存器（如 RCC 时钟使能、GPIO 模式）有副作用，写错可能改变外设/系统行为，写入前确认。"
         ),
     )
-    async def write_peripheral(periph: str, reg: str, value: str) -> str:
+    async def write_peripheral(periph: str, reg: str, value: str,
+                               allow_mismatch: bool = False) -> str:
         try:
             client = _get_client()
             p = _periph_get(periph)
             if not p:
                 avail = ", ".join(x["name"] for x in _periph_list())
                 return _js({"ok": False, "error": f"未知外设 {periph}，可用: {avail}"})
+            # 批次49：写错布局的外设寄存器比读更危险（可能改变系统行为）。
+            guard = _periph_device_guard(client, _BUILTIN_REG_SERIES,
+                                         allow_mismatch=allow_mismatch,
+                                         what="写外设寄存器")
+            if not guard.get("allowed", True):
+                out = dict(guard)
+                out["peripheral"] = p["name"]
+                out["builtin_regmap_series"] = _BUILTIN_REG_SERIES
+                return _js(out)
             rkey = None
             for k in p["regs"]:
                 if k.lower() == (reg or "").lower():
@@ -7825,7 +8461,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def svd_decode(peripheral: str = "", register: str = "", value=0,
-                         address: str = "", svd_file: str = "", device: str = "") -> str:
+                         address: str = "", svd_file: str = "", device: str = "",
+                         allow_mismatch: bool = False) -> str:
         try:
             eff_dev, auto_dev = (device or "").strip(), False
             if (svd_file or device) or not _svd.loaded():
@@ -7847,6 +8484,17 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 except Exception:  # noqa: BLE001
                     return _js({"ok": False, "address": address,
                                 "error": "address 解析失败，支持 0x 前缀或十进制"})
+            # 批次49：SVD 选错芯片同样会给「看着权威的错答案」——先拿目标核对型号。
+            if not allow_mismatch:
+                try:
+                    g = _periph_device_guard(_get_client(), _svd.device() or "",
+                                             what="按 SVD 解寄存器")
+                    if not g.get("allowed", True):
+                        g["svd_device"] = _svd.device()
+                        g["svd_file"] = _svd._CACHE.get("path")
+                        return _js(g)
+                except Exception:  # noqa: BLE001
+                    pass
             out = _svd.decode_value(peripheral=peripheral or "",
                                     register=register or "", value=val, address=addr)
             if isinstance(out, dict):

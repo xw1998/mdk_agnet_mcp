@@ -459,6 +459,53 @@ class UVClient:
         self._run_cache_at = now
         return self._run_cache
 
+    # ---- D-Cache 一致性（批次49）----
+    # 真机反馈：M7 上读线程栈（0x2400FB00 一类 AXI SRAM）连续全 0、confidence=low，
+    # 而工具只给了泛泛的 degenerate 提示。根因是 DAP 直读走 AHB，命中的可能是
+    # 尚未回写的 cache 行或陈旧副本。这里给出「读得出原因 + 有可执行动作」的处理。
+    _SCB_CCR = 0xE000ED14
+    _SCB_DCIMVAC = 0xE000EF5C
+    _SCB_DCCMVAC = 0xE000EF68
+
+    @staticmethod
+    def _ram_like(addr) -> bool:
+        """该地址像不像「走 D-Cache 的 RAM」（SRAM / DTCM / AXI / SRAM1..4）。"""
+        a = int(addr)
+        return (0x20000000 <= a < 0x40000000) or (0x00000000 <= a < 0x00010000)
+
+    def dcache_status(self) -> dict:
+        """D-Cache 是否使能（SCB->CCR bit16）。读不到就如实说读不到，不猜。"""
+        m = self.read_mem(self._SCB_CCR, 4)
+        if not m.get("ok"):
+            return {"ok": False, "error": m.get("status_text") or "读 SCB->CCR 失败"}
+        try:
+            v = int.from_bytes(bytes.fromhex(m.get("data_hex") or ""), "little")
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "error": "SCB->CCR 读数无法解析"}
+        return {"ok": True, "ccr": "0x%08X" % v, "dcache": bool(v & (1 << 16)),
+                "icache": bool(v & (1 << 17)),
+                "source": "SCB->CCR(0xE000ED14) bit16=DC / bit17=IC"}
+
+    def cache_clean_invalidate(self, addr: int) -> dict:
+        """按地址维护 D-Cache：DCCMVAC（clean，脏行写回 RAM）→ DCIMVAC（invalidate）。
+
+        先 clean 再 invalidate 的顺序是有意的：直接 invalidate 会把还没回写的脏数据丢掉。
+        目标须停止（写 SCB 寄存器要调试态）；每步的成败都如实回报，不假装成功。
+        """
+        ops = []
+        ok_all = True
+        for name, reg in (("clean(DCCMVAC)", self._SCB_DCCMVAC),
+                          ("invalidate(DCIMVAC)", self._SCB_DCIMVAC)):
+            try:
+                w = self.write_mem(reg, struct.pack("<I", int(addr) & 0xFFFFFFFF))
+            except Exception as e:  # noqa: BLE001
+                w = {"ok": False, "error": str(e)}
+            ops.append({"op": name, "reg": "0x%08X" % reg, "ok": bool(w.get("ok")),
+                        "error": None if w.get("ok") else
+                        (w.get("status_text") or w.get("error") or "写失败")})
+            ok_all = ok_all and bool(w.get("ok"))
+        return {"ok": ok_all, "addr": "0x%X" % int(addr), "ops": ops}
+
     def read_mem_verified(self, addr: int, n_bytes: int, verify: str = "auto") -> dict:
         """带「脏读防护」的内存读取。
 
@@ -531,6 +578,21 @@ class UVClient:
                 out["degenerate_note"] = (
                     "整帧读出全 %s：整片同值通常不是真实内容，而是读取失败或该区域未初始化。"
                     % ("0x00" if degenerate == "all_zero" else "0xFF"))
+            # 批次49：M7 的 D-Cache。退化读数的另一大来源是 cache——DAP 直读走 AHB，
+            # 可能命中尚未回写的 cache 行或陈旧副本。这里**只给因果与可执行动作**，
+            # 不在读路径里替用户做维护：一旦在这里 clean+invalidate 后改用新值，
+            # 就等于把「写目标状态」藏进一个只读工具，且会额外发一次读、扰动读数序列。
+            # 真要动手，用 dcache_maintain(action="clean_invalidate", addr=...) 显式做。
+            if degenerate and self._ram_like(addr):
+                # 这里**不**去读 SCB->CCR：读路径上任何额外的目标访问都会扰动读数序列
+                # （stop 后的首读本就最容易脏），也会让「一次读内存」变得不可预期。
+                # 所以只给线索与可执行动作，判 D-Cache 状态交给 cache_info / dcache_maintain。
+                out["cache_note"] = (
+                    "额外线索：若目标带 D-Cache（M7 等）且已使能，整帧退化也可能是 DAP "
+                    "读到尚未回写的 cache 行 / 陈旧副本。核实办法：cache_info 看 D-Cache 状态，"
+                    "再 dcache_maintain(action=\"clean_invalidate\", addr=0x%X) 做一次 "
+                    "clean+invalidate（脏行写回内存、丢掉缓存副本）后重读本地址——"
+                    "重读值变了，就说明首帧确实是缓存陈旧副本。" % int(addr))
         # 目标在跑时一律复读：运行态读最典型的坏结果不是「整帧退化」，而是读的中途
         # 被 CPU 改写（逐字节撕裂）——这种脏值不会退化，只有复读比对才看得出来
         need = (mode == "true" or bool(degenerate)

@@ -11,8 +11,12 @@ import logging
 from typing import Optional
 
 from elftools.elf.elffile import ELFFile  # pyelftools
+from elftools.elf.constants import SH_FLAGS  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+# is_code_address 用：按 (axf 绝对路径, mtime) 缓存可执行段范围，改文件自动失效。
+_CODE_RANGE_CACHE: dict = {}
 
 
 def _decode_name(b) -> str:
@@ -416,10 +420,73 @@ class Locator:
     # ------------------------------------------------------------------
     # 完整调用栈辅助 / 局部变量 / 漂移检测 / 代码地址判断
     # ------------------------------------------------------------------
-    @staticmethod
-    def is_code_address(addr: int) -> bool:
-        """判断地址是否落在 FLASH 代码段（真实 PC / 返回地址所在区段）。"""
-        return 0x08000000 <= addr <= 0x081FFFFF
+    def _exec_ranges(self) -> list:
+        """从 .axf 的 ELF 节头推导「可执行段」地址范围 [(start, end), ...]。
+
+        **为什么不写死 0x08000000..0x081FFFFF**：那是 STM32 把 Flash 放在 0x08000000、
+        且不超过 2MB 时才对的经验值。换个内核（XIP 到 0x60000000 的 i.MX RT、
+        Flash 在 0x00000000 的 nRF、代码跑在 RAM 的 bootloader）就会误判——
+        而 is_code_address 是调用栈回溯的合法性判据，误判会把真实 PC 当成噪声丢掉。
+        节头里 SHF_EXECINSTR 是链接器写下的**事实**，比任何型号表都可靠。
+
+        取名 _exec_ranges 而非 _code_ranges：后者是 `_load_code_ranges` 用来缓存
+        「符号（函数/对象）区间」的实例属性，同名会让 `getattr(self, "_code_ranges")`
+        拿到 bound method 而去迭代它（TypeError: method object is not iterable），
+        连带 is_covered / locate / 调用栈回溯全挂。两个东西语义不同，名字也必须不同。
+        """
+        try:
+            key = (os.path.abspath(self.axf_path or ""), self.axf_mtime)
+        except Exception:  # noqa: BLE001
+            return []
+        hit = _CODE_RANGE_CACHE.get(key)
+        if hit is not None:
+            return hit
+        out: list = []
+        path = os.path.abspath(self.axf_path or "")
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "rb") as f:
+                    elf = ELFFile(f)
+                    for sec in elf.iter_sections():
+                        try:
+                            if not (sec["sh_flags"] & SH_FLAGS.SHF_EXECINSTR):
+                                continue
+                            if sec["sh_type"] == "SHT_NOBITS":
+                                continue
+                            start = int(sec["sh_addr"] or 0)
+                            size = int(sec["sh_size"] or 0)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if start and size:
+                            out.append((start, start + size))
+            except Exception:  # noqa: BLE001
+                out = []
+        out.sort()
+        _CODE_RANGE_CACHE[key] = out
+        return out
+
+    def is_code_address(self, addr: int) -> bool:
+        """判断地址是否落在**本 .axf 的可执行段**（真实 PC / 返回地址所在区段）。
+
+        首选按 ELF 节头推导的段范围；推导不出来（无符号文件/节头被裁）时才退回
+        「STM32 典型布局 0x08000000..0x081FFFFF」这一经验值——此时返回值只是**猜测**，
+        调用方需要它时可以用 code_range_source 看这次用的是哪种判据。
+        """
+        try:
+            a = int(addr) & ~1
+        except Exception:  # noqa: BLE001
+            return False
+        for start, end in self._exec_ranges():
+            if start <= a < end:
+                return True
+        if self._exec_ranges():
+            return False
+        return 0x08000000 <= a <= 0x081FFFFF
+
+    @property
+    def code_range_source(self) -> str:
+        """本次 is_code_address 用的判据：elf-sections（事实）/ stm32-heuristic（经验值）。"""
+        return "elf-sections" if self._exec_ranges() else "stm32-heuristic"
 
     @property
     def axf_mtime(self):

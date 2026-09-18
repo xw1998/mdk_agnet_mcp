@@ -19,6 +19,7 @@
 - [十三、全量真机测试（批次37-38，F401 + Keil UVSOCK 实测）](#十三全量真机测试批次37-38f401--keil-uvsock-实测)
 - [十四、OpenOCD 控制台的「无前缀失败回包」（批次39，F401 + DAPLink 实测）](#十四openocd-控制台的无前缀失败回包批次39f401--daplink-实测)
 - [十五、RTOS 任务感知（批次40-41，F401 + DAPLink 实测）](#十五rtos-任务感知批次40-41f401--daplink-实测)
+- [十六、环境一致性：符号同源 / 器件系列 / D-Cache（批次49）](#十六环境一致性符号同源--器件系列--d-cache批次49)
 
 ## 一、真实 Keil 实测要点
 
@@ -1097,6 +1098,43 @@ DWARF，不做目标侧配合。验证固件 `example_gcc_project/freertos_probe
 
 **教训**：真机脚本要用 try/finally 收尾；怀疑读数时先 `netstat -ano | grep :4444`
 看清有几个实例，**不要拿一个可能被抢占的会话去反推自己的代码有问题**。
+
+## 十六、环境一致性：符号同源 / 器件系列 / D-Cache（批次49）
+
+这一轮的三个反馈看起来是三件事，根因是同一个：**工具信任「工程配置」，却不核对「板上真实是什么」**。
+跨仓库调试时，配置与实际不一致不会报错，只会输出**看似权威的错答案**——比没有数据更有害。
+
+- **符号与固件不同源 → PC 全解析成「假符号」**。现象：`flash_download` 烧的是 special 工程，
+  `enter_debug` 加载的却是 Keil 当前打开的**主固件**工程的 `.axf`；两套固件尺寸不同、函数地址错位，
+  PC 被解析成 `rt_mq_send_wait L2909`，而这个函数在 special 的 map 里**早被链接器裁掉了**——纯误导。
+  修法：烧录成功时记下「这次烧的是哪个工程/哪份 axf」，进调试时与当前符号文件做核验
+  （文件同一性优先，必要时用 Flash 内容指纹 + PC 反推偏移做硬证据），不一致就给出
+  `symbol_source_warning` 与 `next_actions`（`set_symbol_file` / `flash_debug` / `env_check`）。
+  **不要靠调用者「自己意识到」**——踩过一次就知道这个坑有多贵。
+- **器件系列配错 → 外设读数看着像样却全错**。现象：SVD 库装的是 F4 的、芯片是 H743，
+  读 RCC 返回 base=`0x40023800`（F4 的 RCC）且值是 `0xAAAAAAAA`，查不到 H7 才有的
+  `AHB3ENR`/`APB1LENR`。**内置寄存器表（periph.py）与内置内存地图同样是写死的 STM32F4 布局**，
+  它们比 SVD 更隐蔽——因为没有任何「加载了什么」的迹象可循。修法：`read_peripheral` /
+  `write_peripheral` / `list_peripherals` / `query_memory_map` / `svd_decode` 统一走设备守卫，
+  先读 `DBGMCU->IDCODE` 的 DEV_ID + `SCB->CPUID` 交叉校验实测芯片，系列不符**默认拒绝执行**
+  （`allow_mismatch=true` 可强读，但返回值会标注 mismatched 以免被当真值）。
+- **判据要来自「目标/ELF 自己说」而不是「我们写死的型号表」**。同一类问题还出现在
+  `is_code_address`：原来固定判 `0x08000000..0x081FFFFF`（STM32 布局 + 假设 Flash ≤2MB），
+  换个内核（XIP 到 `0x60000000` 的 i.MX RT、Flash 在 `0x00000000` 的 nRF、代码跑 RAM 的 bootloader）
+  就会误判，而它是**调用栈回溯的合法性判据**，误判会把真实 PC 当噪声丢掉。改为从 `.axf` 的
+  ELF 节头读 `SHF_EXECINSTR` 段范围（链接器写下的事实），取不到才退回经验值并用
+  `code_range_source` 标明本次用的是哪种判据。
+- **M7 的 D-Cache：读到全 0 不一定是「变量被清零」**。DAP 直读走 AHB，目标 D-Cache 使能时
+  可能读到**尚未回写的陈旧副本**；直写 RAM 也可能被脏行回写覆盖，两者都不报错。
+  修法分两层：`read_mem`/`write_mem` 命中 SRAM 时附 `cache` 字段提示；退化读数的提示里
+  补上因果与可执行动作（`cache_info` 看状态 → `dcache_maintain(action="clean_invalidate")`
+  做 clean+invalidate → 重读对比）。
+  **注意 D-Cache 维护不放在读路径里**：在读内存时顺手 clean+invalidate 并改用新值，
+  等于把「写目标状态」藏进只读工具，还会多发一次目标读、扰动本就不稳的首帧读数序列。
+  动手的动作必须是显式的独立工具。
+- **「原子性」判据也要按字段而不是整字**（承接批次48）：F429 上 `DWT_FUNCTION1` 稳定读回
+  `0x00000200`，写 0 也改不掉；该位落在 FUNCTION 字段（bit[3:0]）之外，按整字判「有没有武装」
+  会假报警。宁可放宽到字段，也不要把硬件保留位残留报成「没清干净」。
 
 ## 九、历次改进留档（按批次）
 

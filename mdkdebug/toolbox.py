@@ -48,10 +48,15 @@ TOOLSETS = {
         "restart_keil", "launch_uvision", "close_uvision", "list_uvision_instances",
         "read_console_output", "read_async_messages", "dismiss_dialog",
         "mdk_guide", "target_info", "session_state",
+        # 环境一致性体检（批次49）：核对外设型号/SVD/符号固件/D-Cache 是否与板上真实一致。
+        # 放在 core 是因为「默认面上就能看到」是它的价值——跨仓库调试踩坑时才想得起用。
+        "env_check",
     },
     "mem": {
         "read_mem_multi", "fill_mem", "search_mem", "snapshot", "snapshot_diff",
         "read_struct", "read_locals", "read_registers", "set_register", "cache_info",
+        # D-Cache 一致性维护（批次49）：M7 上 DAP 直读 RAM 可能取到陈旧副本，先 clean 再 invalidate。
+        "dcache_maintain",
     },
     "symbol": {
         "set_symbol_file", "list_symbol_projects", "find_symbol", "address_for_line",
@@ -113,6 +118,8 @@ TOOLSETS = {
         "trace_scope_stop", "trace_pcsample",
         "coverage_start", "coverage_read", "coverage_stop", "coverage_clear",
         "trace_etm_probe",
+        # 函数运行时线录制（批次49）：MDK/OpenOCD 两条链路分开实现，按 link 选路。
+        "trace_record",
     },
     # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组。
     "rtos": {
@@ -140,7 +147,7 @@ GROUP_NOTES = {
     "toolchain": "非 MDK 构建：gcc/make/cmake 工具链探测、编译、ELF 分析",
     "target": "目标档案：RISC-V/ESP32 等目标型号、调试配置推断、多核目标列选",
     "ocd": "OpenOCD：启停、命令直通、内存/寄存器/断点/烧录、GDB server",
-    "trace": "trace：SWO/ITM、RTT、变量时间线、DWT 计数、PC 采样、插桩",
+    "trace": "trace：SWO/ITM、RTT、变量时间线、函数运行时线录制、DWT 计数、PC 采样、插桩",
     "rtos": "RTOS 任务感知：任务列表/状态、栈水位、队列信号量对象",
 }
 

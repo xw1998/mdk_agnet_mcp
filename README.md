@@ -169,7 +169,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.0.6）
+│   ├── __init__.py           # 包初始化（版本号 0.1.0）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -186,7 +186,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 174 个工具定义
+│   └── server.py             # MCP Server 与 177 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART 三后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -235,10 +235,10 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **174** 个（**默认只暴露 37 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **177** 个（**默认只暴露 38 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
-- **MDK 族（107 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
-- **非 MDK 族（59 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**，25 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **MDK 族（110 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
+- **非 MDK 族（60 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**，26 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 - **常驻元工具（4 个）**——`toolset`（工具面按需装载）/ `list_tools` / `capabilities` / `get_version`：**永不被裁**，否则 AI 连工具清单都问不出来、也装不回来。
 - **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
 
@@ -253,6 +253,7 @@ python run_server.py --transport http --http-port 8300
 | `read_mem` | 读取目标内存（`n_bytes` 可写作别名 `length`；`reloc_delta` 用于 App 侧重定位后按运行地址读）。**脏读防护**（`verify`，默认 `auto`）：stop 后紧跟的首次读可能整帧返 0（真机实测 0x08022000 读出 16 个 `00`，重读即正确）——`auto` 在「首帧整帧退化（全 `0x00`/全 `0xFF`）或距最近一次 stop 不足 1 秒」时自动复读、**连续两次一致才采纳**，并返回 `read_confidence`/`reread_count`/`reread_consistent`/`degenerate`/`since_stop_s`；首帧是脏值时用 `first_read_hex` 留证。`verify=true` 强制确认、`false` 关闭（**布尔/字符串都收**，`verify=false` 与 `"false"` 等价）；Flash 区稳定读出全 `0xFF` 判为**已擦除的预期内容**（`content_note`，不降置信度）。**D-Cache 感知**：读 SRAM 且目标 D-Cache 已使能时附 `cache` 字段，提醒「DAP 直读可能拿到内存旧值（CPU 新值还在脏行里）」。**运行态读写**（`running`，默认 `live`）：目标全速跑时读内存**实测可行**，不再要求先停——`live` 直接读并附 `while_running`（读取期间目标是否在跑）；`running="halt"` 做**停-读-走**快照（自动 stop → 读 → run，返回 `sampling`/`was_running`/`paused_ms`/`resumed`/`halt_note`，恢复失败会告警），会打断目标、有副作用，须显式要求 | `addr`（`0x…` 或十进制）、`n_bytes`、`reloc_delta?`、`verify?`（默认 `auto`，可传布尔）、`running?`（`live`/`halt`，默认 `live`） |
 | `write_mem` | 写入目标内存，**默认写后回读校验**（`verify=true` → `verified`/`readback_hex`）：写入被静默忽略（目标运行中/只读区/另一实例并发写）时给出 `verified=false` 与原因，不再「看着成功其实没写进去」。**D-Cache 感知**：写 SRAM 且目标 D-Cache 已使能时附 `cache` 字段，提醒「写下的值可能稍后被脏行回写覆盖（写入仍报成功）」。**运行态写入**（`running`，默认 `live`）：`running="halt"` 用停-写-校验-走，避免写下的值立刻被 CPU 覆盖（同样返回 `paused_ms`/`resumed`/`halt_note`） | `addr`、`data_hex`（十六进制串，可带空格）、`verify?`（默认 true）、`running?`（`live`/`halt`，默认 `live`） |
 | `cache_info` | 读 `SCB->CCR` 判定目标是否使能 D-Cache / I-Cache（并粗略解析 CCSIDR 得到行/路/组与容量）。**为什么重要**：D-Cache 开着时 DAP **直读 RAM 可能是陈旧值**、**直写 RAM 可能被脏行回写覆盖**，两者都不报错——`read_mem`/`write_mem` 命中 SRAM 时也会附 `cache` 字段提示（探测结果 5 秒 TTL 缓存，不额外拖慢读写）；M3/M4 无 D-Cache、M7 默认不开，此时不产生任何噪声字段 | — |
+| `dcache_maintain` | **D-Cache 一致性维护**（M7 等带 D-Cache 的核）：`read_mem`/`write_mem` 命中 SRAM 时只提示「可能有陈旧值/被脏行回写覆盖」，本工具负责**动手消掉它**——`action="status"` 读 `SCB->CCR` 判使能位；`action="clean_invalidate"` 对目标地址先 `DCCMVAC` clean（把脏行写回内存）再 `DCIMVAC` invalidate（丢掉缓存副本），顺序不能反。维护后**前后各读一遍并对比**：值变了就明说「此前那次读确实取到了未回写的陈旧副本」，没变就如实说「倾向于该地址在 RAM 里就是这些值」，读不到 CCR 就说无法判断——**不猜**。目标在跑时读到的差异可能只是正常并发写，会附 `running` 提醒 | `action?`（`status`/`clean_invalidate`）、`addr?`、`n_bytes?` |
 | `run` | 全速运行 | — |
 | `run_timeout` | 全速运行 N 毫秒后自动暂停并返回停靠位置，用于验证时序；返回 `requested_run_ms` / `actual_run_ms` / `stop_wait_ms` / `total_ms` 四段计时，排查时序不再只能看一个含糊的 `waited_ms` | `timeout_ms`（默认 1000） |
 | `stop` | 暂停执行，**默认带停止确证**：停止是异步生效的（真机实测 stop 回 ok 后紧跟的 `get_status` 仍报「执行中」），故返回 `stopped`/`stop_verified`/`waited_ms`/`state_after_stop`，`verify=false` 可只发命令不确认。**看门狗防御**：暂停期间看门狗（IWDG）仍在计数，halt 超过溢出时间就被复位、RAM 现场全丢——默认自动置位 DBGMCU 冻结位并返回 `watchdog_freeze`，`freeze_watchdogs=false` 可关闭 | `verify?`（默认 true）、`timeout?`、`freeze_watchdogs?`（默认 true） |
@@ -307,6 +308,7 @@ python run_server.py --transport http --http-port 8300
 | `target_info` | 查询目标器件信息：实时读 DBGMCU->IDCODE 判 DEV_ID/REV_ID 映射型号 + SCB->CPUID 判内核 + 标称 Flash/RAM 容量与内存布局，排查资源吃紧/选错型号/容量不符 | — |
 | `profile_sampling` | 采样剖析定位热点：让目标运行，周期性暂停采 PC 归到函数统计占比（run/stop 采样，非硬件 ETM，会轻微扰动时序），找哪个函数占 CPU 最多 | `duration_ms`、`interval_ms`、`max_samples` |
 | `mdk_guide` | 环境自检+工作流引导：一键自检 Keil/UVSOCK/UV4/.axf/源码漂移/调试态/RTOS 类型，返回推荐调试工作流与各场景应调用的工具，AI 落地第一件事先调它 | — |
+| `env_check` | **环境一致性体检（跨仓库调试的防呆入口）**：一次问清「我的配置与板上真实情况是否一致」——① **芯片身份**（读 DBGMCU->IDCODE 的 DEV_ID + SCB->CPUID 交叉校验，多地址探测 F1/F4/F7 的 `0xE0042000` 与 H7 的 `0x5C001000`）；② **外设型号一致性**（工程 `<Device>` / 内置寄存器表 / 已加载 SVD 三方与实测芯片逐项 `series_match`）；③ **符号与固件同源性**（比对「最近一次烧录记录的工程 axf」与实际符号文件，必要时用 Flash 内容指纹 + PC 反推偏移做硬证据）；④ **D-Cache 状态**。返回 `problems` + `next_actions` + `verdict`。**为什么必须有**：烧的是 special 工程、`enter_debug` 加载的却是 Keil 当前打开的主固件 axf 时，两套固件尺寸不同 → PC 全解析成**假符号**（真机踩到 PC 停在 map 里早被裁剪掉的函数上）；SVD 装的是 F4 而芯片是 H743 时，读 RCC 会返回 `0x40023800` 且全是 `0xAAAAAAAA`——**两者都不报错、只输出看似权威的错答案** | `project?`、`link?`、`content_check?` |
 | `capabilities` | **能力自述**：一次问清「这台机器上现在能干什么」——两条调试通道各自可用性（UVSOCK 交互 / UV4 命令行）、内置模块（SVD / 命令知识库 / 工程编辑 / 定位器）、工程与符号来源、工具面（注册总数 / 当前装载组 / 收起数与装回来的办法，`tool_surface`）。AI 冷启动或换环境后的第一个工具 | — |
 | `enter_debug` | 自动进入 Keil 调试模式；**已在调试态时返回 `already_in_debug=true`**，不再报失败（省一轮 `exit`/`enter`）；注意副作用：工程勾选 Update Target before Debugging 时会**自动下载最新程序进 Flash**。进调试后**默认自动冻结看门狗**（`freeze_watchdogs`） | `freeze_watchdogs?`（默认 true）；进调试时会**报告 `.uvoptx` 遗留断点**（这些断点会随进调试被 Keil 自动恢复，软件断点命令清不掉，是「目标行为诡异」的隐蔽干扰源） |
 | `exit_debug` | 自动退出 Keil 调试模式 | — |
@@ -431,7 +433,7 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 | `ocd_gdb` | 借 GDB 批处理做一件 OpenOCD 原生不好做的事（可指定 `elf` 与 `gdb` 路径） | `commands`、`elf?`、`gdb?` 等 |
 | `ocd_log` | 读 OpenOCD 日志尾巴（可按 `keyword` 过滤），排查启动失败用 | `lines?`、`keyword?` |
 
-### trace（`trace_*`，20 个）
+### trace（`trace_*`，21 个）
 
 三条通路：**SWO/ITM**（经 TPIU 单线输出）、**RTT**（目标内存环形缓冲，主机侧自研读写，不依赖 SEGGER 上位机）、**SWD 采样**（`halt` 采 PC，明确标注侵入式）。三条通路解码出的事件（含 MTF 帧）汇入同一缓冲区，由 `trace_events` 统一取。
 
@@ -464,6 +466,8 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 | `coverage_stop` | 停掉后台采样线程并出最终报告（默认把 `DEMCR`/`DWT_CTRL` 恢复原值，`restore=false` 可保留） | `restore?`、`top?`、`unseen?` |
 | `coverage_clear` | 清空已有样本，从这一刻重新开始统计 | — |
 | `trace_etm_probe` | **ETM/ETB 指令级 trace 能力探测**（只探测、不抓取）：走一遍 CoreSight ROM table（默认 `0xE00FF000`）、认一认常规 ETM 窗口 `0xE0041000`（Cortex-M4 PIL 调试地图里这段就是 ETM trace unit，窗口上是合法 CoreSight 组件即说明单元在），并交代两条链路的真实抓取能力。`present`（芯片上有没有，**没测出来给 `null`，不拿「抓不到」冒充「没有」**）与 `supported`（恒为 `false`，Keil/UVSOCK 无 trace 抓取接口、OpenOCD 对 Cortex-M 不提供 ETM 抓取驱动）分得很开，并给出替代方案（SWO/ITM、RTT、PC 采样、DWT）。**不做部件号→名字的硬猜**：只给原始部件号与架构规定的组件类别码 | `link?`、`rom_base?`、`scan?` |
+
+| `trace_record` | **函数运行时线录制（细粒度事件流）**：在选定函数的**入口**下断点，每次命中记一条事件（时间、PC、所属函数、调用者、LR/SP、DWT 周期数），并给出按函数统计、调用者分布与时间线。**MDK 与 OpenOCD 两条链路的抓取方式完全不同**（Keil 走 UVSOCK 的 `BS`/`BK` + `wait_breakpoint`，OpenOCD 走 telnet 的 `bp`/`rbp` + `wait_halt`，后者还要用「读得到核寄存器」当**硬证据**判是否真停），所以**分开实现**、由 `link=auto|keil|ocd` 选路，返回值写明这次实际用的链路。`funcs`/`pattern` **至少给一个**（全表下断点既不可能也没意义）；`max_breakpoints` 是愿意占用的槽位（默认 4，硬件断点一般 6 个、M0 只有 4 个），要监控的函数多于槽位时只布前 N 个，`armed`/`skipped` 如实说明。`watch_exit=true` 时命中入口后用 LR **动态补返回地址断点**拿 exit 事件（槽位不够就没有 exit，返回里说明，不编）。**录制的是事件流不是精确耗时**：`gap_cyc` 是相邻两次命中的 CYCCNT 差值（精确耗时用 `profile_function`），`depth_est` 由 SP 推算属估计值；命中不落在任何已知函数区间时标 `unknown` 并保留原 PC，**不硬塞函数名**——符号与板上固件不同源时正是这种「假符号」场景。`reloc_delta` 用于 App 重定位场景 | `action?`（`run`/`status`/`read`/`stop`）、`funcs?`、`pattern?`、`max_events?`、`max_ms?`、`max_breakpoints?`、`watch_exit?`、`kind?`、`func?`、`limit?`、`reloc_delta?`、`leave_halted?`、`link?` |
 
 ### RTOS 任务感知（`rtos_*`，3 个）
 
@@ -540,13 +544,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-174 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 37 个**（`core` 组 33 个 + 4 个元工具），其余 137 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+177 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 38 个**（`core` 组 34 个 + 4 个元工具），其余 139 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 174 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 177 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -555,16 +559,16 @@ toolset(action="load",   toolsets="all")        # 一次全装 174 个（=full/*
 
 | 组名 | 内容 |
 |---|---|
-| `core` | 进出调试 / 运行控制 / 状态 / 跨会话状态（33 个） |
-| `mem` | 内存与外设读写（10 个） |
-| `symbol` | 符号与源码定位（8 个） |
+| `core` | 进出调试 / 运行控制 / 状态 / 跨会话状态 / 环境一致性体检（34 个） |
+| `mem` | 内存与外设读写 / D-Cache 一致性维护（11 个） |
+| `symbol` | 符号与源码定位（9 个） |
 | `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑（16 个） |
 | `serial` | 宿主机串口监听与命令应答 + Modbus 主站（14 个） |
 | `advanced` | 诊断 / 剖析 / SVD / 工程编辑 / 复位循环识别等进阶能力（26 个） |
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
 | `target` | 非 MDK：目标档案查询与自动识别、工程现场调试配置发现、多核目标列举与切换（7 个） |
 | `ocd` | 非 MDK：OpenOCD 会话 / 内存 / 寄存器 / 断点 / 烧录（17 个） |
-| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 插桩组件部署 / 代码覆盖率 / ETM 能力探测（25 个） |
+| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 函数运行时线录制 / 插桩组件部署 / 代码覆盖率 / ETM 能力探测（26 个） |
 | `rtos` | RTOS 任务感知：任务列表 / 栈水位 / 队列信号量（3 个；跨 Keil 与 OpenOCD 两条链路） |
 
 四条防翻车约定：**收起 ≠ 坏了**——收起只是不进工具清单，`load` 装回来立刻可用（返回值里的 `exposed` 是新暴露数）；**`list_tools` / `get_version` / `capabilities` / `toolset` 四个元工具永不被裁**（否则 AI 连工具清单都问不出来也装不回来），未归类的工具一律保留、组名写错时只告警不裁剪（宁可少裁不错杀）；**装完若客户端报「未知工具」**，多半是它缓存了旧的 tools/list——重新拉一次清单即可；**装载状态随时可核对**：`toolset(action="status")` 与 `capabilities.tool_surface` 都会报当前装载组、收起数与注册总数。
@@ -634,7 +638,7 @@ toolset(action="load",   toolsets="all")        # 一次全装 174 个（=full/*
 ```
 
 > 请将示例中的绝对路径替换为你的工程实际路径。
-#### 注入自定义符号工程
+### 注入自定义符号工程
 
 可切换的符号工程（供 `list_symbol_projects` 列表、配合 `set_symbol_file` 切换）默认仅含仓库内置的
 `mdk_test`（路径相对仓库根自动推导，`clone` 后编译出 `.axf` 即自动可用，不写死本机绝对路径）。
@@ -713,7 +717,7 @@ AI 修改代码后，可按如下顺序实现"自己编译、自己烧录、自�
 **跑全部**（默认 4 路并发，本机约 72s；串行约 157s，两者结论一致）：
 
 ```bash
-python tools/run_all_tests.py            # 实际工具数 vs tests/README 写死的断言 + 22 个模块
+python tools/run_all_tests.py            # 实际工具数 vs tests/README 写死的断言 + 全部批次模块
 python tools/run_all_tests.py --fast     # 只跑关键 5 批（改一两个模块时用，约 48s）
 python tools/run_all_tests.py --only test_batch36,test_batch35   # 指定模块
 python tools/run_all_tests.py --jobs 1   # 退化成串行（怀疑并发干扰时用）
@@ -782,7 +786,7 @@ modbus_session(action="close")                 # 用完把口还回去
 - **连接缓存**：常驻服务内共享一条 TCP 连接，`idle_timeout` 空闲自动断开、下次调用自动重连，兼顾实时性与资源释放；
 - **可靠性优先**：不可信的数据不参与结论（脏读防护 / 停止确证 / 粘滞位时效）、并发调用统一串行化、串口用完就还——速查见上节「可靠性约定」，实测数据与踩坑过程见 [docs/PITFALLS.md](./docs/PITFALLS.md)；
 - **输出控制做在调用出口**：`compact` / `max_lines` / `full` 统一在 MCP 调用出口实现（含 `batch` 子命令），
-  而不是逐个改 99 个工具——新增工具自动继承，也不会有人漏改；非受控工具（如 `write_mem`）保持原样；
+  而不是逐个改上百个工具——新增工具自动继承，也不会有人漏改；非受控工具（如 `write_mem`）保持原样；
 - **内存读写分块**：超过单次上限（16 KB）自动分块读，规避 Keil 协议长度限制；
 - **地址解析**：工具层统一支持 `0x` / `0b` / `0o` 前缀或纯十进制；
 - **编译烧录选型**：采用 Keil 官方 `UV4.exe` 命令行（`-b`/`-r`/`-f`/`-o`），退出码 0=成功、1=成功有警告、2=有错误、≥3=不完整；编译输出经 `-o` 重定向到临时日志文件捕获；`build_and_flash` 在编译成功后自动接烧录，形成闭环；
