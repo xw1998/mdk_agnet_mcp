@@ -120,6 +120,8 @@ TOOLSETS = {
         "trace_etm_probe",
         # 函数运行时线录制（批次49）：MDK/OpenOCD 两条链路分开实现，按 link 选路。
         "trace_record",
+        # CMSIS Event Recorder（批次53）：MDK 原生事件缓冲，走调试器读内存，不要 SWO。
+        "trace_eventrec",
     },
     # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组。
     "rtos": {

@@ -1465,7 +1465,7 @@ GUIDE = {
         "通用性：变量 scope、RTT、halt 采样、DWT 计数、PC 采样两条链路通用；"
         "**SWO（trace_swo_start）只走 OpenOCD**，Keil 用户请用 trace_rtt_* 或 trace_scope/trace_pcsample。\n"
         "  MDK 原生的 Event Recorder / Event Statistics 是 **uVision 自己的窗口能力**"
-        "（走调试器读目标 RAM 缓冲，不需要 SWO 引脚），本工具集不解码它的缓冲。\n"
+        "（走调试器读目标 RAM 缓冲，不需要 SWO 引脚）——**本工具集能直接解码**：用 trace_eventrec 读这份缓冲（批次53 起）。\n"
         "ITM 结构化解码（trace_decode）与 itm 报文读取两条链路通用。"
     ),
     "swd_wiring": (
@@ -1503,8 +1503,13 @@ GUIDE = {
         "两个前提：① **必须插桩**——工程要链组件并调 API，没调的地方不会有记录，"
         "它**不是**自动捕获所有函数；② 要挂着调试会话才看得到（数据在目标 RAM，靠调试器搬，"
         "不像 RTT 有独立 Viewer 能离线看）。\n"
-        "  · 本工具集**不解码** Event Recorder 的目标侧缓冲（它的 Event Record 是私有格式，"
-        "且事件名要配 SCVD），这条要在 uVision 自己的 Event Recorder / Event Statistics 窗口里看。\n"
+        "  ✅ **本工具集能解码** Event Recorder 的目标侧缓冲：trace_eventrec"
+        "（action=read 给事件流、action=stats 给次数/总时间/最短/最长/平均，"
+        "与 uVision 的 Event Statistics 同口径）。边界仍要如实知道：① 事件名靠工程里的 "
+        "SCVD 文件，本工具只给 component/message 编号与槽位号，给不了你那套名字；"
+        "② level 不随记录存储（写入前 id 与 0xFFFF），只有 component=0xEF 那组"
+        "（EventStartX/EventStopX）能按 message 反推组别 A/B/C/D 与槽位；"
+        "③ 目标没插桩就一条数据都没有，这种情况会明确报 eventrec-symbol-missing。\n"
         "  ✅ **变量 scope（非侵入）**：DAP 读 RAM 不需要停核，主机侧按周期轮询就能把"
         "变量连成时间线 → trace_scope_start/read/stop。代价：轮询有间隔，"
         "两次采样之间的跳变看不到；采样率是主机轮询率而非目标周期。\n"
@@ -1532,7 +1537,7 @@ GUIDE = {
         "    所以 RTT / Event Recorder 是「插桩但不停机」（低侵扰，SEGGER 把这条叫非侵入式调试），"
         "trace_record 是「免插桩但停机」——两者互补，不是同一类。\n"
         "  【选型：SWD 两线做函数级观测】按上面两个维度分四类——\n"
-        "    · 改得动代码、要求不停机 → MDK Event Recorder + Event Statistics（原生窗口），"
+        "    · 改得动代码、要求不停机 → MDK Event Recorder + Event Statistics（原生窗口，本工具集用 trace_eventrec 也能读），"
         "或 SEGGER RTT / SystemView（可离线看）。\n"
         "    · 改不动代码、能接受停机 → trace_record（盯少数关键函数）。\n"
         "    · 只看整体热点占比 → trace_pcsample（不 halt）/ trace_profile（停机、更确定）。\n"
@@ -1565,7 +1570,7 @@ def register(server, js=None) -> int:
             "swd_wiring（接线）/ links（Keil 链路 vs OpenOCD 链路：观测类工具都带 "
             "link 参数，两条链路的取舍）/ rtt_notes / itm_notes / "
             "when_unavailable（没数据时怎么排查）；留空返回全部。\n"
-            "**没有 SWO 引脚并不等于不能 trace**：RTT 只要 SWD，采样剖析连缓冲都不要，"
+            "**没有 SWO 引脚并不等于不能 trace**：RTT 只要 SWD，采样剖析连缓冲都不要，MDK 原生 Event Recorder / Event Statistics 也只要 SWD（trace_eventrec 直接读它的缓冲），"
             "只是能拿到的东西不同——这份指南就是帮你按手头硬件选对路子。"
         ),
     )

@@ -513,6 +513,16 @@ ERROR_CODES = {
             "只要「整体热点占比」、不需要进入/退出事件：改用 trace_pcsample 或 trace_profile",
         ],
     },
+    "eventrec-symbol-missing": {
+        "text": "符号文件里没找到 EventRecorderInfo，定位不到 Event Recorder 缓冲",
+        "next_actions": [
+            "确认目标工程真的链了 CMSIS Event Recorder 组件并调了 EventRecordXxx"
+            "（它不是自动捕获，没插桩就一条数据都没有）",
+            "符号可能被 --gc-sections 回收了：给 trace_eventrec 传 info_addr 直接指地址，"
+            "或在工程里保留 EventRecorderInfo 符号",
+            "只想看热点/函数进入退出（不需要插桩）：改用 trace_pcsample / trace_record",
+        ],
+    },
     "unknown-error": {
         "text": "未归类的失败",
         "next_actions": ["调 keil_health 看 Keil 侧状态", "用 read_async_messages 读 Keil 的异步报错原文"],
@@ -548,6 +558,9 @@ _RULES = (
     (r"没找到 RTT 控制块", "trace-rtt-not-found"),
     (r"不是 RTT 控制块|控制块字段不合理|控制块太短|控制块数据不足", "trace-rtt-invalid"),
     (r"没有正在进行的 SWO 采集", "trace-swo-not-running"),
+    # Event Recorder 定位失败（批次53）：工具自己会给 eventrec-symbol-missing，
+    # 这条规则是给「只有中文文本」的路径兜底，别让它落进 unknown-error。
+    (r"没找到符号\s*EventRecorderInfo", "eventrec-symbol-missing"),
     (r"OpenOCD 拒绝了|^\s*Error\s*:", "ocd-command-failed"),
     # ---- MDK / Keil 链路 ----
     (r"未定位到 UV4|UV4\.exe.*(不存在|找不到)|找不到 UV4", "uv4-not-found"),

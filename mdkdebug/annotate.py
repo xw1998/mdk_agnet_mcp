@@ -58,6 +58,8 @@ READONLY = {
     "ocd_cfg_list", "ocd_status", "ocd_log", "ocd_probe", "ocd_flash_info",
     "ocd_read_mem",
     "trace_guide", "trace_status", "trace_decode", "trace_events",
+    # Event Recorder（批次53）：只读目标 RAM 缓冲 + 本地 .axf，不改目标状态、不占资源。
+    "trace_eventrec",
     "trace_rtt_find", "trace_swo_read",
     # 串口：只列端口与读日志
     "serial_list_ports", "serial_monitor_status", "serial_read",

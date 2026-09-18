@@ -59,6 +59,7 @@ from . import reloc as _reloc
 from . import chipid as _chipid
 from . import rtrecord as _rtr
 from . import rtrace as _rtrace
+from . import eventrec as _eventrec
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 
@@ -5154,6 +5155,71 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     pass
             _trace_rec.update({"report": rep, "at": time.time()})
             return _js(rep)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "action": action, "error": str(e)})
+
+    @server.tool(
+        name="trace_eventrec",
+        title="读 CMSIS Event Recorder（MDK 原生、纯 SWD 可用的事件缓冲）",
+        description=(
+            "读并解码目标 RAM 里的 CMSIS Event Recorder 缓冲——这是 MDK 原生、"
+            "**不需要 SWO 引脚**的事件记录通路（uVision 的 Event Recorder / Event "
+            "Statistics 窗口读的就是这份数据，数据通路是调试器读目标内存）。\n"
+            "action：\n"
+            "  status —— 录制器状态：协议版本、记录条数、缓冲地址、是否在记录、"
+            "写指针、时间戳源与频率、EventStatus 签名校验；\n"
+            "  read   —— 最近 N 条事件（旧→新）：目标侧时间戳、组件号、消息号、"
+            "val1/val2、中断上下文、序号、首/末标记；\n"
+            "  stats  —— EventStartX(slot)/EventStopX(slot) 成对事件的次数与耗时聚合"
+            "（即 uVision 的 Event Statistics 口径：次数/总时间/最短/最长/平均）。\n"
+            "**两个前提必须知道**：① 目标工程要链了 Event Recorder 组件并真的调了 "
+            "EventRecordXxx —— 它不是自动捕获，没插桩就一条数据都没有（这种情况会明确报"
+            "「没找到符号 EventRecorderInfo」）；② 事件名要靠工程里的 SCVD 文件，本工具只能"
+            "给 component/message 编号与槽位号，给不了你那套名字。\n"
+            "三条如实披露的口径：level 不随记录存储（写入前 id 被 &0xFFFF），只有 "
+            "component=0xEF 那组（EventStartX/EventStopX）能按 message 反推组别 A/B/C/D "
+            "与槽位；ts 是目标侧时间戳（DWT CYCCNT / SysTick），不是主机时间；读到写一半的"
+            "记录会跳过并计数，不当数据。\n"
+            "定位：默认用当前符号文件里的 EventRecorderInfo 符号，也可用 info_addr 直接指地址。"
+            "link 选内存通路：auto（默认）/ keil / ocd。"
+        ),
+    )
+    async def trace_eventrec(action: str = "status", link: str = "auto",
+                             elf: str = "", info_addr: str = "",
+                             limit: int = 100) -> str:
+        try:
+            a = (action or "status").strip().lower()
+            xa = 0
+            sv = str(info_addr or "").strip()
+            if sv:
+                try:
+                    xa = int(sv, 16) if sv.lower().startswith("0x") else int(sv, 10)
+                except ValueError:
+                    return _js({"ok": False, "action": a,
+                                "error": "info_addr 解析失败：%r（支持 0x 前缀十六进制或十进制）"
+                                         % info_addr,
+                                "next_actions": ["地址类参数支持 0x 前缀；"
+                                                 "也可用当前符号文件里的 EventRecorderInfo 符号"]})
+            ef = str(elf or "").strip() or ((_symbol_cfg or {}).get("axf") or "")
+            if a == "status":
+                out = _eventrec.status(elf=ef, info_addr=xa, link=link)
+            elif a in ("read", "events", "timeline"):
+                out = _eventrec.read(elf=ef, info_addr=xa, limit=int(limit or 100),
+                                     link=link)
+                if isinstance(out, dict) and out.get("ok"):
+                    out["action"] = "read"
+            elif a in ("stats", "statistics"):
+                out = _eventrec.stats(elf=ef, info_addr=xa,
+                                      limit=int(limit or 0), link=link)
+                if isinstance(out, dict):
+                    out["action"] = "stats"
+            else:
+                return _js({"ok": False, "action": a,
+                            "error": "未知 action：%r" % action,
+                            "available": ["status", "read", "stats"]})
+            if isinstance(out, dict) and ef:
+                out.setdefault("symbol_axf", ef)
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "action": action, "error": str(e)})
 
