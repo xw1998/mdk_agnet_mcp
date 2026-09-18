@@ -596,10 +596,19 @@ def section_f():
     check("F2 拒绝时给出确认型号/换 SVD 的可执行说明",
           "svd_list" in (g.get("note") or "") and "allow_mismatch" in (g.get("note") or ""),
           g.get("note"))
+    check("F2b 拒绝时也给机器可读的 next_actions，且按实测系列给具体器件名提示"
+          "（batch50）",
+          isinstance(g.get("next_actions"), list) and g["next_actions"]
+          and any("STM32F429xx" in a for a in g["next_actions"])
+          and any("allow_mismatch" in a for a in g["next_actions"]), g.get("next_actions"))
     g2 = C.guard_configured_device(MemClient(), "STM32H743xx", allow_mismatch=True,
                                    chip=chip_f4)
     check("F3 allow_mismatch=true → 放行但明确标注本次结果不可信",
           g2["allowed"] is True and "不可信" in (g2.get("note") or ""), g2)
+    check("F3b 强读放行时同样给出「换成实测系列那份 SVD」的 next_actions（batch50）",
+          isinstance(g2.get("next_actions"), list) and g2["next_actions"]
+          and any("svd_list" in a or "svd_file" in a for a in g2["next_actions"]),
+          g2.get("next_actions"))
     g3 = C.guard_configured_device(MemClient(), "STM32H743xx", chip=chip_h7)
     check("F4 型号一致 → 放行且不带错误码",
           g3["allowed"] is True and g3["verdict"] == "matched"
@@ -648,6 +657,41 @@ def section_g():
         SV._client = saved
     check("G6 Backend 子类各自声明链路名（机制分开实现，接口对齐）",
           RT.KeilBackend.name == "keil" and RT.OcdBackend.name == "ocd", "")
+
+    # G7/G8（batch50）：UVSOCK 的 socket 是懒连接，没连 ≠ 链路不可用
+    class _Phy:
+        is_connected = False
+    class _FakeCli:
+        def __init__(self):
+            self.phy = _Phy()
+            self.tried = 0
+        def _ensure_connected(self):
+            self.tried += 1
+            self.phy.is_connected = True
+    saved = SV._client
+    try:
+        fc = _FakeCli()
+        SV._client = fc
+        be, err = RT.pick("keil")
+        check("G7 懒连接尚未发生时先主动连一次，不当成「链路不可用」"
+              "（env_check 因此才不会连芯片都不去实测）",
+              be is not None and err is None and fc.tried == 1, (be, err, fc.tried))
+    finally:
+        SV._client = saved
+
+    class _BadCli:
+        def __init__(self):
+            self.phy = _Phy()
+        def _ensure_connected(self):
+            raise OSError("Connection refused(mock)")
+    try:
+        SV._client = _BadCli()
+        be, err = RT.pick("keil")
+        check("G8 真连不上 → 报底层真实原因（不替 Keil 猜），且不换另一条链路顶上",
+              be is None and err["reason"] == "no-keil-link"
+              and "连不上" in err["error"] and "Connection refused(mock)" in err["error"], err)
+    finally:
+        SV._client = saved
 
 
 def section_h():
@@ -964,6 +1008,15 @@ def section_k():
               r.get("verdict") in ("mismatch", "unverified"), r.get("verdict"))
         check("K21 note 讲清 consistent/unverified 的含义边界",
               "没发现问题" in (r.get("note") or ""), r.get("note"))
+        check("K21b link_state 把「链路不可用」与「已连通」分开说（batch50）",
+              r.get("link_state") == "unavailable", r.get("link_state"))
+        check("K21c 没实测出芯片 → guard.active=false，并**明说守卫本次没生效**、"
+              "别把「体检没报错」当成「一定没问题」",
+              r["guard"]["active"] is False
+              and "没有生效" in r["guard"]["note"]
+              and "自行核对型号" in r["guard"]["note"]
+              and any("enter_debug" in a for a in r["guard"]["next_actions"]),
+              r.get("guard"))
     finally:
         rest_pick()
         rest_cli()
@@ -991,6 +1044,9 @@ def section_k():
               r["problems"])
         check("K25 有真问题时 verdict=mismatch（不吞掉）",
               r.get("verdict") == "mismatch", r.get("verdict"))
+        check("K25b 实测出芯片系列 → guard.active=true，说明守卫生效（batch50）",
+              r["guard"]["active"] is True and r["guard"]["next_actions"] == []
+              and "守卫生效" in r["guard"]["note"], r.get("guard"))
     finally:
         rest_sc()
         rest_probe()

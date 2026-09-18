@@ -317,6 +317,19 @@ def probe_chip(client) -> dict:
     return out
 
 
+def _series_to_device_hint(chip: dict) -> str:
+    """实测系列 → 可用的 SVD 器件名提示（查不到就给系列名，让调用方自己 select）。
+
+    只在「已知的常见系列」上给具体型号；不认识就退回系列名，不编型号。
+    """
+    s = str((chip or {}).get("series") or "")
+    table = {"STM32F4": "STM32F429xx", "STM32F7": "STM32F767xx",
+             "STM32H7": "STM32H743xx", "STM32L4": "STM32L476xx",
+             "STM32F1": "STM32F103xx", "STM32F0": "STM32F072xx",
+             "STM32G4": "STM32G474xx", "STM32L0": "STM32L073xx"}
+    return table.get(s, s or "STM32H743xx")
+
+
 def guard_configured_device(client, configured_name: str, allow_mismatch: bool = False,
                             what: str = "读外设", chip: dict = None) -> dict:
     """外设级操作前的环境校验：配置里的型号 vs 实测芯片。
@@ -337,9 +350,19 @@ def guard_configured_device(client, configured_name: str, allow_mismatch: bool =
             out["note"] = ("确认芯片型号后改用对应的 .svd（svd_list(device=「STM32H743xx」) "
                            "或 svd_file=）；确知自己在做什么时可传 allow_mismatch=true 强读，"
                            "此时返回值会标 mismatched 以免被当成真值。")
+            # batch50：拒绝也要机器可读的下一步（与统一信封的 next_actions 对齐）
+            out["next_actions"] = [
+                "改用与实测系列一致的寄存器表/SVD：svd_list(device=「%s」) 或 svd_file="
+                % _series_to_device_hint(chip),
+                "或改用不依赖内置布局的读法：read_mem 直接按地址读，再自己对字段",
+                "确知自己在做什么时可传 allow_mismatch=true 强读（结果会标 mismatched）",
+            ]
         else:
             out["note"] = ("器件识别不一致但你要求强读：%s 本次结果**不可信**，别当真实布局用。"
                            % m.get("reason"))
+            out["next_actions"] = [
+                "把 SVD/寄存器表换成实测系列那一份后重跑（svd_list(device=…) 或 svd_file=）",
+            ]
     elif m.get("verdict") == "unknown":
         out["note"] = ("无法比对配置型号与实测芯片（%s）：继续执行，但外设读数请自行核对。"
                        % m.get("reason"))

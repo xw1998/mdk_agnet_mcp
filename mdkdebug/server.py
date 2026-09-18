@@ -5169,7 +5169,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "比对）、dcache（D-Cache 是否使能）、last_flashed（本进程最近一次烧录的工程与 "
             ".axf）、problems / next_actions。\n"
             "**判据一律拿目标说话**：读不到 IDCODE 就说 unknown，不拿工程配置冒充实测结果；"
-            "allow_mismatch 只影响「后续外设工具要不要放行」，不改变这里的判定。"
+            "allow_mismatch 只影响「后续外设工具要不要放行」，不改变这里的判定。\n"
+            "**guard 字段告诉你器件守卫这次到底有没有生效**：active=false 表示没能实测出芯片"
+            "型号（多数是目标没在调试态），此时外设级读数**没有**型号核对保护，请自行核对型号——"
+            "别把「体检没报错」当成「一定没问题」。\n"
+            "链路是懒连接的：只连 UVSOCK **不会**进调试/停机/下载，可以放心先跑本工具看环境。"
         ),
     )
     async def env_check(project: str = "", link: str = "auto",
@@ -5186,6 +5190,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             out["link"] = be.name if be is not None else None
             if be is None:
                 out["link_error"] = (berr or {}).get("error")
+                out["link_state"] = "unavailable"
+            else:
+                out["link_state"] = "connected"
             # 1) 实测芯片
             if client is not None:
                 try:
@@ -5273,6 +5280,24 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                  "error_code": "chip-unknown"})
                 actions.append("确认目标已进入调试（Keil: enter_debug / OCD: ocd_start→halt）"
                                "后重跑 env_check")
+            # 器件守卫有没有真的生效：只有实测出系列（confidence=high）才谈得上核对
+            guard_active = bool(chip.get("series")) and chip.get("confidence") == "high"
+            out["guard"] = {
+                "active": guard_active,
+                "what": "外设级读写（list_peripherals/read_peripheral/write_peripheral/"
+                        "svd_decode/query_memory_map）在型号不符时默认拒绝执行",
+                "note": ("实测芯片系列已拿到，守卫生效；下面的 checks 是按实测结果逐项核对"
+                         if guard_active else
+                         "**器件守卫本次没有生效**：没能实测出芯片型号（%s），"
+                         "外设级读数没有型号核对保护，请自行核对型号后再采信"
+                         % (chip.get("reason") or "原因未知")),
+                "next_actions": [] if guard_active else [
+                    "确认目标处于调试态（Keil: enter_debug / OpenOCD: ocd_start→halt）后重跑 env_check",
+                    "不带调试器时可用 ocd_probe / ocd_reg 读 DEV_ID 间接核对",
+                ],
+            }
+            if not guard_active:
+                actions.extend(out["guard"]["next_actions"])
             out["problems"] = problems
             out["next_actions"] = list(dict.fromkeys(actions))
             if problems:

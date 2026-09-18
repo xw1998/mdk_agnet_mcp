@@ -270,15 +270,26 @@ def pick(link: str = "auto", who: str = "录制函数时间线"):
     return None, _fail("auto", kerr, oerr)
 
 def _try_keil():
+    # batch50：UVClient 的 socket 是**懒连接**——首次真正用到才开。若只看
+    # phy.is_connected，会把「还没连」误报成「链路不可用」，于是 env_check 连芯片都
+    # 不去实测（守卫静默失效）。这里先主动连一次：连 UVSOCK 只是开 TCP 与握手，
+    # **不进调试、不 halt、不碰目标**，与其余工具首次调用时的行为一致，无副作用。
     try:
         from . import server as _server
         c = getattr(_server, "_client", None)
         if c is None:
-            return None, "本进程还没有 Keil 会话（先 enter_debug）"
+            return None, "本进程还没有 Keil 客户端实例（先创建 MCP 服务）"
+        if not c.phy.is_connected:
+            try:
+                c._ensure_connected()
+            except Exception as e:  # noqa: BLE001
+                # 连不上就是真不可用；异常里已带端口/Keil 进程的体检结论，原样透出
+                return None, "连不上 Keil UVSOCK：%s" % e
         b = KeilBackend(c)
         if b.available():
             return b, None
-        return None, "Keil 侧的 UVSOCK 会话没连着（先 enter_debug / restart_keil）"
+        return None, ("已连上 UVSOCK，但调试会话不可用（先 enter_debug；"
+                      "若 Keil 侧弹了模态框/未启用 UVSOCK，用 keil_health 看断在哪一环）")
     except Exception as e:  # noqa: BLE001
         return None, "取 Keil 会话失败：%s" % e
 
