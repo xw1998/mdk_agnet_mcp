@@ -17,7 +17,9 @@
   1. 以 mdkdebug.server.create_server() 实际注册的工具数为唯一事实来源
   2. 扫描 tests/test_*.py 里写死的工具总数断言，必须都等于实际值
   3. 扫描 README.md 里对工具数的描述，必须等于实际值
-  4. 列出 tests/ 下存在但未纳入闸门的模块（信息提示，不判失败）
+  4. 扫描 README / docs / skills 的 Markdown 表格：同一张表各行的列分隔数必须一致
+     （单元格里有未转义的 | 会把整行切成多余列、尾部内容溢出表外——渲染时不报错，只"看着怪"）
+  5. 列出 tests/ 下存在但未纳入闸门的模块（信息提示，不判失败）
 """
 import asyncio
 import os
@@ -160,6 +162,49 @@ def discover_ungated():
     return out
 
 
+def scan_md_tables():
+    """扫仓库里的 Markdown 表格：同一张表内各行的列分隔数必须一致。
+
+    一个单元格里出现**未转义**的 `|`（例如 `link=auto|keil|ocd`），GFM 会把它当成分隔符，
+    整行会被切成多余列、尾部内容溢出表格——渲染出来只是"表格看着怪"，不报错，属静默的格式腐烂。
+    正解是写成 `\\|`。
+
+    返回 [(相对路径, 行号, 该行列分隔数, 同表多数行的列分隔数, 该行内容), ...]
+    """
+    skip = {".git", "__pycache__", ".venv", "node_modules", "build", "out", ".lingxi"}
+    targets = []
+    for d, dirs, files in os.walk(ROOT):
+        dirs[:] = [x for x in dirs if x not in skip]
+        for fn in sorted(files):
+            if fn.endswith(".md"):
+                targets.append(os.path.relpath(os.path.join(d, fn), ROOT))
+
+    pipe = re.compile(r"(?<!\\)\|")
+    out = []
+    for rel in targets:
+        path = os.path.join(ROOT, rel)
+        if not os.path.exists(path):
+            continue
+        block = []
+
+        def flush(block=block, rel=rel):
+            if len(block) < 2:
+                return
+            counts = [c for _, c, _ in block]
+            majority = max(set(counts), key=counts.count)
+            for no, c, txt in block:
+                if c != majority:
+                    out.append((rel, no, c, majority, txt.strip()))
+
+        for i, line in enumerate(dec(open(path, "rb").read()).splitlines(), 1):
+            if line.strip().startswith("|"):
+                block.append((i, len(pipe.findall(line)), line))
+            else:
+                flush()
+                block = []
+        flush()
+    return out
+
 def consistency():
     print("== 一致性检查 ==")
     n = actual_tool_count()
@@ -185,6 +230,17 @@ def consistency():
     if not rhits:
         bad += 1
         print("  [不一致] README 没扫到工具数描述，检查扫描规则是否失效")
+
+    tbad = scan_md_tables()
+    if tbad:
+        bad += len(tbad)
+        print("Markdown 表格列数一致性：发现 %d 处裂行（单元格内有未转义的 |）" % len(tbad))
+        for rel, no, c, majority, line in tbad:
+            print("  [表格裂开] %s:%d 该行列分隔 %d 个，同表多数行 %d 个\n            %s"
+                  % (rel, no, c, majority, line[:110]))
+        print("             修法：把单元格里的 | 写成 \\|（GFM 会在单元格内还原成 |）")
+    else:
+        print("Markdown 表格列数一致性：通过（全仓 Markdown 无裂行）")
 
     ungated = discover_ungated()
     if ungated:
