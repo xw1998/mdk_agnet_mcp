@@ -79,6 +79,14 @@ ERROR_CODES = {
             "确实要同时开多个工程窗口：传 single=false",
         ],
     },
+    "component-sources-mismatch": {
+        "text": "构建清单与实际后端源文件不一致（漏列/多列 .c）",
+        "next_actions": [
+            "看 build_list_check.checks 里每个清单文件的 missing（目录有、清单没列）与 ghost（清单列了但不存在）",
+            "改组件源文件后同步更新 mdk_trace.mk 的 MDK_TRACE_SRCS 与 CMakeLists.txt 的 target_sources",
+            "漏列的后端 .c 会让那条通路根本没编进工程，别等链接期才发现",
+        ],
+    },
     "component-link-failed": {
         "text": "目标侧插桩组件缺符号：按现状接进构建会在链接期失败",
         "next_actions": [

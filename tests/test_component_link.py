@@ -183,6 +183,70 @@ def main():
     finally:
         loop.close()
 
+    # ============ E. 构建清单自检 ============
+    print("E. 构建清单自检：清单列出的 .c 与目录里的实际源文件一致")
+    r = trace.build_sources_check(src_dir=COMPONENT_DIR)
+    check("E1 生成模板 + CMakeLists 都覆盖全部后端 .c", r.get("ok") is True, r)
+    check("E2 报告里能看到实际源文件与各清单的比对结果",
+          r.get("actual") == ["mdk_trace.c", "mdk_trace_buff.c", "mdk_trace_rtt.c",
+                              "mdk_trace_swd.c"] and len(r.get("checks") or {}) >= 2, r)
+
+    tmp2 = tempfile.mkdtemp(prefix="mdkdebug_bsc_")
+    try:
+        # 反证一：清单漏列一个后端 .c（历史上 mk 与 CMake 都漏过 mdk_trace_swd.c）
+        d1 = os.path.join(tmp2, "miss")
+        shutil.copytree(COMPONENT_DIR, d1)
+        mk1 = os.path.join(d1, "mdk_trace.mk")
+        open(mk1, "w", encoding="utf-8", newline="\n").write(
+            "# test: MDK_TRACE_SRCS := $(MDK_TRACE_DIR)/mdk_trace.c \\\n"
+            "#                  $(MDK_TRACE_DIR)/mdk_trace_buff.c \\\n"
+            "#                  $(MDK_TRACE_DIR)/mdk_trace_rtt.c\n")
+        r1 = trace.build_sources_check(src_dir=d1)
+        check("E3 反证：清单漏列 mdk_trace_swd.c → 自检失败并点名",
+              r1.get("ok") is False
+              and "mdk_trace_swd.c" in (r1.get("reason") or ""), r1)
+        check("E4 漏列时给出可执行下一步（hint 指向同步清单）",
+              "同步更新" in (r1.get("hint") or ""), r1.get("hint"))
+
+        # 反证二：清单列了不存在的文件（多列）
+        d2 = os.path.join(tmp2, "ghost")
+        shutil.copytree(COMPONENT_DIR, d2)
+        cml = os.path.join(d2, "CMakeLists.txt")
+        open(cml, "a", encoding="utf-8", newline="\n").write(
+            "\ntarget_sources(mdk_trace PRIVATE mdk_trace_ghost.c)\n")
+        r2 = trace.build_sources_check(src_dir=d2)
+        check("E5 反证：清单列了不存在的 mdk_trace_ghost.c → 自检失败并点名",
+              r2.get("ok") is False
+              and "mdk_trace_ghost.c" in (r2.get("reason") or ""), r2)
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
+
+    # 接线：部署返回里带 build_list_check
+    tmp3 = tempfile.mkdtemp(prefix="mdkdebug_bsc2_")
+    try:
+        tgt3 = os.path.join(tmp3, "proj", "components", "trace")
+        o = trace.deploy_component(tgt3, backend="swd", overwrite=True)
+        blc = o.get("build_list_check") or {}
+        check("E6 部署返回带 build_list_check 且通过",
+              blc.get("ok") is True and o.get("ok") is True, blc)
+
+        # 把目标目录的 mk 改坏（漏 swd）后重新部署：清单自检必须把整体判失败
+        mkp = os.path.join(tgt3, "mdk_trace.mk")
+        txt = open(mkp, encoding="utf-8").read()
+        open(mkp, "w", encoding="utf-8", newline="\n").write(
+            "\n".join(ln for ln in txt.splitlines() if "mdk_trace_swd.c" not in ln))
+        o2 = trace.deploy_component(tgt3, backend="swd", overwrite=False)
+        check("E7 目标目录清单漏列 → ok=false + component-sources-mismatch",
+              o2.get("ok") is False
+              and o2.get("error_code") == "component-sources-mismatch",
+              {k: o2.get(k) for k in ("ok", "error_code", "error")})
+    finally:
+        shutil.rmtree(tmp3, ignore_errors=True)
+
+    check("E8 ERROR_CODES 登记 component-sources-mismatch",
+          "component-sources-mismatch" in errors.ERROR_CODES,
+          "component-sources-mismatch" in errors.ERROR_CODES)
+
     print("\n==== 组件链接自检 %d 通过 / %d 失败 / %d 跳过 ===="
           % (len(PASS), len(FAIL), len(SKIP)))
     for s in SKIP:

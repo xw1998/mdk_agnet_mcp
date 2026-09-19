@@ -697,9 +697,10 @@ def test_surface(server):
           "when_to_use" in nm, list(nm)[:12])
 
     import mdkdebug
-    check("E9 版本号 0.1.3",
-          str(getattr(mdkdebug, "__version__", "")).startswith("0.1.3"),
-          getattr(mdkdebug, "__version__", None))
+    import re as _re
+    _ver = str(getattr(mdkdebug, "__version__", ""))
+    check("E9 版本号形如 x.y.z（不写死具体版本）",
+          bool(_re.fullmatch(r"\d+\.\d+\.\d+", _ver)), _ver)
 
 def test_gdb_pick(server):
     """F gdb 解析：只挑真能跑的、且不跨架构。

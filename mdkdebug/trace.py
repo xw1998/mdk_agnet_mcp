@@ -1477,6 +1477,63 @@ def component_link_check(backend: str = "itm", src_dir: str = "",
         if not keep_temp:
             shutil.rmtree(tmp, ignore_errors=True)
 
+def build_sources_check(src_dir: str = "", backend: str = "itm") -> dict:
+    """构建清单自检：各处列出的 .c 与**实际存在的后端源文件**是否一致。
+
+    比对三份「清单」：
+
+    - `mdk_trace.mk(生成模板)`：工具自己生成的 Make 片段（改组件后最容易忘记同步的就是它）；
+    - `mdk_trace.mk`：部署目录里的实际文件（可能被用户改过、或是旧版遗留）；
+    - `CMakeLists.txt`：部署目录里的 CMake 清单。
+
+    两个方向都查，缺一个都不算通过：
+
+    - **漏**：目录里有 `mdk_trace_*.c` 却没被列出 —— 那条通路的代码根本没编进工程，
+      要到链接期甚至运行时才暴露（`mdk_trace.mk` 与 `CMakeLists.txt` 历史上都漏过 `mdk_trace_swd.c`）；
+    - **多**：清单列了目录里不存在的文件 —— 构建必然失败，而报错点在用户工程里。
+
+    清单是「承诺」，目录里的 .c 是「事实」，两者不一致就是缺陷，不该等用户第一次 build 才发现。
+    部署目录里没有某个清单文件时按「不适用」跳过（ok=None），既不冒充通过也不误报失败。
+    """
+    d = os.path.abspath(src_dir or COMPONENT_DIR)
+    actual = sorted(f for f in os.listdir(d)
+                    if f.startswith("mdk_trace") and f.endswith(".c"))
+    texts = [("mdk_trace.mk(生成模板)", _gen_make_fragment())]
+    for name in ("mdk_trace.mk", "CMakeLists.txt"):
+        fp = os.path.join(d, name)
+        if os.path.isfile(fp):
+            try:
+                texts.append((name, open(fp, encoding="utf-8", errors="replace").read()))
+            except OSError as e:
+                texts.append((name, "\n<读不了：%s>" % e))
+        else:
+            texts.append((name, ""))
+    checks = {}
+    for label, text in texts:
+        if not text:
+            checks[label] = {"ok": None, "reason": "该目录没有这个清单文件（不适用）"}
+            continue
+        listed = sorted(set(re.findall(r"mdk_trace[a-z_]*\.c", text)))
+        missing = [f for f in actual if f not in listed]
+        ghost = [f for f in listed if f not in actual]
+        checks[label] = {"ok": (not missing and not ghost), "listed": listed,
+                         "missing": missing, "ghost": ghost}
+    bad = {k: v for k, v in checks.items() if v.get("ok") is False}
+    out = {"ok": not bad, "dir": d, "actual": actual, "backend": backend,
+           "checks": checks}
+    if bad:
+        bits = []
+        for k, v in bad.items():
+            if v.get("missing"):
+                bits.append("%s 漏列 %s" % (k, ", ".join(v["missing"])))
+            if v.get("ghost"):
+                bits.append("%s 列了不存在的 %s" % (k, ", ".join(v["ghost"])))
+        out["reason"] = "；".join(bits) or "构建清单与源文件不一致"
+        out["hint"] = ("清单是承诺、目录里的 .c 是事实，两者必须一致：漏列该后端的 .c 会让"
+                       "那条通路根本没编进去；改组件后同步更新 mdk_trace.mk 模板与 "
+                       "CMakeLists.txt。")
+    return out
+
 def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
                      rtt_up: int = 2, rtt_down: int = 1, rtt_buf: int = 1024,
                      coreclk: int = 0, overwrite: bool = False,
@@ -1578,6 +1635,16 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
                                       % (chk.get("reason") or "未提供原因"))
     else:
         out["self_check"] = {"checked": False, "reason": "link_check=false（调用方关闭）"}
+
+    # 构建清单自检：与链接自检独立（不依赖 C 编译器），漏列一个后端源文件同样致命
+    blc = build_sources_check(src_dir=dst, backend=b)
+    out["build_list_check"] = blc
+    if not blc.get("ok"):
+        out["ok"] = False
+        if not out.get("error_code"):
+            out["error_code"] = "component-sources-mismatch"
+        out["error"] = ("构建清单自检失败：%s —— 工程按现状接进构建会少编/误编源文件。"
+                        % (blc.get("reason") or "清单与源文件不一致"))
     return out
 
 
@@ -3619,6 +3686,10 @@ def register(server, js=None) -> int:
             "swd 的旋钮：swd_bytes（环字节数 = 静态 RAM，默认 8192）、swd_ts_shift（0 = 每周期）、"
             "swd_clear_on_init（**默认 true**，与 buff 相反——无缝流主机是从游标往 head 读，"
             "环里留着上一次运行的字节会把两段无关运行无缝拼在一起，没有可见接缝，最危险）。\n"
+            "**构建清单自检**：返回里还带 build_list_check —— 核对 mdk_trace.mk 与 "
+            "CMakeLists.txt 列出的 .c 是否与目录里实际的后端源文件一致（漏列 = 那条通路"
+            "根本没编进去，多列 = 构建必然失败）；不一致时 ok=false、"
+            "error_code=component-sources-mismatch。这一项不依赖 C 编译器。\n"
             "**部署后自检**：返回里带 self_check —— 就地用 arm-none-eabi-gcc 把该后端的"
             "组件源文件真编一遍并链接（空壳提供 CMSIS 内在函数与入口），缺符号当场报 "
             "undefined reference，就是 build 时那个 L6218E 的等价物。缺符号时整体 ok=false、"
