@@ -28,44 +28,156 @@ from . import winutil
 
 logger = logging.getLogger(__name__)
 
-# 常见 Keil 安装路径（用于自动探测 UV4.exe）
-_UV4_CANDIDATES = [
-    r"C:\Keil_v5\UV4\UV4.exe",
-    r"C:\Keil\UV4\UV4.exe",
-    r"D:\Keil_v5\UV4\UV4.exe",
-    r"E:\Keil_v5\UV4\UV4.exe",
-    r"C:\Program Files\Keil_v5\UV4\UV4.exe",
-    r"C:\Program Files (x86)\Keil_v5\UV4\UV4.exe",
-]
+# 常见 Keil 安装子目录（相对某个盘符根，如 D:\ → D:\Keil_v5\UV4\UV4.exe）
+_KEIL_UV4_SUBDIRS = (
+    r"Keil_v5\UV4\UV4.exe",
+    r"Keil\UV4\UV4.exe",
+    r"Keil_v4\UV4\UV4.exe",
+    r"Program Files\Keil_v5\UV4\UV4.exe",
+    r"Program Files (x86)\Keil_v5\UV4\UV4.exe",
+)
+
+# 盘符枚举结果缓存（一次进程内不变；非 Windows 为空表）
+_DRIVE_CACHE: list[str] | None = None
 
 
-def find_uv4(explicit: str | None = None) -> str | None:
-    """定位 UV4.exe。优先显式路径，其次探测常见路径，再查注册表。"""
+def _logical_drives() -> list[str]:
+    """本机存在的盘符根，形如 ['C:\\', 'D:\\']。
+
+    真机踩坑：旧实现把候选写死成 C:/D:/E: 那几条——Keil 装在别处（F: 盘、移动盘、
+    第二个系统）时连候选都没有；注册表那一路又查错视图（见 _uv4_from_registry），
+    于是 `find_uv4()` 在本机其实「靠巧合」才命中。这里枚举真实盘符，候选随机器走。
+    """
+    global _DRIVE_CACHE
+    if _DRIVE_CACHE is not None:
+        return _DRIVE_CACHE
+    drives: list[str] = []
+    if os.name == "nt":
+        for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            root = "%s:\\" % ch
+            try:
+                if os.path.isdir(root):
+                    drives.append(root)
+            except OSError:
+                continue
+    _DRIVE_CACHE = drives
+    return drives
+
+
+def uv4_candidates(extra: list[str] | None = None) -> list[str]:
+    """UV4.exe 候选路径：盘符枚举 × 常见安装子目录（去重保序）。
+
+    候选全部**动态**算出，不再依赖写死的盘符；extra 用于追加调用方已知的目录。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str) -> None:
+        q = str(path or "")
+        if q and q not in seen:
+            seen.add(q)
+            out.append(q)
+
+    for d in (extra or []):
+        _add(d)
+    for root in _logical_drives():
+        for sub in _KEIL_UV4_SUBDIRS:
+            _add(os.path.join(root, sub))
+    return out
+
+
+# 注册表里 Keil 的 Path 值有的指安装根（...\Keil_v5），有的指工具根（...\Keil_v5\ARM），
+# UV4 在两者的 UV4\ 子目录下——两类都要试，见 _uv4_from_registry。
+_KEIL_REG_KEYS = (
+    r"SOFTWARE\Keil\Products\MDK",
+    r"SOFTWARE\Keil\Products\Keil",
+)
+
+
+def _keil_reg_views() -> list[tuple[str, int]]:
+    """(视图名, 访问标志) 列表：32 位 + 64 位两个注册表视图。
+
+    Keil MDK 是 32 位程序 → 注册到 `SOFTWARE\\WOW6432Node\\...`；64 位 Python 默认
+    按 64 位视图读 `SOFTWARE\\...`，**必然查不到**。旧实现只读默认视图，等于没查。
+    """
+    try:
+        import winreg  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return []
+    views = []
+    for name, flag in (("32 位视图", getattr(winreg, "KEY_WOW64_32KEY", 0)),
+                       ("64 位视图", getattr(winreg, "KEY_WOW64_64KEY", 0))):
+        if flag:
+            views.append((name, winreg.KEY_READ | flag))
+    if not views:
+        views.append(("默认视图", winreg.KEY_READ))
+    return views
+
+
+def _uv4_from_registry() -> tuple[str | None, list[str]]:
+    """查注册表定位 UV4.exe。返回 (路径或 None, 尝试记录)。
+
+    两个坑（本机实测）：
+    1. 只查一个视图 → `HKLM\\SOFTWARE\\Keil\\Products\\MDK` 在 64 位视图下报
+       「找不到（错误码 2）」，值只在 WOW6432Node（32 位视图）里。
+    2. `Path` 的值是 `D:\\Keil_v5\\ARM`（**工具根**，不是安装根），旧实现拼
+       `Path\\UV4\\UV4.exe` 拼出的文件根本不存在；上提一级才是真路径。
+    找不到时把「试过哪些键/视图/值」一并返回——报错要有证据，不静默。
+    """
+    try:
+        import winreg  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None, ["非 Windows：无注册表"]
+    views = _keil_reg_views()
+    if not views:
+        return None, ["非 Windows：无注册表"]
+    tried: list[str] = []
+    for sub in _KEIL_REG_KEYS:
+        for hive, hname in ((winreg.HKEY_LOCAL_MACHINE, "HKLM"),
+                            (winreg.HKEY_CURRENT_USER, "HKCU")):
+            for vname, access in views:
+                try:
+                    with winreg.OpenKey(hive, sub, 0, access) as key:
+                        root, _ = winreg.QueryValueEx(key, "Path")
+                except OSError as e:
+                    tried.append("%s\\%s（%s）：取不到（%s）"
+                                 % (hname, sub, vname, getattr(e, "winerror", e)))
+                    continue
+                base = str(root or "").rstrip("\\/")
+                if not base:
+                    tried.append("%s\\%s（%s）：Path 值为空" % (hname, sub, vname))
+                    continue
+                for cand_root in (base, os.path.dirname(base)):
+                    uv4 = os.path.join(cand_root, "UV4", "UV4.exe")
+                    if os.path.isfile(uv4):
+                        logger.info("注册表定位到 UV4.exe：%s（%s\\%s，%s）",
+                                    uv4, hname, sub, vname)
+                        return uv4, tried
+                tried.append("%s\\%s（%s）：Path=%s，其下没有 UV4\\UV4.exe"
+                             % (hname, sub, vname, base))
+    return None, tried
+
+
+def find_uv4_detailed(explicit: str | None = None) -> dict:
+    """定位 UV4.exe，并把「试过哪些地方」一并返回（找不到时要有证据，不静默）。"""
     if explicit:
         p = Path(explicit)
         if p.is_file():
-            return str(p)
+            return {"uv4": str(p), "source": "显式路径", "tried": []}
         logger.warning("指定 UV4 路径不存在：%s", explicit)
-    for cand in _UV4_CANDIDATES:
+    for cand in uv4_candidates():
         if os.path.isfile(cand):
             logger.info("探测到 UV4.exe：%s", cand)
-            return cand
-    try:
-        import winreg  # noqa: PLC0415
-        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            try:
-                with winreg.OpenKey(hive, r"SOFTWARE\Keil\Products\MDK") as key:
-                    root, _ = winreg.QueryValueEx(key, "Path")
-                uv4 = os.path.join(root, "UV4", "UV4.exe")
-                if os.path.isfile(uv4):
-                    logger.info("注册表定位到 UV4.exe：%s", uv4)
-                    return uv4
-            except OSError:
-                continue
-    except Exception:  # noqa: BLE001
-        pass
-    return None
+            return {"uv4": cand, "source": "盘符候选", "tried": []}
+    reg_uv4, tried = _uv4_from_registry()
+    if reg_uv4:
+        return {"uv4": reg_uv4, "source": "注册表", "tried": tried}
+    return {"uv4": None, "source": None, "tried": tried}
 
+
+def find_uv4(explicit: str | None = None) -> str | None:
+    """定位 UV4.exe。优先显式路径，其次枚举盘符的常见安装位置，最后查注册表。"""
+    return find_uv4_detailed(explicit)["uv4"]
 
 # 编译/烧录默认超时（秒）。
 # 旧默认 300s 对大型工程 / 首次全量编译 / 带预处理脚本（gen_scatter.py 等）的工程

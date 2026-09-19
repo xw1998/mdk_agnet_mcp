@@ -843,6 +843,56 @@ def _attach_locator(axf: str, source: str, project_dir: str | None = None):
     return loc
 
 
+def _find_project_candidates(max_depth: int = 4, cap: int = 200) -> list:
+    """有界搜索 .uvprojx，供「没给工程 / 工程不存在」时把候选列出来。
+
+    吸收 embeddedskills / Serial-Agent 的硬规则：多候选时**不许替调用方挑一个**。
+
+    **必须是模块级**（批次60）：模块级的 `_ensure_locator()` 也要用它做「附近自动发现」
+    兜底；此前它缩在 `create_server()` 里，`_ensure_locator` 调到它只会抛
+    `NameError: name '_find_project_candidates' is not defined`——于是「启动时没配工程」
+    这个**正是它要解决的场景**里，第 4 条兜底直接崩，既拿不到自动挂载也拿不到
+    设计好的提示。真机按空注册表复现过。
+    此前只有一句「未指定工程路径」，调用方还得自己去找工程在哪——这里直接把
+    候选摊开。深度与目录数都设了上限，避免在大盘上走成一次全盘扫描。
+
+    深度默认 4：Keil 工程的常规布局是 `<仓库>/<工程>/MDK-ARM/x.uvprojx`（3 层），
+    旧默认 2 层**连本仓库自带的 example_mdk_project 都找不到**，却会回一句
+    「未在附近找到任何 .uvprojx」——又是一条看似权威的错答案。目录数仍由 cap 兜住。
+    """
+    roots = []
+    dp = _builder_cfg.get("default_project")
+    if dp:
+        roots.append(os.path.dirname(str(dp)))
+    try:
+        roots.append(os.getcwd())
+    except OSError:
+        pass
+    out, seen, scanned = [], set(), 0
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        base_depth = root.rstrip("\\/").count(os.sep)
+        for cur, dirs, files in os.walk(root):
+            scanned += 1
+            if scanned > cap:
+                break
+            if cur.count(os.sep) - base_depth >= max_depth:
+                dirs[:] = []
+            dirs[:] = [d for d in dirs
+                       if d.lower() not in (".git", "__pycache__", "node_modules",
+                                            ".pytest_cache", "obj", "bin")]
+            for fn in files:
+                if fn.lower().endswith(".uvprojx"):
+                    full = os.path.join(cur, fn)
+                    if full not in seen:
+                        seen.add(full)
+                        out.append(full)
+        if out:
+            break
+    return out[:20]
+
+
 def _ensure_locator() -> Locator | None:
     """按需惰性解析符号定位器——真机踩坑：启动时没配工程，一整族工具全废。
 
@@ -1553,11 +1603,37 @@ def _parse_target(locator, target: str):
     """把目标字符串解析为地址。支持 0x地址 或 文件:行号（如 main.c:77）。"""
     return _parse_target_ex(locator, target)["addr"]
 
+# 源文件后缀：用来把「看起来是源文件」与「写法根本不认识」分开，好在报错里说清该补什么
+_SOURCE_EXTS = (".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".s", ".asm", ".inc")
+
+
+def _looks_like_file(s: str) -> bool:
+    """判断字符串「看起来是源文件」（带路径分隔符，或后缀是源文件后缀）。
+
+    存在的意义是把错误原因**指对方向**：`D:\\proj\\Core\\Src\\main.c` 漏写行号时，
+    rsplit(':', 1) 会切成 file='D' / line='\\proj\\Core\\Src\\main.c'，旧实现于是报
+    「行号不是整数：'\\proj\\...'」——把 AI 引去「修行号」，而真正缺的是行号本身。
+    """
+    q = (s or "").strip().strip('"').strip("'")
+    if not q:
+        return False
+    if "\\" in q or "/" in q:
+        return True
+    return os.path.splitext(q)[1].lower() in _SOURCE_EXTS
+
+
 def _parse_target_ex(locator, target: str):
-    """目标解析的**带证据版**（批次48）。
+    """目标解析的**带证据版**（批次48/60）。
 
     旧实现只回一个地址，行号解析撞了同名文件也看不出来。这里把匹配证据一并返回，
     供 run_to_line 在触发前拦截可疑目标（详见 locator.line_to_addr_ex）。
+
+    批次60 补四类判别（此前都会静默给出**误导性**原因）：
+      * 漏写行号的绝对路径（``D:\\a\\main.c``）被报成「行号不是整数」→ 改报缺行号
+      * 冒号后为空（``main.c:``）→ 明确说「行号缺失」
+      * 行号 0 / 负数 → 直接拒绝（行号从 1 起算，0 没有对应指令）
+      * 文件名缺失（``:77``）→ 明确说「文件名缺失」，不丢给 locator 去猜
+    无冒号但看起来是文件路径的（``main.c``、``Core/Src/main.c``）同样提示缺行号。
     """
     t = (target or "").strip()
     if t.lower().startswith("0x"):
@@ -1568,15 +1644,44 @@ def _parse_target_ex(locator, target: str):
                     "reason": "0x 地址解析失败：%r" % t}
     if ":" in t:
         file, line = t.rsplit(":", 1)
-        try:
-            ln = int(line.strip())
-        except ValueError:
+        fname = file.strip()
+        lstr = line.strip()
+        if not fname:
             return {"addr": None, "kind": "line", "explicit": False,
+                    "file": fname, "line": None,
+                    "reason": "文件名缺失：%r" % t,
+                    "hint": "写成 文件:行号（如 Core/Src/main.c:77）"}
+        if not lstr:
+            return {"addr": None, "kind": "line", "explicit": False,
+                    "file": fname, "line": None,
+                    "reason": "行号缺失：%r（冒号后面是空的）" % t,
+                    "hint": "写成 文件:行号（如 %s:77）" % fname}
+        try:
+            ln = int(lstr)
+        except ValueError:
+            if _looks_like_file(t):
+                return {"addr": None, "kind": "line", "explicit": False,
+                        "file": fname, "line": None,
+                        "reason": "看起来是源文件路径，但缺少行号：%r" % t,
+                        "hint": ("写法应为 文件:行号（如 Core/Src/main.c:77）；"
+                                 "若这本来不是文件，请改用 0x 地址或符号名")}
+            return {"addr": None, "kind": "line", "explicit": False,
+                    "file": fname, "line": None,
                     "reason": "行号不是整数：%r" % line}
-        ex = locator.line_to_addr_ex(file.strip(), ln)
+        if ln <= 0:
+            return {"addr": None, "kind": "line", "explicit": False,
+                    "file": fname, "line": ln,
+                    "reason": "行号必须 >= 1（收到 %d）：行号从 1 起算，0 没有对应指令" % ln,
+                    "hint": "不确定停在哪一行时先 get_current_location 看一眼"}
+        ex = locator.line_to_addr_ex(fname, ln)
         ex["kind"] = "line"
         ex["explicit"] = False
         return ex
+    if _looks_like_file(t):
+        return {"addr": None, "kind": "line", "explicit": False,
+                "file": t, "line": None,
+                "reason": "看起来是源文件路径，但缺少行号：%r" % t,
+                "hint": "写法应为 文件:行号（如 main.c:77）"}
     return {"addr": None, "kind": "unknown", "explicit": False,
             "reason": "无法识别的目标写法：需为 0x地址 或 文件:行号（如 main.c:77）"}
 
@@ -4924,7 +5029,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                             "error": ex.get("reason")
                                      or "无法解析目标：需为 0x地址 或 文件:行号（如 main.c:77）",
                             "target_parse": ex,
-                            "hint": "行号写法尽量带上目录（如 Core/Src/main.c:77），避免同名文件撞行号"})
+                            "hint": (ex.get("hint")
+                                     or "行号写法尽量带上目录"
+                                        "（如 Core/Src/main.c:77），避免同名文件撞行号")})
             addr = int(addr) & ~1
             client = _get_client()
             guard, gev = _run_to_line_guard(client, loc, ex, addr,
@@ -5981,45 +6088,6 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     # ---------------- 编译 / 烧录（UV4 命令行） ----------------
-    def _find_project_candidates(max_depth: int = 2, cap: int = 200) -> list:
-        """有界搜索 .uvprojx，供「没给工程 / 工程不存在」时把候选列出来。
-
-        吸收 embeddedskills / Serial-Agent 的硬规则：多候选时**不许替调用方挑一个**。
-        此前只有一句「未指定工程路径」，调用方还得自己去找工程在哪——这里直接把
-        候选摊开。深度与目录数都设了上限，避免在大盘上走成一次全盘扫描。
-        """
-        roots = []
-        dp = _builder_cfg.get("default_project")
-        if dp:
-            roots.append(os.path.dirname(str(dp)))
-        try:
-            roots.append(os.getcwd())
-        except OSError:
-            pass
-        out, seen, scanned = [], set(), 0
-        for root in roots:
-            if not root or not os.path.isdir(root):
-                continue
-            base_depth = root.rstrip("\\/").count(os.sep)
-            for cur, dirs, files in os.walk(root):
-                scanned += 1
-                if scanned > cap:
-                    break
-                if cur.count(os.sep) - base_depth >= max_depth:
-                    dirs[:] = []
-                dirs[:] = [d for d in dirs
-                           if d.lower() not in (".git", "__pycache__", "node_modules",
-                                                ".pytest_cache", "obj", "bin")]
-                for fn in files:
-                    if fn.lower().endswith(".uvprojx"):
-                        full = os.path.join(cur, fn)
-                        if full not in seen:
-                            seen.add(full)
-                            out.append(full)
-            if out:
-                break
-        return out[:20]
-
     def _resolve_project(project: str) -> str:
         """解析待操作工程：参数优先，其次服务配置的默认工程。
 
