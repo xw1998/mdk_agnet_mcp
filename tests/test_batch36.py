@@ -697,8 +697,8 @@ def test_surface(server):
           "when_to_use" in nm, list(nm)[:12])
 
     import mdkdebug
-    check("E9 版本号 0.1.2",
-          str(getattr(mdkdebug, "__version__", "")).startswith("0.1.2"),
+    check("E9 版本号 0.1.3",
+          str(getattr(mdkdebug, "__version__", "")).startswith("0.1.3"),
           getattr(mdkdebug, "__version__", None))
 
 def test_gdb_pick(server):
