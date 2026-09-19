@@ -50,6 +50,10 @@ read_variable / watch / read_struct / read_registers
 - `run_timeout` 的超时看 `pc_confidence`：PC 读数不收敛时它会给低置信，别当结论用；
 - 停机过久怕被看门狗复位：`stop` / `enter_debug` 已自动冻结 IWDG/WWDG，失败会在
   `warning` 里说清。
+- 三个烧录类工具的返回值里带 **`symbol_rebind`**（烧录＝符号漂移的源头，服务端顺手对齐）：
+  `rebound` ＝ 符号已自动钉到刚烧的 `.axf`；`kept-explicit` ＝ 你此前 `set_symbol_file`
+  显式选过，服务端**没覆盖**（要继续调新固件就按 `next_actions` 切，做 App 重定位/双工程
+  对比调试就保持）；`already-current` / `skipped` 会如实说明为什么没动。
 
 ### 2. 只读排查（不动目标）
 
@@ -277,7 +281,8 @@ view_guide(topic="howto")                # 不知道该配哪张图？先问它�
 |------|------|
 | 连不上 / 时通时不通 | `keil_health`、`get_status`、`list_uvision_instances` |
 | 表达式集体解析失败 | `get_status` 看 `symbol_stale`，必要时 `set_symbol_file`（在 `symbol` 组、默认不暴露：先 `toolset(action="load", toolsets="symbol")`） |
-| 断点/PC 解析出「板上不存在的函数」（假符号） | `env_check` 看 `firmware_symbol` → 按它的 `next_actions` 装 `symbol` 组并 `set_symbol_file` 切到与刚烧录固件同源的那份 |
+| 断点/PC 解析出「板上不存在的函数」（假符号） | `get_current_location` 看 `symbol_verified`，再 `env_check` 看 `firmware_symbol` → 按它的 `next_actions` 装 `symbol` 组并 `set_symbol_file` 切到与刚烧录固件同源的那份 |
+| 函数名/行号**解析出来了**，但不确定是不是假符号 | `get_current_location` 的 `symbol_verified`：false ＝ 本会话**没核对过**这份符号与板上固件是否同源（解析成功 ≠ 名字可信），跑一次 `env_check` 才会变成 true |
 | 断点下不上（error 57/65/145） | 返回体里的 `checks` 与 `hints`，或 `find_symbol` 核对符号 |
 | 编译失败看不懂 | `parse_build_errors`、`explain_build_error` |
 | 外设寄存器值看不懂 | `svd_list` / `svd_decode`（自动按工程器件推断 SVD） |

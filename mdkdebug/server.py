@@ -567,7 +567,13 @@ _client: UVClient | None = None
 # 编译/烧录配置（UV4.exe 路径与默认工程）
 _builder_cfg = {"uv4": None, "default_project": None}
 # 符号定位配置（.axf 路径与 Locator 实例）
-_symbol_cfg = {"locator": None, "axf": None, "source_type": None}
+# axf_source 记录「这份符号是怎么来的」：显式 set_symbol_file / 启动参数 / 默认工程推断 /
+# 自动匹配 / 会话恢复 / 随烧录重钉——烧录时要不要重钉符号要靠它判断（显式选择优先）。
+_symbol_cfg = {"locator": None, "axf": None, "source_type": None, "axf_source": None}
+# 「当前符号是否已核对过与板上固件同源」的最近结论：只有 _symbol_source_check 得出
+# same / content-confirmed 才记入，烧录换固件时作废。_build_location 据此透出
+# symbol_verified——解析出函数名 ≠ 这个名字可信，假符号最隐蔽的形态是「解析得很成功」。
+_symbol_verify = {"axf": None, "verdict": None, "ts": 0.0, "reason": None}
 # 预登记候选符号工程注册表：AI 可据此切换/自动匹配当前调试固件的符号文件。
 # flash 区段用于 PC 自动匹配（辅助定位，固件 flash 可能重叠，手动 set_symbol_file 为主）。
 #
@@ -1027,8 +1033,13 @@ class MapLocator:
         d["covered"] = True
         return d
 
-def _load_symbol_file(path: str):
-    """加载符号文件（.axf 或 .map），更新 _symbol_cfg。返回 (ok, message, count)。"""
+def _load_symbol_file(path: str, source: str = "set_symbol_file"):
+    """加载符号文件（.axf 或 .map），更新 _symbol_cfg。返回 (ok, message, count)。
+
+    source 记录「这次是谁装的符号」：调用方显式切换（set_symbol_file）还是服务端自己
+    的动作（按 PC 自动匹配 / 随烧录重钉 / 会话恢复）。烧录后是否自动重钉要看它——
+    显式选择优先，服务端不替调用方改回去（见 _rebind_symbol_to_flashed）。
+    """
     global _symbol_cfg
     p = (path or "").strip().strip('"')
     if not p:
@@ -1041,14 +1052,16 @@ def _load_symbol_file(path: str):
         loc._ensure_loaded()
         if not loc.is_ready():
             return False, f".map 未解析到任何符号: {p}", 0
-        _symbol_cfg = {"locator": loc, "axf": None, "source_type": "map"}
+        _symbol_cfg = {"locator": loc, "axf": None, "source_type": "map",
+                       "axf_source": source}
         return True, f"已加载 .map 符号（{loc.total_entries()} 条，无 DWARF 行号）", loc.total_entries()
     try:
         loc = Locator(p)
         n = loc.total_entries()
     except Exception as e:  # noqa: BLE001
         return False, f"加载 .axf 失败: {e}", 0
-    _symbol_cfg = {"locator": loc, "axf": os.path.abspath(p), "source_type": "axf"}
+    _symbol_cfg = {"locator": loc, "axf": os.path.abspath(p), "source_type": "axf",
+                   "axf_source": source}
     return True, f"已加载 .axf 符号（{n} 条）", n
 
 # ----------------------------------------------------------------------
@@ -1124,7 +1137,15 @@ def _record_flashed_firmware(project: str, target: str = "", reason: str = "") -
                     "reason": reason or "", "ts": time.time(),
                     "time_text": _file_mtime_text(time.time())})
     _chip_probe["ts"] = 0.0        # 换固件了：芯片探测缓存作废
-    return dict(_fw_cfg)
+    # 换固件了：上一次「符号已核对」的结论随之失效（先清、再按新固件重钉；重钉成功会重记）。
+    _symbol_verify.update({"axf": None, "verdict": None, "ts": 0.0, "reason": None})
+    out = dict(_fw_cfg)
+    try:
+        out["symbol_rebind"] = _rebind_symbol_to_flashed(out.get("axf") or "", reason)
+    except Exception as e:  # noqa: BLE001
+        out["symbol_rebind"] = {"action": "failed", "error": str(e),
+                                "note": "烧录后自动重钉符号时出错，符号保持不变。"}
+    return out
 
 def _same_file(a: str, b: str) -> bool:
     if not a or not b:
@@ -1133,6 +1154,67 @@ def _same_file(a: str, b: str) -> bool:
         return os.path.samefile(os.path.abspath(a), os.path.abspath(b))
     except OSError:
         return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+def _rebind_symbol_to_flashed(axf: str, reason: str = "") -> dict:
+    """烧录后把符号重新钉到刚烧的那份 .axf 上（调用方显式切换过则不覆盖）。
+
+    为什么放在烧录里：符号与板上固件不同源这件事，**源头就是烧录**——服务端在这一步
+    顺手对齐，比事后在 env_check / get_current_location 里反复提醒省事得多（那两处已经
+    能报，但报完还要调用方自己动手）。
+
+    优先级规则（不许悄悄替调用方做决定）：
+      - 当前符号是调用方**显式 set_symbol_file** 装的 -> 不覆盖，只回 kept-explicit 与
+        可执行的切换动作：显式切换往往意味着调用方知道自己在干什么（App 重定位、双工程
+        对比调试），服务端擅自改回去属于替调用方做决定；
+      - 其余（启动参数 / 默认工程推断 / 按 PC 自动匹配 / 上一次自动重钉 / 本来没符号）
+        -> 重钉到刚烧的 .axf；
+      - 推不出 .axf、或文件不存在 -> skipped，如实说明，不猜替代品。
+
+    返回 {action, ...}，action ∈ rebound / kept-explicit / already-current / skipped / failed。
+    """
+    cur = (_symbol_cfg or {}).get("axf") or ""
+    src = str((_symbol_cfg or {}).get("axf_source") or "")
+    out = {"target_axf": axf or None, "flashed_reason": reason or "",
+           "current_axf": cur or None, "symbol_source": src or None}
+    if not axf:
+        out["action"] = "skipped"
+        out["note"] = ("刚烧工程的 .axf 推不出来（未编译出可执行文件 / 工程配置里没有可执行"
+                       "文件输出路径），符号未自动重钉；要切换请 list_symbol_projects "
+                       "看候选后 set_symbol_file 指定。")
+        return out
+    if not os.path.isfile(axf):
+        out["action"] = "skipped"
+        out["note"] = "刚烧工程推导出的 .axf 不存在（%s），未自动重钉符号。" % axf
+        return out
+    if cur and _same_file(cur, axf):
+        out["action"] = "already-current"
+        out["note"] = "当前符号已经是刚烧录的那份 .axf，无需切换。"
+        return out
+    if "set_symbol_file" in src:
+        out["action"] = "kept-explicit"
+        out["note"] = ("当前符号是显式 set_symbol_file 选定的（%s，来源：%s），本次烧录未自动"
+                       "覆盖——显式选择优先。若这次烧的固件才是要调的对象，按下面的动作切过去；"
+                       "若你在做 App 重定位 / 双工程对比调试，保持现状即可，符号是否与板上同源"
+                       "由停靠位置里的 symbol_verified 与 env_check 透出。"
+                       % (os.path.basename(cur or "?") or cur, src or "未记录"))
+        out["next_actions"] = _symbol_switch_actions() + [
+            "env_check 核对当前符号与板上固件是否同源（切完立即复核）"]
+        return out
+    ok, msg, n = _load_symbol_file(axf, source="随烧录自动重钉（%s）" % (reason or "flash"))
+    out["action"] = "rebound" if ok else "failed"
+    out["message"] = msg
+    out["previous_axf"] = cur or None
+    if ok:
+        out["entries"] = n
+        # 刚烧的固件与这次加载的 .axf 是同一次编译产物：记「已核对」，让停靠位置不再
+        # 每次都对一次刚烧完的符号唱「未核对」。
+        _symbol_verify.update({"axf": os.path.abspath(axf), "verdict": "same",
+                               "ts": time.time(),
+                               "reason": "烧录后自动重钉到刚烧的 .axf（同一次编译产物）"})
+    else:
+        out["error"] = msg
+    return out
+
 
 def _symbol_switch_actions(server=None) -> list:
     """「把符号切到与板上固件同源的那份」的可执行动作清单（含必要的工具面装卸步骤）。
@@ -1168,6 +1250,38 @@ def _symbol_switch_hint(server=None) -> str:
 
 def _symbol_source_check(client=None, axf: str = "", deep: str = "auto",
                          server=None) -> dict:
+    """核对「当前符号 .axf」与「最近一次烧录的固件」是否同源，并把结论记进 _symbol_verify。
+
+    这里只是薄包装：判据全在 _symbol_source_check_impl，外面这层负责把结论写进状态，
+    供 _build_location 透出「本会话这份符号被核对过没有」。
+    """
+    out = _symbol_source_check_impl(client=client, axf=axf, deep=deep, server=server)
+    _note_symbol_check(out)
+    return out
+
+
+def _note_symbol_check(out: dict) -> None:
+    """把一次核对结论记进 _symbol_verify（供 _build_location 透出可信度）。
+
+    只有「已证明同源」的两种结论才算数：same（文件就是刚烧的那份）与
+    content-confirmed（Flash 指纹逐块比对一致）。其余一律**清空**——different /
+    content-mismatch / no-symbols / no-flash-record / unknown 都不是「通过」，宁可说
+    「未核对」，也不留下上一次留下的绿色标记。没测 ≠ 通过。
+    """
+    v = (out or {}).get("verdict")
+    if v in ("same", "content-confirmed"):
+        _symbol_verify.update({
+            "axf": (out.get("symbol_axf") or (out.get("flashed") or {}).get("axf")
+                    or (_symbol_cfg or {}).get("axf")),
+            "verdict": v, "ts": time.time(),
+            "reason": ("符号就是刚烧录的那份 .axf" if v == "same"
+                       else "板上内存与含符号的 .axf 内容指纹一致（同源）")})
+    else:
+        _symbol_verify.update({"axf": None, "verdict": None, "ts": 0.0, "reason": None})
+
+
+def _symbol_source_check_impl(client=None, axf: str = "", deep: str = "auto",
+                              server=None) -> dict:
     """核对「当前符号 .axf」与「最近一次烧录的固件」是否同源。
 
     判据分两层，**先证据后推断**：
@@ -1616,7 +1730,8 @@ def _auto_match_symbol(client):
                     cur = _symbol_cfg.get("axf")
                     if cur and os.path.normcase(os.path.abspath(cur)) == os.path.normcase(os.path.abspath(axf)):
                         return None  # 已是当前符号文件
-                    ok, msg, _n = _load_symbol_file(axf)
+                    ok, msg, _n = _load_symbol_file(
+                        axf, source="按 PC 自动匹配（%s）" % pr.get("name"))
                     if ok:
                         return {"auto_switched": True, "project": pr["name"],
                                 "axf": axf, "message": msg, "pc": hex(pc)}
@@ -1868,6 +1983,32 @@ def _backtrace(client, loc, pc, lr, sp, max_frames: int = 16, stack_bytes: int =
     return frames
 
 
+def _note_symbol_verified(result: dict) -> None:
+    """在停靠位置结果里透出「这份符号被核对过没有」。
+
+    只透出可信度、不改任何行为：**解析出函数名/行号 ≠ 这个名字可信**。假符号最隐蔽的
+    形态就是「解析得很成功」——PC 落在另一套固件的函数里，名字看着像样，其实是板上早被
+    链接器裁掉的函数（真机踩过：PC 显示停在 rt_mq_send_wait，map 里根本没它）。
+
+    判据：_symbol_verify 里记的 axf 必须就是当前在用的这份（文件同一性），否则一律
+    symbol_verified=False——换了符号文件、烧了新固件之后，旧结论不算数。
+    """
+    axf = (_symbol_cfg or {}).get("axf") or ""
+    v = _symbol_verify or {}
+    ok = bool(v.get("verdict")) and _same_file(v.get("axf") or "", axf)
+    result["symbol_verified"] = bool(ok)
+    if ok:
+        result["symbol_verified_note"] = ("符号已核对与板上固件同源（%s：%s）"
+                                         % (v.get("verdict"), v.get("reason") or ""))
+    else:
+        result["symbol_verified_note"] = (
+            "本会话尚未核对这份符号与板上固件是否同源：下面解析出的函数名/行号可能来自另一套"
+            "固件（即「假符号」，板上根本没有这个函数）。要确认请跑 env_check 做内容级核对，"
+            "或 set_symbol_file 切到与刚烧固件同源的 .axf。"
+            + ("（" + _symbol_switch_hint() + "）"
+               if _toolbox.tool_hidden("set_symbol_file") else ""))
+
+
 def _build_location(client):
     """读取当前 PC 并构建停靠位置信息：文件行、源码上下文、完整调用栈。
 
@@ -1928,6 +2069,7 @@ def _build_location(client):
             result["callstack"] = _backtrace(client, loc, pc, lr, sp)
             return result
     if cur:
+        _note_symbol_verified(result)
         result["file"] = cur["file"]
         result["line"] = cur["line"]
         result["address"] = hex(cur["address"])
@@ -6482,7 +6624,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                               ensure_debug_channel=ensure_debug_channel))
             _note_firmware_event("flash_download")
             if out.get("ok", True):
-                _record_flashed_firmware(p, target.strip() or "", "flash_download")
+                # 烧录＝符号漂移的源头：顺手把符号钉到刚烧的 .axf（显式选择优先，见
+                # _rebind_symbol_to_flashed），比事后反复提醒「符号可能不同源」省事。
+                fw = _record_flashed_firmware(p, target.strip() or "", "flash_download")
+                if fw.get("symbol_rebind"):
+                    out["symbol_rebind"] = fw["symbol_rebind"]
             # 批次29：烧录后旧调试会话的符号已过期——处理它（默认自动退出），
             # 避免调用方拿着旧符号求值却得到一堆 status 13 解析错误。
             try:
@@ -6522,7 +6668,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                                ensure_debug_channel=ensure_debug_channel))
             _note_firmware_event("build_and_flash")
             if out.get("ok", True):
-                _record_flashed_firmware(p, target.strip() or "", "build_and_flash")
+                fw = _record_flashed_firmware(p, target.strip() or "", "build_and_flash")
+                if fw.get("symbol_rebind"):
+                    out["symbol_rebind"] = fw["symbol_rebind"]
             try:
                 out["debug_session"] = _post_flash_debug_state(_get_client(),
                                                                do_exit=bool(exit_debug_after))
@@ -6617,10 +6765,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     break
             if enter is None:
                 enter = {"ok": False, "error": last_error or "进入调试失败"}
+            symbol_rebind = None
             if enter.get("ok"):
                 _note_firmware_event("flash_debug")
                 _mark_debug_session("flash_debug")   # 新会话＝新固件符号，重新记基线
-                _record_flashed_firmware(p, "", "flash_debug")
+                symbol_rebind = _record_flashed_firmware(p, "", "flash_debug").get("symbol_rebind")
             payload = {
                 "ok": enter.get("ok", False),
                 "action": "flash_debug", "stage": "调试",
@@ -6633,6 +6782,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                "工程未勾选 Update Target before Debugging，已显式 UV4 -f 烧录新固件"),
                 "build": bf if auto_dl else bf.get("build"),
                 "flash": None if auto_dl else bf.get("flash"),
+                # 烧录/自动下载后符号有没有重钉到新固件（kept-explicit＝你显式选过，没覆盖）
+                "symbol_rebind": symbol_rebind,
                 "launch_uvision": launch, "enter_debug": enter,
                 # 披露窗口处置：复用还是新开、新实例 pid 是多少——调用方据此判断要不要收敛窗口
                 "launch_reused": bool(launch.get("reused")) if isinstance(launch, dict) else None,
@@ -9181,7 +9332,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                          "current": cur_axf,
                          "reason": "可恢复（需 apply=true）：把符号文件切回状态里记录的那份"})
         else:
-            ok, msg, cnt = _load_symbol_file(axf)
+            ok, msg, cnt = _load_symbol_file(axf, source="会话恢复（状态快照里记录的符号）")
             one = {"item": "symbol_file", "action": ("applied" if ok else "failed"),
                    "path": axf, "current_before": cur_axf, "message": msg}
             if ok:
