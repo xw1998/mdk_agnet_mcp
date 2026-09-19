@@ -60,6 +60,7 @@ from . import reloc as _reloc
 from . import chipid as _chipid
 from . import rtrecord as _rtr
 from . import rtrace as _rtrace
+from . import viz as _viz
 from . import eventrec as _eventrec
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
@@ -9347,7 +9348,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                             ("coverage", _coverage),
                             ("scatter", _scatter),
                             ("cores", _cores),
-                            ("etm", _etm)):
+                            ("etm", _etm), ("viz", _viz)):
         try:
             _extra_counts[_mod_name] = _mod.register(server, _js)
         except Exception as _e:  # noqa: BLE001

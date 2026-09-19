@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 186 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 188 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -62,6 +62,7 @@ watch_reset                                 # 反复复位/启动即死：按间
 coverage_start → coverage_read → coverage_stop   # 跑到哪些函数/行：DWT PC 采样，不停目标
 trace_etm_probe                             # 先问「这块板能不能抓指令 trace」：只探测不抓取，抓不到直说
 trace_eventrec                              # 读 MDK 原生 Event Recorder 缓冲（纯 SWD 可用；要目标插桩，没插桩会说清）
+view_render(data_file=...)                  # 把上面任意采集结果渲染成一张能缩放/回放的单文件网页：别手写 HTML
 ```
 
 **多核目标先问是哪个核**：`core_info`（我连的这个核是哪一款内核）/ `core_list` + `core_select`（OpenOCD 链路真列真切；Keil 链路如实报不支持——一条 UVSOCK 会话就绑当前调试的那个核，双核要分别在两个 target/工程里连）。两个核的 SCS 地址完全一样，**读到的现场属于谁只由调试器当前挂的 AP/target 决定**。
@@ -162,7 +163,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 40 个（`core` 34 个 + 6 个元工具），其余 146 个按需装载——
+- **工具面默认精简**：默认只暴露 42 个（`core` 36 个 + 6 个元工具），其余 146 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。
@@ -233,7 +234,41 @@ trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0,
 （`MDK_TRACE_FAULT_CAPTURE()`，一次拿到 PC/LR/SP/xPSR + CFSR，性价比最高）→ 喂狗点与复位原因
 → 任务/上下文切换点 → 状态迁移点。高频中断最内层、被内联的小函数、时间敏感临界区不要插。
 
-## 六、出问题先看这几个工具
+## 六、给人看图：`view_render` / `view_guide`
+
+上面采集回来的都是 JSON。要给人看（汇报、贴图、解释「为什么死在这」），**不要从头手写网页**——
+把采集结果直接丢给 `view_render`，它出一张单文件 HTML（无外部依赖，`file://` 可开、可直接转发）：
+
+```
+trace_buff_dump(elf=..., out_file="trace.json", names="0x10=switch")
+view_render(data_file="trace.json", title="任务切换")   # → path，打开即可
+
+view_render(data={...})                  # 也可以内联 JSON，不必落盘
+view_render(data={...}, view="scope")    # 已经知道该出哪种图时显式指定
+view_guide(topic="howto")                # 不知道该配哪张图？先问它（howto/views/spec/limits/all）
+```
+
+四种视图（`view=auto` 按数据形状自认）：
+
+| 视图 | 适合的数据 | 图上有什么 |
+|------|------------|------------|
+| `timeline` | 任务切换/中断/异常事件流（`trace_buff_dump`、`trace_swd_read`、`trace_record`） | 泳道 + 切换时刻标记（放大后标出切给谁）+ 中断进出区间 + 异常虚线 + **缺口斜纹带** |
+| `scope` | 变量/波形样本（`trace_scope_read`）、自写 spec 的算法波形 | 每通道一带；模拟量折线、布尔/枚举阶梯；左侧给 min/max/变化次数/游标当前值 |
+| `bars` | 函数/命中的占比排名（`trace_pcsample`、`trace_profile`、`coverage_read`） | 横向条形榜 + 绝对值 + 占比 |
+| `report` | `{sections:[...]}` 自组结论页 | 结论块（ok/warn/bad）+ 段落 + 列表 + **可嵌套上面任一种图** |
+
+页面自带：滚轮**以鼠标为锚**缩放、拖动平移、单击定位游标（读数跟着游标走）、双击全览、
+`▶ 回放`（按原始时间 1:1 走一遍）、按轨道开关显隐。**每个图都带「边界」栏**：时间轴口径、
+抽稀/合并/上限、丢失计数都摊在页面上——**图上看不到的，只能说没被记录/没插桩，不等于没发生**。
+
+三条规矩：
+
+- **认不出来就报错（`view-unknown-data`），不画空图**——空图会被读成「这段时间什么都没发生」。
+- **自己写 spec 也要能直接出图**：`{"kind":"timeline"|"scope"|"bars"|"report", ...}`，
+  字段说明看 `view_guide(topic="spec")`；结构不对报 `view-bad-spec`，不静默画个半截图。
+- **省 token 的用法**：AI 只说「把这个结果渲染出来」，不写一行 HTML/CSS/JS。
+
+## 七、出问题先看这几个工具
 
 | 现象 | 先调 |
 |------|------|
@@ -251,8 +286,9 @@ trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0,
 | 要改 .sct / 校验分散加载文件 | `scatter_read` → `scatter_check` → `scatter_edit`（改前备份、改后重解析校验，校验不过不落盘） |
 | 想看任务切换 / 上下文切换的完整过程 | `trace_instrument(backend="buff")` 插桩 → 跑 → `trace_buff_dump`（全速录不停目标、10ns 粒度）。读回全 0 是「没读到」不是「没有」，先 `stop` |
 | 想看异常为什么死 | 在 handler 第一条指令放 `MDK_TRACE_FAULT_CAPTURE()`，事后 `trace_buff_dump` 拿 PC/LR/SP/xPSR + CFSR 分位 |
+| 要给人看波形/时间线/排名（不想手写网页） | `view_render(data_file=..., view="auto")`；不知配哪张图先 `view_guide(topic="views")` |
 
-## 七、一条总原则
+## 八、一条总原则
 
 **宁可报错，也不给「看似权威的错答案」**：信息不足时这些工具会明确报错、返回
 `available: false` 或标注低置信（`matched_by` / `pc_confidence` / `conflict` 之类），

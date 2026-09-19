@@ -69,6 +69,8 @@ READONLY = {
     # 通过写 drained 回报目标——写的是**读数游标**（协议自身的一部分），不动用户数据。
     "trace_swd_status", "trace_swd_read",
     "trace_rtt_find", "trace_swo_read",
+    # 可视化说明（批次59）：纯返回文本，不写任何文件。
+    "view_guide",
     # 串口：只列端口与读日志
     "serial_list_ports", "serial_monitor_status", "serial_read",
     # Modbus：只有「离线解析报文」是纯只读（不碰端口、不发字节）。
@@ -108,6 +110,9 @@ NON_IDEMPOTENT = {
     "close_uvision", "ocd_start", "ocd_stop", "run", "run_timeout", "step",
     "wait_fault", "trace_instrument", "toolchain_env", "session_state",
     "uvprojx_edit", "batch", "batch_debug_script", "flash_debug",
+    # 渲染默认每次生成一个带时间戳的新文件（重复调用会攒出多个页面），
+    # 因此不是幂等——与 session_state 同口径。
+    "view_render",
     "scatter_edit", "core_select",
     "restart_keil", "reset_connection", "trace_swo_start", "trace_swo_stop",
     "trace_profile", "profile_function", "profile_sampling",
@@ -159,6 +164,10 @@ MUTATING = {
     # SWD 无缝流复位（批次56）：同样写 reset_req，目标重开一段录制（清环、清字典、
     # seq+1、写 SYNC 标记）。同样是延迟生效。
     "trace_swd_reset",
+    # 可视化渲染（批次59）：**不动目标**（不碰内存/Flash/调试会话），但会往
+    # 本机磁盘写一个 html（默认 ./mdkdebug_views/），按本文件口径（只读＝不改任何
+    # 持久状态，含用户文件）不属于只读；out 也可能覆盖已有文件。
+    "view_render",
 }
 
 # 本服务面向**本机**的开发环境（Keil 进程、调试探针、本地工具链、本地文件），

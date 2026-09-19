@@ -51,6 +51,10 @@ TOOLSETS = {
         # 环境一致性体检（批次49）：核对外设型号/SVD/符号固件/D-Cache 是否与板上真实一致。
         # 放在 core 是因为「默认面上就能看到」是它的价值——跨仓库调试踩坑时才想得起用。
         "env_check",
+        # 可视化人机交互（批次59）：把采集结果渲染成人能看懂的单文件网页。
+        # 放 core 的理由与 env_check 同：**默认面上就能看到是它的价值**——
+        # 它的存在意义就是「别再手写 HTML」，藏起来就没机会被想到。
+        "view_render", "view_guide",
     },
     "mem": {
         "read_mem_multi", "fill_mem", "search_mem", "snapshot", "snapshot_diff",
@@ -201,7 +205,7 @@ FULL_ALIASES = ("all", "full", "*")
 
 # 组的一句话用途，给 status/工具描述用。
 GROUP_NOTES = {
-    "core": "调试核心：进/出调试、运行控制、断点、内存读写、Keil 健康、环境引导",
+    "core": "调试核心：进/出调试、运行控制、断点、内存读写、Keil 健康、环境引导、可视化出图",
     "mem": "内存进阶：批量读、搜索、填充、快照对比、结构体/局部变量/寄存器",
     "symbol": "符号与反汇编：查符号、行号定位、断点位置、反汇编、map 解析",
     "build": "编译烧录：build/rebuild/clean、下载、工程(.uvprojx)读写、多目标",

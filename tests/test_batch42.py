@@ -67,7 +67,7 @@ def group_ab():
     os.environ.pop("MDKDEBUG_TOOLSETS", None)
     srv = create_server(port=PORT_A, toolsets=None)
     ns = names(srv)
-    check("A1 默认只暴露 40 个（core 34 + 常驻 6）", len(ns) == 40, len(ns))
+    check("A1 默认只暴露 42 个（core 36 + 常驻 6）", len(ns) == 42, len(ns))
     for t in ("enter_debug", "read_mem", "write_mem", "mdk_guide", "session_state",
               "keil_health", "diagnose", "target_info") + tuple(STAY):
         check("A2 默认含 %s" % t, t in ns, "")
@@ -77,14 +77,14 @@ def group_ab():
         check("A3 默认不含未装载组的 %s" % t, t not in ns, "")
 
     st = call_sync(srv, "toolset", {"action": "status"})
-    check("A4 status 自述一致（core 已装载 / 收起 146 / 注册 186 / 来源 default）",
+    check("A4 status 自述一致（core 已装载 / 收起 146 / 注册 188 / 来源 default）",
           st.get("ok") and st.get("loaded_groups") == ["core"]
-          and st.get("hidden") == 146 and st.get("total_registered") == 186
+          and st.get("hidden") == 146 and st.get("total_registered") == 188
           and st.get("source") == "default", {k: st.get(k) for k in
                                               ("loaded_groups", "hidden", "total_registered", "source")})
     g = st.get("groups") or {}
     check("A5 status 列全 11 个组且各组规模正确",
-          len(g) == 11 and g.get("core", {}).get("size") == 34
+          len(g) == 11 and g.get("core", {}).get("size") == 36
           and g.get("trace", {}).get("size") == 33 and g.get("ocd", {}).get("size") == 17
           and g.get("target", {}).get("size") == 7
           and g.get("rtos", {}).get("size") == 3
@@ -95,23 +95,23 @@ def group_ab():
     cap = call_sync(srv, "capabilities", {})
     su = cap.get("tool_surface") or {}
     check("A7 capabilities 如实报注册总数 / 收起数 / 未装载组",
-          su.get("registered_total") == 186 and su.get("hidden") == 146
+          su.get("registered_total") == 188 and su.get("hidden") == 146
           and su.get("loaded_groups") == ["core"]
           and "trace" in (su.get("not_loaded_groups") or []), su)
     lt = call_sync(srv, "list_tools", {})
-    check("A8 list_tools 只列当前暴露的（total=40）", lt.get("total") == 40, lt.get("total"))
+    check("A8 list_tools 只列当前暴露的（total=42）", lt.get("total") == 42, lt.get("total"))
 
     print("B. 运行期装卸")
     r = call_sync(srv, "toolset", {"action": "load", "toolsets": "mem,rtos"})
-    check("B1 load mem,rtos 装回 14 个、暴露数 54",
-          r.get("ok") and len(r.get("loaded") or []) == 14 and r.get("exposed") == 54, r)
+    check("B1 load mem,rtos 装回 14 个、暴露数 56",
+          r.get("ok") and len(r.get("loaded") or []) == 14 and r.get("exposed") == 56, r)
     ns2 = names(srv)
     check("B2 装回后立即可见（read_struct / rtos_tasks）",
           "read_struct" in ns2 and "rtos_tasks" in ns2, "")
     lt2 = call_sync(srv, "list_tools", {"keyword": "rtos"})
     got3 = set(t["tool"] for t in (lt2.get("tools") or []))
-    check("B3 list_tools 立即可按新工具过滤（三个 rtos 工具都命中，面仍是 54）",
-          lt2.get("total") == 54
+    check("B3 list_tools 立即可按新工具过滤（三个 rtos 工具都命中，面仍是 56）",
+          lt2.get("total") == 56
           and {"rtos_info", "rtos_tasks", "rtos_objects"} <= got3, sorted(got3))
 
     r2 = call_sync(srv, "toolset", {"action": "load", "toolsets": "mem"})
@@ -119,11 +119,11 @@ def group_ab():
           r2.get("ok") and not (r2.get("loaded") or []) and len(r2.get("already_loaded") or []) == 11, r2)
 
     r3 = call_sync(srv, "toolset", {"action": "unload", "toolsets": "mem,rtos"})
-    check("B5 unload 还原到 40", r3.get("ok") and r3.get("exposed") == 40
+    check("B5 unload 还原到 42", r3.get("ok") and r3.get("exposed") == 42
           and len(r3.get("unloaded") or []) == 14, r3)
 
     r4 = call_sync(srv, "toolset", {"action": "load", "toolsets": "all"})
-    check("B6 toolsets=all 一次全装到 186", r4.get("ok") and r4.get("exposed") == 186, r4)
+    check("B6 toolsets=all 一次全装到 188", r4.get("ok") and r4.get("exposed") == 188, r4)
     srv_all = create_server(port=PORT_B, toolsets="all")
     check("B7 装卸若干轮后，工具顺序仍与全量面完全一致（不把工具甩到队尾）",
           order(srv) == order(srv_all), "本地 %d / 全量 %d" % (len(order(srv)), len(order(srv_all))))
@@ -139,7 +139,7 @@ def group_ab():
     check("B11 卸载常驻组（core）不会把常驻入口一起收走",
           r6.get("ok") and set(names(srv)) == STAY, names(srv))
     call_sync(srv, "toolset", {"action": "load", "toolsets": "core"})
-    check("B12 装回 core 后回到 40", len(names(srv)) == 40, len(names(srv)))
+    check("B12 装回 core 后回到 42", len(names(srv)) == 42, len(names(srv)))
     return srv, srv_all
 
 # ======================================================================
@@ -165,14 +165,14 @@ def _run(code, env):
 def group_c():
     print("C. 显式配置")
     base = {k: v for k, v in os.environ.items() if k != "MDKDEBUG_TOOLSETS"}
-    for spec, want, label in (("all", "186", "MDKDEBUG_TOOLSETS=all 仍是全开"),
+    for spec, want, label in (("all", "188", "MDKDEBUG_TOOLSETS=all 仍是全开"),
                               ("serial", "20", "=serial 只留 14 串口 + 6 常驻"),
-                              ("core,mem", "51", "=core,mem 组合生效"),
-                              ("bogus", "186", "=bogus 组名认不出 → 不裁剪（宁可少裁不错杀）")):
+                              ("core,mem", "53", "=core,mem 组合生效"),
+                              ("bogus", "188", "=bogus 组名认不出 → 不裁剪（宁可少裁不错杀）")):
         got, _ = _run(CODE, dict(base, MDKDEBUG_TOOLSETS=spec))
         check("C1 %s（期望 %s）" % (label, want), got.endswith(want), got)
     got, allout = _run(CODE, base)
-    check("C2 不设环境变量 → 默认精简 40", got.endswith("40"), got)
+    check("C2 不设环境变量 → 默认精简 42", got.endswith("42"), got)
     got, allout = _run(CODE, dict(base, MDKDEBUG_TOOLSETS="bogus"))
     check("C3 组名认不出时有告警（不静默）", "未知组名" in allout, allout[-300:])
     got, _ = _run(CODE_ARG, dict(base, MDKDEBUG_TOOLSETS="all"))
@@ -205,7 +205,7 @@ def group_d(srv_all):
           "toolset" in AN.MUTATING and "toolset" not in AN.READONLY
           and "toolset" not in AN.DESTRUCTIVE, "")
     bad = AN.check_surface(full)
-    check("D8 annotate.check_surface 在 186 个工具上无问题", not bad, bad)
+    check("D8 annotate.check_surface 在 188 个工具上无问题", not bad, bad)
 
 # ======================================================================
 # E. 失败归类

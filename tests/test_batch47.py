@@ -4,7 +4,7 @@
 来源：用户缺口表里剩下四项——代码覆盖率、.sct 受控编辑、多核调试、
 硬件 ETM/ETB 指令级 trace。四项共用一条准则：**能测到才说，测不到就说测不到**。
 
-  A 工具面：注册总数 186、四组归属、注解归类、组规模
+  A 工具面：注册总数 188、四组归属、注解归类、组规模
   B coverage 纯逻辑：函数区间 / 行匹配 / scope / 报告字段
   C coverage 会话：无符号表·空 scope·DWT 读不到·写不进 → 各自的 reason；
      正常采样 → 样本、触达、unmapped 归因；采样器不工作 → usable=false
@@ -141,7 +141,7 @@ def _u32(v):
 def section_a():
     print("A. 工具面与注解")
     total = sum(len(v) for v in TB.TOOLSETS.values()) + len(TB.ALWAYS)
-    check("A1 注册工具总数 186（分组表 180 + 常驻 6）", total == 186, total)
+    check("A1 注册工具总数 188（分组表 180 + 常驻 6）", total == 188, total)
     for t in ("coverage_start", "coverage_read", "coverage_stop", "coverage_clear",
               "trace_etm_probe"):
         check("A2 %s 归在 trace 组" % t, t in (TB.TOOLSETS.get("trace") or []), "")
@@ -154,7 +154,7 @@ def section_a():
     for _v in TB.TOOLSETS.values():
         _all |= set(_v)
     bad = A.check_surface(sorted(_all))
-    check("A3 annotate.check_surface 在 186 个工具上无问题", not bad, bad)
+    check("A3 annotate.check_surface 在 188 个工具上无问题", not bad, bad)
 
     ro = ["coverage_read", "scatter_read", "scatter_check", "core_list", "core_info",
           "trace_etm_probe"]

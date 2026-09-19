@@ -568,6 +568,76 @@ ERROR_CODES = {
             "只想看热点/函数进入退出（不需要插桩）：改用 trace_pcsample / trace_record",
         ],
     },
+    # ---- 可视化（view_render / view_guide）----
+    # 这一族的报错是「认不出数据」而不是「操作失败」：宁可报错，也不给一张空图
+    # ——空图会让人以为「这段时间什么都没发生」，那是比报错更坏的答案。
+    "view-unknown-data": {
+        "text": "认不出这是什么数据，也没有显式指定 view（不会硬画一张空图）",
+        "next_actions": [
+            "把采集工具的返回原样传给 data：trace_swd_read/trace_buff_dump/trace_eventrec"
+            "（events→时间线）、trace_scope_read（recent→波形）、trace_pcsample/trace_profile/"
+            "coverage_read（by_function/hot→排行）、trace_record(action=read)",
+            "显式传 view=timeline|scope|bars|report；或自己写 spec（见 view_guide topic=spec）",
+            "只想看「数据长什么样」：先在采集工具侧确认这次真的采到了（counts/events 非空）",
+        ],
+    },
+    "view-no-data": {
+        "text": "既没给 data 也没给 data_file，没有可渲染的数据",
+        "next_actions": [
+            "把采集结果传给 data；大数据先 out_file 落盘再传 data_file（省 token、避免截断）",
+        ],
+    },
+    "view-file-missing": {
+        "text": "data_file 指向的文件不存在",
+        "next_actions": [
+            "核对 out_file 的落盘路径（采集工具返回里有），路径按绝对路径传",
+        ],
+    },
+    "view-file-bad": {
+        "text": "data_file 不是合法 JSON（或读不动）",
+        "next_actions": [
+            "确认那确实是采集工具 out_file 写出的 json（不要传 html / 二进制 / 空文件）",
+        ],
+    },
+    "view-bad-names": {
+        "text": "names 里有解析不了的条目（id 名字表格式不对）",
+        "next_actions": [
+            "写法：names=\"0x10=switch,1=led_task\"（十进制或 0x 都行，逗号分隔）",
+        ],
+    },
+    "view-bad-view": {
+        "text": "view 传了不认识的视图名",
+        "next_actions": [
+            "可选：auto|timeline|scope|bars|report；不确定就用 auto（认数据不认人）",
+        ],
+    },
+    "view-bad-data": {
+        "text": "数据形状不对（或 data 传了不是 JSON 的字符串）",
+        "next_actions": [
+            "把采集工具的返回**原样**传进来，别先做转换；或传 data_file",
+            "自写 spec 时核对字段（view_guide(topic=\"spec\")），时间单位一律 µs",
+        ],
+    },
+    "view-bad-spec": {
+        "text": "自写的 spec 结构不对（例如 report 不是对象 / 缺 sections）",
+        "next_actions": [
+            "report 需要 {kind:\"report\", verdict:{level,text}, sections:[{h,p,bullets,code,view}]}",
+            "看 view_guide(topic=\"spec\") 的完整字段表",
+        ],
+    },
+    "view-bad-topic": {
+        "text": "view_guide 的 topic 不认识",
+        "next_actions": [
+            "可选：howto|views|spec|limits|all",
+        ],
+    },
+    "view-write-failed": {
+        "text": "可视化 HTML 写盘失败（目录不存在/只读、磁盘满、文件被占用）",
+        "next_actions": [
+            "换 out 到可写目录（默认 ./mdkdebug_views/）；核对磁盘空间",
+            "输出目录只读时显式给 out=（绝对路径）",
+        ],
+    },
     "unknown-error": {
         "text": "未归类的失败",
         "next_actions": ["调 keil_health 看 Keil 侧状态", "用 read_async_messages 读 Keil 的异步报错原文"],
