@@ -21,6 +21,8 @@
 - [十五、RTOS 任务感知（批次40-41，F401 + DAPLink 实测）](#十五rtos-任务感知批次40-41f401--daplink-实测)
 - [十六、环境一致性：符号同源 / 器件系列 / D-Cache（批次49）](#十六环境一致性符号同源--器件系列--d-cache批次49)
 - [十七、目标侧插桩与 trace 后端（批次55，F401 + SVCrtOS 实测）](#十七目标侧插桩与-trace-后端批次55f401--svcrtos-实测)
+- [十八、SWD 无缝 stream：节拍与停机搬环（批次56 实测）](#十八swd-无缝-stream节拍与停机搬环批次56-实测)
+- [十九、AC5（ARMCC 5）：编译成功 ≠ 那行代码生效（批次56 实测）](#十九ac5armcc-5编译成功--那行代码生效批次56-实测)
 
 ## 一、真实 Keil 实测要点
 
@@ -1317,3 +1319,142 @@ DWARF，不做目标侧配合。验证固件 `example_gcc_project/freertos_probe
   Keil 已退出则明确说明「会话已丢失」并指向 `restart_keil`；若被模态框挡住则报出对话框标题。
 - 细节：`search_mem` 支持 `pattern_text`（直接搜 `appstat` 这类字符串，不用手工转十六进制）；
   `read_peripheral` 的每条寄存器同时给裸名（`MODER`）与全名（`GPIOC_MODER`）字段。
+
+## 十八、SWD 无缝 stream：节拍与停机搬环（批次56 实测）
+
+只接 SWD 两线（没有 SWO / ETM）时，要把事件流连续录下来：目标侧用「四元组字典 + varint」
+把每条事件压到 1~3 字节写进环形缓冲，调试器按节奏停下来搬走。这一节是它在
+STM32F401 + SVCrtOS 上真机撞出来的边界，配套工具见 `trace_swd_*` 与
+`trace_guide(topic="time_granularity")`。
+
+### 18.1 无缝的硬条件是节拍，不是缓冲大小
+
+> **搬运间隔 < 环容量 / 事件率**
+
+实测 8 KB 环、约 10k 事件/s（SysTick 500µs 拍 ×2 + PendSV 每次切换 2 条 + 阻塞事件），
+窗口只有 0.22 s：
+
+| 搬运间隔 | 真机结果 |
+|---|---|
+| 0.25 s | `lost_events = 29,015`（环溢出） |
+| **0.12 s** | **`lost_events = 0`**：5.36 s 连续录制 / 56,355 事件 / 5,386 次切换 / 24,136 次中断进出 |
+
+⇒ 把缓冲开大只是把窗口拉长，**节奏必须短于窗口**；两者要一起算，别只调一边。
+
+### 18.2 丢是丢「整条」，不是覆盖：任何时刻停下，已录的那段都完整
+
+写 token 前先查 `head - drained + n > cap - RESERVE(16)`，不够就**整条丢弃并计数**
+（`lost_events` / `lost_bytes`），**绝不覆盖未读区**（`RESERVE` 只留给 `CTL`）。
+所以「跑一段 → 停机搬走 → 继续跑」是安全的：压力大时丢的是事件，不是结构。
+
+### 18.3 读环必须停机
+
+Keil 链路全速运行时读 SRAM 可能**整片读回 0**（工具如实报 `swd-read-degenerate`）——
+这是「没读到」，不是「缓冲是空的」。停机搬走不会丢数据，靠的就是 18.2 的背压语义。
+
+### 18.4 失步要重对齐，不要硬解
+
+字典不同步时继续解会解出**错误的 key**（看着像合理数据，是最危险的那种错）。
+工具报 `swd-stream-desync`，正解是 `trace_swd_reset` 让目标重开一段录制
+（清 head/drained/lost、`seq+1`、写 `CTL_SYNC`）。实测重置后 30/30 次搬运全部成功、可自愈。
+
+### 18.5 时间粒度可调：三档真机实测
+
+`trace_swd_reset(granularity=...)` 是**切换粒度的唯一入口**（写完粒度再写 `reset_req`，
+延迟生效，需配一次重开录制）：
+
+| 粒度写法 | 语义 | 实测字节/事件 |
+|---|---|---|
+| `cycle`（最细） | 每个 CPU 周期一个单位 | 3.69 |
+| `500us`（内核 tick） | 量化到 500µs；量化后 `dt == 0` 自动走 1 字节 `HITN` | 1.61 |
+| `none` | 只记顺序、不记时间：`dt_cycles=None`、`ts="none"`，**不推进虚拟时间** | 1.60 |
+
+- `trace_swd_read(granularity=...)` **只做校验**，是防「读到的是按旧粒度量化过的流」：
+  不符报 `swd-granularity-mismatch`，读到一半被改报 `swd-granularity-changed`，
+  写法非法报 `swd-granularity-invalid`。
+- **量化只损时间分辨力，不损事件顺序**：同一量化窗口内的多条事件 `dt` 全为 0，
+  先后仍完整、间隔不可分辨。要定位抖动就别调粗。
+
+## 十九、AC5（ARMCC 5）：编译成功 ≠ 那行代码生效（批次56 实测）
+
+真机现象：控制块符号 `mdk_trace_swd_blob` 整片读回 `0x00`；换固件、改 halt 时机、
+连读 5 次都一样。最后发现**板子跑的确实是新固件，但新固件里根本没有 SWD 后端**。
+
+### 19.1 `__has_include` 在 AC5 里不是宏 → 工程配置头被静默跳过
+
+```c
+#if defined(__has_include)              /* 只有 GCC / AC6 把它当宏 */
+#  if __has_include("mdk_trace_config.h")
+#    include "mdk_trace_config.h"
+#  endif
+#elif defined(MDK_TRACE_USE_CONFIG_FILE)
+#  include "mdk_trace_config.h"
+#endif
+```
+
+armcc（AC5）里 `__has_include` 不是宏，`#if defined(__has_include)` 为假；第二个分支又要求
+显式定义 `MDK_TRACE_USE_CONFIG_FILE`。两个都不成立 ⇒ 工程自己的
+`mdk_trace_config.h`（写着 `MDK_TRACE_BACKEND_SWD 1`）**被静默跳过**，用的是默认头里的
+ITM 后端 —— 一个要 SWO 引脚的别的后端。于是 `mdk_trace_swd_init()` 被整段编译掉，
+blob 恒为 0，而**编译 0 Error**。
+
+**解法**：AC5 工程必须在命令行加 `-DMDK_TRACE_USE_CONFIG_FILE`；库作者更该在
+「检测到 AC5 且没定义该宏」时 `#warning`，把静默错答案变成响的（本仓库已按此改）。
+
+### 19.2 uvprojx 的 `<Define>` 追加宏不进命令行 → 宏要走 `<MiscControls>`
+
+实测：往 `<Cads>/<VariousControls>/<Define>` 里追加 `MDK_TRACE_SWD_EXTERNAL_PLATFORM`，
+编译器仍走默认分支（表现为 `__get_PRIMASK` 这类 CMSIS 函数报隐式声明）；
+同一处改成 `<MiscControls>-DMDK_TRACE_SWD_EXTERNAL_PLATFORM</MiscControls>` 立刻生效。
+
+- `<Cads>` 在 uvprojx 约 315-345 行；`<MiscControls>` 340、`<Define>` 341、`<IncludePath>` 343。
+- 结论：**宏走 `<MiscControls>`**。两边都写会重复，记得把 `<Define>` 里的删掉。
+
+### 19.3 `register ... __asm("lr")` 语法能过，但会被绑到普通寄存器
+
+`register uint32_t x __asm("lr");` 编译无错，`fromelf --disassemble` 看到的是
+`STR r0,[r1]` 而**不是** `MOV r0, lr` —— 读到的不是 LR，却没有任何告警。
+
+同类写法逐条实测：
+
+| 写法 | 结果 |
+|---|---|
+| `register ... __asm("MSP"/"PSP"/"PRIMASK")` | `#1229 unknown register name`（报错，反而安全） |
+| GCC 风格 `__asm volatile("MRS %0, PRIMASK":"=r"(v))` | `#18 expected a ")"` |
+| `__ASM`（大写，无 CMSIS 时） | 未定义 |
+| `__asm { MOV x, lr }` / `MOV x, r14` | `identifier lr is undefined` |
+
+**可用且反汇编逐字核对过的写法**：
+
+```c
+__asm void My_Handler(void) {
+    IMPORT sym;
+    PUSH {r0-r3, r4, lr}
+    MOV  r0, lr
+    MRS  r1, MSP
+    MRS  r2, PSP
+    BL   sym
+    POP  {r0-r3, r4, lr}
+    B    other
+}
+```
+
+- 嵌汇编函数里 `IMPORT` 可用；尾跳转会生成 `B.W`。
+- `__asm { MRS pm, PRIMASK }` / `CPSID i` / `MSR PRIMASK, pm` / `MRS a, MSP|PSP` 都可用。
+- **不能用 C 宏展开去生成 `__asm` 函数**（宏会把换行合成空格 → `A1207E: Bad or unknown attribute`），
+  必须逐字写开。
+
+### 19.4 判据与三件套
+
+**判据**：符号在 axf 里存在、地址能从 ELF 解出来，但运行时恒为初始值 →
+**先怀疑「这段代码根本没编进去」**，不要先怀疑目标没跑或内存读不对。
+
+三件套（顺序别换）：
+
+1. `fromelf --disassemble <file>.o` 看生成代码 —— 「能编译过」不构成证据；
+2. 看 axf 里符号是否存在、地址能否从 ELF 解出；
+3. 运行时读关键符号，确认它不是初始值。
+
+> 一句话：**编译成功 ≠ 那行代码生效**。AC5 下凡是「配置没进来 / 寄存器没绑对 / 分支没走」，
+> 都先按这三件套证实，再谈目标侧或调试链路的问题。
+

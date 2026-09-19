@@ -201,6 +201,23 @@ trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0,
 - **「没插桩」不等于「没发生」**：`WAIT` 只覆盖 `wait/wait_period/block` 三条路径，
   其余阻塞在这条时间线上不可见。桩点清单本身就是这份 trace 的可信边界。
 
+**第三种：SWD 无缝 stream（只接 SWD 两线，批次56）**——目标侧用「四元组字典 + varint」
+把事件压到 1~3 字节写进环形缓冲，调试器按节奏**停机搬走**（既不是 buff 的「全速录到事后一次读」，
+也不是 rtt 的「持续读」）。三条硬规矩（真机撞出来的，详见 [PITFALLS 第十八节](../docs/PITFALLS.md)）：
+
+- **搬运间隔必须短于「环容量 / 事件率」**：8 KB 环 @ 约 10k 事件/s 只有 0.22 s 窗口——
+  0.25 s 节奏丢 29,015 条，**0.12 s 节奏 `lost_events = 0`**。缓冲开大只是把窗口拉长，
+  节奏不对照样丢，两个数要一起算。
+- **读环必须停机**：目标全速跑时读 SRAM 可能整片读回 0（如实报 `swd-read-degenerate`）——
+  **丢的是「没读到」，不是「没有」**。停机搬走不会丢数据（背压保证任何时刻已录的那段都完整，
+  丢的只是事件，不是结构）。
+- **时间粒度可调**：`trace_swd_reset(granularity=...)` 是唯一入口（`cycle` / `500us` /
+  `none` / `1ms` / `1us`…，见 `trace_guide(topic="time_granularity")`），实测
+  **3.69 / 1.61 / 1.60 字节每事件**。调粗只损时间分辨力：**事件顺序完整，但同一量化窗口内
+  的先后不可分辨**。`trace_swd_read(granularity=...)` 只做校验，不符会报
+  `swd-granularity-mismatch` / `-changed` / `-invalid`。失步报 `swd-stream-desync`，
+  正解是 `trace_swd_reset` 重对齐（别硬解，字典不同步会解出看着合理的错误 key）。
+
 **桩该插在哪儿**（`trace_guide(topic="instrument_points")` 有完整版）：异常 handler 第一条指令
 （`MDK_TRACE_FAULT_CAPTURE()`，一次拿到 PC/LR/SP/xPSR + CFSR，性价比最高）→ 喂狗点与复位原因
 → 任务/上下文切换点 → 状态迁移点。高频中断最内层、被内联的小函数、时间敏感临界区不要插。
