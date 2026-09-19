@@ -8,7 +8,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 186 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
-## 一、动手前的三条纪律
+## 一、动手前的四条纪律
 
 1. **冷启动先对齐环境**，不要凭印象直接下命令：
    - `capabilities` —— 有哪些通道可用（UVSOCK / UV4 命令行 / SVD / 串口 / 构建），当前工程与符号状态；
@@ -20,6 +20,17 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
    工程路径、符号文件、目标器件是否就是用户要的那一份。
 3. **读到可疑数据不要急着下结论**：整帧 0、`UsageFault` 置位、读值与预期不符时，
    先看返回体里的 `note` / `next_actions` / `cache_info`，再复读一次或复位后对比。
+4. **Keil 只开一个窗口，且「先改文件、后开 Keil」**——顺序反了会自己把通道堵死：
+   - 正确顺序：`改源码/改工程 → launch_uvision → 调试 → close_uvision`。**先开 Keil 再改文件**
+     会让 Keil 弹「文件已被外部修改」的**模态框**，模态框会把 UVSOCK 通道一起堵住
+     （后续命令全超时，表现成「调试通道假死」）。
+   - `launch_uvision` 默认 `single=true`：已经开着**别的工程**的窗口时**直接拒绝**
+     （`error_code=keil-multiple-instances`，返回既有实例与下一步），不代替你关窗口；
+     已有**同工程**窗口则强制复用（`reuse_forced=true`）。确实要同时开多个窗口才传 `single=false`。
+   - `uvprojx_edit` 在 Keil 开着同一工程时同样会被拦下（`project-open-in-keil`）：先
+     `close_uvision` 再改，或显式 `force=true`（不推荐，Keil 里那份仍是旧内容）。
+   - 收窗口用 `close_uvision(keep="oldest")`：**持 UVSOCK 4823 的是最早那个实例**，
+     别按「留最新」关。
 
 ## 二、五条主线工作流
 

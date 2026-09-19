@@ -171,18 +171,14 @@ def _run_uv4(uv4: str, args: list[str], timeout: int,
     # UV4 子进程用 Windows 系统 PATH 查找 python 以执行 gen_scatter.py 等预处理脚本；
     # 若 python 不在系统 PATH（venv / Git Bash 内解释器），会报 CreateProcess failed。
     # 注入当前解释器目录到 PATH 前部，保证 UV4 能找到 python。
-    env = None
+    # 统一走 winutil.child_env：剥掉宿主 python 变量（Keil BeforeMake 钩子的
+    # `py -3 gen_scatter.py` 若继承 PYTHONHOME，会加载宿主的标准库而崩在 site 初始化上）。
+    env = winutil.child_env()
     if os.name == "nt":
-        env = os.environ.copy()
         py_dir = os.path.dirname(sys.executable)
         if py_dir:
             cur = env.get("PATH", "")
             env["PATH"] = py_dir + (os.pathsep + cur if cur else "")
-        # 清掉会干扰 Keil BeforeMake 钩子（py -3 xxx.py）的 Python 环境变量：
-        # MCP 服务进程若带 PYTHONHOME/PYTHONPATH，钩子里的 python 会因解释器定位错乱
-        # 抛出多帧 traceback，把真正的编译结论（0 Error(s)）淹没在噪声里。
-        for _k in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"):
-            env.pop(_k, None)
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
@@ -552,9 +548,35 @@ def list_uvision_instances(project: str = "") -> dict:
     return out
 
 
+def _keil_multi_refusal(inst, others, project) -> dict:
+    """拒绝新开窗口时的统一返回：摆出既有实例 + 机器可读错误码 + 下一步动作。"""
+    if project:
+        why = ("已有 %d 个 Keil 实例打开的是**其它**工程：%s。再开一个会累积成多窗口"
+               "（真机实测曾累积到 6 个），已拒绝。"
+               % (len(others), "；".join("pid=%s %s" % (i.get("pid"), i.get("project"))
+                                         for i in others)))
+    else:
+        why = ("本次调用没给 project，无法判断要打开的是不是既有实例的那个工程。"
+               "当前已有 %d 个 Keil 实例，为避免多窗口已拒绝。"
+               % len(inst))
+    return {
+        "ok": False,
+        "error": why,
+        "error_code": "keil-multiple-instances",
+        "single": True,
+        "requested_project": project or None,
+        "open_instances": [{"pid": i.get("pid"), "project": i.get("project")}
+                           for i in inst],
+        "next_actions": [
+            '先 close_uvision(keep="oldest") 收掉窗口再打开目标工程'
+            '（持 UVSOCK 4823 的是**最早**那个实例，别按「留最新」关）',
+            "确实要同时开多个工程窗口：传 single=false",
+        ],
+    }
+
 def launch_uvision(uv4: str, project: str, reuse: bool = True,
                    uvsock_port: int | None = None,
-                   no_layout: bool = False) -> dict:
+                   no_layout: bool = False, single: bool = True) -> dict:
     """可见方式启动 Keil uVision 并打开指定工程（供调试查看界面）。
 
     两个官方命令行开关（吸收自 dsh-keil-mcp / McuBuddy 的痛点）：
@@ -573,21 +595,38 @@ def launch_uvision(uv4: str, project: str, reuse: bool = True,
     - reuse=True（默认）：已有同工程窗口则**复用**（前置该窗口）并如实返回 reused=true，
       不再新开窗口；
     - reuse=False：无条件新开一个窗口（仅在确实需要第二个窗口时使用）。
+
+    single（默认 True）——把「只保留一个 Keil 窗口」这条工程纪律**做成机制**：
+    - 已有**其它工程**的窗口 → 直接拒绝（error_code=keil-multiple-instances），返回既有
+      实例清单与下一步动作；不做「先关再开」的隐式动作（关窗口是不可逆操作，必须由调用方
+      显式决定）；
+    - 已有**同工程**窗口 → 复用（reuse=False 时也复用，返回 reuse_forced=true 并说明），
+      因为此刻再开就是多窗口；
+    - 本次没给 project 且已有实例 → 无从比对，同样拒绝（宁可报错也不猜）；
+    - 确实要同时开多个窗口：传 single=False，显式承担窗口堆积的后果。
     """
-    if reuse and project:
-        same = [i for i in winutil.uv4_instances()
-                if _same_project(i.get("project"), project)]
-        if same:
-            cur = same[-1]                      # 列表按创建时间升序 → 末位为最新
-            focused = winutil.focus_window(cur.get("hwnd"))
-            return {
-                "ok": True, "reused": True, "pid": cur.get("pid"),
-                "instances": len(same), "focused": focused,
-                "msg": "已有同工程 Keil 实例，复用该窗口（未新开；当前同工程窗口 %d 个）"
-                       % len(same),
-                "hint": ('如需收敛到单窗口：close_uvision(keep="latest")；'
-                         "如需看全部实例：list_uvision_instances。"),
-            }
+    inst = winutil.uv4_instances()
+    same = [i for i in inst if project and _same_project(i.get("project"), project)]
+    others = [i for i in inst
+              if not (project and _same_project(i.get("project"), project))]
+    if single and others:
+        return _keil_multi_refusal(inst, others, project)
+    if same and (reuse or single):
+        cur = same[-1]                          # 列表按创建时间升序 → 末位为最新
+        focused = winutil.focus_window(cur.get("hwnd"))
+        out = {
+            "ok": True, "reused": True, "pid": cur.get("pid"),
+            "instances": len(same), "focused": focused,
+            "msg": "已有同工程 Keil 实例，复用该窗口（未新开；当前同工程窗口 %d 个）"
+                   % len(same),
+            "hint": ('如需收敛到单窗口：close_uvision(keep="latest")；'
+                     "如需看全部实例：list_uvision_instances。"),
+        }
+        if not reuse:
+            out["reuse_forced"] = True
+            out["hint"] = ("single=true 下不新开窗口，已强制复用同工程窗口"
+                           "（reuse=false 被否决）；确实要第二个窗口请传 single=false。")
+        return out
     extra = []
     if uvsock_port:
         extra += ["-s", str(int(uvsock_port))]
@@ -605,6 +644,9 @@ def launch_uvision(uv4: str, project: str, reuse: bool = True,
         "msg": "已脱离父进程启动 Keil uVision 并打开工程",
         "hint": "UVSOCK 需数秒才监听；可用 keil_health 确认 port_listening，"
                 "或用 restart_keil 一步完成关闭→重启→等待→重连。",
+        "order_hint": "Keil 已打开该工程：**此刻起不要再改源码/工程文件**——"
+                      "Keil 会弹「文件已被外部修改」模态框并堵住调试通道。"
+                      "要改就先 close_uvision 收窗口，改完再回来 launch。",
     }
     if uvsock_port:
         out["uvsock_port"] = int(uvsock_port)

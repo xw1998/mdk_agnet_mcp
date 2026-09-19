@@ -6177,6 +6177,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "reuse（默认 true）：已有打开同一工程的 Keil 窗口时**复用**该窗口并前置，不新开——"
             "真机实测 UV4.exe 并非单实例程序，反复调用本工具会累积出多个同工程窗口（曾达 6 个），"
             "因此默认复用；确需第二个窗口时才传 reuse=false。"
+            "**single（默认 true）＝「只保留一个 Keil 窗口」的执行者**：已经开着**别的工程**的"
+            "窗口时直接拒绝（error_code=keil-multiple-instances，返回 open_instances 与下一步），"
+            "不做「偷偷关掉再开」；已经开着**同工程**窗口时强制复用（reuse=false 也被否决，"
+            "返回 reuse_forced=true）；本次没给 project 且已有实例同样拒绝（无从比对就不猜）。"
+            "确实要同时开多个窗口才传 single=false。"
             "返回值含 reused / pid / instances（当前同工程窗口数）。"
             "用户无需手动打开 Keil，AI 可通过本工具拉起；想看当前开了几个窗口用 list_uvision_instances，"
             '想把多余的收掉用 close_uvision(keep="latest")。'
@@ -6187,14 +6192,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def launch_uvision(project: str = "", reuse: bool = True,
-                             uvsock_port: int = 0, no_layout: bool = False) -> str:
+                             uvsock_port: int = 0, no_layout: bool = False,
+                             single: bool = True) -> str:
         try:
             if _builder_cfg["uv4"] is None:
                 raise RuntimeError("未定位到 UV4.exe，请用 --uv4-path 指定")
             p = _resolve_project(project)
             return _js(builder.launch_uvision(_builder_cfg["uv4"], p, reuse=bool(reuse),
                                               uvsock_port=(int(uvsock_port) or None),
-                                              no_layout=bool(no_layout)))
+                                              no_layout=bool(no_layout),
+                                              single=bool(single)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -6473,6 +6480,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 })
             # 3) 重新打开本工程（干净实例，加载新固件符号）
             launch = builder.launch_uvision(uv4, p)
+            if not launch.get("ok"):
+                # single 守卫/启动失败时别再硬着头皮 enter_debug：那只会得到一条含混的
+                # 连接错误。把「重开被拒」这一真实原因与既有窗口清单直接提到顶层。
+                return _js({
+                    "ok": False, "action": "flash_debug", "stage": "重开工程",
+                    "close_uvision": close, "flash_plan": flash_plan,
+                    "serial_release": serial_release, "build_flash": bf,
+                    "launch_uvision": launch,
+                    "error": launch.get("error") or "重新打开工程失败",
+                    "error_code": launch.get("error_code") or "keil-launch-failed",
+                    "next_actions": launch.get("next_actions"),
+                    "status_text": "新固件已上板，但重新打开工程未成功（未进调试）",
+                })
             # 4) 进入调试：Keil 启动需时间，对连接类错误做短暂重试
             client = _get_client()
             enter = None
@@ -8695,18 +8715,46 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "3. **改完要重编译**：工程文件变了但 .axf 没变，调试看到的是旧固件的符号。\n"
             "实现上是**文本级替换**（不是 ElementTree 序列化），保留原缩进与属性顺序，"
             "所以 diff 干净、不会把文件洗一遍；每处替换都断言锚点唯一，命中数不为 1 就放弃写入并报错。"
+            "4. **Keil 开着同一工程时会被拦下**：返回 project-open-in-keil，"
+            "先 close_uvision 收窗口再改——先开 Keil 再改工程会让它弹「文件已被外部修改」模态框，"
+            "模态框会把调试通道一起堵死（真机踩过）。确实要写传 force=true。\n"
             "**中风险**：会真实修改用户的工程文件（已自动备份）。"
         ),
     )
     async def uvprojx_edit(action: str, project: str = "", target: str = "",
                            paths="", pattern: str = "", group: str = "",
-                           files="", backup: bool = True) -> str:
+                           files="", backup: bool = True,
+                           force: bool = False) -> str:
         try:
             p = _resolve_project(project)
             if not os.path.isfile(p):
                 return _js({"ok": False, "project": p, "error": "工程文件不存在"})
             a = (action or "").strip().lower()
             bk = bool(backup)
+            # 写工程文件前先问一句「Keil 是不是正开着这个工程」——这是真机上撞出来的：
+            # 先 launch_uvision 打开工程、再改 .uvprojx，Keil 会弹「文件已被外部修改」
+            # 的**模态**对话框，而模态框会把 UVSOCK 通道一起堵死（后续命令全超时，
+            # 表现成"调试通道假死"）。把这一句做成契约，调用方就不可能踩到。
+            if not force:
+                _opened = []
+                try:
+                    _inst = builder.list_uvision_instances(project=p)
+                    _opened = [i.get("pid") for i in (_inst.get("instances") or [])]
+                except Exception:  # noqa: BLE001
+                    _opened = []          # 探测失败不阻断写入（不能让探测把功能锁死）
+                if _opened:
+                    return _js({
+                        "ok": False, "project": p, "action": a,
+                        "error_code": "project-open-in-keil",
+                        "error": "工程正被 Keil 打开（PID %s）；此时写入会让 Keil 弹"
+                                 "「文件已被外部修改」模态框，并把调试通道一起堵住。"
+                                 % ", ".join(str(_x) for _x in _opened),
+                        "open_instances": _opened,
+                        "next_actions": [
+                            '先 close_uvision(keep="none") 收起 Keil，改完工程再 launch_uvision；',
+                            "确实要在 Keil 开着时写就传 force=true（不推荐：Keil 里那份仍是旧内容）。",
+                        ],
+                    })
             if a == "add_include_path":
                 items = _csv_tokens(paths)
                 if not items:

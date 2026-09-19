@@ -77,7 +77,8 @@ class Env:
 
     def __enter__(self):
         self._real = (winutil.keil_health, winutil.launch_detached,
-                      winutil.wait_port_listening, builder._reset_connection_hook)
+                      winutil.wait_port_listening, builder._reset_connection_hook,
+                      winutil.uv4_instances)
 
         def fake_health(port=winutil.DEFAULT_UVSOCK_PORT):
             return self.snaps.pop(0) if self.snaps else snap(False)
@@ -94,11 +95,15 @@ class Env:
         winutil.launch_detached = fake_launch
         winutil.wait_port_listening = fake_wait
         builder.set_reset_connection_hook(lambda reason: self.reset_calls.append(reason))
+        # 自愈路径会经 launch_uvision 的 single 守卫枚举已开实例，
+        # 这里打桩为空，避免去枚举真机实例而被 keil-multiple-instances 拒绝。
+        winutil.uv4_instances = lambda: []
         return self
 
     def __exit__(self, *exc):
         (winutil.keil_health, winutil.launch_detached,
-         winutil.wait_port_listening, builder._reset_connection_hook) = self._real
+         winutil.wait_port_listening, builder._reset_connection_hook,
+         winutil.uv4_instances) = self._real
         return False
 
 

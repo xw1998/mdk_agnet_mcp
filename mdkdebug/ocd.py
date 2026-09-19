@@ -33,6 +33,7 @@ import tempfile
 import time
 
 from . import targets as _targets
+from . import winutil
 
 __all__ = ["OCDTelnet", "OCDSession", "get_session", "register"]
 
@@ -447,7 +448,7 @@ class OCDSession:
         try:
             self.proc = subprocess.Popen(
                 argv, stdout=self._log_fp, stderr=subprocess.STDOUT,
-                cwd=cwd or None, env=env or os.environ.copy(), stdin=subprocess.DEVNULL)
+                cwd=cwd or None, env=winutil.child_env(base=env), stdin=subprocess.DEVNULL)
         except Exception as e:  # noqa: BLE001
             self._log_fp.close()
             self._log_fp = None

@@ -91,7 +91,8 @@ PendSV/SysTick 中断活动与阻塞事件通道）：
 - **编译 / 烧录闭环**：基于 Keil 官方 `UV4.exe` 命令行，提供 `build_project`（编译）、`rebuild_project`（重编译）、`flash_download`（烧录）、`build_and_flash`（编译成功后自动烧录），支持 AI 自主"改代码 → 编译 → 烧录 → 上板"全流程闭环；
 - **后台静默编译**：编译 / 烧录以隐藏窗口方式启动 UV4，**不会闪现新的 Keil 界面**，用户已打开的实例不受打扰；
 - **AI 管理 Keil 开关（闭环）**：`launch_uvision` 拉起 Keil 打开工程（已有同工程窗口则复用，不新开），`close_uvision` 关闭 Keil（默认优雅关闭、残留自动强制），Keil 的开启/关闭全部由 AI 闭环管理，无需手动操作；
-- **Keil 窗口不累积**：UV4.exe **不是**单实例程序（真机实测同工程可并存 6 个窗口），因此 `launch_uvision`、编译后调试通道自愈都先查已有实例、复用而不新开；`list_uvision_instances` 可随时清点，`close_uvision(keep="latest")` 把多余的收敛成一个，保证「只开一个窗口调试」；
+- **Keil 窗口不累积**：UV4.exe **不是**单实例程序（真机实测同工程可并存 6 个窗口），因此 `launch_uvision`、编译后调试通道自愈都先查已有实例、复用而不新开；默认 `single=true` 时**已经开着别的工程就拒绝新开**（`keil-multiple-instances`，摆出既有实例与下一步），同工程则强制复用（`reuse_forced`）——确需多窗口才传 `single=false`。`list_uvision_instances` 可随时清点，`close_uvision(keep="oldest")` 把多余的收敛成一个（**持 UVSOCK 4823 的是最早那个实例**），保证「只开一个窗口调试」；
+- **先改文件、后开 Keil**：「先开 Keil 再改源码/工程」会让 Keil 弹「文件已被外部修改」的**模态框**，并把 UVSOCK 通道一起堵死（表现成「调试通道假死」）。因此 `launch_uvision` 成功即返回 `order_hint`，`uvprojx_edit` 在 Keil 开着同一工程时直接拒绝（`project-open-in-keil`，`force=true` 才放行）；
 - **规避旧窗口调试旧代码**：`flash_debug` 自动按「关闭所有 Keil → 让新固件上板 → 重新打开本工程 → 进入调试」顺序执行，避免因残留旧工程窗口导致调试到旧代码（即使 AI 不记得先关旧窗口也能保证加载的是新固件符号）；上板方式**自动选路**：工程勾选了 Keil 的 `Update Target before Debugging`（`.uvprojx` 的 `UpdateFlashBeforeDebugging=1`，Keil 默认）时，进入调试会由 Keil 自己把最新程序下载进 Flash，于是只编译、不再显式烧录（省掉一次全片擦写与 `UV4 -f` 往返），返回 `flash_plan=debug_download`；未勾选时才退回显式烧录（`flash_plan=explicit_flash`）；
 - **编译烧录输出集中返回**：每次编译/烧录的完整日志（含警告/错误）经 `-o` 捕获并由 AI 完整返回，在对话中即可查看，无需盯 Keil 窗口；
 - **UV4 自动探测**：优先显式 `--uv4-path`，其次探测常见安装目录，再查 Windows 注册表；
@@ -358,7 +359,7 @@ python run_server.py --transport http --http-port 8300
 | `set_breakpoint` | 在符号 / 地址处设软件断点；已存在时 Keil 报 `error 145`，按成功处理并附 `already_exists`。**地址路径与符号路径同一套归一**：入参地址带 Thumb 位（bit0=1）时自动按偶地址下断并返回 `thumb_bit_stripped`/`address_normalized`（真机实测 Keil 的 `BS` 对奇数地址一律报 `error 57: illegal address`）；失败时返回 `diagnosis`（错误码含义 + 地址落在哪个内存区 + 是否在 .axf 覆盖范围 + 下一步建议） | `expr`（如 `main`、`0x08001034`；奇地址会自动清 bit0） |
 | `clear_breakpoint` | 清除断点：`expr`（符号/地址）、`bp_id`（内部 id）、`keil_number`（Keil 界面/BL 里的**真实断点编号**，数据观察点只能这样清）；`bp_id` 在内部表找不到时自动按 Keil 编号处理并给 `resolve_note` | `expr?`、`bp_id?`、`keil_number?` |
 | `list_breakpoints` | 列出断点（含对应的 文件:行号 位置）；`real` / `real_total` 给出 Keil 侧**真实断点表**（编号/类型/访问方式/地址/长度/命中计数/启用状态） | — |
-| `launch_uvision` | 可见方式拉起 Keil 打开工程；已有同工程窗口则**复用并前置**，不新开；以 `CREATE_BREAKAWAY_FROM_JOB` **脱离父进程 job** 启动，不会随调用链被回收。可选追加 `-s <端口>` 让**这次拉起的实例**在指定端口开 UVSOCK（用户 Keil 里 UVSOCK 没开/端口被改过时一步到位）、`-sg` 禁用 uvguix 布局（布局文件损坏导致起不来时绕开） | `project`、`reuse?`（默认 true）、`uvsock_port?`、`no_layout?` |
+| `launch_uvision` | 可见方式拉起 Keil 打开工程；已有同工程窗口则**复用并前置**，不新开；以 `CREATE_BREAKAWAY_FROM_JOB` **脱离父进程 job** 启动，不会随调用链被回收。`single`（默认 true）把「只保留一个窗口」做成机制：已有**别的工程**的窗口 → 拒绝并返回 `keil-multiple-instances`（不做偷偷关窗口）；已有**同工程**窗口 → 强制复用（`reuse_forced`）；没给 `project` 且已有实例 → 同样拒绝。可选追加 `-s <端口>` 让**这次拉起的实例**在指定端口开 UVSOCK（用户 Keil 里 UVSOCK 没开/端口被改过时一步到位）、`-sg` 禁用 uvguix 布局（布局文件损坏导致起不来时绕开） | `project`、`reuse?`（默认 true）、`single?`（默认 true）、`uvsock_port?`、`no_layout?` |
 | `list_uvision_instances` | 列出当前 Keil 实例（PID / 启动时间 / 打开的工程），一眼看清是否残留多个窗口 | `project?` |
 | `close_uvision` | 关闭 Keil 实例；`keep="latest"/"oldest"` 可**只保留一个窗口**、其余关闭 | `force?`、`keep?`、`project?` |
 | `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口；编译后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |

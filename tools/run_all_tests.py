@@ -33,7 +33,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BATCHES = [
     "test_e2e", "test_mcp", "test_stdio", "test_unhardcode",
     "test_batch9", "test_batch10", "test_batch13", "test_batch14",
-    "test_batch15", "test_batch16", "test_batch18", "test_batch25",
+    "test_batch15", "test_batch16", "test_batch18", "test_batch21", "test_batch25",
     "test_batch26", "test_batch28", "test_batch29", "test_batch30",
     "test_batch31", "test_batch32", "test_batch33", "test_batch34",
     "test_batch35", "test_batch36", "test_batch37",
@@ -48,6 +48,7 @@ BATCHES = [
     "test_batch54",
     "test_batch55",
     "test_batch56",
+    "test_batch57",
 ]
 
 # --fast：改一两个模块时先跑这几批（覆盖协议层/统一信封/非 MDK 链路），全绿再跑全量

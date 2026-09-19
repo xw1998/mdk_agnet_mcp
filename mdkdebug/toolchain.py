@@ -29,6 +29,8 @@ import re
 import subprocess
 import time
 
+from . import winutil
+
 __all__ = [
     "FAMILIES", "discover", "find_tool", "find_gdb", "apply_env", "env_state",
     "run_tool", "detect_project", "build", "parse_gcc_output",
@@ -454,7 +456,8 @@ def probe_version(path: str, refresh: bool = False) -> dict:
             "version": None, "first_line": None, "error": None}
     try:
         p = subprocess.run([path] + args, capture_output=True, timeout=20,
-                           cwd=os.path.dirname(path) or None)
+                           cwd=os.path.dirname(path) or None,
+                           env=winutil.child_env())
         raw = (p.stdout or b"") + (p.stderr or b"")
         text = raw.decode("utf-8", "replace")
         first = ""
@@ -650,9 +653,7 @@ def run_tool(tool: str, args=None, cwd: str = "", timeout: float = 300,
     if isinstance(args, str):
         args = _split_args(args)
     argv = [exe] + [str(a) for a in (args or [])]
-    env = os.environ.copy()
-    for k, v in (env_extra or {}).items():
-        env[str(k)] = str(v)
+    env = winutil.child_env(extra=env_extra)
     t0 = time.time()
     out = {"ok": False, "tool": os.path.basename(exe), "path": exe,
            "args": argv[1:], "cmd": " ".join(_quote(a) for a in argv),

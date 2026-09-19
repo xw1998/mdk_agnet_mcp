@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 import socket
 import subprocess
@@ -376,6 +377,28 @@ def find_modal_dialogs() -> list:
         return []
 
 
+# 宿主进程（MCP 服务跑在宿主的 Python 里）可能带着 PYTHONHOME/PYTHONPATH 等变量。
+# 被启动的外部工具若再「另起一个 python」——Keil 的 BeforeMake 钩子 `py -3 xxx.py`、
+# ESP-IDF 的 idf.py——会拿宿主的变量去定位标准库，而解释器版本往往对不上：
+# 真机上表现为 site 初始化失败、刷一屏 traceback，把真正的结论淹没。
+# 所以凡是我们启动的外部工具，一律剥掉宿主 python 变量。
+HOST_PY_ENV_VARS = ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
+                    "PYTHONUSERBASE", "VIRTUAL_ENV", "CONDA_PREFIX")
+
+def child_env(base=None, extra=None) -> dict:
+    """外部工具子进程的环境变量：剥掉宿主 python 变量，可再叠加 extra。
+
+    base=None 时以 os.environ 为底（复制，不改动宿主）；给 base 时以它为底
+    （用于调用方已构造好环境、只想再剥一遍的场景）。extra 最后覆盖。
+    """
+    env = dict(os.environ if base is None else base)
+    for _k in HOST_PY_ENV_VARS:
+        env.pop(_k, None)
+    for _k, _v in (extra or {}).items():
+        env[str(_k)] = str(_v)
+    return env
+
+
 def launch_detached(uv4: str, project: str = "", extra_args: list = None) -> dict:
     """以"脱离调用方 job"的方式启动 UV4，避免进程随调用链被回收。
 
@@ -384,8 +407,9 @@ def launch_detached(uv4: str, project: str = "", extra_args: list = None) -> dic
       （MCP 服务进程若在 job 里，普通子进程会随之被一起杀掉）；
     - DETACHED_PROCESS(0x00000008)：不继承控制台；
     - CREATE_NEW_PROCESS_GROUP(0x00000200)：独立进程组。
-    同时把 stdin/stdout/stderr 接到 DEVNULL，避免继承调用方的管道
-    （也顺带避免 Keil 的 BeforeMake 钩子继承被污染的 PYTHONHOME 等环境）。
+    同时把 stdin/stdout/stderr 接到 DEVNULL，避免继承调用方的管道；
+    并用 child_env() 剥掉宿主 python 变量（否则 Keil 的 BeforeMake 钩子会继承
+    被污染的 PYTHONHOME，`py -3 xxx.py` 直接崩在 site 初始化上）。
     """
     if not uv4:
         return {"ok": False, "error": "未定位到 UV4.exe"}
@@ -396,14 +420,16 @@ def launch_detached(uv4: str, project: str = "", extra_args: list = None) -> dic
     devnull = subprocess.DEVNULL if hasattr(subprocess, "DEVNULL") else open("nul", "wb")  # noqa: SIM115
     try:
         proc = subprocess.Popen(cmd, creationflags=full, close_fds=True,
-                                stdin=devnull, stdout=devnull, stderr=devnull)
+                                stdin=devnull, stdout=devnull, stderr=devnull,
+                                env=child_env())
         return {"ok": True, "pid": proc.pid, "creationflags": hex(full),
                 "detached": True, "breakaway": True, "command": " ".join(cmd)}
     except OSError as e:
         # 某些环境不允许 breakaway（如已在 job 且 job 设了限制），退化为不带该标志
         try:
             proc = subprocess.Popen(cmd, creationflags=base, close_fds=True,
-                                    stdin=devnull, stdout=devnull, stderr=devnull)
+                                    stdin=devnull, stdout=devnull, stderr=devnull,
+                                    env=child_env())
             return {"ok": True, "pid": proc.pid, "creationflags": hex(base),
                     "detached": True, "breakaway": False, "breakaway_error": str(e),
                     "command": " ".join(cmd)}

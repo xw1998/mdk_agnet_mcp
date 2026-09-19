@@ -11,7 +11,8 @@ winutil.launch_detached，绕过了任何复用判断。
 本批：
   A 窗口标题 → 工程路径解析（含各种标题形态）
   B uv4_instances 组装与排序（按创建时间升序，取不到时间也不崩）
-  C launch_uvision：已有同工程实例 → 复用不新开；无实例 / reuse=False → 才新开
+  C launch_uvision：已有同工程实例 → 复用不新开；single=true（默认）时别的工程在开 →
+    拒绝新开（keil-multiple-instances），reuse=false 也被否决；无实例 → 才新开
   D close_uvision(keep=...)：latest / oldest / all 的目标选择，保留的实例不得被关
   E list_uvision_instances 工具输出（count/total/note/别名）
   F server 层参数透传与工具数
@@ -172,23 +173,43 @@ def main():
               and r.get("pid") == 12 and not env.launched, r)
         check("C2 复用的是最新实例并前置窗口",
               r.get("instances") == 2 and env.focused == [112], (r, env.focused))
+        # ---- single（默认 true）= 把「只保留一个 Keil 窗口」做成机制 ----
         r2 = builder.launch_uvision(r"D:\Keil_v5\UV4\UV4.exe", r"D:\other\o.uvprojx")
-        check("C3 不同工程 → 新开窗口",
-              r2.get("reused") is False and len(env.launched) == 1, (r2, env.launched))
+        check("C3 single=true 下已有别的工程 → 拒绝新开（keil-multiple-instances）",
+              r2.get("ok") is False and r2.get("error_code") == "keil-multiple-instances"
+              and [i["pid"] for i in r2.get("open_instances", [])] == [11, 12]
+              and not env.launched, (r2, env.launched))
+        check("C4 拒绝时不偷偷关窗口（关窗口只能由调用方显式决定）",
+              env.closed == [] and env.terminated == [], (env.closed, env.terminated))
+        check("C5 拒绝时给出可执行的下一步（收窗口 / 或显式 single=false）",
+              any("close_uvision" in a for a in r2.get("next_actions", []))
+              and any("single=false" in a for a in r2.get("next_actions", [])), r2)
+        r2b = builder.launch_uvision(r"D:\Keil_v5\UV4\UV4.exe",
+                                    r"D:\other\o.uvprojx", single=False)
+        check("C6 只有显式 single=false 才允许同时开多个工程窗口",
+              r2b.get("reused") is False and len(env.launched) == 1, (r2b, env.launched))
+        # 回到「只开着本工程」的现场：C6 又开了别的工程窗口，会先被 single 拦下
+        env.instances = [inst(11), inst(12)]
         r3 = builder.launch_uvision(r"D:\Keil_v5\UV4\UV4.exe", PROJ, reuse=False)
-        check("C4 reuse=False 时无条件新开（确需第二个窗口）",
-              r3.get("reused") is False and len(env.launched) == 2, (r3, env.launched))
+        check("C7 single=true 下 reuse=false 被否决 → 强制复用同工程窗口",
+              r3.get("reused") is True and r3.get("reuse_forced") is True
+              and len(env.launched) == 1, (r3, env.launched))
+        r3b = builder.launch_uvision(r"D:\Keil_v5\UV4\UV4.exe", PROJ,
+                                     reuse=False, single=False)
+        check("C8 single=false 时 reuse=false 才真新开（确需第二个窗口）",
+              r3b.get("reused") is False and len(env.launched) == 2, (r3b, env.launched))
+        r4 = builder.launch_uvision(r"D:\Keil_v5\UV4\UV4.exe", "")
+        check("C9 不给 project 且已有实例 → 无从比对，同样拒绝（宁可报错也不猜）",
+              r4.get("ok") is False and r4.get("error_code") == "keil-multiple-instances", r4)
         n_before = len(env.launched)
-        builder.launch_uvision(r"D:\Keil_v5\UV4\UV4.exe", PROJ, reuse=False)
-        builder.launch_uvision(r"D:\Keil_v5\UV4\UV4.exe", PROJ, reuse=False)
-        check("C5 reuse=True 连调 3 次不再新增窗口",
-              len(builder.launch_uvision(
-                  r"D:\Keil_v5\UV4\UV4.exe", PROJ).get("pid", 0) and env.launched) == n_before + 2,
-              env.launched)
-        check("C6 大小写/分隔符不同的同一路径也判为同工程",
+        for _ in range(3):
+            builder.launch_uvision(r"D:\Keil_v5\UV4\UV4.exe", PROJ)
+        check("C10 single=true 下同工程连调 3 次不再新增窗口（单调递增地收敛）",
+              len(env.launched) == n_before, env.launched)
+        check("C11 大小写/分隔符不同的同一路径也判为同工程",
               builder._same_project(r"D:/Work/Demo/MDK-ARM/demo.uvprojx",
                                     r"d:\work\demo\MDK-ARM\demo.uvprojx") is True)
-        check("C7 空工程不误判为同工程",
+        check("C12 空工程不误判为同工程",
               builder._same_project("", PROJ) is False)
     finally:
         env.uninstall()

@@ -12,10 +12,14 @@
 
 运行：python -m tests.test_batch21
 """
-import sys, os, json, time, asyncio, tempfile
+import sys, os, json, time, asyncio, tempfile, shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+
+# 批次42 起工具面默认精简（只暴露 core 组），本批校验的是**全量**工具面里的 flash_debug
+# 等工具，必须显式要求不裁剪——否则单独跑本文件时 flash_debug 根本不在工具表里。
+os.environ.setdefault("MDKDEBUG_TOOLSETS", "all")
 
 from tests.mock_uvsock_server import MockUVSOCKServer
 from mdkdebug.server import create_server, _get_client, _parse_uvprojx_config, _builder_cfg
@@ -46,10 +50,14 @@ UVPROJ_TMPL = """<?xml version="1.0" encoding="UTF-8"?>
 </Project>
 """
 
+# 临时工程一律放进**专用子目录**：直接往系统临时目录根扔 .uvprojx 会污染其它测试
+# （test_batch36 的 A8「认不出就说 none」会向上层目录找工程文件证据），并发跑时随机失败。
+TMPDIR = tempfile.mkdtemp(prefix="mdkdebug_b21_")
+
 def make_project(flag):
     """生成临时 .uvprojx；flag 为 '1' / '0' / None（不含该节点）。"""
     inner = "" if flag is None else ("<UpdateFlashBeforeDebugging>%s</UpdateFlashBeforeDebugging>" % flag)
-    fd, path = tempfile.mkstemp(suffix=".uvprojx")
+    fd, path = tempfile.mkstemp(dir=TMPDIR, suffix=".uvprojx")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(UVPROJ_TMPL % inner)
     return path
@@ -168,4 +176,6 @@ async def main():
     return 1 if FAIL else 0
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    _rc = asyncio.run(main())
+    shutil.rmtree(TMPDIR, ignore_errors=True)
+    sys.exit(_rc)

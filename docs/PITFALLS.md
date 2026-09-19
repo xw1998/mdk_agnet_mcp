@@ -23,6 +23,8 @@
 - [十七、目标侧插桩与 trace 后端（批次55，F401 + SVCrtOS 实测）](#十七目标侧插桩与-trace-后端批次55f401--svcrtos-实测)
 - [十八、SWD 无缝 stream：节拍与停机搬环（批次56 实测）](#十八swd-无缝-stream节拍与停机搬环批次56-实测)
 - [十九、AC5（ARMCC 5）：编译成功 ≠ 那行代码生效（批次56 实测）](#十九ac5armcc-5编译成功--那行代码生效批次56-实测)
+- [二十、宿主 Python 变量泄漏进外部工具子进程（批次57）](#二十宿主-python-变量泄漏进外部工具子进程批次57)
+- [二十一、Keil 窗口与文件时序：模态框会堵死调试通道（批次57）](#二十一keil-窗口与文件时序模态框会堵死调试通道批次57)
 
 ## 一、真实 Keil 实测要点
 
@@ -1458,3 +1460,93 @@ __asm void My_Handler(void) {
 > 一句话：**编译成功 ≠ 那行代码生效**。AC5 下凡是「配置没进来 / 寄存器没绑对 / 分支没走」，
 > 都先按这三件套证实，再谈目标侧或调试链路的问题。
 
+
+## 二十、宿主 Python 变量泄漏进外部工具子进程（批次57）
+
+### 20.1 症状骗人：报错点在 SVCrtOS 的脚本上，根因在宿主环境
+
+真机上「F401 工程 Before-Build 的 `py -3 tools/gen_scatter.py` 失败」，看到的是：
+
+```
+SyntaxError: f-string: unmatched '('
+```
+
+第一反应会去查脚本语法——**脚本没问题**。真正的证据链是：
+
+1. `python -c "import site; print(site.__file__)"` 打印出的 `site.py` **来自 Python 3.12**，
+   而实际解释器是 `py -3` 拉起的 **3.10.7**：两个版本的标准库被混着用；
+2. `env -u PYTHONHOME -u PYTHONPATH py -3 tools/gen_scatter.py` 立刻跑通（打印「检查通过」）；
+3. `reg query "HKCU\Environment"` / HKLM 里**都没有** `PYTHONHOME` —— 说明它不在系统环境里，
+   而是**由宿主会话注入**（MCP 服务所在的 Python 进程带进来的）。
+
+### 20.2 传播路径
+
+```
+宿主会话（注入 PYTHONHOME / PYTHONPATH）
+  → MCP 服务进程继承
+    → 我们启动的 UV4.exe 继承（launch_detached / _run_uv4 / ocd / toolchain 都算）
+      → Keil 的 Before-Build 钩子 `py -3 xxx.py` 继承
+        → 3.10 的解释器去加载 3.12 的 site.py → 崩在 site 初始化 / SyntaxError
+```
+
+同一个坑对 ESP-IDF 的 `idf.py` 同样成立：**凡是「我们的进程再拉起一个 python」的链条都会中招**。
+
+### 20.3 约定：外部工具子进程一律走 `winutil.child_env()`
+
+```python
+HOST_PY_ENV_VARS = ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
+                    "PYTHONUSERBASE", "VIRTUAL_ENV", "CONDA_PREFIX")
+env = winutil.child_env()                 # 以 os.environ 为底，剥掉上面这些
+env = winutil.child_env(base=env, extra={"PATH": ...})   # 已有环境再剥一遍 + 追加
+```
+
+落点（改完由 `tests/test_batch57.py` 的 B 段守住）：`winutil.launch_detached`（两处 Popen）、
+`builder._run_uv4`、`ocd`、`toolchain.run_tool` / `probe_version`。
+
+### 20.4 两条元教训
+
+- **注释与实现两张皮**：`launch_detached` 的注释早就写着「避免继承被污染的环境」，
+  但 `Popen` 根本没传 `env=`。**声称做了的事必须有断言看着**，否则等于没做。
+- **报错点 ≠ 根因点**：跨进程/跨语言边界的报错，先证明「子进程看到的环境是什么」，
+  再谈代码逻辑。
+
+> 排查三件事：`site.__file__` 属于哪个版本、`env -u` 去掉变量是否就好、变量是否真在注册表里。
+
+## 二十一、Keil 窗口与文件时序：模态框会堵死调试通道（批次57）
+
+### 21.1 现场
+
+调试 trace 的一轮里，Keil 被开出多个窗口，而且**弹出了模态框**；用户原话：
+
+> 「又开始开多个 mdk 窗口了，而且窗口还有弹窗，感觉你是先开 mdk 再改代码的，
+> 导致 mdk 弹窗说文件更新，之前不是说好只开一个 mdk 的吗？」
+
+根因有两条，且是**不同层面**的：
+
+1. **文件时序反了**：先 `launch_uvision` 打开工程，之后又去改源码/工程文件 → Keil 检测到
+   外部修改，弹「文件已被外部修改」的**模态**对话框。模态框不止挡人，它会**把 UVSOCK
+   通道一起堵住**，后续命令全部超时——表现成「调试通道假死」，很难联想到是弹窗造成的。
+2. **窗口没有收敛机制**：`launch_uvision(reuse=True)` 只处理「同工程复用」，
+   对「已经开着**别的**工程」没有任何拦阻，于是一次次调用就累积成多窗口（UV4 不是单实例程序）。
+
+### 21.2 处置：把纪律做成机制，不靠自觉
+
+| 层面 | 机制 | 失败时的表现 |
+|------|------|-------------|
+| 开窗口 | `launch_uvision(single=True)`（默认） | 已有**别的工程**的窗口 → 拒绝，`error_code=keil-multiple-instances`，返回 `open_instances` + 下一步；已有**同工程**窗口 → 强制复用（`reuse_forced=true`）；没给 `project` 且已有实例 → 同样拒绝（**无从比对就不猜**） |
+| 关窗口 | `close_uvision(keep="all"/"latest"/"oldest")` | 收敛时用 `keep="oldest"`：**持 UVSOCK 4823 的是最早那个实例**，按「留最新」关会把通道关掉 |
+| 改工程 | `uvprojx_edit` 先问「Keil 是否开着这个工程」 | 开着 → 拒绝，`error_code=project-open-in-keil`，给出 `open_instances` 与 `close_uvision` 建议；`force=true` 才放行 |
+| 开窗口后的顺序 | `launch_uvision` 成功即返回 `order_hint` | 明写「**此刻起不要再改源码/工程文件**；要改先 `close_uvision`」 |
+
+**为什么是「拒绝」而不是「自动关掉再开」**：关掉用户的 IDE 是不可逆动作，
+必须由调用方显式决定（工具只负责把「现在有几个、都是什么工程」摆清楚）。
+守则是**宁可报错，也不给看似权威的错答案**：宁可让调用方停下来看现场，也不悄悄制造多窗口/模态框。
+
+### 21.3 真机验证与回归守卫
+
+- 守卫的探测失败**不阻断写入**（`list_uvision_instances` 抛异常时放行）：守卫只做加法，
+  不能让一个探测把功能锁死；
+- `tests/test_batch26.py` 的 C 段覆盖 single 的四种组合（拒绝 / 强制复用 / `single=false` 放行 /
+  无 `project` 时拒绝），`tests/test_batch57.py` 的 C、D 段覆盖 `uvprojx_edit` 守卫与 server 层透传；
+- 另外把 `test_batch21` 补进闸门（它原先没设 `MDKDEBUG_TOOLSETS=all`，
+  工具面默认精简后 `flash_debug` 根本不在表里，单独跑必挂——**闸门漏网比测试失败更危险**）。

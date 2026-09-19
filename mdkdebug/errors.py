@@ -65,6 +65,27 @@ ERROR_CODES = {
             "调 close_uvision 关闭占用实例后重试；需要保留则改在该实例里手工操作",
         ],
     },
+    "keil-launch-failed": {
+        "text": "以可见方式启动 Keil uVision 失败",
+        "next_actions": [
+            "调 list_uvision_instances 看清当前实例；确认 UV4.exe 路径正确（--uv4-path）",
+            "调 restart_keil 走「关→起→等就绪」标准流程再试",
+        ],
+    },
+    "keil-multiple-instances": {
+        "text": "已经开着其它工程的 Keil 窗口，再开一个会累积成多窗口（UV4 不是单实例程序）",
+        "next_actions": [
+            '先 close_uvision(keep="oldest") 收掉其它工程的窗口（持 UVSOCK 4823 的是最早那个实例），再打开目标工程',
+            "确实要同时开多个工程窗口：传 single=false",
+        ],
+    },
+    "project-open-in-keil": {
+        "text": "工程正被 Keil 打开着，此时改 .uvprojx 会触发模态弹窗并堵住调试通道",
+        "next_actions": [
+            '先 close_uvision(keep="none") 收起 Keil 窗口，改完工程文件再 launch_uvision 打开',
+            "确实要在 Keil 开着时写入，传 force=true（不推荐：Keil 里那份仍是旧内容）",
+        ],
+    },
     "uv4-not-found": {
         "text": "未定位到 UV4.exe",
         "next_actions": ["启动服务时用 --uv4-path 指定 UV4.exe 的完整路径", "确认 Keil 安装目录未被移动"],

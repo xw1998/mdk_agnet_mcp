@@ -207,10 +207,15 @@ async def main():
                     "detached": True, "breakaway": True}
 
         builder.winutil.launch_detached = fake_launch
+        # single 守卫（批次57）会先枚举实例：本机真开着别的 Keil 时会把这里判成拒绝，
+        # 与用例意图无关 → 打桩为空，保持用例只验证「脱离 job 的启动路径」。
+        real_instances = builder.winutil.uv4_instances
+        builder.winutil.uv4_instances = lambda: []
         try:
             r = builder.launch_uvision(r"C:\fake\UV4.exe", r"C:\fake\x.uvprojx")
         finally:
             builder.winutil.launch_detached = real_launch
+            builder.winutil.uv4_instances = real_instances
         check("L1 launch_uvision 走 launch_detached（脱离 job）",
               captured.get("uv4") == r"C:\fake\UV4.exe" and captured.get("project") == r"C:\fake\x.uvprojx",
               str(captured))
