@@ -12,6 +12,9 @@
   D launch_uvision single：只保留一个 Keil 窗口（拒绝新开 / 强制复用 / 显式放行）
   E 错误码登记与统一信封
 
+纪律：本用例**不得真正启动 Keil GUI**（会在桌面留下窗口且无人收）。main() 入口即把
+launch_detached 换成抛异常的桩，需要走启动路径的分支必须显式打桩。
+
 运行：python -m tests.test_batch57
 """
 import os
@@ -55,6 +58,15 @@ async def call(server, name, args=None):
         return {"_raw": txt[:300]}
 
 def main():
+    # 测试禁止真正启动 Keil GUI：任何漏打桩的启动路径立即失败，而不是在桌面留下窗口
+    _real_launch_detached = winutil.launch_detached
+
+    def _no_gui(*a, **kw):
+        raise AssertionError(
+            "测试不得真正启动 Keil GUI：launch_detached 未被打桩（会多留一个 Keil 窗口）")
+
+    winutil.launch_detached = _no_gui
+
     # ============ A. child_env ============
     print("A. winutil.child_env：剥掉宿主 python 变量")
     saved = {}
@@ -102,7 +114,7 @@ def main():
         Popen=fake_popen, DEVNULL=-3, DETACHED_PROCESS=0x8,
         CREATE_NEW_PROCESS_GROUP=0x200, CREATE_BREAKAWAY_FROM_JOB=0x1000000)
     try:
-        r = winutil.launch_detached(r"C:\fake\UV4.exe", PROJ)
+        r = _real_launch_detached(r"C:\fake\UV4.exe", PROJ)
         check("B1 launch_detached 启动 UV4 时 env 里没有宿主 PYTHONHOME/PYTHONPATH",
               r.get("ok") is True and isinstance(captured.get("env"), dict)
               and "PYTHONHOME" not in captured["env"]
@@ -183,10 +195,23 @@ def main():
         check("D2 拒绝经统一信封补出 error_hint 与 next_actions",
               bool(r4.get("error_hint")) and any("close_uvision" in a
                                                  for a in r4.get("next_actions", [])), r4)
-        r5 = loop.run_until_complete(call(server, "launch_uvision",
-                                          {"project": PROJ, "single": False}))
-        check("D3 single=false 才放行（参数经 server 透传到 builder）",
-              r5.get("ok") is False or r5.get("reused") is False, r5)
+        real_ld = winutil.launch_detached
+        launched = []
+
+        def _fake_launch(uv4, project="", extra_args=None):
+            launched.append((uv4, project))
+            return {"ok": True, "pid": 999, "breakaway": True,
+                    "creationflags": "0x1020208"}
+
+        winutil.launch_detached = _fake_launch
+        try:
+            r5 = loop.run_until_complete(call(server, "launch_uvision",
+                                              {"project": PROJ, "single": False}))
+        finally:
+            winutil.launch_detached = real_ld
+        check("D3 single=false 才放行（server 透传到 builder，且真的走了启动路径）",
+              r5.get("ok") is True and r5.get("reused") is False
+              and launched and launched[0][1] == PROJ, (r5, launched))
     finally:
         winutil.uv4_instances = real_inst
 
