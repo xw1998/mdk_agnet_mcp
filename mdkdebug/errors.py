@@ -319,6 +319,13 @@ ERROR_CODES = {
             "也可以直接用 link=\"keil\" 或 link=\"ocd\" 指定链路，报错里会分别给出两条链路的缺失原因",
         ],
     },
+    "guide-unknown-tool": {
+        "text": "mdk_guide(topic=tool) 里的 name 不是本服务的工具名",
+        "next_actions": [
+            "用 tools_groups(group=...) 或 list_tools(keyword=...) 查准确工具名",
+            "工具名要完全一致（如 trace_swd_read，不是 swd_read）",
+        ],
+    },
     "toolset-unknown-group": {
         "text": "toolset 的 toolsets 参数里没有可识别的组名",
         "next_actions": [
@@ -672,8 +679,8 @@ def _classify_structured(obj: dict) -> str:
         return "rtos-no-queue-registry"
     if _rr == "no-mem-link":
         return "rtos-no-mem-link"
-    # 工具面（批次42）：reason 里已经写了码，直接透传，别让分类器去猜中文
-    if isinstance(_rr, str) and _rr.startswith("toolset-"):
+    # 工具面/描述取回（批次42、56）：reason 里已经写了码，直接透传，别让分类器去猜中文
+    if isinstance(_rr, str) and _rr.startswith(("toolset-", "guide-")):
         return _rr
     return ""
 

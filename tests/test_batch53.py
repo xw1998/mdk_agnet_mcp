@@ -11,7 +11,7 @@ Event Record 解出来，并给出 Event Statistics 口径的聚合。
 EventRecorder.c 里。所以本测试的重点是「位域对不对」——猜错一位，解出来的
 就是看着像样、其实是别的东西的事件流：
 
-  A 工具面：注册总数 184 / 归 trace 组 / 只读注解 / 默认仍只暴露 38
+  A 工具面：注册总数 186 / 归 trace 组 / 只读注解 / 默认仍只暴露 40
   B info 字位域：component/message/seq/dlen/IRQ/first/last/locked/valid/toggle
   C 记录重建：ts/val1/val2 的 bit31 是 toggle，真值高位在 info —— 必须能还原
   D 槽位事件反推：component=0xEF 那组能反推组别 A/B/C/D 与槽位，其他一律不给 level
@@ -140,7 +140,7 @@ def msg(group, kind, slot):
 def section_a():
     print("A. 工具面与注解")
     total = sum(len(v) for v in TB.TOOLSETS.values()) + len(TB.ALWAYS)
-    check("A1 注册总数 184（分组表 174 + 常驻 4）", total == 184, total)
+    check("A1 注册总数 186（分组表 180 + 常驻 6）", total == 186, total)
     check("A2 trace_eventrec 归 trace 组（组规模 26->27，批次55 再加 3 个 buff 到 30，批次56 再加 3 个 swd 到 33）",
           "trace_eventrec" in (TB.TOOLSETS.get("trace") or [])
           and gsize("trace") == 33, gsize("trace"))
@@ -151,10 +151,10 @@ def section_a():
     for v in TB.TOOLSETS.values():
         allnames |= set(v)
     bad = A.check_surface(sorted(allnames))
-    check("A4 check_surface 在 184 个工具上无问题", not bad, bad)
+    check("A4 check_surface 在 186 个工具上无问题", not bad, bad)
     exposed = gsize("core") + len(TB.ALWAYS)
-    check("A5 默认仍只暴露 38（新工具在 trace 组，不进默认面）", exposed == 38, exposed)
-    check("A6 默认收起 146（184-38）", 184 - exposed == 146, 184 - exposed)
+    check("A5 默认仍只暴露 40（批次56 两个元工具进默认面，trace 组不进）", exposed == 40, exposed)
+    check("A6 默认收起 146（186-40）", 186 - exposed == 146, 186 - exposed)
 
 def section_b():
     print("B. info 字位域")
@@ -473,13 +473,13 @@ def section_m():
 
     readme = rd("README.md")
     skill = rd("skills/mdkdebug/SKILL.md")
-    check("M6 README 写的是 184 个工具、收起 146",
-          "184 个" in readme and "146 个" in readme and "178 个" not in readme
+    check("M6 README 写的是 186 个工具、收起 146",
+          "186 个" in readme and "146 个" in readme and "178 个" not in readme
           and "139 个" not in readme, "")
     check("M7 README 工具表里有 trace_eventrec 一行（含 action 三个取值）",
           "trace_eventrec" in readme and "`status`/`read`/`stats`" in readme, "")
-    check("M8 SKILL.md 工具数 184、收起 146、只读清单里有 trace_eventrec",
-          "184 个工具" in skill and "146 个" in skill and "trace_eventrec" in skill, "")
+    check("M8 SKILL.md 工具数 186、收起 146、只读清单里有 trace_eventrec",
+          "186 个工具" in skill and "146 个" in skill and "trace_eventrec" in skill, "")
 
 def main():
     section_a()

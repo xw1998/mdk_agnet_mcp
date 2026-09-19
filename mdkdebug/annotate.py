@@ -25,6 +25,8 @@ from __future__ import annotations
 # 不起停进程、不占用共享资源）。**不在表里 = 会被标成非只读。**
 # ----------------------------------------------------------------------
 READONLY = {
+    # 工具面查询（批次56）：只读——看有哪些组、当前装了什么
+    "tools_groups",
     # Keil / UVSOCK 侧：查询与解析
     "get_version", "get_status", "keil_health", "calc_expression", "read_variable",
     "read_mem", "read_mem_multi", "find_symbol", "get_current_location", "read_locals",
@@ -121,6 +123,8 @@ NON_IDEMPOTENT = {
 # `check_surface()` 会把这个不变式真的校一遍，别只写在注释里。
 # ----------------------------------------------------------------------
 MUTATING = {
+    # 工具面装卸（批次56）：改变上下文里的工具面，属于改状态
+    "tools_load",
     "batch", "batch_debug_script", "build_and_flash", "build_project",
     "clean_project", "clear_all_breakpoints", "clear_all_watchpoints",
     "clear_breakpoint", "clear_faults", "clear_uvoptx_breakpoints",

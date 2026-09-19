@@ -34,8 +34,21 @@
 
 #include <stdint.h>
 
+/* Pick up the board config the same way mdk_trace.h does. This backend needs
+ * the core clock (to report time) and may be tuned through the same file, so
+ * it must not sit in a translation unit that never sees it. GCC / Clang / AC6
+ * answer __has_include; AC5 users define MDK_TRACE_USE_CONFIG_FILE instead.
+ * A missing file is not an error: the defaults below stand. */
+#if defined(__has_include)
+#  if __has_include("mdk_trace_config.h")
+#    include "mdk_trace_config.h"
+#  endif
+#elif defined(MDK_TRACE_USE_CONFIG_FILE)
+#  include "mdk_trace_config.h"
+#endif
+
 #define MDK_TRACE_SWD_MAGIC_STR   "MDKSWD1"
-#define MDK_TRACE_SWD_VERSION     1u
+#define MDK_TRACE_SWD_VERSION     2u   /* 2: added HITN tag, dt_unit, TS_OFF */
 #define MDK_TRACE_SWD_NSLOT       64u
 #define MDK_TRACE_SWD_CTRL_BYTES  80u
 #define MDK_TRACE_SWD_RESERVE     16u   /* bytes kept free for CTL tokens */
@@ -56,18 +69,36 @@
 #define MDK_TRACE_SWD_TS_SHIFT    0u
 #endif
 
+/* Core clock, used by the host to turn DWT cycles into time. A board should
+ * define its clock once as MDK_TRACE_CPU_HZ and let every backend inherit it,
+ * so this defaults to that rather than to 0. Zero is not "unknown but
+ * harmless": it means the host cannot report t_us at all and every
+ * time-based granularity request has to be refused.
+ * Define MDK_TRACE_SWD_CPU_HZ directly only to give this backend a clock that
+ * differs from the project's. */
 #ifndef MDK_TRACE_SWD_CPU_HZ
-#define MDK_TRACE_SWD_CPU_HZ      0u
+#  ifdef MDK_TRACE_CPU_HZ
+#    define MDK_TRACE_SWD_CPU_HZ  ((uint32_t)MDK_TRACE_CPU_HZ)
+#  else
+#    define MDK_TRACE_SWD_CPU_HZ  0u
+#  endif
 #endif
 
 #define MDK_TRACE_SWD_FLAG_ENABLED    (1u << 0)
 #define MDK_TRACE_SWD_FLAG_SEQ_KNOWN  (1u << 1)
+/* Host -> target: record event ORDER only, no timestamps at all. The host must
+ * then label the stream as untimed and must NOT paint it on a time axis. */
+#define MDK_TRACE_SWD_FLAG_TS_OFF     (1u << 2)
 
 /* One token tag lives in the top two bits of the first byte of a token. */
-#define MDK_TRACE_SWD_TAG_HIT   0u   /* [00|slot]                      varint(dt) */
-#define MDK_TRACE_SWD_TAG_LIT   1u   /* [01|000000] type kind id varint(arg) varint(dt) */
-#define MDK_TRACE_SWD_TAG_CTL   2u   /* [10|subcmd]                    <payload> */
-#define MDK_TRACE_SWD_TAG_RSV   3u
+#define MDK_TRACE_SWD_TAG_HIT   0u   /* [00|slot]  varint(dt)                            */
+#define MDK_TRACE_SWD_TAG_LIT   1u   /* [01|000000] type kind id varint(arg) varint(dt)  */
+#define MDK_TRACE_SWD_TAG_CTL   2u   /* [10|subcmd]  <payload>                           */
+#define MDK_TRACE_SWD_TAG_HITN  3u   /* [11|slot]  NO dt - one byte per event. Emitted
+                                      * whenever the quantised dt is 0, which is what
+                                      * a coarse granularity produces most of the time.
+                                      * The host must read it as dt = 0 (same instant
+                                      * as the previous event), never as "unknown". */
 
 /* CTL sub-commands. */
 #define MDK_TRACE_SWD_CTL_SYNC  0u   /* payload: varint(seq) */
@@ -147,12 +178,20 @@ typedef struct {
     uint32_t cycles;         /* absolute DWT cycle of the most recent event */
     uint32_t flags;
     uint32_t reset_req;      /* host -> target: 1 asks for a fresh recording */
-    uint32_t reserved[3];    /* pads the block out to exactly ctrl_bytes */
+    uint32_t dt_unit;        /* host -> target: dt = cycles / dt_unit.
+                              * 0 (=1 cycle) is the finest resolution; 42000 at
+                              * 84 MHz gives one unit per 500 us kernel tick.
+                              * Divide, not shift: a kernel tick is not a power
+                              * of two, and rounding it to one is a wrong answer. */
+    uint32_t reserved[2];    /* pads the block out to exactly ctrl_bytes */
 } mdk_trace_swd_ctrl_t;
 
 /* Offset of reset_req inside the control block, for hosts that write it by
  * address instead of by struct. */
 #define MDK_TRACE_SWD_RESET_REQ_OFF 64u
+#define MDK_TRACE_SWD_DT_UNIT_OFF   68u
+#define MDK_TRACE_SWD_TS_SHIFT_OFF  48u
+#define MDK_TRACE_SWD_FLAGS_OFF     60u
 
 /* The whole thing. The host locates "mdk_trace_swd_blob", reads the control
  * block, then reads (cap) bytes starting at blob + ring_off. */

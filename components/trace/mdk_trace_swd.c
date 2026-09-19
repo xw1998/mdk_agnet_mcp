@@ -253,13 +253,30 @@ void mdk_trace_swd_event(uint8_t type, uint8_t kind, uint16_t id, uint32_t arg)
         swd_begin_new_recording();
     }
 
-    /* Timestamps stay on the DWT cycle counter: a 500 us kernel tick as the
-     * time base collapses every interesting interval to dt = 0. */
+    /* Timestamps stay on the DWT cycle counter; the RESOLUTION is whatever
+     * the host last asked for. All three knobs live in the control block, so
+     * the granularity can be changed at run time without reflashing:
+     *
+     *   TS_OFF set      -> order only, dt is always 0 (no time axis at all)
+     *   dt_unit != 0    -> dt = cycles / dt_unit  (a kernel tick is not a
+     *                      power of two, so this must be a divide - rounding
+     *                      500 us to the nearest 2^n would be a wrong answer)
+     *   ts_shift != 0   -> dt = cycles >> ts_shift (cheap, power-of-two only)
+     *   neither         -> 1 cycle per unit, the finest the core can express
+     *
+     * Reading the block on every event is what the other host-owned fields
+     * (drained, reset_req) already do, so this costs nothing extra. */
     now = SWD_NOW();
     dt  = now - s_last_cycles;
     s_last_cycles = now;
     c->cycles = now;
-    dt >>= MDK_TRACE_SWD_TS_SHIFT;
+    if ((c->flags & MDK_TRACE_SWD_FLAG_TS_OFF) != 0u) {
+        dt = 0u;
+    } else if (c->dt_unit != 0u) {
+        dt = dt / c->dt_unit;
+    } else if (c->ts_shift != 0u) {
+        dt = dt >> c->ts_shift;
+    }
 
     /* Report an earlier overflow before encoding anything else, so the host
      * sees the discontinuity in the right place. */
@@ -269,8 +286,19 @@ void mdk_trace_swd_event(uint8_t type, uint8_t kind, uint16_t id, uint32_t arg)
     h = swd_slot_of(type, kind, id, arg);
 
     if ((s_slot_used[h] != 0u) && (s_slot_key[h] == key)) {
-        buf[0] = (uint8_t)((MDK_TRACE_SWD_TAG_HIT << 6) | h);
-        n = 1u + swd_varint_put(&buf[1], dt);
+        if (dt == 0u) {
+            /* One byte, and no ambiguity: dt == 0 already means "same instant
+             * as the previous event", which is exactly what a coarse
+             * granularity produces most of the time. So raising the
+             * granularity makes the stream cheaper on its own - no extra
+             * switch, and nothing is hidden: the host reads this back as
+             * dt = 0, not as "unknown". */
+            buf[0] = (uint8_t)((MDK_TRACE_SWD_TAG_HITN << 6) | h);
+            n = 1u;
+        } else {
+            buf[0] = (uint8_t)((MDK_TRACE_SWD_TAG_HIT << 6) | h);
+            n = 1u + swd_varint_put(&buf[1], dt);
+        }
     } else {
         s_slot_key[h]  = key;
         s_slot_used[h] = 1u;
@@ -345,10 +373,15 @@ void mdk_trace_swd_init(void)
         c->ring_off   = MDK_TRACE_SWD_CTRL_BYTES;
         c->seq        = 0u;
         c->ts_shift   = MDK_TRACE_SWD_TS_SHIFT;
+        c->dt_unit    = 0u;
         c->cpu_hz     = MDK_TRACE_SWD_CPU_HZ;
+        c->flags      = MDK_TRACE_SWD_FLAG_ENABLED | MDK_TRACE_SWD_FLAG_SEQ_KNOWN;
+    } else {
+        /* Warm re-init (init is documented as safe to call repeatedly): keep
+         * the host's granularity request. Silently reverting to cycle
+         * timestamps would change what the recording means without saying so. */
+        c->flags |= MDK_TRACE_SWD_FLAG_ENABLED | MDK_TRACE_SWD_FLAG_SEQ_KNOWN;
     }
-
-    c->flags = MDK_TRACE_SWD_FLAG_ENABLED | MDK_TRACE_SWD_FLAG_SEQ_KNOWN;
 
 #if MDK_TRACE_SWD_CLEAR_ON_INIT
     /* A seamless host reads from drained towards head; leaving stale bytes

@@ -2086,43 +2086,62 @@ def _swd_session(addr: int) -> dict:
         s = {"addr": addr, "dec": _swd.Decoder(), "events": [], "faults": [],
              "drained": None, "seq": None, "rel_cycles": 0, "restarts": 0,
              "syncs": 0, "bytes_read": 0, "events_seen": 0,
-             "anchor_cycle": None, "cursor_write_failed": False}
+             "anchor_cycle": None, "cursor_write_failed": False,
+             "gran": None}
         _T["swd"] = s
     return s
 
 
 def _swd_fold(s: dict, items: list, ts_shift: int, cpu_hz: int,
-              names: dict) -> list:
+              names: dict, dt_unit: int = 0, ts_off: bool = False) -> list:
     """把解码出的 token 序列折成带时间的事件列表，并推进会话的时间累计。
 
     gap / sync 要按**流里的先后**插进事件序列（因此用 Decoder.items 而不是把
     events 与 ctl 分开看）——时间轴上一条断口画在哪一格，取决于它前面是哪条事件。
+
+    dt 的量化单位由目标侧控制块决定，三分支（顺序固定、与固件一致）：
+      ts_off  → 整条流没有时间戳：dt_cycles / t_us 一律给 None，绝不按到达顺序
+                编一个假的相对时间（那会让下游以为这是一条有时间轴的数据）；
+      dt_unit → dt * dt_unit（整数除法得来的，粒度可以不是 2 的幂，
+                内核 tick 500us = 42000 周期正是这种情况）；
+      ts_shift→ dt << ts_shift；两者都为 0 就是 1 周期 / 单位，最细。
     """
     out = []
     cur_fault = None
     for it in items:
         if it[0] == "ctl":
             sub, val = it[1], it[2]
+            tm = {"ts": "none"} if ts_off else {"rel_cycles": s["rel_cycles"]}
             if sub == _swd.CTL_LOST:
-                out.append({"type": "gap", "kind": "lost", "events_dropped": val,
-                            "rel_cycles": s["rel_cycles"],
-                            "note": "目标在这里丢了 %d 条事件（宿主没跟上）" % val})
+                ev = {"type": "gap", "kind": "lost", "events_dropped": val,
+                      "note": "目标在这里丢了 %d 条事件（宿主没跟上）" % val}
+                ev.update(tm)
+                out.append(ev)
             elif sub == _swd.CTL_SYNC:
                 s["syncs"] += 1
-                out.append({"type": "sync", "kind": "point", "seq": val,
-                            "rel_cycles": s["rel_cycles"],
-                            "note": "目标在这里重开了录制段（seq=%d），字典已清" % val})
+                ev = {"type": "sync", "kind": "point", "seq": val,
+                      "note": "目标在这里重开了录制段（seq=%d），字典已清" % val}
+                ev.update(tm)
+                out.append(ev)
             continue
         key, dt = it[1], it[2]
         t, k, i, a = key
-        s["rel_cycles"] = (s["rel_cycles"] + (dt << ts_shift)) & _swd.U32
+        dcyc = None
+        if not ts_off:
+            dcyc = (dt * dt_unit) if dt_unit else (dt << ts_shift)
+            s["rel_cycles"] = (s["rel_cycles"] + dcyc) & _swd.U32
         s["events_seen"] += 1
         typ = _swd.TYPES.get(t, "type%d" % t)
         ev = {"type": typ, "kind": _swd.KINDS.get(k, "kind%d" % k),
-              "id": i, "arg": a, "dt_cycles": dt << ts_shift,
-              "rel_cycles": s["rel_cycles"]}
-        if cpu_hz:
-            ev["t_us"] = round(s["rel_cycles"] * 1e6 / cpu_hz, 3)
+              "id": i, "arg": a}
+        if ts_off:
+            ev["dt_cycles"] = None
+            ev["ts"] = "none"
+        else:
+            ev["dt_cycles"] = dcyc
+            ev["rel_cycles"] = s["rel_cycles"]
+            if cpu_hz:
+                ev["t_us"] = round(s["rel_cycles"] * 1e6 / cpu_hz, 3)
         nm = names.get(i)
         if nm:
             ev["id_name"] = nm
@@ -2189,8 +2208,98 @@ def _swd_session_view(s: dict, limit: int = 0) -> dict:
     }
 
 
+def _swd_gran_desc(info: dict) -> dict:
+    """把控制块里的量化参数翻成人话——别让调用方自己拼 ts_shift / dt_unit / ts_off。
+
+    `unit_cycles` 是「一个 dt 单位 = 多少个 CPU 周期」，是**唯一**该拿去做换算的数；
+    cpu_hz 已知时再补一个 unit_us。ts_off 时 unit_cycles 给 None：这段流压根没有
+    时间维度，给个数就等于在编。
+    """
+    ts_off = bool(info.get("ts_off"))
+    du = info.get("dt_unit") or 0
+    sh = info.get("ts_shift") or 0
+    if ts_off:
+        d = {"mode": "none", "unit_cycles": None, "unit_us": None,
+             "ts_off": True, "dt_unit": 0, "ts_shift": 0,
+             "note": "只记事件顺序：整条流没有时间戳，cycles / t_us 一律为 null"}
+    elif du:
+        d = {"mode": "dt_unit", "unit_cycles": du, "ts_off": False,
+             "dt_unit": du, "ts_shift": 0,
+             "note": "dt 的单位是 %d 个 CPU 周期（整数除法，粒度精确；"
+                     "不是 2 的幂也支持——内核 tick 正是这种）" % du}
+    else:
+        d = {"mode": "ts_shift", "unit_cycles": 1 << sh, "ts_off": False,
+             "dt_unit": 0, "ts_shift": sh,
+             "note": ("dt 的单位是 2^%d = %d 个 CPU 周期" % (sh, 1 << sh)) if sh
+                     else "最小粒度：一个 dt 单位就是一个 CPU 周期"}
+    if d["unit_cycles"] and info.get("cpu_hz"):
+        d["unit_us"] = round(d["unit_cycles"] * 1e6 / float(info["cpu_hz"]), 4)
+    return d
+
+
+def _swd_gran_of_info(info: dict) -> tuple:
+    """从控制块抽出「当前生效的三元组」，用来跟调用方请求的粒度比。
+
+    dt_unit 与 ts_shift 全为 0 且 ts_off 为假，就是最细粒度；不能只看 ts_shift
+    ——内核 tick 那种非 2 的幂粒度走的是 dt_unit，ts_shift 恰好是 0。
+    """
+    return (info.get("ts_shift") or 0, info.get("dt_unit") or 0,
+            bool(info.get("ts_off")))
+
+
+def _swd_apply_granularity(addr: int, info: dict, spec) -> dict:
+    """把时间粒度写进控制块：TS_SHIFT / DT_UNIT / FLAGS 里的 TS_OFF 位。
+
+    只写这三个字，不动 cpu_hz / cycles（那是目标自己维护的，宿主写进去就把
+    对锚的基准毁了）。写完**紧接着必须写 reset_req**——一段流里混两种单位就
+    没法正确换算时间，所以真正的入口是 trace_swd_reset(granularity=...)，
+    别单独调这个函数改粒度。
+    """
+    try:
+        ts_shift, dt_unit, ts_off, note = _swd.resolve_granularity(
+            spec, info.get("cpu_hz") or 0)
+    except ValueError as e:
+        return {"ok": False, "error_code": "swd-granularity-invalid",
+                "error": str(e),
+                "hint": "粒度写法可用 cycle（最小）/ none（不记时间戳）/ 500us / 1ms "
+                        "/ 2.5us 这类字符串，或直接给微秒数。"}
+    if ts_shift is None:
+        return {"ok": True, "changed": False, "requested": spec,
+                "granularity": _swd_gran_desc(info), "note": note}
+    flags = (1 if info.get("enabled") else 0) | (
+        _swd.FLAG_TS_OFF if ts_off else 0)
+    wrote = []
+    for off, val in ((_swd.OFF_TS_SHIFT, ts_shift), (_swd.OFF_DT_UNIT, dt_unit),
+                     (_swd.OFF_FLAGS, flags)):
+        w = _write_mem(addr + int(off), struct.pack("<I", int(val) & _swd.U32))
+        if not w.get("ok"):
+            w = _write_mem(addr + int(off), struct.pack("<I", int(val) & _swd.U32))
+        if not w.get("ok"):
+            return {"ok": False, "error_code": "swd-granularity-write-failed",
+                    "error": "写 0x%X（控制块偏移 %d，值 %d）失败：%s"
+                             % (addr + int(off), off, val,
+                                w.get("error") or "未知"),
+                    "wrote": wrote,
+                    "hint": "目标全速跑时经 Keil 链路写 SRAM 可能不生效：先 halt"
+                            "（stop）再试，然后重开一段录制。"}
+        wrote.append({"off": int(off), "addr": "0x%X" % (addr + int(off)),
+                      "value": int(val)})
+    cur = dict(info)
+    cur.update({"ts_shift": ts_shift, "dt_unit": dt_unit, "ts_off": ts_off})
+    return {"ok": True, "changed": True, "requested": spec,
+            "granularity": _swd_gran_desc(cur), "wrote": wrote,
+            "note": note + "。改粒度必须配一次重开录制才生效得干净"
+                            "（trace_swd_reset(granularity=...)）——"
+                            "一段流里混两种单位就换算不出时间轴。"}
+
+
 def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
-    """只读 80 字节控制块：够便宜，能一眼看出「宿主跟不跟得上」。"""
+    """只读 80 字节控制块：够便宜，能一眼看出「宿主跟不跟得上」。
+
+    顺带把当前的**时间粒度**翻成人话（granularity 字段：一个 dt 单位 = 多少
+    CPU 周期 / 多少微秒，TS_OFF 时明说没有时间轴）。只读不改——改粒度必须配
+    一次重开录制，走 trace_swd_reset(granularity=...)。
+    """
     a, loc = _swd_locate(elf=elf, addr=addr)
     if a is None:
         return loc
@@ -2203,6 +2312,7 @@ def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
     out = dict(info)
     out["ok"] = True
     out["locate"] = loc
+    out["granularity"] = _swd_gran_desc(info)
     s = _T.get("swd")
     if s and s.get("addr") == a:
         out["session"] = {
@@ -2216,6 +2326,11 @@ def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
     if info["events"]:
         out["overall_bytes_per_event"] = round(info["head"] / float(info["events"]), 2)
         out["compression_vs_12B"] = round(12.0 / max(0.01, info["head"] / float(info["events"])), 2)
+    if info["ts_off"]:
+        out.setdefault("warnings", []).append(
+            "控制块的 TS_OFF 置位：这段流**只有事件顺序、没有任何时间戳**"
+            "（事件里的 cycles/t_us 一律为 null，工具也不会替你编一个相对时间）。"
+            "要时间轴就把粒度调回 cycle/500us 并重开一段录制。")
     out["next"] = ["trace_swd_read 把未读的那段搬走并解成事件",
                    "trace_swd_reset 让目标开一段新录制"]
     if not out["cpu_hz"]:
@@ -2242,11 +2357,17 @@ def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
 
 def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
              names: str = "", link: str = "auto", reset_session: bool = False,
+             granularity: str = "",
              max_session_events: int = _SWD_MAX_SESSION_EVENTS) -> dict:
     """无缝流的**核心动作**：把 [drained, head) 搬走 → 解码 → 把 drained 推上去。
 
     多次调用会累加成一个连续的时间线（会话状态留在进程内）。
     返回 events 只给最新 limit 条；全量用 out_file 落盘。
+
+    granularity= 是**校验**不是设置：给了就要求控制块当前的粒度与它一致，不一致
+    直接报 swd-granularity-mismatch（一段流里混两种单位，时间轴换算出来就是错的）。
+    改粒度请用 trace_swd_reset(granularity=...)——它会写完粒度后重开一段录制。
+    会话里记下的粒度若与控制块不符（谁在背后改过），也报错而不是照算。
     """
     a, loc = _swd_locate(elf=elf, addr=addr)
     if a is None:
@@ -2268,11 +2389,42 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         s["drained"] = info["drained"]
         s["rel_cycles"] = 0
         s["anchor_cycle"] = None
+        s["gran"] = None
         s["restarts"] += 1
         notes.append("目标重开过录制（seq -> %d）：宿主解码器已重来，"
                      "此前解出的事件仍保留在会话里，它们与之后的事件不在同一条时间基上"
                      % info["seq"])
     s["seq"] = info["seq"]
+
+    # ---- 时间粒度：一段流里只能有一种单位，混着换算出来就是错的
+    cur_gran = _swd_gran_of_info(info)
+    if granularity:
+        try:
+            want = _swd.resolve_granularity(granularity, info.get("cpu_hz") or 0)
+        except ValueError as e:
+            return {"ok": False, "addr": "0x%X" % a, "locate": loc,
+                    "error_code": "swd-granularity-invalid", "error": str(e),
+                    "hint": "粒度写法可用 cycle / none / 500us / 1ms / 2.5us，"
+                            "或直接给微秒数。"}
+        if want[:3] != cur_gran:
+            return {"ok": False, "addr": "0x%X" % a, "locate": loc,
+                    "error_code": "swd-granularity-mismatch",
+                    "error": "控制块当前粒度 ts_shift=%r dt_unit=%r ts_off=%r，"
+                             "与请求的 %r 不符" % (cur_gran + (granularity,)),
+                    "current": _swd_gran_desc(info), "requested": granularity,
+                    "hint": "改粒度不能在一段流中间做：前半段用旧单位、后半段用新"
+                            "单位，换算出来的时间轴是错的。用 trace_swd_reset"
+                            "(granularity=%r) 让目标开一段新录制。" % (granularity,)}
+    if s["gran"] is not None and s["gran"] != cur_gran:
+        return {"ok": False, "addr": "0x%X" % a, "locate": loc,
+                "error_code": "swd-granularity-changed",
+                "error": "会话记下的是 ts_shift=%r dt_unit=%r ts_off=%r，控制块现在"
+                         "是 %r——粒度在会话中途被改过" % (s["gran"] + (cur_gran,)),
+                "current": _swd_gran_desc(info),
+                "hint": "已解出的事件是按旧单位换算的，两者不能混在同一条时间轴上。"
+                        "重开一段：trace_swd_reset(granularity=...)，然后"
+                        " trace_swd_read(reset_session=true)。"}
+    s["gran"] = cur_gran
 
     drained = s["drained"]
     if drained is None:
@@ -2354,16 +2506,17 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         if stable:
             s["anchor_cycle"] = info2["cycles"]
             s["cpu_hz"] = info2["cpu_hz"]
-            s["ts_shift"] = info2["ts_shift"]
+            s["ts_shift"], s["dt_unit"], s["ts_off"] = _swd_gran_of_info(info2)
 
     if "cpu_hz" not in s:
         s["cpu_hz"] = info["cpu_hz"]
-        s["ts_shift"] = info["ts_shift"]
+    s["ts_shift"], s["dt_unit"], s["ts_off"] = cur_gran
 
     new_items = dec.items[base_it:]
     evs = _swd_fold(s, new_items, s["ts_shift"], s["cpu_hz"],
-                    _buff_parse_names(names))
-    if s["anchor_cycle"] is not None:
+                    _buff_parse_names(names), dt_unit=s["dt_unit"] or 0,
+                    ts_off=bool(s["ts_off"]))
+    if s["anchor_cycle"] is not None and not s["ts_off"]:
         _swd_anchor(s, s["anchor_cycle"], s["cpu_hz"], evs)
     s["events"].extend(evs)
     if len(s["events"]) > int(max_session_events or 0) > 0:
@@ -2378,7 +2531,9 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         "ctrl": {k: info[k] for k in ("version", "cap", "ring_off", "head",
                                        "drained", "pending", "lost_events",
                                        "lost_bytes", "events", "tokens", "seq",
-                                       "ts_shift", "cpu_hz", "cycles", "enabled")},
+                                       "ts_shift", "dt_unit", "ts_off", "cpu_hz",
+                                       "cycles", "enabled")},
+        "granularity": _swd_gran_desc(info),
         "cursor_before": drained,
         "cursor_after": s["drained"],
         "bytes_drained": len(data),
@@ -2387,7 +2542,9 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
                     "restarts": s["restarts"], "syncs": s["syncs"],
                     "anchored": s["anchor_cycle"] is not None,
                     "dropped_from_session": s.get("session_events_dropped", 0)},
-        "time_origin": ("绝对（DWT 周期数，锚在控制块 cycles 上）"
+        "time_origin": ("无（TS_OFF：这段流只有事件顺序，没有时间戳）"
+                        if s["ts_off"] else
+                        "绝对（DWT 周期数，锚在控制块 cycles 上）"
                         if s["anchor_cycle"] is not None else
                         "相对（会话第一条事件为 0；本批没对上锚）"),
         "measured_bytes_per_event": (round(s["bytes_read"] / float(view["event_count"]), 2)
@@ -2416,6 +2573,10 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         out["warnings"] = out.get("warnings", []) + [
             "这次读的置信度不高（%s）：结果可能不完整，建议重读一次复核"
             % (rmeta.get("degenerate") or "read_unstable")]
+    if s["ts_off"]:
+        out["warnings"] = out.get("warnings", []) + [
+            "这段流是 TS_OFF（不记时间戳）：事件里的 dt_cycles/cycles/t_us 都是 null，"
+            "只有先后顺序——别把等距排列当成等距时间。"]
     if info["lost_events"]:
         out["warnings"] = out.get("warnings", []) + [
             "lost_events=%d：目标因为宿主跟不上丢了事件，这条时间线不是完整的"
@@ -2444,13 +2605,19 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
     return out
 
 
-def swd_reset(elf: str = "", addr="", wait: bool = True, link: str = "auto") -> dict:
+def swd_reset(elf: str = "", addr="", wait: bool = True, link: str = "auto",
+              granularity: str = "") -> dict:
     """请目标**开一段新录制**：清环、清计数、字典两边一起清、seq 加一。
 
     这是无缝流唯一的「重新对齐」手段：宿主字典与目标字典不同步时，只能靠目标
     重开一段来把两边一起归零——宿主单方面清字典只会让后续每个 HIT 都解错。
     与 buff 一样是**延迟生效**的：目标在下一條事件写入时才处理，长期没有插桩
     事件时会一直挂着（返回 request_latched 说明这一点）。
+
+    granularity= 是**切换时间粒度的唯一入口**：先把 TS_SHIFT / DT_UNIT / FLAGS 的
+    TS_OFF 位写进控制块，紧接着请求重开录制，于是新录的那段整段都是新粒度，不会
+    出现「半段旧单位、半段新单位」这种换算不出来的流。取值 cycle / none / 500us /
+    1ms / 2.5us，或直接给微秒数；留空表示不动粒度。
     """
     a, loc = _swd_locate(elf=elf, addr=addr)
     if a is None:
@@ -2459,10 +2626,22 @@ def swd_reset(elf: str = "", addr="", wait: bool = True, link: str = "auto") -> 
     if info is None:
         return err
     seq0 = info["seq"]
+    gran = None
+    if granularity:
+        g = _swd_apply_granularity(a, info, granularity)
+        if not g.get("ok"):
+            g.update({"addr": "0x%X" % a, "locate": loc, "seq_before": seq0})
+            return g
+        gran = g
     w = _write_mem(a + _swd.OFF_RESET_REQ, struct.pack("<I", 1))
     out = {"ok": bool(w.get("ok")), "addr": "0x%X" % a, "locate": loc,
            "wrote": "0x%X" % (a + _swd.OFF_RESET_REQ), "write_meta": w,
            "seq_before": seq0}
+    if gran is not None:
+        out["granularity"] = gran["granularity"]
+        out["granularity_write"] = gran
+        out["granularity_note"] = (
+            gran["note"] + "。它与 reset_req 一起生效：新录的那段整段都是这个粒度。")
     if not w.get("ok"):
         out["error_code"] = "swd-reset-write-failed"
         out["error"] = w.get("error") or "写 reset_req 失败"
@@ -2495,6 +2674,7 @@ def swd_reset(elf: str = "", addr="", wait: bool = True, link: str = "auto") -> 
             s["dec"] = _swd.Decoder()
             s["rel_cycles"] = 0
             s["anchor_cycle"] = None
+            s["gran"] = None
             s["restarts"] += 1
     else:
         out["note"] = ("reset_req 已写进去但还没被执行（seq 仍是 %d）：它在下一条事件"
@@ -2732,7 +2912,49 @@ GUIDE = {
         "控制块里的周期计数才被当成最后一条事件的绝对时刻（anchor），否则时间原点标为「相对」。\n"
         "上手三步：\n"
         "  trace_swd_status → trace_swd_read（可反复调，一直看新的）→ trace_swd_reset（开新的）\n"
+        "  记录量不够（环几分钟就绕一圈）时先别急着放弃：**时间粒度可以调粗**，"
+        "见 topic=time_granularity。\n"
         "  插桩点怎么选见 topic=instrument_points；两种老模式见 topic=instrument_modes。"
+    ),
+    "time_granularity": (
+        "无缝流的时间粒度是**可调的**：从「1 个 CPU 周期」到「一个系统调度 tick」"
+        "再到「完全不记时间戳」——录得多长、看得多细，由你定。\n"
+        "为什么需要它：事件率是硬的（SysTick 500us 一拍就要写 2 条、每次上下文切换写 "
+        "2~3 条，真板上实测约 **10.5k 事件/秒**），而 dt 是变长编码——粒度高的时候"
+        "几乎每条事件都要拖一个 varint 时间差。粒度调粗后相邻事件的时间差常常量化成 "
+        "0，这时编码器自动改用 **HITN token（1 字节、干脆不带 dt）**，所以调粗粒度"
+        "不只是「省几个字节」，是把绝大多数 token 压到 1 字节。\n"
+        "  · 实测：cycle 档 3.67 字节/事件（8 KB 环装 0.21 s）；tick/none 档约 "
+        "1.00 字节/事件（8 KB 环装 0.78 s，**约 3.7 倍**）。\n"
+        "怎么切——**只有 trace_swd_reset(granularity=...) 这一个入口**，它先把粒度写进"
+        "控制块（TS_SHIFT / DT_UNIT / FLAGS 的 TS_OFF 位），紧接着请求重开一段录制；"
+        "于是新录的那一段整段都是新粒度，不会出现「半段旧单位、半段新单位」——"
+        "那种流的时间轴是换算不出来的，工具会直接报 swd-granularity-mismatch，"
+        "而不是给你一条看起来对、其实每格都错的时间轴。\n"
+        "取值与语义：\n"
+        "  · cycle —— 最细，1 个 dt 单位 = 1 个 CPU 周期；要看函数级/中断级的精确间隔时用。\n"
+        "  · 500us —— **对齐内核 tick**（相当于「每 tick 一个单位」，粗到看不见 tick 内部）。"
+        "注意 500us @84MHz = 42000 个周期，**不是 2 的幂**，所以走的是整数除法（DT_UNIT）"
+        "而不是移位：把 42000 凑成 2 的幂就是给你一个错答案，我们不这么干。\n"
+        "  · 1ms / 2.5us / 42 —— 直接给时间，工具按 cpu_hz 换算成周期数；"
+        "恰好是 2 的幂时自动改走移位并在 note 里如实说明（移位最便宜）。\n"
+        "  · none —— 完全不记时间戳，只留事件顺序，最省。**这时工具会明确告诉你"
+        "「这段流没有时间轴」**：事件里的 dt_cycles / cycles / t_us 一律给 null，"
+        "绝不按到达顺序编一个等距的假时间；画回放时也不能把等距排列画成等距时间。\n"
+        "两条边界：\n"
+        "  ① 按时间换算粒度前必须知道 cpu_hz——控制块里 cpu_hz=0（固件没填 "
+        "MDK_TRACE_SWD_CPU_HZ）时会**直接报错**，让你改用 cycle / none，"
+        "而不是拿一个编出来的主频去算；\n"
+        "  ② 粗粒度只丢**分辨率**，不丢**事件**：每条事件都在，只是同单位内的先后"
+        "被量化掉了（所以同刻的几条会被画在同一格）。时间原点仍锚在控制块的绝对周期"
+        "计数上，量化误差只在段内、不累积。\n"
+        "一次录制能不能装下，就是道算术题：\n"
+        "  **环容量 ÷（事件率 × 字节/事件）** = 能录多久，再乘上主机的搬运频率就是上限。"
+        "真板 10.5k 事件/秒时，cycle 档 8 KB 只装 0.21 s、tick 档 0.78 s——"
+        "要长时间录就把粒度调粗、把插桩点收窄，或把环开大。\n"
+        "与 ts_shift 的关系：ts_shift 是「单位 = 2^shift 个周期」，dt_unit 是"
+        "「单位 = dt_unit 个周期」，两者只生效一个；都为 0 就是最细。"
+        "用 time_granularity 这层抽象就不用自己算 shift 了。"
     ),
     "instrument_points": (
         "「桩插在哪儿」比「怎么读」更决定这次 trace 有没有用。按对排查的价值排序：\n"
@@ -2805,6 +3027,9 @@ def register(server, js=None) -> int:
             "主机增量搬走），各自代价与选型**）/ swd_seamless（**只有 SWD 两线时怎么做"
             "无缝不丢的连续录制：背压而非覆盖、四元组字典压缩、丢失即双方清字典、"
             "reset_req 握手与延迟生效、搬字节的固定顺序**）/ "
+            "time_granularity（**无缝流的时间粒度从「1 个 CPU 周期」到「系统 tick」"
+            "再到「完全不记时间戳」怎么切：HITN 自动省字节、dt_unit 精确对齐 tick、"
+            "改粒度必须重开一段录制**）/ "
             "instrument_points（**该往哪儿插桩：HardFault 等异常 handler 排第一，"
             "其次是看门狗喂狗点与任务切换点，以及哪些地方不该插**）/ "
             "lessons（**这几次在真板上撞出来的 7 个坑：运行态读 RAM 读回 0、"
@@ -3370,8 +3595,12 @@ def register(server, js=None) -> int:
         description=(
             "swd 无缝流后端（压缩 + 背压，只要 SWD 两线的**连续**录制）的健康快照。"
             "只读 80 字节控制块，很便宜。返回：head/drained/pending、重复次数 seq、"
-            "lost_events/lost_bytes、环容量、时间粒度 ts_shift、cpu_hz，"
-            "以及整体的 overall_bytes_per_event 与 compression_vs_12B。\n"
+            "lost_events/lost_bytes、环容量、cpu_hz，以及整体的 "
+            "overall_bytes_per_event 与 compression_vs_12B。\n"
+            "**时间粒度**在 granularity 字段里翻成人话：mode=ts_shift/dt_unit/none、"
+            "unit_cycles（一个 dt 单位 = 多少 CPU 周期）、unit_us。"
+            "mode=none 表示这段流压根没有时间戳（只有事件顺序）。"
+            "改粒度请用 trace_swd_reset(granularity=...)——它必须配一次重开录制。\n"
             "**定位**：默认按 ELF 符号 mdk_trace_swd_blob 找（elf= 或会话已 set_symbol_file 的可省），"
             "也可以 addr=0x... 直接给；找不到会明确报 swd-symbol-missing，不会猜。\n"
             "**读回整片 0 不等于没事件**：目标全速运行时经 SWD 读 RAM 可能整片读回 0，"
@@ -3400,17 +3629,23 @@ def register(server, js=None) -> int:
             "事件里 auto 带出 gap（丢了一段）、sync（目标重开了录制段）、fault（异常，含 CFSR 拆位"
             "与寄存器现场）。\n"
             "**宿主一侧没有「从半路接上」的办法**：HIT token 只带槽号，字典一旦漂移就会解出错误的 id，"
-            "那时会报 swd-stream-desync，正确做法是 trace_swd_reset 让目标重开一段。"
+            "那时会报 swd-stream-desync，正确做法是 trace_swd_reset 让目标重开一段。\n"
+            "**时间粒度**：返回里的 granularity 说明这段流一个 dt 单位是多少 CPU 周期"
+            "（mode=none 就是没有时间戳、只有顺序）。granularity= 传值时只做**校验**："
+            "与控制块不符会报 swd-granularity-mismatch（一段流里混两种单位换算出来就是"
+            "错的），改粒度要用 trace_swd_reset(granularity=...)。"
         ),
     )
     async def trace_swd_read(elf: str = "", addr: str = "", limit: int = 200,
                              out_file: str = "", names: str = "",
                              link: str = "auto",
-                             reset_session: bool = False) -> str:
+                             reset_session: bool = False,
+                             granularity: str = "") -> str:
         try:
             return _js(swd_read(elf=elf, addr=addr, limit=int(limit),
                                 out_file=out_file, names=names, link=link,
-                                reset_session=bool(reset_session)))
+                                reset_session=bool(reset_session),
+                                granularity=granularity))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1
@@ -3424,13 +3659,20 @@ def register(server, js=None) -> int:
             "**这是无缝流唯一的重新对齐手段**：宿主字典与目标字典不同步时，宿主单方面清字典只会让"
             "后续每个 HIT 都解错——只能由目标重开一段把两边一起归零。\n"
             "与 buff 一样是**延迟生效**的：目标长期没有插桩事件时会一直挂着（返回 request_latched），"
-            "那不是失败，但也不能当成「已清空」。生效与否以 seq 是否变化为准（wait=true 会重读确认）。"
+            "那不是失败，但也不能当成「已清空」。生效与否以 seq 是否变化为准（wait=true 会重读确认）。\n"
+            "**granularity= 是切换时间粒度的唯一入口**：先把 TS_SHIFT / DT_UNIT / "
+            "FLAGS 的 TS_OFF 位写进控制块，再请求重开录制，于是新录的那一段整段都是"
+            "新粒度。取值 cycle（最小，1 个 CPU 周期）/ none（完全不记时间戳，只留"
+            "顺序，最省字节）/ 500us（对齐内核 tick）/ 1ms / 2.5us，或直接给微秒数；"
+            "留空不动粒度。想多录事件就把粒度调粗：tick 档实测约 1.00 字节/事件。"
         ),
     )
     async def trace_swd_reset(elf: str = "", addr: str = "",
-                              wait: bool = True, link: str = "auto") -> str:
+                              wait: bool = True, link: str = "auto",
+                              granularity: str = "") -> str:
         try:
-            return _js(swd_reset(elf=elf, addr=addr, wait=bool(wait), link=link))
+            return _js(swd_reset(elf=elf, addr=addr, wait=bool(wait), link=link,
+                                 granularity=granularity))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

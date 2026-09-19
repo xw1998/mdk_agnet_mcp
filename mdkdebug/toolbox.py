@@ -16,7 +16,7 @@
    要用别的组，调 `toolset(action="load", toolsets="mem,trace")` 装回来。
 2. **显式设了但认不出来 → 不裁剪（全开）+ 告警**：宁可少裁不错杀。
    一个手滑的组名不该静默缩减用户的工具面（那会让人以为"配置生效了"）。
-3. **`list_tools` / `get_version` / `capabilities` / `toolset` 永远保留**：
+3. **`list_tools` / `get_version` / `capabilities` / `toolset` / `tools_groups` / `tools_load` 永远保留**：
    否则 AI 连「现在有哪些工具、怎么装回来」都问不出来，会陷入瞎试。
 4. **未归类的工具一律保留**，只裁「明确归到别的组」的工具。
 5. 装卸都按原始注册顺序重排，并对调用方明说「客户端可能缓存了工具列表」。
@@ -133,8 +133,65 @@ TOOLSETS = {
     },
 }
 
-# 永远保留：这四个是「问工具面」的入口，裁掉它们 AI 会陷入瞎试。
-ALWAYS = {"list_tools", "get_version", "capabilities", "toolset"}
+# 永远保留：这几个是「问工具面 / 装卸工具面」的入口，裁掉它们 AI 会
+# 陷入瞎试——连「现在有哪些工具、怎么装回来」都问不出来。
+ALWAYS = {"list_tools", "get_version", "capabilities", "toolset",
+          "tools_groups", "tools_load"}
+
+# nano 极简档（批次56）：**小上下文模型**的最小可用面。
+# 它不是「组」而是一个**档位**（profile）——这批工具横跨 core/build/trace 三组，
+# 用「组」表达不了。toolset(toolsets=nano) 与 tools_load(group=nano) 都认它。
+NANO_TOOLS = (
+    "keil_health", "build_and_flash",            # 健康检查 / 编译烧录
+    "enter_debug", "exit_debug", "run", "stop",  # 进出调试 / 跑停
+    "read_mem", "write_mem", "read_variable",    # 内存与变量
+    "set_breakpoint", "clear_breakpoint",        # 断点
+    "trace_swd_read",                            # 读 trace
+    "tools_groups", "tools_load",                # 装卸入口本身
+    # 取回入口必须在这个档里：描述瘦成一句摘要后，正文全靠 mdk_guide 取回——
+    # 指针指着一个装不上的工具，就是「看似权威的错答案」。
+    "mdk_guide",
+)
+PROFILES = {
+    "nano": {"tools": NANO_TOOLS,
+             "note": "极简档：健康检查 / 编译烧录 / 进出调试 / 跑停 / "
+                     "读写内存与变量 / 断点 / 读 trace / 元工具（含说明取回）"},
+}
+_ALL_GROUP_NAMES = sorted(TOOLSETS) + sorted(PROFILES)
+
+
+def _names_of(g) -> set:
+    """一个组或一个档位的工具名集合。"""
+    if g in PROFILES:
+        return set(PROFILES[g]["tools"])
+    return set(TOOLSETS.get(g) or ())
+
+
+def tools_of(g):
+    """某个组/档的工具名（排序）；认不出来返回 None（调用方据此报未知组）。"""
+    g = str(g or "").strip().lower()
+    if g in PROFILES or g in TOOLSETS:
+        return sorted(_names_of(g))
+    return None
+
+
+def desc_default_for(spec=None) -> str:
+    """工具描述分层的默认档位：nano 极简档用 min，其余用 full（不改写）。
+
+    小上下文场景下 nano 档本来就是为了「装得下」，所以它直接走 min（正文只留
+    一句摘要，全文仍可 mdk_guide 逐字取回）；其余工具面默认 full——默认对外
+    暴露的描述不该缺内容，想省上下文要由调用方显式选 lean/min。
+    显式设了 MDKDEBUG_DESC 时由 thin.mode_from_env 覆盖本默认值。
+    spec=None 表示「调用方没给」——这时看 MDKDEBUG_TOOLSETS（与裁剪策略同一来源）。
+    """
+    s = spec
+    if s is None or not str(s).strip():
+        s = env_raw()
+    if s and str(s).strip().lower() not in FULL_ALIASES:
+        want, _unknown = parse_groups(s)
+        if want == ["nano"]:
+            return "min"
+    return "full"
 
 # 默认（不设 MDKDEBUG_TOOLSETS 时）暴露的组：调试核心 + 环境引导。
 DEFAULT_GROUPS = ("core",)
@@ -173,8 +230,9 @@ def parse_groups(spec) -> tuple:
     """把 "mem, trace" 解析成 (known, unknown)。组名大小写不敏感。"""
     toks = [t.lower() for t in
             str(spec or "").replace(",", " ").replace(";", " ").split()]
-    known = [t for t in toks if t in TOOLSETS]
-    unknown = sorted({t for t in toks if t not in TOOLSETS})
+    known = [t for t in toks if t in TOOLSETS or t in PROFILES]
+    unknown = sorted({t for t in toks
+                      if t not in TOOLSETS and t not in PROFILES})
     # 去重但保持顺序
     seen, want = set(), []
     for t in known:
@@ -193,7 +251,9 @@ def plan(tool_names=None, spec=None, source="env") -> dict:
     names = set(tool_names or [])
     assigned = assigned_names()
     unassigned = sorted(n for n in names if n not in assigned) if names else []
-    base = {"available_groups": sorted(TOOLSETS),
+    base = {"available_groups": list(_ALL_GROUP_NAMES),
+            "profiles": {k: {"size": len(v["tools"]), "note": v["note"]}
+                         for k, v in PROFILES.items()},
             "unassigned": unassigned, "source": source}
     if spec is None:
         want, unknown, on = list(DEFAULT_GROUPS), [], True
@@ -213,7 +273,7 @@ def plan(tool_names=None, spec=None, source="env") -> dict:
         on, note = True, "按 MDKDEBUG_TOOLSETS 指定组裁剪"
     keep = set(ALWAYS) | set(unassigned)
     for g in want:
-        keep |= set(TOOLSETS[g])
+        keep |= _names_of(g)
     removed = sorted(n for n in names if n not in keep)
     return dict(base, on=on, requested=want, unknown_groups=unknown,
                 removed=removed, kept=sorted(n for n in names if n in keep),
@@ -302,7 +362,9 @@ class Toolbox:
             "total_registered": len(self.all),
             "loaded_groups": self.loaded_groups(),
             "default_groups": list(DEFAULT_GROUPS),
-            "available_groups": sorted(TOOLSETS),
+            "available_groups": list(_ALL_GROUP_NAMES),
+            "profiles": {k: {"size": len(v["tools"]), "note": v["note"]}
+                         for k, v in PROFILES.items()},
             "groups": groups,
             "requested": list(self.requested),
             "source": self.source,
@@ -333,7 +395,7 @@ class Toolbox:
     def _grab(self, groups, want_load: bool) -> dict:
         added, removed, already, kept = [], [], [], []
         for g in groups:
-            for nm in sorted(TOOLSETS[g]):
+            for nm in sorted(_names_of(g)):
                 if nm in ALWAYS:
                     kept.append(nm)
                     continue
@@ -359,8 +421,9 @@ class Toolbox:
         return {"ok": False,
                 "error": "没有可识别的组名：%s" % ("、".join(unknown) or "(空)"),
                 "reason": "toolset-unknown-group", "unknown_groups": unknown,
-                "available_groups": sorted(TOOLSETS),
-                "hint": "可用的组：%s（也可以直接写 all）" % "、".join(sorted(TOOLSETS))}
+                "available_groups": list(_ALL_GROUP_NAMES),
+                "hint": "可用的组：%s；档位：%s（也可以直接写 all）"
+                        % ("、".join(sorted(TOOLSETS)), "、".join(sorted(PROFILES)))}
 
     def load(self, spec) -> dict:
         """把若干组工具装回工具面（幂等：已经在的不重复装）。spec=all 即全装。"""

@@ -229,7 +229,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 184 个工具定义
+│   └── server.py             # MCP Server 与 186 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -278,7 +278,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **184** 个（**默认只暴露 38 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **186** 个（**默认只暴露 40 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
 - **MDK 族（110 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
 - **非 MDK 族（67 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**，33 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
@@ -592,18 +592,18 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-184 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 38 个**（`core` 组 34 个 + 4 个元工具），其余 146 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+186 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 40 个**（`core` 组 34 个 + 6 个元工具），其余 146 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 184 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 186 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
 
-共 11 个组（`core` 为默认装载组）：
+共 11 个组 + 1 个档位（`core` 为默认装载组；小上下文模型另有 `nano` 极简档，见下）：
 
 | 组名 | 内容 |
 |---|---|
@@ -619,7 +619,23 @@ toolset(action="load",   toolsets="all")        # 一次全装 184 个（=full/*
 | `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 函数运行时线录制 / 插桩组件部署（含目标侧缓冲后端、SWD 无缝流后端）/ 代码覆盖率 / ETM 能力探测（33 个） |
 | `rtos` | RTOS 任务感知：任务列表 / 栈水位 / 队列信号量（3 个；跨 Keil 与 OpenOCD 两条链路） |
 
-四条防翻车约定：**收起 ≠ 坏了**——收起只是不进工具清单，`load` 装回来立刻可用（返回值里的 `exposed` 是新暴露数）；**`list_tools` / `get_version` / `capabilities` / `toolset` 四个元工具永不被裁**（否则 AI 连工具清单都问不出来也装不回来），未归类的工具一律保留、组名写错时只告警不裁剪（宁可少裁不错杀）；**装完若客户端报「未知工具」**，多半是它缓存了旧的 tools/list——重新拉一次清单即可；**装载状态随时可核对**：`toolset(action="status")` 与 `capabilities.tool_surface` 都会报当前装载组、收起数与注册总数。
+四条防翻车约定：**收起 ≠ 坏了**——收起只是不进工具清单，`load` 装回来立刻可用（返回值里的 `exposed` 是新暴露数）；**`list_tools` / `get_version` / `capabilities` / `toolset` / `tools_groups` / `tools_load` 六个元工具永不被裁**（否则 AI 连工具清单都问不出来也装不回来），未归类的工具一律保留、组名写错时只告警不裁剪（宁可少裁不错杀）；**装完若客户端报「未知工具」**，多半是它缓存了旧的 tools/list——重新拉一次清单即可；**装载状态随时可核对**：`toolset(action="status")` 与 `capabilities.tool_surface` 都会报当前装载组、收起数与注册总数。
+
+#### 小上下文模型：`nano` 档 + 描述分层
+
+工具数只是上下文成本的一半，另一半是**每个工具的描述**：186 个工具的描述合计约 9.5 万字符，其中约八成是背景叙述、失败模式、真机踩坑这类「参考手册」内容。两条路一起用，冷启动成本能压到很小：
+
+| 档位 | 工具数 | 描述总字符 | 怎么用 |
+|---|---|---|---|
+| 默认（`core` 组 + 元工具） | 40 | 约 2.2 万 | 不设环境变量 |
+| **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 4.6 千** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
+| `all`（全装，描述默认 `full`） | 186 | 约 9.5 万 | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=lean` | 186 | 约 8.0 万 | 正文只留 ~360 字符（结构化尾块与结尾告警照留） |
+| `all` + `MDKDEBUG_DESC=min` | 186 | 约 5.1 万 | 工具全要，但描述只留一句摘要 |
+
+- **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。
+- **描述分层**（`MDKDEBUG_DESC=full|lean|min`，**默认 `full`**——默认对外暴露的描述一个字不改）：选 `lean` / `min` 时，常驻层只留一句话用途 ＋ 【输出控制】/【参数】/【调用示例】块；被挪走的正文**一个字不改**地归档，随时用 `mdk_guide(topic="tool", name="read_mem")` 逐字取回（取回结果与瘦身前完全一致）。正文截断保留「段首 + 段末」，**绝不把结尾的关键告警截掉**（如 `read_mem` 结尾的「置信度低时不要据此下结论」）——**schema 里有的参数，描述里必须有说明**，不允许出现「参数在、说明没了」这种看似权威的错答案。**默认档为什么是 `full`**：186 个工具里有七十多个长到会被截，而截掉的往往是边界条件与失败模式——默认档悄悄砍掉它们，模型反而更容易用错工具（这是「看似权威的错答案」的同族问题）；要省上下文请走 `nano` 档（自动 `min`）或显式选 `lean` / `min`，别指望默认档替你省。
+- 两个装卸入口：`tools_groups()` 列全部组 / 档与当前是否已装（可直接 `tools_groups(group="mem")` 看某组里有什么）；`tools_load(group="mem,trace")` 按需装上（`group=nano` / `all` 也认，`unload=true` 收起）。`toolset` 与它们等价，老用法不受影响。
 
 ### 参数约定（别名 / 类型宽容 / 单位换算）
 

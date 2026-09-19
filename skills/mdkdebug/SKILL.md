@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 184 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 186 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的三条纪律
@@ -151,9 +151,16 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 38 个（`core` 34 个 + 4 个元工具），其余 146 个按需装载——
+- **工具面默认精简**：默认只暴露 40 个（`core` 34 个 + 6 个元工具），其余 146 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
-  启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`。
+  启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
+  `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。
+- **上下文不够时的两把刀**：`nano` 极简档（`MDKDEBUG_TOOLSETS=nano`，19 个工具 / 约 4.6 千字符
+  描述，自动用 `min` 描述档；含 `mdk_guide`，正文取回不用另外装）＋ **描述分层** `MDKDEBUG_DESC=full|lean|min`（默认 `full`，只有 `nano` 档自动用 `min`；要省上下文得显式选 `lean`/`min`）。
+  描述分层只把「参考手册」式长正文挪出上下文，正文一字不改地归档，
+  用 `mdk_guide(topic="tool", name="read_mem")` 可逐字取回；**结构化尾块
+  （【输出控制】/【参数】/【风险】）与正文结尾的关键告警一定保留**——
+  宁可多留字符，也不让描述出现「参数在、说明没了」。
 - **统一信封**：所有工具返回体都带 `status`（ok/error/…) 与 `next_actions`（下一步建议）；
   失败时还有 `error_code` 与 `error_hint`。
 

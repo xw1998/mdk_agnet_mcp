@@ -48,6 +48,7 @@ from . import trace as _trace
 from . import workspace as _workspace
 from . import rtos as _rtos
 from . import toolbox as _toolbox
+from . import thin as _thin
 from . import traceproto as _traceproto
 from . import modbus as _modbus
 from . import resetwatch as _resetwatch
@@ -2371,7 +2372,46 @@ def _usage_summary(desc: str, limit: int = 170) -> str:
     return cut.rstrip() + "…"
 
 
+
+def _guide_tool(topic: str, name: str, server) -> dict:
+    """取回工具说明：单个工具的**完整原文**，或全部归档索引 + 描述档位。
+
+    背景：为省上下文，长描述在工具列表里只留一句话摘要，正文挪进 thin.py 的归档。
+    这里就是取回入口——AI 需要边界条件/失败模式/踩坑细节时调它。
+    """
+    st = _thin.stats()
+    tm = getattr(server, "_tool_manager", None)
+    tools = getattr(tm, "_tools", None) or {}
+    nm = (name or "").strip()
+    if nm:
+        full = _thin.full_of(nm)
+        if full is None:
+            if nm not in tools:
+                return {"ok": False, "name": nm, "reason": "guide-unknown-tool",
+                        "error_code": "guide-unknown-tool",
+                        "error": "没有这个工具：%s" % nm,
+                        "hint": "工具名要完全一致（如 trace_swd_read）；"
+                                "用 list_tools 或 tools_groups 查准确名字"}
+            return {"ok": True, "name": nm, "thinned": False,
+                    "description": (getattr(tools[nm], "description", "") or ""),
+                    "note": "这个工具的说明本来就不长，没有被挪出上下文"}
+        ent = _thin.archived().get(nm) or {}
+        return {"ok": True, "name": nm, "thinned": True, "mode": ent.get("mode"),
+                "moved_chars": ent.get("moved"), "description": full,
+                "note": "这是被挪出上下文的完整说明原文（与瘦身前逐字一致）"}
+    idx = {k: {"mode": v.get("mode"), "moved_chars": v.get("moved")}
+           for k, v in sorted(_thin.archived().items())}
+    return {"ok": True, "topic": topic or "tool", "desc_mode": st["mode"],
+            "thinned_tools": len(idx), "saved_chars": st["saved"],
+            "before_chars": st["before"], "after_chars": st["after"],
+            "modes": st["modes"], "env": st["env"], "tools": idx,
+            "note": "给 name= 取回某个工具的完整说明；"
+                    "描述档位用环境变量 MDKDEBUG_DESC=full/lean/min 调（默认 full，"
+                    "只有 nano 档自动用 min）"}
+
+
 def _apply_param_hints(server) -> int:
+
     """给所有已注册工具的描述追加【参数】/【调用示例】（幂等）。"""
     tm = getattr(server, "_tool_manager", None)
     tools = getattr(tm, "_tools", None) or {}
@@ -8301,10 +8341,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "AI 落地的第一个工具：一键自检 Keil/UVSOCK/UV4/.axf/源码漂移/调试态/RTOS 类型，"
             "并返回推荐的调试工作流与各场景应调用的工具，避免 AI 盲目试错。"
             "返回 {environment:{...}, recommended_workflow:[...], scene_tools:{...}}。注意：建议 AI 落地第一件事先调本工具获取环境自检与工作流，再按场景选择工具；自检为无副作用只读操作，可在任意时刻调用。"
+            "topic=tool, name=<工具名> 取回该工具被挪出上下文的**完整说明**（为省上下文，长描述在工具列表里只留一句话摘要，正文全文存在这里）；"
+            "topic=tool 不带 name 则列出全部已归档工具与描述档位。"
         ),
     )
-    async def mdk_guide() -> str:
+    async def mdk_guide(topic: str = "", name: str = "") -> str:
         try:
+            _t = (topic or "").strip().lower()
+            if _t in ("tool", "tools", "desc", "description") or (name or "").strip():
+                return _js(_guide_tool(_t, name, server))
             host = getattr(_client, "host", "127.0.0.1")
             port = getattr(_client, "port", 4823)
             env = {
@@ -9081,11 +9126,12 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         name="toolset",
         title="工具面装卸（按组按需加载工具）",
         description=(
-            "本服务的工具按 11 个组划分，**默认只暴露 core 组**（调试核心 + 环境引导），"
-            "其余组用到时现装——这样上下文里只放当前真正用得上的工具描述，"
-            "工具多的时候这是省上下文的主要手段。"
+            "本服务的工具按 11 个组划分，另有一个 **nano 极简档**（只暴露十几个最短入口），"
+            "**默认只暴露 core 组**（调试核心 + 环境引导），其余组用到时现装——"
+            "这样上下文里只放当前真正用得上的工具描述，工具多的时候这是省上下文的主要手段。"
             "action=status 看当前暴露了哪些组、各组多少个、还差什么；"
-            "action=load 把 toolsets 指定的组装回来（例：toolsets=mem,trace，toolsets=all 一次全装 161 个）；"
+            "action=load 把 toolsets 指定的组装回来（例：toolsets=mem,trace，"
+            "toolsets=all 一次全装，toolsets=nano 极简）；"
             "action=unload 把某组收起来（例：toolsets=trace）。"
             "可用组与含义：core 调试核心/引导、mem 内存进阶、symbol 符号反汇编、"
             "build 编译烧录、serial 串口、advanced 异常/watch/SVD、"
@@ -9094,6 +9140,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "**装卸后工具面立即变化，但很多 MCP 客户端缓存了工具列表**："
             "若装完仍报未知工具，先重新拉一次 tools/list 再调。"
             "list_tools / get_version / capabilities / toolset 这四个永远保留。"
+            "**小上下文模型**：先 tools_groups() 看有哪些组，再 tools_load(group=...) "
+            "现装；或直接以 MDKDEBUG_TOOLSETS=nano 启动，只暴露十几个最短入口。"
         ),
     )
     async def toolset_tool(action: str = "status", toolsets: str = "") -> str:
@@ -9110,6 +9158,82 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                         "reason": "toolset-bad-action",
                         "hint": "例：action=load, toolsets=mem,trace",
                         "example_args": {"action": "load", "toolsets": "mem,trace"}})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="tools_groups",
+        title="列工具分组与当前装载（精简）",
+        description=(
+            "列出工具分组（含 nano 极简档）与当前是否已装进上下文。"
+            "group 留空给总览；给了组名则列出该组工具名。"
+            "小上下文模型从这里挑组，再 tools_load(group=...) 装上。"
+        ),
+    )
+    async def tools_groups(group: str = "") -> str:
+        try:
+            st = _toolbox.status(server)
+            if not st.get("ok"):
+                return _js(st)
+            g = (group or "").strip().lower()
+            if g:
+                names = _toolbox.tools_of(g)
+                if names is None:
+                    return _js({"ok": False, "group": g,
+                                "reason": "toolset-unknown-group",
+                                "error_code": "toolset-unknown-group",
+                                "error": "没有这个组/档：%s" % g,
+                                "available_groups": st.get("available_groups"),
+                                "hint": "组名见 tools_groups() 总览；也可直接用 all / nano"})
+                hidden = set(st.get("hidden_tools") or [])
+                return _js({"ok": True, "group": g, "size": len(names), "tools": names,
+                            "exposed": [n for n in names if n not in hidden],
+                            "hidden": [n for n in names if n in hidden],
+                            "note": "看某组里有什么；把这一组装上用 tools_load，"
+                                    "group 参数就填这个组名"})
+            groups = {k: {"size": v["size"], "loaded": v["loaded"], "note": v["note"]}
+                      for k, v in (st.get("groups") or {}).items()}
+            return _js({"ok": True, "desc_mode": _thin.stats()["mode"],
+                        "exposed": st.get("exposed"), "hidden": st.get("hidden"),
+                        "total_registered": st.get("total_registered"),
+                        "loaded_groups": st.get("loaded_groups"),
+                        "groups": groups, "profiles": st.get("profiles"),
+                        "hint": "装某组：tools_load(group=组名)；全装 group=all；"
+                                "极简档 group=nano；看某个组里有什么："
+                                "tools_groups(group=组名)"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="tools_load",
+        title="按组装载工具（含 nano 极简档）",
+        description=(
+            "把 group 指定的组装进工具面（unload=true 则收起）。"
+            "group 可写单个组名、逗号分隔多个、或 all / nano。"
+            "装完若客户端仍报未知工具，重新拉一次 tools/list（客户端会缓存工具列表）。"
+        ),
+    )
+    async def tools_load(group: str = "", unload: bool = False) -> str:
+        try:
+            g = (group or "").strip()
+            if not g:
+                return _js({"ok": False, "error": "group 不能为空",
+                            "reason": "toolset-bad-action",
+                            "error_code": "toolset-bad-action",
+                            "hint": "例：group=mem、group=mem,trace、group=all、group=nano",
+                            "example_args": {"group": "mem,trace"}})
+            r = _toolbox.unload(g, server) if unload else _toolbox.load(g, server)
+            if not r.get("ok"):
+                r.setdefault("reason", "toolset-unknown-group")
+                r.setdefault("error_code", r.get("reason"))
+                return _js(r)
+            return _js({"ok": True,
+                        "action": r.get("action") or ("unload" if unload else "load"),
+                        "groups": r.get("groups"),
+                        "loaded": r.get("loaded"), "unloaded": r.get("unloaded"),
+                        "exposed": r.get("exposed"), "hidden": r.get("hidden"),
+                        "loaded_groups": r.get("loaded_groups"),
+                        "note": r.get("note"), "client_note": r.get("client_note")})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -9194,6 +9318,20 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     # 不必靠 "Field required" 反复试错。
     hinted = _apply_param_hints(server)
     logger.info("已为 %d 个工具补充参数调用示例", hinted)
+
+    # 工具描述分层（批次56）：把「参考手册」式的长正文挪出上下文，需要时用
+    # mdk_guide(topic=tool, name=...) 取回。**必须在 _apply_param_hints 之后**
+    # （要连【参数】/【输出控制】块一起保留）、在 toolbox.install 快照之前
+    # （快照的就是瘦身后的）。默认档位看工具面：nano 极简档用 min，其余 full
+    # （不改写）——默认描述不该缺内容，要省得显式选 lean/min；
+    # MDKDEBUG_DESC 显式设了的话以它为准。
+    try:
+        _thin.install(server,
+                      mode=_thin.mode_from_env(
+                          _toolbox.desc_default_for(toolsets)),
+                      summarizer=_usage_summary)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("工具描述分层失败（按原样继续，不影响功能）：%s", _e)
 
     # 工具面：默认精简 + 运行期按需装卸（实现在 toolbox.py）。
     # **必须在输出控制与参数示例注入之后**——Tool 对象是在这里被快照的，

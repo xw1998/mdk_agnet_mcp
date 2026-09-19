@@ -4,13 +4,13 @@
 来源：用户在真机反馈里提的两条——「默认 150 个工具全量暴露，对上下文预算和小模型
 不友好（有裁剪机制但默认全开）」。处置：
 
-  * 默认**只暴露 core 组 + 4 个常驻入口**（38 个），其余 10 组用
+  * 默认**只暴露 core 组 + 4 个常驻入口**（40 个），其余 10 组用
     `toolset(action="load", toolsets="mem,trace")` 现装；
   * `MDKDEBUG_TOOLSETS` 仍然有效，`all` / `full` / `*` 仍是全开；
   * 显式设了组名却一个都认不出来 → **不裁剪**（宁可少裁不错杀）并告警。
 
 本文件锁住的是这批改动的行为边界：
-  A 默认精简：38 个、core 齐全、其余组不在、status/capabilities/list_tools 三处自述一致
+  A 默认精简：40 个、core 齐全、其余组不在、status/capabilities/list_tools 三处自述一致
   B 运行期装卸：load 幂等、unload 还原、装卸后顺序不漂、常驻四件套永在
   C 显式配置：all / serial / core,mem / bogus 四种取值 + create_server(toolsets=) 优先级
   D 分组表完备性：无重复归属、无幽灵名、未归类恰好是四个常驻入口、与 annotate 一致
@@ -56,7 +56,8 @@ async def call(srv, n, a):
 def call_sync(srv, n, a):
     return asyncio.run(call(srv, n, a))
 
-STAY = {"list_tools", "get_version", "capabilities", "toolset"}
+STAY = {"list_tools", "get_version", "capabilities", "toolset",
+        "tools_groups", "tools_load"}
 
 # ======================================================================
 # A/B. 默认工具面 + 运行期装卸（同一个 server 实例）
@@ -66,7 +67,7 @@ def group_ab():
     os.environ.pop("MDKDEBUG_TOOLSETS", None)
     srv = create_server(port=PORT_A, toolsets=None)
     ns = names(srv)
-    check("A1 默认只暴露 38 个（core 34 + 常驻 4）", len(ns) == 38, len(ns))
+    check("A1 默认只暴露 40 个（core 34 + 常驻 6）", len(ns) == 40, len(ns))
     for t in ("enter_debug", "read_mem", "write_mem", "mdk_guide", "session_state",
               "keil_health", "diagnose", "target_info") + tuple(STAY):
         check("A2 默认含 %s" % t, t in ns, "")
@@ -76,9 +77,9 @@ def group_ab():
         check("A3 默认不含未装载组的 %s" % t, t not in ns, "")
 
     st = call_sync(srv, "toolset", {"action": "status"})
-    check("A4 status 自述一致（core 已装载 / 收起 146 / 注册 184 / 来源 default）",
+    check("A4 status 自述一致（core 已装载 / 收起 146 / 注册 186 / 来源 default）",
           st.get("ok") and st.get("loaded_groups") == ["core"]
-          and st.get("hidden") == 146 and st.get("total_registered") == 184
+          and st.get("hidden") == 146 and st.get("total_registered") == 186
           and st.get("source") == "default", {k: st.get(k) for k in
                                               ("loaded_groups", "hidden", "total_registered", "source")})
     g = st.get("groups") or {}
@@ -94,23 +95,23 @@ def group_ab():
     cap = call_sync(srv, "capabilities", {})
     su = cap.get("tool_surface") or {}
     check("A7 capabilities 如实报注册总数 / 收起数 / 未装载组",
-          su.get("registered_total") == 184 and su.get("hidden") == 146
+          su.get("registered_total") == 186 and su.get("hidden") == 146
           and su.get("loaded_groups") == ["core"]
           and "trace" in (su.get("not_loaded_groups") or []), su)
     lt = call_sync(srv, "list_tools", {})
-    check("A8 list_tools 只列当前暴露的（total=38）", lt.get("total") == 38, lt.get("total"))
+    check("A8 list_tools 只列当前暴露的（total=40）", lt.get("total") == 40, lt.get("total"))
 
     print("B. 运行期装卸")
     r = call_sync(srv, "toolset", {"action": "load", "toolsets": "mem,rtos"})
-    check("B1 load mem,rtos 装回 14 个、暴露数 52",
-          r.get("ok") and len(r.get("loaded") or []) == 14 and r.get("exposed") == 52, r)
+    check("B1 load mem,rtos 装回 14 个、暴露数 54",
+          r.get("ok") and len(r.get("loaded") or []) == 14 and r.get("exposed") == 54, r)
     ns2 = names(srv)
     check("B2 装回后立即可见（read_struct / rtos_tasks）",
           "read_struct" in ns2 and "rtos_tasks" in ns2, "")
     lt2 = call_sync(srv, "list_tools", {"keyword": "rtos"})
     got3 = set(t["tool"] for t in (lt2.get("tools") or []))
-    check("B3 list_tools 立即可按新工具过滤（三个 rtos 工具都命中，面仍是 52）",
-          lt2.get("total") == 52
+    check("B3 list_tools 立即可按新工具过滤（三个 rtos 工具都命中，面仍是 54）",
+          lt2.get("total") == 54
           and {"rtos_info", "rtos_tasks", "rtos_objects"} <= got3, sorted(got3))
 
     r2 = call_sync(srv, "toolset", {"action": "load", "toolsets": "mem"})
@@ -118,27 +119,27 @@ def group_ab():
           r2.get("ok") and not (r2.get("loaded") or []) and len(r2.get("already_loaded") or []) == 11, r2)
 
     r3 = call_sync(srv, "toolset", {"action": "unload", "toolsets": "mem,rtos"})
-    check("B5 unload 还原到 38", r3.get("ok") and r3.get("exposed") == 38
+    check("B5 unload 还原到 40", r3.get("ok") and r3.get("exposed") == 40
           and len(r3.get("unloaded") or []) == 14, r3)
 
     r4 = call_sync(srv, "toolset", {"action": "load", "toolsets": "all"})
-    check("B6 toolsets=all 一次全装到 184", r4.get("ok") and r4.get("exposed") == 184, r4)
+    check("B6 toolsets=all 一次全装到 186", r4.get("ok") and r4.get("exposed") == 186, r4)
     srv_all = create_server(port=PORT_B, toolsets="all")
     check("B7 装卸若干轮后，工具顺序仍与全量面完全一致（不把工具甩到队尾）",
           order(srv) == order(srv_all), "本地 %d / 全量 %d" % (len(order(srv)), len(order(srv_all))))
 
     r5 = call_sync(srv, "toolset", {"action": "unload", "toolsets": "all"})
     check("B8 全收后只剩 4 个常驻入口",
-          r5.get("ok") and r5.get("exposed") == 4 and set(names(srv)) == STAY, names(srv))
+          r5.get("ok") and r5.get("exposed") == 6 and set(names(srv)) == STAY, names(srv))
     check("B9 只剩常驻时 status 仍可用（它自己就是常驻）",
-          call_sync(srv, "toolset", {"action": "status"}).get("exposed") == 4, "")
+          call_sync(srv, "toolset", {"action": "status"}).get("exposed") == 6, "")
     check("B10 只剩常驻时 list_tools 仍可问出工具面",
-          call_sync(srv, "list_tools", {}).get("total") == 4, "")
+          call_sync(srv, "list_tools", {}).get("total") == 6, "")
     r6 = call_sync(srv, "toolset", {"action": "unload", "toolsets": "core"})
     check("B11 卸载常驻组（core）不会把常驻入口一起收走",
           r6.get("ok") and set(names(srv)) == STAY, names(srv))
     call_sync(srv, "toolset", {"action": "load", "toolsets": "core"})
-    check("B12 装回 core 后回到 38", len(names(srv)) == 38, len(names(srv)))
+    check("B12 装回 core 后回到 40", len(names(srv)) == 40, len(names(srv)))
     return srv, srv_all
 
 # ======================================================================
@@ -164,19 +165,19 @@ def _run(code, env):
 def group_c():
     print("C. 显式配置")
     base = {k: v for k, v in os.environ.items() if k != "MDKDEBUG_TOOLSETS"}
-    for spec, want, label in (("all", "184", "MDKDEBUG_TOOLSETS=all 仍是全开"),
-                              ("serial", "18", "=serial 只留 14 串口 + 4 常驻"),
-                              ("core,mem", "49", "=core,mem 组合生效"),
-                              ("bogus", "184", "=bogus 组名认不出 → 不裁剪（宁可少裁不错杀）")):
+    for spec, want, label in (("all", "186", "MDKDEBUG_TOOLSETS=all 仍是全开"),
+                              ("serial", "20", "=serial 只留 14 串口 + 6 常驻"),
+                              ("core,mem", "51", "=core,mem 组合生效"),
+                              ("bogus", "186", "=bogus 组名认不出 → 不裁剪（宁可少裁不错杀）")):
         got, _ = _run(CODE, dict(base, MDKDEBUG_TOOLSETS=spec))
         check("C1 %s（期望 %s）" % (label, want), got.endswith(want), got)
     got, allout = _run(CODE, base)
-    check("C2 不设环境变量 → 默认精简 38", got.endswith("38"), got)
+    check("C2 不设环境变量 → 默认精简 40", got.endswith("40"), got)
     got, allout = _run(CODE, dict(base, MDKDEBUG_TOOLSETS="bogus"))
     check("C3 组名认不出时有告警（不静默）", "未知组名" in allout, allout[-300:])
     got, _ = _run(CODE_ARG, dict(base, MDKDEBUG_TOOLSETS="all"))
-    check("C4 create_server(toolsets=) 参数优先于环境变量（all + serial → 18）",
-          got.endswith("18"), got)
+    check("C4 create_server(toolsets=) 参数优先于环境变量（all + serial → 20）",
+          got.endswith("20"), got)
     got, _ = _run(CODE_SRC, dict(base, MDKDEBUG_TOOLSETS="all"))
     check("C5 显式参数时来源如实报 param（不误报 default）", "SRC param" in got, got)
 
@@ -195,7 +196,7 @@ def group_d(srv_all):
     check("D1 每个工具最多归属一个组（无重复）", not dup, dup)
     check("D2 分组表里没有不存在的工具（无幽灵）", not (seen - full), sorted(seen - full))
     check("D3 未归类工具恰好是四个常驻入口",
-          set(TB.ALWAYS) == (full - seen) and 4 == len(TB.ALWAYS), sorted(full - seen))
+          set(TB.ALWAYS) == (full - seen) and 6 == len(TB.ALWAYS), sorted(full - seen))
     check("D4 常驻表与分组表不重叠（常驻不靠组来保）", not (TB.ALWAYS & seen), sorted(TB.ALWAYS & seen))
     check("D5 11 个组都有用途说明", len(TB.GROUP_NOTES) == len(TB.TOOLSETS), len(TB.GROUP_NOTES))
     check("D6 默认组只有 core，且 core 在分组表里",
@@ -204,7 +205,7 @@ def group_d(srv_all):
           "toolset" in AN.MUTATING and "toolset" not in AN.READONLY
           and "toolset" not in AN.DESTRUCTIVE, "")
     bad = AN.check_surface(full)
-    check("D8 annotate.check_surface 在 184 个工具上无问题", not bad, bad)
+    check("D8 annotate.check_surface 在 186 个工具上无问题", not bad, bad)
 
 # ======================================================================
 # E. 失败归类
