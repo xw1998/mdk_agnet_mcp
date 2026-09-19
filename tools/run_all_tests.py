@@ -92,8 +92,8 @@ def dec(b):
     return (b or b"").decode("utf-8", "replace")
 
 
-def actual_tool_count():
-    """唯一事实来源：真起一个 server 数注册了多少个工具。
+def actual_tool_names():
+    """唯一事实来源：真起一个 server，取注册的工具名全集。
 
     显式传 ``toolsets="all"``：工具面默认精简（只暴露 core 组），但本检查要对齐的是
     **注册总数**——各测试的「工具总数」断言与 README 描述写的都是这个数。
@@ -103,7 +103,11 @@ def actual_tool_count():
         sys.path.insert(0, ROOT)
     from mdkdebug import server as srv  # noqa: E402
     server = srv.create_server(toolsets="all")
-    return len(asyncio.run(server.list_tools()))
+    return [t.name for t in asyncio.run(server.list_tools())]
+
+def actual_tool_count():
+    """注册的工具总数（= 工具名全集的大小，口径见 actual_tool_names）。"""
+    return len(actual_tool_names())
 
 
 def scan_test_counts(n):
@@ -162,6 +166,11 @@ def discover_ungated():
     return out
 
 
+def _is_delim_row(line):
+    """判断一行是不是表格的「表头分隔行」（形如 |---|:--:|）。"""
+    s = line.strip().replace("|", "").strip()
+    return bool(s) and set(s) <= set("-: ") and "-" in s
+
 def _cell_pipes(line):
     """返回 (列分隔符个数, 反斜杠转义竖线的个数)。转义的竖线不算列分隔符。"""
     sep = 0
@@ -189,8 +198,12 @@ def scan_md_tables():
          反斜杠（用户 2026-09 在 gitee 看到 `link=auto\|keil\|ocd`），表格该裂还是裂
     约定：表格单元格里不出现竖线，"或"写成 `/` 或 `、`（例 `link` 参数（`auto`/`keil`/`ocd`））。
 
+    3. 一段以 `|` 开头的连续行若整段没有分隔行（`|---|---|`），它根本不是表格——典型成因是
+       表格中间被插了一个空行，后半段成了"无表头块"，浏览器会把竖线当普通文字原样显示
+
     返回 {"misaligned": [(相对路径, 行号, 该行列数, 同表多数行列数, 该行), ...],
-          "escaped":    [(相对路径, 行号, 该行), ...]}
+          "escaped":    [(相对路径, 行号, 该行), ...],
+          "nohead":     [(相对路径, 起行, 止行, 行数), ...]}
     """
     skip = {".git", "__pycache__", ".venv", "node_modules", "build", "out", ".lingxi"}
     targets = []
@@ -202,32 +215,80 @@ def scan_md_tables():
 
     out = []
     escaped = []
+    nohead = []
     for rel in targets:
         path = os.path.join(ROOT, rel)
         if not os.path.exists(path):
             continue
-        block = []
-
-        def flush(block=block, rel=rel):
-            if len(block) < 2:
-                return
-            counts = [c for _, c, _ in block]
-            majority = max(set(counts), key=counts.count)
-            for no, c, txt in block:
-                if c != majority:
-                    out.append((rel, no, c, majority, txt.strip()))
-
+        # 先把「以 | 开头的连续行」切成块，再逐块判定。
+        # 注意别用 `def flush(block=block)` 那种闭合：块之间的 rebind 会让默认参数停在第一块上，
+        # 结果是多块文件里只有第一块被检查（本函数 2026-09 就这么错过一次，靠反向用例才发现）。
+        blocks = []
+        cur = []
         for i, line in enumerate(dec(open(path, "rb").read()).splitlines(), 1):
-            if line.strip().startswith("|"):
+            if line.lstrip().startswith("|"):
                 sep, esc = _cell_pipes(line)
-                block.append((i, sep, line))
+                cur.append((i, sep, line))
                 if esc:
                     escaped.append((rel, i, line.strip()))
             else:
-                flush()
-                block = []
-        flush()
-    return {"misaligned": out, "escaped": escaped}
+                if cur:
+                    blocks.append(cur)
+                cur = []
+        if cur:
+            blocks.append(cur)
+
+        for blk in blocks:
+            # 整块都没有分隔行 → 它根本不是表格（典型成因：表中间插了空行，后半段成了"无表头块"）
+            if not any(_is_delim_row(txt) for _, _, txt in blk):
+                nohead.append((rel, blk[0][0], blk[-1][0], len(blk)))
+            if len(blk) < 2:
+                continue
+            counts = [c for _, c, _ in blk]
+            majority = max(set(counts), key=counts.count)
+            for no, c, txt in blk:
+                if c != majority:
+                    out.append((rel, no, c, majority, txt.strip()))
+    return {"misaligned": out, "escaped": escaped, "nohead": nohead}
+
+README_SECTION_RE = re.compile(r"`([a-z][a-z0-9_]*)_\*`，\s*(\d+)\s*个")
+
+def scan_readme_sections(names):
+    """README 的 `### 家族（`prefix_*`，N 个）` 小节：三个数必须相等。
+
+    1. 标题里声明的 N
+    2. 紧跟的表格里实际列出的 `prefix_*` 行数
+    3. create_server() 注册的该前缀工具数
+
+    典型腐烂：加了新工具却没进 README 表格（表里少几行）、或表里行数变了但标题的 N 没跟着改。
+    返回 [(行号, 标题, 声明数, 表里行数, 注册数, 表里缺的, 表里多的), ...]，只列不一致的。
+    """
+    lines = dec(open(os.path.join(ROOT, "README.md"), "rb").read()).splitlines()
+    bad = []
+    for i, line in enumerate(lines):
+        if not line.startswith("#"):
+            continue
+        m = README_SECTION_RE.search(line)
+        if not m:
+            continue
+        prefix, claim = m.group(1) + "_", int(m.group(2))
+        j = i + 1
+        while j < len(lines) and not lines[j].lstrip().startswith("|"):
+            j += 1
+        listed = []
+        while j < len(lines) and lines[j].lstrip().startswith("|"):
+            cell = lines[j].strip()
+            if not _is_delim_row(cell):
+                mm = re.match(r"\|\s*`([^`]+)`", cell)
+                if mm and mm.group(1).startswith(prefix):
+                    listed.append(mm.group(1))
+            j += 1
+        registered = sorted(x for x in names if x.startswith(prefix))
+        missing = [x for x in registered if x not in listed]
+        extra = [x for x in listed if x not in registered]
+        if claim != len(listed) or len(listed) != len(registered):
+            bad.append((i + 1, line.strip(), claim, len(listed), len(registered), missing, extra))
+    return bad
 
 def consistency():
     print("== 一致性检查 ==")
@@ -255,10 +316,24 @@ def consistency():
         bad += 1
         print("  [不一致] README 没扫到工具数描述，检查扫描规则是否失效")
 
+    sec = scan_readme_sections(actual_tool_names())
+    if sec:
+        bad += len(sec)
+        print("README 家族小节数量：发现 %d 处对不上（标题声明 / 表里行数 / 注册数）" % len(sec))
+        for no, title, claim, listed, reg, missing, extra in sec:
+            print("  [数量对不上] README.md:%d 声明 %d / 表里 %d / 注册 %d\n            %s"
+                  % (no, claim, listed, reg, title[:90]))
+            if missing:
+                print("            表里缺：%s" % ", ".join(missing))
+            if extra:
+                print("            表里多（注册里没有）：%s" % ", ".join(extra))
+    else:
+        print("README 家族小节数量：通过（声明数 / 表里行数 / 注册数 三者一致）")
+
     tabs = scan_md_tables()
-    tbad, tesc = tabs["misaligned"], tabs["escaped"]
-    if tbad or tesc:
-        bad += len(tbad) + len(tesc)
+    tbad, tesc, tnoh = tabs["misaligned"], tabs["escaped"], tabs["nohead"]
+    if tbad or tesc or tnoh:
+        bad += len(tbad) + len(tesc) + len(tnoh)
         if tbad:
             print("Markdown 表格列数：发现 %d 处裂行（单元格里有未转义的竖线）" % len(tbad))
             for rel, no, c, majority, line in tbad:
@@ -268,9 +343,14 @@ def consistency():
             print("Markdown 表格单元格：发现 %d 处用反斜杠逃逸竖线（Gitee 会原样显示反斜杠，等于没修）" % len(tesc))
             for rel, no, line in tesc:
                 print("  [逃逸不管用] %s:%d\n            %s" % (rel, no, line[:110]))
-        print('             修法：表格单元格里不写竖线，"或"改用 / 或 、（例 `auto`/`keil`/`ocd`）')
+        if tnoh:
+            print("Markdown 表格结构：发现 %d 处无表头块（一段以竖线开头的行里没有任何分隔行）" % len(tnoh))
+            for rel, a, b, cnt in tnoh:
+                print("  [表格不存在] %s:%d~%d（%d 行）——多半是表中间被插了空行，后半段会渲染成一段带竖线的正文"
+                      % (rel, a, b, cnt))
+        print('             修法：单元格里不写竖线（"或"改用 / 或 、）；表内不要插空行')
     else:
-        print("Markdown 表格检查：通过（全仓 Markdown 无裂行、无竖线逃逸）")
+        print("Markdown 表格检查：通过（无裂行、无竖线逃逸、无无表头块）")
 
     ungated = discover_ungated()
     if ungated:

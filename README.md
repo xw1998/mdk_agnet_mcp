@@ -432,7 +432,7 @@ python run_server.py --transport http --http-port 8300
 | `toolchain_objcopy` | 生成 bin/hex/ihex/srec 等镜像格式 | `elf`、`fmt?`、`out?`、`family?`、`extra?` |
 | `toolchain_errors` | **把编译器日志变成结构化错误**：逐条给出 `file`/`line`/`col`/`severity`/`message`/`hint`，警告单独放 `warnings` 不混进 `errors`，便于 AI 直接改代码 | `text`、`limit?` |
 
-### 目标档案（`target_*`，3 个 + 工程配置发现 1 个）
+### 目标档案（`target_*`，4 个 + 工程配置发现 1 个）
 
 把「这颗芯片用哪种接口、多快、SWO 主频与速率、RTT 控制块地址、DWT 是否可用」固化成 **20 份档案**（STM32F401/F411/F429/F407/F446/F103/F7/H7/L4、GD32F303、Cortex-M 通用、RISC-V 通用、ESP32/C3/C6/S2/S3、nRF52、RP2040、AIR001），避免每次调试都手写一长串 OpenOCD 参数。
 
@@ -440,6 +440,7 @@ python run_server.py --transport http --http-port 8300
 |------|------|----------|
 | `target_list` | 列出全部档案（可按 `arch` / `keyword` 过滤），一眼看清有哪些现成配置 | `arch?`、`keyword?` |
 | `target_show` | 出一份档案的完整参数，并直接给出可用的 **OpenOCD 参数串**（`openocd_args`），可原样喂给 `ocd_start` | `profile`、`interface?`、`target?`、`transport?`、`speed?`、`extra_cfg?` |
+| `target_info` | **查目标芯片信息**：实时读 `DBGMCU->IDCODE` 拿 `DEV_ID`（低 12 位）与 `REV_ID`（高 16 位）并映射到型号，返回标称 Flash/RAM 容量与内存布局——排查「资源吃紧 / 选错型号 / 容量不符」时先调它。实时读 IDCODE 需要**已进入调试**（内存读依赖调试会话），非调试态只返回静态布局；未收录型号**如实返回标称容量 `None`** 并提示按丝印确认，不猜 | — |
 | `target_guess` | **不认识芯片名/`.elf` 时先猜档案**：按型号名正则（`STM32F407ZGT6`→`stm32f407`）或 ELF 的 `e_machine` 推断，**多候选时全列出来不挑一个像样的** | `elf?`、`name?` |
 | `debug_config` | **从工程现场发现调试配置**：解析 `.vscode/launch.json`（cortex-debug，支持 JSONC 注释），把 `device`/`interface`/`configFiles`/`executable`/`svdFile` 直接翻成可喂给 `ocd_start` 的 `profile`/`interface`/`target`，省掉「猜 cfg 名→猜错→再猜」。返回值里的 **`config_source` 一定看**：逐字段说明参数出处；`servertype` 不是 openocd 时会明确说只能借型号与可执行文件。`ocd_start` 在**一个连接参数都没给**时也会自动查一次（`MDKDEBUG_NO_LAUNCH_DISCOVERY=1` 可关） | `path?`、`name?`、`start_dir?`、`list_only?` |
 
@@ -477,7 +478,7 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 | `ocd_gdb` | 借 GDB 批处理做一件 OpenOCD 原生不好做的事（可指定 `elf` 与 `gdb` 路径） | `commands`、`elf?`、`gdb?` 等 |
 | `ocd_log` | 读 OpenOCD 日志尾巴（可按 `keyword` 过滤），排查启动失败用 | `lines?`、`keyword?` |
 
-### trace（`trace_*`，21 个）
+### trace（`trace_*`，29 个）
 
 三条通路：**SWO/ITM**（经 TPIU 单线输出）、**RTT**（目标内存环形缓冲，主机侧自研读写，不依赖 SEGGER 上位机）、**SWD 采样**（`halt` 采 PC，明确标注侵入式）。三条通路解码出的事件（含 MTF 帧）汇入同一缓冲区，由 `trace_events` 统一取。
 
@@ -510,12 +511,14 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 | `coverage_stop` | 停掉后台采样线程并出最终报告（默认把 `DEMCR`/`DWT_CTRL` 恢复原值，`restore=false` 可保留） | `restore?`、`top?`、`unseen?` |
 | `coverage_clear` | 清空已有样本，从这一刻重新开始统计 | — |
 | `trace_etm_probe` | **ETM/ETB 指令级 trace 能力探测**（只探测、不抓取）：走一遍 CoreSight ROM table（默认 `0xE00FF000`）、认一认常规 ETM 窗口 `0xE0041000`（Cortex-M4 PIL 调试地图里这段就是 ETM trace unit，窗口上是合法 CoreSight 组件即说明单元在），并交代两条链路的真实抓取能力。`present`（芯片上有没有，**没测出来给 `null`，不拿「抓不到」冒充「没有」**）与 `supported`（恒为 `false`，Keil/UVSOCK 无 trace 抓取接口、OpenOCD 对 Cortex-M 不提供 ETM 抓取驱动）分得很开，并给出替代方案（SWO/ITM、RTT、PC 采样、DWT）。**不做部件号→名字的硬猜**：只给原始部件号与架构规定的组件类别码 | `link?`、`rom_base?`、`scan?` |
-
 | `trace_eventrec` | **读 CMSIS Event Recorder（MDK 原生、纯 SWD 可用的事件缓冲）**：数据通路是**调试器读目标 RAM**、不是 SWO 引脚（uVision 的 Event Recorder / Event Statistics 窗口读的就是这份数据）。`action`：`status`（协议版本/记录条数/缓冲地址/是否在记录/写指针/时间戳源与频率/EventStatus 签名校验）、`read`（最近 N 条事件，旧→新：目标侧时间戳、组件号、消息号、val1/val2、中断上下文、序号、首/末标记）、`stats`（EventStartX/EventStopX 成对的次数与耗时聚合，与 uVision 的 Event Statistics 同口径）。**三条如实披露**：目标是**必须插桩**（没链组件/没调 EventRecordXxx 就一条数据都没有，报 `eventrec-symbol-missing`）；事件名要靠工程里的 SCVD，工具只给 component/message 编号与槽位号；`level` 不随记录存储，只有 `component=0xEF` 那组能按 message 反推组别与槽位；读到写一半的记录会跳过并计数。定位默认用符号文件里的 `EventRecorderInfo`，也可 `info_addr` 直接指地址 | `action?`（`status`/`read`/`stats`）、`link?`、`elf?`、`info_addr?`、`limit?` |
 | `trace_record` | **函数运行时线录制（细粒度事件流）**：在选定函数的**入口**下断点，每次命中记一条事件（时间、PC、所属函数、调用者、LR/SP、DWT 周期数），并给出按函数统计、调用者分布与时间线。**MDK 与 OpenOCD 两条链路的抓取方式完全不同**（Keil 走 UVSOCK 的 `BS`/`BK` + `wait_breakpoint`，OpenOCD 走 telnet 的 `bp`/`rbp` + `wait_halt`，后者还要用「读得到核寄存器」当**硬证据**判是否真停），所以**分开实现**、由 `link` 参数（`auto`/`keil`/`ocd`）选路，返回值写明这次实际用的链路。`funcs`/`pattern` **至少给一个**（全表下断点既不可能也没意义）；`max_breakpoints` 是愿意占用的槽位（默认 4，硬件断点一般 6 个、M0 只有 4 个），要监控的函数多于槽位时只布前 N 个，`armed`/`skipped` 如实说明。`watch_exit=true` 时命中入口后用 LR **动态补返回地址断点**拿 exit 事件（槽位不够就没有 exit，返回里说明，不编）。**录制的是事件流不是精确耗时**：`gap_cyc` 是相邻两次命中的 CYCCNT 差值（精确耗时用 `profile_function`），`depth_est` 由 SP 推算属估计值；命中不落在任何已知函数区间时标 `unknown` 并保留原 PC，**不硬塞函数名**——符号与板上固件不同源时正是这种「假符号」场景。`reloc_delta` 用于 App 重定位场景 | `action?`（`run`/`status`/`read`/`stop`）、`funcs?`、`pattern?`、`max_events?`、`max_ms?`、`max_breakpoints?`、`watch_exit?`、`kind?`、`func?`、`limit?`、`reloc_delta?`、`leave_halted?`、`link?` |
 | `trace_buff_status` | **看目标侧静态环形缓冲的现状**（`backend=buff` 的配套）：一次读出控制块里的 magic/版本/容量/**写指针**/**总条数**/**丢失数**、时间戳移位与 CPU 频率、是否已回卷、是否发生过复位重启。**读回全 0 一律按失败处理**（报 `buff-read-degenerate` 并提示先 halt）——目标全速运行时经调试器读 SRAM 返回的 0 是「没读到」，不是「缓冲是空的」 | `elf?`、`addr?`、`link?` |
 | `trace_buff_dump` | **把缓冲里的记录搬出来并解码时间线**：`[type][kind][id][arg][dt]` 定长 12 B 记录 → 结构化事件（切换/阻塞/ISR/异常现场/标记…），时间戳是**差值**，绝对时刻由控制块 `last_cycles` 向前回推。`names="0x10=switch,0x11=wait"` 给 id 起名；记录多时 `limit` 只截返回条数、`out_file` 全量落盘 JSON。**回卷会显式警告「看到的是一个窗口，不是全程」**，丢记录时明说「这条时间线不完整」 | `elf?`、`addr?`、`limit?`、`out_file?`、`names?`、`link?` |
 | `trace_buff_reset` | **复位目标侧缓冲**（往控制块写 `reset_req`）。**延迟生效**：目标在下一次写记录时才处理，所以用 `seq` 有没有变来区分 `applied`（已清空）与 `request_latched`（只落了请求）——写成功 ≠ 已清空 | `elf?`、`addr?`、`wait?`、`link?` |
+| `trace_swd_status` | **SWD 无缝流后端的健康快照**（`backend=swd` 的配套，只读 80 B 控制块、很便宜）：`head`/`drained`/`pending`、重复次数 `seq`、`lost_events`/`lost_bytes`、环容量、`cpu_hz`，以及 `overall_bytes_per_event` 与 `compression_vs_12B`。**时间粒度**翻成人话放在 `granularity`：`mode=ts_shift`/`dt_unit`/`none` + `unit_cycles` + `unit_us`（`mode=none` 就是这段流压根没有时间戳、只有事件顺序）。**读回整片 0 一律按失败处理**（报 `swd-read-degenerate` 并提示先 halt）——目标全速运行时经 SWD 读 SRAM 拿到的 0 是「没读到」，不是「没事件」，停一下不会丢数据；`pending` 逼近容量时会在 `warnings` 里提醒宿主再跟不上目标就要开始丢事件 | `elf?`、`addr?`、`link?` |
+| `trace_swd_read` | **无缝流的核心动作**：读控制块 → 读 `[drained, head)` → 解码 → 把 `drained` 推上去（目标因此能循环用那块环，反复调就能一直录下去）。与 buff 的关键区别是**未读区永不被覆盖**：宿主跟不上时目标丢的是**新**事件并计入 `lost_events`（权威计数），已经录下的那段始终完整可读。多次调用累加成一条连续时间线（会话状态在进程内），`events` 只给最新 `limit` 条、全量用 `out_file` 落盘（几万条不要往对话里塞）；事件里 `auto` 带出 `gap`（丢了一段）/`sync`（目标重开了录制段）/`fault`（异常，含 CFSR 拆位与寄存器现场）。**宿主没有「从半路接上」的办法**：HIT token 只带槽号，字典一旦漂移就会解出看着合理的错误 id，那时报 `swd-stream-desync`，正解是 `trace_swd_reset` 让目标重开一段；`granularity=` 传值时只做**校验**，与控制块不符报 `swd-granularity-mismatch`（一段流里混两种单位换算出来就是错的），改粒度要用 `trace_swd_reset(granularity=...)` | `elf?`、`addr?`、`limit?`、`out_file?`、`names?`、`link?`、`reset_session?`、`granularity?` |
+| `trace_swd_reset` | 往控制块 `reset_req` 写 1，目标在下一条事件写入时清环、清计数、**字典两边一起清**、`seq` 加一，并往新流里写一个 `SYNC` 标记。**这是无缝流唯一的重新对齐手段**（宿主单方面清字典只会让后续每个 HIT 都解错）。与 buff 同样是**延迟生效**：目标长期没有插桩事件时会一直挂着（返回 `request_latched`），那不是失败，但也不能当成「已清空」，生效与否以 `seq` 是否变化为准（`wait=true` 会重读确认）。**`granularity=` 是切换时间粒度的唯一入口**：先把 `TS_SHIFT`/`DT_UNIT`/`FLAGS` 的 `TS_OFF` 位写进控制块再请求重开录制，于是新录的那段整段都是新粒度；取值 `cycle`（最小，1 个 CPU 周期）/`none`（完全不记时间戳、只留顺序，最省字节）/`500us`（对齐内核 tick）/`1ms`/`2.5us`，或直接给微秒数；留空不动粒度。想多录事件就把粒度调粗：tick 档实测约 1.00 字节/事件 | `elf?`、`addr?`、`wait?`、`link?`、`granularity?` |
 
 ### 结果可视化（`view_*`，2 个）
 
