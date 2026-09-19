@@ -600,15 +600,33 @@ def rtt_parse_cb(raw: bytes) -> dict:
             "up": up, "down": down}
 
 
-def _read_mem_words(addr: int, n_bytes: int, timeout: float = 10.0, link="auto"):
+def _read_mem_words(addr: int, n_bytes: int, timeout: float = 10.0, link="auto",
+                    raw: bool = False):
     """读目标内存：走链路原语层，Keil(UVSOCK) / OpenOCD 谁活着用谁。
 
     返回 (bytes|None, meta)。meta 里带读置信度与「目标当时在不在跑」——
     上层要如实披露，**读到的 0 不等于数据是 0**。
+
+    raw=True 走 **单次读**（Keil 链路的 read_once），不复读、不比对：
+    给的是**正在被目标改写**的内存（无缝流环形缓冲就是典型）时，
+    read_mem_verified 的复读比对永远不会一致，于是它每块都多读一遍
+    + 中间 sleep 50ms，还把**后一帧**当结果返回——搬一段就会被拖成两倍
+    时间，且拼出来的字节来自两个不同时刻（流必失步）。
+    这类「本来就在变」的内存，要的是一次成形的一致快照，不是复读确认。
     """
     lk, err = _link.pick(link, who="读目标内存")
     if lk is None:
         return None, err
+    if raw:
+        one = getattr(lk, "read_once", None)
+        if one is not None:
+            data, meta = one(int(addr), int(n_bytes))
+            if data is None:
+                return None, meta
+            m = dict(meta or {})
+            m.setdefault("read_mode", "single")
+            m.setdefault("read_raw", True)
+            return data, m
     return lk.read(int(addr), int(n_bytes))
 
 
@@ -2237,12 +2255,66 @@ def _swd_read_ctrl(addr: int, link: str = "auto"):
     return info, None
 
 
+# 一次 UVSOCK 请求最多能搬多少字节（client.MAX_CHUNK 就是 16384）。
+# 环的默认容量 8192 因此**一请求就能搬完**：零碎的 1KB 分块会把缓冲区
+# 对应的 UVSOCK 往返次数抬 8 倍，而往返开销才是这条通路的瓶颈（真机实测
+# 1KB 分块只有 ~3B/ms，搬不过目标 6B/ms 的产出速度）。
+_SWD_READ_CHUNK = 16384
+
+# 伪值签名判定门槛：至少 16 字节（4 个相同的、字节不全同的字）才算伪值。
+# 环的增量搬运常常一次只有几十字节，门槛太低会把正常小段误判成脏读。
+_SWD_FAKE_MIN = 16
+
+
+def _swd_fake_kind(data: bytes) -> str:
+    """对**搬回来的整段字节**做伪值签名检查（不看 meta）。返回原因或 ""。
+
+    真机实测（STM32F427 + Keil UVSOCK）：目标全速运行时经 SWD 读 SRAM 的某些区段
+    （实测 ≥ 0x20004000，以及外设区）会整段重复同一个 4 字节字。它既不是全 0
+    也不是全 FF，旧检测认不出来，于是伪值被当正常字节流解码——结果是失步 + 丢事件，
+    而且看起来像「目标丢了数据」。
+    """
+    if not data or len(data) < _SWD_FAKE_MIN:
+        return ""
+    if all(b == 0x00 for b in data):
+        return "all_zero"
+    if all(b == 0xFF for b in data):
+        return "all_ff"
+    # 「重复字」必须**扫描着找**，不能只看整段：真机上往往只有一段（实测是
+    # 环尾跨过 0x20004000 的那截）是伪值，前半段完全正常——整段判定会漏掉。
+    # 逐字节滑动（不假设 4 字节对齐：起点取决于 drained，不必对齐），
+    # 连续 12 个相等的相邻四字节窗 = 有 ≥ 16 字节的重复区；再看这个字是不是
+    # 字节全同（HITN 密集段就是 0x40 连发，那是**正常**流，不能判伪）。
+    run = 0
+    for i in range(max(0, len(data) - 8)):
+        if data[i:i + 4] == data[i + 4:i + 8]:
+            run += 1
+            if run >= 12 and len(set(data[i:i + 4])) > 1:
+                return "repeated_word"
+        else:
+            run = 0
+    return ""
+
+
+def _swd_resume(lk) -> None:
+    """停机搬运收尾：把目标放回运行态（失败不报，调用方自己会看到状态）。"""
+    if lk is None:
+        return
+    try:
+        lk.resume()
+    except Exception:                                               # noqa: BLE001
+        pass
+
+
 def _swd_read_stream(ring_addr: int, cap: int, start: int, n: int,
-                     link: str = "auto", chunk: int = 1024):
+                     link: str = "auto", chunk: int = _SWD_READ_CHUNK):
     """按**逻辑**偏移 [start, start+n) 读环内容，跨环尾时自动分两段。
 
     只读用得着的那一段，不整片搬：增量搬运是这条通路的核心动作，
     每次多读一倍就是白花一倍的调试链路时间。
+
+    字节一律**单次读**（raw）：环正被目标持续覆写，复读比对永远不一致，
+    只会把每一块拖成两倍时间、还把后一帧当结果拼进来（失步的直接成因）。
     """
     out = bytearray()
     meta = {}
@@ -2251,7 +2323,7 @@ def _swd_read_stream(ring_addr: int, cap: int, start: int, n: int,
         take = min(chunk, n - done)
         phys = (start + done) & (cap - 1)
         first = min(take, cap - phys)
-        d, m = _read_mem_words(ring_addr + phys, first, link=link)
+        d, m = _read_mem_words(ring_addr + phys, first, link=link, raw=True)
         if d is None:
             return None, {"ok": False, "error_code": "swd-read-failed",
                           "error": (m or {}).get("error") or "读环形缓冲失败",
@@ -2267,7 +2339,7 @@ def _swd_read_stream(ring_addr: int, cap: int, start: int, n: int,
         meta = m or meta
         rest = take - first
         if rest:
-            d2, m2 = _read_mem_words(ring_addr, rest, link=link)
+            d2, m2 = _read_mem_words(ring_addr, rest, link=link, raw=True)
             if d2 is None or len(d2) < rest:
                 return None, {"ok": False, "error_code": "swd-read-short",
                               "error": "环形缓冲回绕段读失败/读短（0x%X，期望 %d 字节）"
@@ -2556,9 +2628,18 @@ def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
 
 def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
              names: str = "", link: str = "auto", reset_session: bool = False,
-             granularity: str = "",
+             granularity: str = "", consistent: str = "halt",
              max_session_events: int = _SWD_MAX_SESSION_EVENTS) -> dict:
     """无缝流的**核心动作**：把 [drained, head) 搬走 → 解码 → 把 drained 推上去。
+
+    consistent= 决定「怎么搬这一块」：
+      * halt（默认）：先 halt → 就地重读控制块（一致快照）→ 搬 → 写游标 → resume。
+        真机实测这是唯一能保证「搬到的就是目标写进去的那一份」的做法
+        （停机读与目标 tokens 计数逐字节吻合），代价是每搬一次停几毫秒；
+        停机期间未读数据不会丢（背压不覆写），所以「跑一段 → 停一下搬走」是无损的。
+      * run：全速搬（快）。但实测有的目标/地址段会整片读回伪值（全 0、全 FF、
+        或整段重复同一个 4 字节字），遇到伪值**直接报 swd-read-untrusted**，不拿去解码。
+      * auto：先全速读，发现伪值自动停机重读一次（读得快又不会静默错）。
 
     多次调用会累加成一个连续的时间线（会话状态留在进程内）。
     返回 events 只给最新 limit 条；全量用 out_file 落盘。
@@ -2568,6 +2649,14 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
     改粒度请用 trace_swd_reset(granularity=...)——它会写完粒度后重开一段录制。
     会话里记下的粒度若与控制块不符（谁在背后改过），也报错而不是照算。
     """
+    mode = (consistent or "halt").strip().lower()
+    if mode not in ("halt", "run", "auto"):
+        # 参数错就报错，**一句都不碰目标**：校验放在任何读/停机之前。
+        return {"ok": False, "error_code": "swd-consistent-invalid",
+                "error": "consistent 只能是 halt / run / auto，收到 %r" % (consistent,),
+                "hint": "halt=停机搬（可信，代价是几毫秒停机）；run=全速搬（快，"
+                        "但实测有的目标/地址段会读回伪值，遇到伪值直接报错）；"
+                        "auto=先全速读，发现伪值自动停机重读。"}
     a, loc = _swd_locate(elf=elf, addr=addr)
     if a is None:
         return loc
@@ -2641,13 +2730,102 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
                 "seq": info["seq"], "ctrl": {k: info[k] for k in
                                               ("head", "drained", "cap", "events", "tokens")}}
 
+    def _drain_now():
+        d, m = _swd_read_stream(info["ring_addr"], info["cap"], drained,
+                                pending, link=link)
+        return d, (m or {})
+
+    def _halt_and_reread_ctrl():
+        """停机 + 就地重读控制块（停机后 head 不再动，这一段是个一致快照）。
+
+        返回 (lk, 错误 dict 或 None)。成功时把外层的 info / pending 就地更新。
+        """
+        nonlocal info, pending
+        lk, lerr = _link.pick(link, who="停机搬环")
+        if lk is None:
+            return None, dict(lerr or {}, ok=False, error_code="swd-halt-failed")
+        r = lk.halt() or {}
+        if not r.get("ok"):
+            return None, {"ok": False, "addr": "0x%X" % a, "locate": loc,
+                          "error_code": "swd-halt-failed",
+                          "error": "停机失败：%s"
+                                   % (r.get("error") or r.get("status_text") or "未知"),
+                          "hint": "consistent=halt 要求能把目标停下来；停不了就改 "
+                                  "consistent=\"run\"，但要自己担运行态读的伪值风险。"}
+        info2, e2 = _swd_read_ctrl(a, link=link)
+        if info2 is None:
+            _swd_resume(lk)
+            return None, e2
+        info = info2
+        pending = (info["head"] - drained) & _swd.U32
+        if pending > info["cap"]:
+            _swd_resume(lk)
+            return None, {
+                "ok": False, "addr": "0x%X" % a, "locate": loc,
+                "error_code": "swd-cursor-mismatch",
+                "error": "停机后控制块 head=%d 与宿主游标 %d 差 %d > cap=%d"
+                         % (info["head"], drained, pending, info["cap"]),
+                "hint": "宿主会话与目标不同步（MCP 重启过 / 换了固件 / 目标复位过）："
+                        "reset_session=true 重建会话，或 trace_swd_reset 重开一段录制。"}
+        return lk, None
+
     data = b""
     rmeta = {}
+    lk_h = None
+    halted = False
+    halt_ms = None
+    halt_started = None
+    did_halt = False
+    drain_notes = []
     if pending:
-        data, rmeta = _swd_read_stream(info["ring_addr"], info["cap"],
-                                       drained, pending, link=link)
+        if mode == "halt":
+            halt_started = time.perf_counter()
+            lk_h, herr = _halt_and_reread_ctrl()
+            if lk_h is None:
+                return herr
+            halted = True
+            did_halt = True
+        data, rmeta = _drain_now()
         if data is None:
+            if halted:
+                _swd_resume(lk_h)
             return rmeta
+        fake = _swd_fake_kind(data) or (rmeta.get("degenerate") or "")
+        if fake and not halted:
+            if mode == "run":
+                return {"ok": False, "addr": "0x%X" % a, "locate": loc,
+                        "error_code": "swd-read-untrusted",
+                        "error": "全速运行时搬回的这段字节是伪值（%s，共 %d 字节）"
+                                 % (fake, len(data)),
+                        "at_drained": drained, "unread_bytes": pending,
+                        "hint": "这段字节不是目标写进去的内容，拿去解码只会解出垃圾并失步。"
+                                "consistent=\"halt\"（或 auto）会停机搬——停机读实测与目标"
+                                " tokens 计数逐字节吻合；停机期间未读数据不会丢（靠背压）。"}
+            halt_started = time.perf_counter()
+            lk_h, herr = _halt_and_reread_ctrl()
+            if lk_h is None:
+                drain_notes.append("全速搬回的是伪值（%s），且停机失败：这批字节不可信"
+                                   % fake)
+                data, rmeta = b"", {}
+            else:
+                halted = True
+                d2, m2 = _drain_now()
+                if d2 is None:
+                    _swd_resume(lk_h)
+                    return m2
+                k2 = _swd_fake_kind(d2) or ((m2 or {}).get("degenerate") or "")
+                if k2:
+                    _swd_resume(lk_h)
+                    return {"ok": False, "addr": "0x%X" % a, "locate": loc,
+                            "error_code": "swd-read-untrusted",
+                            "error": "停机后搬回的字节仍是伪值（%s）" % k2,
+                            "hint": "这不再是「运行态读」的问题，而是链路/固件本身："
+                                    "核对 cap/ring_addr 与固件是否一致，或换链路重试。"}
+                data, rmeta = d2, m2
+                did_halt = True
+                drain_notes.append("全速搬回的是伪值（%s，%d 字节），已改用停机搬运"
+                                   % (fake, len(data)))
+    notes.extend(drain_notes)
 
     dec = s["dec"]
     base_ev, base_ct, base_it = len(dec.events), len(dec.ctl), len(dec.items)
@@ -2693,6 +2871,13 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         else:
             s["cursor_write_failed"] = False
         s["drained"] = info["head"]
+
+    # ---- 停机搬运：游标已推完才放目标跑（运行态写 SRAM 也可能不生效，停机时写最稳）
+    if halted:
+        _swd_resume(lk_h)
+        halted = False
+        if halt_started is not None:
+            halt_ms = (time.perf_counter() - halt_started) * 1000.0
 
     # ---- 对上锚：本批读完后控制块没再动过，cycles 就是**本会话最后一条事件**的时刻
     stable = False
@@ -2755,6 +2940,8 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         "faults": view["faults"],
         "events": view["events"],
         "truncated": view["truncated"],
+        "consistent": "halt" if did_halt else "run",
+        "halt_ms": round(halt_ms, 2) if halt_ms is not None else None,
         "read_meta": {k: rmeta.get(k) for k in ("read_confidence", "while_running")
                       if k in rmeta} or None,
         "next": ["连续录：反复调 trace_swd_read，每次它只搬走新增的那一段",
@@ -3844,19 +4031,28 @@ def register(server, js=None) -> int:
             "**时间粒度**：返回里的 granularity 说明这段流一个 dt 单位是多少 CPU 周期"
             "（mode=none 就是没有时间戳、只有顺序）。granularity= 传值时只做**校验**："
             "与控制块不符会报 swd-granularity-mismatch（一段流里混两种单位换算出来就是"
-            "错的），改粒度要用 trace_swd_reset(granularity=...)。"
+            "错的），改粒度要用 trace_swd_reset(granularity=...)。\n"
+            "**consistent= 决定怎么搬这一块**（默认 halt）：halt=先停机、就地重读控制块做个"
+            "一致快照、搬完写游标再放行——真机实测这是唯一能保证「搬到的就是目标写进去的"
+            "那一份」的做法（停机读与目标 tokens 计数逐字节吻合），停机期间未读数据不会丢"
+            "（背压不覆写），代价是每搬一次停几毫秒；run=全速搬，但实测有的目标/地址段会"
+            "整片读回伪值（全 0 / 全 FF / 整段重复同一个 4 字节字），碰到伪值直接报 "
+            "swd-read-untrusted 而不是拿去解码；auto=先全速读，发现伪值自动停机重读一次。"
+            "返回里的 consistent / halt_ms 说明这一块实际是怎么搬的。"
         ),
     )
     async def trace_swd_read(elf: str = "", addr: str = "", limit: int = 200,
                              out_file: str = "", names: str = "",
                              link: str = "auto",
                              reset_session: bool = False,
-                             granularity: str = "") -> str:
+                             granularity: str = "",
+                             consistent: str = "halt") -> str:
         try:
             return _js(swd_read(elf=elf, addr=addr, limit=int(limit),
                                 out_file=out_file, names=names, link=link,
                                 reset_session=bool(reset_session),
-                                granularity=granularity))
+                                granularity=granularity,
+                                consistent=consistent))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

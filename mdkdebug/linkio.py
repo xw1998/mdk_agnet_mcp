@@ -189,7 +189,17 @@ class KeilLink(Link):
         if len(data) < int(n_bytes):
             return None, {"link": self.name,
                           "error": "读回长度不足（%d/%d）" % (len(data), int(n_bytes))}
-        return data, {"link": self.name, "read_mode": "single"}
+        meta = {"link": self.name, "read_mode": "single"}
+        # 单次读不复读，只能靠「伪值签名」把明显不可信的一帧标出来（all_zero /
+        # all_ff / 整段重复同一个 4 字节字）。下游据此决定「停机重读」还是报错，
+        # 而不是把伪值当真实字节流用。
+        try:
+            deg = self.client._degenerate_kind(data)
+        except Exception:                                           # noqa: BLE001
+            deg = ""
+        if deg:
+            meta["degenerate"] = deg
+        return data, meta
 
     def read(self, addr: int, n_bytes: int):
         c = self.client

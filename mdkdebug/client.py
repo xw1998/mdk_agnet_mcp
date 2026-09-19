@@ -429,13 +429,26 @@ class UVClient:
     # ---- 带脏读防护的内存读取（批次30 反馈①） ----
     @staticmethod
     def _degenerate_kind(data: bytes) -> str:
-        """识别「整帧退化」：整片全 0x00 或全 0xFF。真实内存很少整片同值。"""
+        """识别「整帧退化」：整片全 0x00 / 全 0xFF / 整段重复同一个 4 字节字。
+
+        真机实测（STM32F427 + Keil UVSOCK）：目标**全速运行时**经 SWD 读 SRAM 的
+        某些区段会整段重复同一个 4 字节字——同一个字在换地址、换长度时都一样，
+        且随读的推进而变（实测相邻读差约 1400）。它既不是全 0 也不是全 FF，
+        旧检测认不出来，于是伪值被当正常字节流用，这是最危险的一类静默错答案。
+        门槛取 16 字节（4 个相同的、字节不全同的字），避免把「真存了重复值的小数组」
+        误判成脏读。
+        """
         if not data:
             return ""
         if data[0] == 0x00 and all(b == 0x00 for b in data):
             return "all_zero"
         if data[0] == 0xFF and all(b == 0xFF for b in data):
             return "all_ff"
+        if len(data) >= 16:
+            word = data[:4]
+            if len(set(word)) > 1 and all(
+                    data[i:i + 4] == word for i in range(0, len(data) - 3, 4)):
+                return "repeated_word"
         return ""
 
     def running_cached(self, ttl: float = 1.0, fresh: bool = False):
@@ -574,6 +587,11 @@ class UVClient:
                 out["content_note"] = (
                     "该地址落在 Flash 区段，已擦除的 Flash 读出全 0xFF 是**预期内容**"
                     "（不是脏读）；若此处本该有代码/常量，说明对应区域尚未烧写或被擦除。")
+            elif degenerate == "repeated_word":
+                out["degenerate_note"] = (
+                    "整帧是同一个 4 字节字（0x%s）的重复：真机实测这是「目标全速运行时"
+                    "经 SWD 读 SRAM」的伪值签名之一，不是真实内容。先 halt 再读（停机读"
+                    "实测逐字节吻合），或换链路重试。" % data[:4].hex())
             else:
                 out["degenerate_note"] = (
                     "整帧读出全 %s：整片同值通常不是真实内容，而是读取失败或该区域未初始化。"
