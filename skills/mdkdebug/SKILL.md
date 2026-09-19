@@ -167,6 +167,9 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。
+  **符号修复手段都在 `symbol` 组**：`set_symbol_file` / `list_symbol_projects` 默认不在面上——
+  `env_check` 报「符号与固件不同源」时，它的 `next_actions` 会把「先 `toolset(action="load", toolsets="symbol")`」这一步一并写出来；
+  自己手工切符号时也记得先装这一组，否则只会撞「未知工具」。
 - **上下文不够时的两把刀**：`nano` 极简档（`MDKDEBUG_TOOLSETS=nano`，19 个工具 / 约 4.6 千字符
   描述，自动用 `min` 描述档；含 `mdk_guide`，正文取回不用另外装）＋ **描述分层** `MDKDEBUG_DESC=full|lean|min`（默认 `full`，只有 `nano` 档自动用 `min`；要省上下文得显式选 `lean`/`min`）。
   描述分层只把「参考手册」式长正文挪出上下文，正文一字不改地归档，
@@ -273,7 +276,8 @@ view_guide(topic="howto")                # 不知道该配哪张图？先问它�
 | 现象 | 先调 |
 |------|------|
 | 连不上 / 时通时不通 | `keil_health`、`get_status`、`list_uvision_instances` |
-| 表达式集体解析失败 | `get_status` 看 `symbol_stale`，必要时 `set_symbol_file` |
+| 表达式集体解析失败 | `get_status` 看 `symbol_stale`，必要时 `set_symbol_file`（在 `symbol` 组、默认不暴露：先 `toolset(action="load", toolsets="symbol")`） |
+| 断点/PC 解析出「板上不存在的函数」（假符号） | `env_check` 看 `firmware_symbol` → 按它的 `next_actions` 装 `symbol` 组并 `set_symbol_file` 切到与刚烧录固件同源的那份 |
 | 断点下不上（error 57/65/145） | 返回体里的 `checks` 与 `hints`，或 `find_symbol` 核对符号 |
 | 编译失败看不懂 | `parse_build_errors`、`explain_build_error` |
 | 外设寄存器值看不懂 | `svd_list` / `svd_decode`（自动按工程器件推断 SVD） |

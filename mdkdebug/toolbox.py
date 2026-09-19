@@ -511,6 +511,26 @@ def loaded_groups(server=None) -> list:
     return tb.loaded_groups() if tb else []
 
 
+def tool_hidden(name: str, server=None):
+    """某个工具当前是否被收起（不在暴露的工具面上）。
+
+    返回 True=已收起 / False=在面上 / None=**查不到账本**（工具面还没初始化）。
+    None 是「不知道」，不是「没有」——调用方要按前者措辞，别把它当 False 用，
+    否则会把「没查到」说成「已在面上」。
+    """
+    if not name:
+        return None
+    tb = _pick(server)
+    if tb is None or not getattr(tb, "ready", False):
+        return None
+    alltools = getattr(tb, "all", None)
+    inactive = getattr(tb, "inactive", None)
+    if not isinstance(alltools, dict) or not isinstance(inactive, dict):
+        return None
+    if name not in alltools:      # 压根没注册过这个工具：不算「被收起」
+        return False
+    return name in inactive
+
 def status(server=None) -> dict:
     """当前工具面：暴露/收起数量、各组装载情况、怎么装回来。"""
     tb = _pick(server)

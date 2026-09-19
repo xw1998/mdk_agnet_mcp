@@ -942,7 +942,7 @@ def section_k():
         rest_pick = use_pick(be)
         rest_cli = use_client(MemClient(rd32_regions({}) ))
         rest_sc = use_attr(SV, "_symbol_source_check",
-                           lambda client=None, axf="", deep="auto":
+                           lambda client=None, axf="", deep="auto", server=None:
                            {"verdict": "different", "warning": "符号不是刚烧的那份"})
         try:
             r = call(srv, "trace_record", {"action": "run", "funcs": "task_a",
@@ -1027,7 +1027,7 @@ def section_k():
     rest_cli = use_client(MemClient())
     rest_probe = use_attr(SV, "_probe_chip_cached", lambda client, ttl=5.0: dict(chip_h7))
     rest_sc = use_attr(SV, "_symbol_source_check",
-                       lambda client=None, axf="", deep="auto":
+                       lambda client=None, axf="", deep="auto", server=None:
                        {"verdict": "content-mismatch", "warning": "符号与板上固件不同源",
                         "next_actions": ["set_symbol_file 切到对应 .axf"]})
     try:

@@ -284,7 +284,9 @@ def _bp_failure_hint(client, addr, r, loc=None):
         checks = {"addr": None,
                   "addr_note": "未能从符号名解析出地址（不在当前 .axf 符号表内）"}
         hints.append("未解析出地址：符号名可能不在当前 .axf 里——用 find_symbol 搜索，"
-                     "或 set_symbol_file 切到与目标固件匹配的 .axf。")
+                     "或 set_symbol_file 切到与目标固件匹配的 .axf。"
+                     + ("（" + _symbol_switch_hint() + "）"
+                        if _toolbox.tool_hidden("set_symbol_file") else ""))
     else:
         checks = {"addr": "0x%08X" % addr,
                   "addr_odd": bool(addr & 1),
@@ -1132,7 +1134,40 @@ def _same_file(a: str, b: str) -> bool:
     except OSError:
         return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
-def _symbol_source_check(client=None, axf: str = "", deep: str = "auto") -> dict:
+def _symbol_switch_actions(server=None) -> list:
+    """「把符号切到与板上固件同源的那份」的可执行动作清单（含必要的工具面装卸步骤）。
+
+    为什么动作里必须显式带上「装 symbol 组」：报符号不一致的 env_check 在**默认可见的
+    core 组**，而唯一的修复手段 set_symbol_file 在**默认不暴露的 symbol 组**
+    （toolbox.DEFAULT_GROUPS=("core",)）。旧文案只说「set_symbol_file 切到…」，调用方
+    照做只会撞「未知工具」——而「要先装 symbol 组」这条线索当时只写在 toolset 工具的
+    描述里，不在报错里、也不在体检结论里。检测器与修复手段不在同一个工具面上时，
+    「怎么把手段拿到手」必须和手段写在同一条动作里，否则等于递了把打不开的钥匙。
+
+    set_symbol_file 是否真的不在面上，按当前工具面**账面**判断（不猜）：账本查得到才
+    断言「已被收起」；查不到（None）时按「可能不在」措辞，并如实说明这是未知而非已知。
+    """
+    hid = _toolbox.tool_hidden("set_symbol_file", server)
+    acts = []
+    if hid is True:
+        acts.append(
+            '先 toolset(action="load", toolsets="symbol") 把符号组装进工具面'
+            "（本服务默认只暴露 core 组，set_symbol_file / list_symbol_projects 都不在"
+            "默认面上，不装的话下一步会报「未知工具」；装完若客户端仍报未知工具，"
+            "先重拉一次 tools/list）")
+    elif hid is None:
+        acts.append(
+            'set_symbol_file 若不在当前工具面上（本服务默认只暴露 core 组），先调 '
+            'toolset(action="load", toolsets="symbol") 把它装上再调')
+    acts.append("set_symbol_file 切到与刚烧录固件同源的 .axf")
+    return acts
+
+def _symbol_switch_hint(server=None) -> str:
+    """把 _symbol_switch_actions 压成一句话，供 warning / 提示文案内嵌。"""
+    return "；".join(_symbol_switch_actions(server))
+
+def _symbol_source_check(client=None, axf: str = "", deep: str = "auto",
+                         server=None) -> dict:
     """核对「当前符号 .axf」与「最近一次烧录的固件」是否同源。
 
     判据分两层，**先证据后推断**：
@@ -1195,14 +1230,14 @@ def _symbol_source_check(client=None, axf: str = "", deep: str = "auto") -> dict
             "「假符号」——真机踩过：PC 显示停在 rt_mq_send_wait，而该函数在板上固件的 map 里"
             "早被链接器裁掉了，会把人带偏。请先确认刚烧的是哪个工程，再 set_symbol_file 切到"
             "与它对应的 .axf。")
-        out["next_actions"] = [
-            "set_symbol_file 切到与刚烧录固件同源的 .axf",
+        out["next_actions"] = _symbol_switch_actions(server) + [
             "flash_debug 走「关旧Keil→编烧→开新→进调试」闭环，避免符号与固件不同源",
             "env_check 一键体检环境一致性（芯片 / SVD / 固件 / 符号 / D-Cache）",
         ]
         return out
     if not cur:
         out["verdict"] = "no-symbols"
+        out["next_actions"] = _symbol_switch_actions(server)
         if cv == "firmware-confirmed":
             out["note"] = ("板上固件与刚烧录的 %s 指纹一致；但本会话尚未加载符号文件，"
                            "解析位置前请先 set_symbol_file 指到这份 .axf。"
@@ -1221,8 +1256,7 @@ def _symbol_source_check(client=None, axf: str = "", deep: str = "auto") -> dict
             "PC/断点会被解析成别套固件的符号——「符号表里早被裁剪掉的函数」就是这么冒出来的。"
             "请用 set_symbol_file 切到与板上固件对应的 .axf。"
             % (os.path.basename(cur or "?"), os.path.basename(flashed or "?")))
-        out["next_actions"] = [
-            "set_symbol_file 切到与刚烧录固件同源的 .axf",
+        out["next_actions"] = _symbol_switch_actions(server) + [
             "env_check 做一次完整体检",
         ]
         return out
@@ -1868,7 +1902,9 @@ def _build_location(client):
     # 汇编级降级：符号未就绪或 PC 无法解析时，仍返回地址级信息并显式告警，不硬套源码
     if not loc or not loc.is_ready() or not isinstance(pc, int):
         result["warning"] = ("符号定位未就绪，仅返回汇编/地址级信息；"
-                             "请用 set_symbol_file 指定当前固件的 .axf/.map")
+                             "请用 set_symbol_file 指定当前固件的 .axf/.map"
+                             + ("（" + _symbol_switch_hint() + "）"
+                                if _toolbox.tool_hidden("set_symbol_file") else ""))
         result["callstack"] = []
         if isinstance(pc, int):
             result["address"] = hex(pc)
@@ -1885,7 +1921,9 @@ def _build_location(client):
                 loc = loc2
         if cur is None:
             result["warning"] = (f"当前 PC({hex(pc)}) 未能在当前符号文件解析，符号可能与固件不匹配；"
-                                 "请 set_symbol_file 切换符号文件，或以地址级信息为准")
+                                 "请 set_symbol_file 切换符号文件，或以地址级信息为准"
+                                 + ("（" + _symbol_switch_hint() + "）"
+                                    if _toolbox.tool_hidden("set_symbol_file") else ""))
             result["address"] = hex(pc)
             result["callstack"] = _backtrace(client, loc, pc, lr, sp)
             return result
@@ -3231,7 +3269,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 # 真机踩过：烧的是 special 工程，加载的却是主固件工程的 .axf，
                 # PC 全解析成假符号；工具不校验就等于默认它们一致，跨仓库调试必踩。
                 try:
-                    sc = _symbol_source_check(client=_get_client())
+                    sc = _symbol_source_check(client=_get_client(), server=server)
                     if sc:
                         out["symbol_source"] = sc
                         if sc.get("warning"):
@@ -5294,7 +5332,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                                   "名字会是「假符号」——先 env_check 核对")
             if check_symbols:
                 try:
-                    sc = _symbol_source_check(client=client)
+                    sc = _symbol_source_check(client=client, server=server)
                     if sc:
                         rep["symbol_check"] = sc
                         if sc.get("warning"):
@@ -5467,7 +5505,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             # 4) 符号 vs 板上固件
             try:
                 out["firmware_symbol"] = _symbol_source_check(
-                    client=client, deep=("auto" if content_check else "false"))
+                    client=client, deep=("auto" if content_check else "false"),
+                    server=server)
             except Exception as e:  # noqa: BLE001
                 out["firmware_symbol"] = {"verdict": "unknown", "error": str(e)}
             # 5) D-Cache
