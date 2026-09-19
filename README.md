@@ -213,7 +213,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.1.6）
+│   ├── __init__.py           # 包初始化（版本号 0.1.7）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -305,7 +305,7 @@ python run_server.py --transport http --http-port 8300
 | `reset` | 复位目标（变量回初值、断点保留）。**真机实测：复位后停在复位向量、处于停止态，不会自行往下跑**——必须再 `run`（或 `run_timeout`/`run_to_line`）才开始执行；返回 `state_after_reset`/`stopped_after_reset` 与 `hint`；`run_after=true` 可复位后自动 run | `run_after?`（默认 false） |
 | `step` | 单步执行，成功后自动附带停靠位置（`stopped_file`/`stopped_line`/`stopped_address`）+ 源码上下文 + 调用栈 | `mode`：`into`/`over`/`out`/`instruction` |
 | `run_to_line` | 运行到指定行（run to cursor），接受 `文件:行号` 或 `0x地址` | `target`（如 `main.c:77`） |
-| `get_current_location` | 读取当前 PC，定位到 文件:行号 + 源码上下文 + 完整调用栈回溯 + 源码漂移提示 + 断点命中反馈 | — |
+| `get_current_location` | 读取当前 PC，定位到 文件:行号 + 源码上下文 + 完整调用栈回溯 + 源码漂移提示 + 断点命中反馈。另附 `symbol_verified`：这份符号与板上固件**核对过没有**（解析成功 ≠ 名字可信——假符号照样能解析出像样的函数名，只有 `env_check` 证明同源才会是 true） | — |
 | `address_for_line` | **源码 文件:行号 → 地址**（`get_current_location` 的反方向）：想在没符号的行上下断点时，先拿地址再 `set_breakpoint(expr=地址)`。按「≤ 该行的最近一条行记录」匹配并返回 `matched_line`；返回**偶数地址**（Keil 对奇数地址一律报 `error 57`）与带 Thumb 位的 `thumb_address_hex`。编译不出地址的行**不会**被 DWARF 的文件起始占位行（地址 0）糊弄成 `0x00000000` | `file`、`line` |
 | `read_locals` | 读取当前函数 参数+局部变量 及其值（DWARF 解析变量名，`calc_expression` 在当前上下文求值） | — |
 | `snapshot` | 状态快照：位置（文件行+PC）+ 源码上下文 + 完整调用栈 + 局部变量 + 指定全局变量，一站式看清当前运行状态 | `globals`、`source_context` |
@@ -365,10 +365,10 @@ python run_server.py --transport http --http-port 8300
 | `build_project` | 编译工程（`UV4 -b`，后台隐藏窗口；编译后自动检查调试通道） | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
 | `rebuild_project` | 全量重编译（`UV4 -r`，编译后自动检查调试通道）；`clean_first=true` 用 `-cr` **先清理再重建**（比 `-r` 更彻底，增量误判残留也能清掉） | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`clean_first?` |
 | `clean_project` | 清理工程（`UV4 -c`，删除中间产物不动源码）；编译失败的 `next_actions` 会指到这里——增量编译残留可疑时先 clean 再 build | `project`、`target`、`timeout_s`、`ensure_debug_channel` |
-| `flash_download` | 烧录到目标 Flash（`UV4 -f`，烧录后自动检查调试通道）；**烧录后若仍在调试态则自动退出调试**（`exit_debug_after`，旧会话符号已过期），返回值 `debug_session` 说明处理过程 | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
-| `build_and_flash` | 编译成功后才烧录，AI 全流程闭环（自带通道自愈）；烧录后同样自动退出旧调试会话（`exit_debug_after`，返回 `debug_session`） | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
+| `flash_download` | 烧录到目标 Flash（`UV4 -f`，烧录后自动检查调试通道）；**烧录后若仍在调试态则自动退出调试**（`exit_debug_after`，旧会话符号已过期），返回值 `debug_session` 说明处理过程。返回值另带 `symbol_rebind`：烧录后符号有没有钉到刚烧的 `.axf`（`rebound` 自动重钉 / `kept-explicit` 你显式 `set_symbol_file` 过、没覆盖 / `already-current` / `skipped` 推不出） | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
+| `build_and_flash` | 编译成功后才烧录，AI 全流程闭环（自带通道自愈）；烧录后同样自动退出旧调试会话（`exit_debug_after`，返回 `debug_session`）；另有 `symbol_rebind`（含意同 `flash_download`） | `project`、`target`、`timeout_s`、`ensure_debug_channel`、`exit_debug_after` |
 | `batch_debug_script` | **Keil 官方命令行批处理调试（第二条通道）**：把一串命令写成初始化文件挂到 `.uvoptx` 的 `<tIfile>`，用 `UV4 -d -j0` 无人值守执行，按日志逐条判定「执行到没有」。**为什么留着它**：命令通道不依赖 UVSOCK 交互式会话，进程隔离、天然可重放，适合「跑一段固定脚本 → 拿结果」的场景。已处理三个真机硬坑：初始化文件与 trace 必须落在 ASCII 临时目录（中文路径会 `UnicodeEncodeError`）、`.uvoptx` **前置备份 + finally 字节级还原**（Keil 退出会回写，不还原就是脏工程）、`<tIfile>` 唯一性先数再换（多 target 工程常有多个）。静态 lint 会拦下真机会挂死的写法（`Go main`、`DISPLAY`、`SAVE`、`Step`）并给出正确写法；`EXIT` 缺失时自动补一条 | `commands`、`project?`、`timeout_s?`、`visible?` |
-| `flash_debug` | 「关旧 Keil→新固件上板→开新→进调试」一体闭环，规避旧窗口调试旧代码；上板方式自动选路（`flash_plan`：`debug_download` 由 Keil 进调试时自动下载 / `explicit_flash` 显式烧录） | `project`、`target` |
+| `flash_debug` | 「关旧 Keil→新固件上板→开新→进调试」一体闭环，规避旧窗口调试旧代码；上板方式自动选路（`flash_plan`：`debug_download` 由 Keil 进调试时自动下载 / `explicit_flash` 显式烧录）；返回值亦带 `symbol_rebind` | `project`、`target` |
 | `keil_command` | **命令窗口直通**：把命令原样发给 Keil 命令窗口并结构化返回（成功/报错行、错误码含义、是否可用 `batch_debug_script` 批处理）。调试语义与 Keil 官方命令行一致——同事反馈「命令方式问题更少」时可直接用；报错会带上错误码解读 | `command`、`timeout_s?` |
 | `read_console_output` | 读取命令窗口输出 | `clear?` |
 | `read_async_messages` | 读取异步消息/报错 | `clear?` |
