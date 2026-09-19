@@ -49,6 +49,7 @@ BATCHES = [
     "test_batch55",
     "test_batch56",
     "test_batch57",
+    "test_component_link",
 ]
 
 # --fast：改一两个模块时先跑这几批（覆盖协议层/统一信封/非 MDK 链路），全绿再跑全量

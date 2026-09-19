@@ -24,6 +24,14 @@
 
 #include "mdk_trace_buff.h"
 
+/* ------------------------------------------------------------ state */
+
+/* The host locates the entire buffer through this ONE symbol: control block
+ * at its start, record array right behind it at ctrl + CTRL_BYTES. It has to
+ * be defined here (not declared only in the header) or nothing links -- this
+ * is the same contract mdk_trace_swd.c keeps for mdk_trace_swd_blob. */
+mdk_trace_buff_blob_t mdk_trace_buff_blob;
+
 static void _zero_bytes(void *dst, uint32_t n)
 {
     uint8_t *p = (uint8_t *)dst;

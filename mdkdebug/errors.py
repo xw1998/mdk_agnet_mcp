@@ -79,6 +79,15 @@ ERROR_CODES = {
             "确实要同时开多个工程窗口：传 single=false",
         ],
     },
+    "component-link-failed": {
+        "text": "目标侧插桩组件缺符号：按现状接进构建会在链接期失败",
+        "next_actions": [
+            "看 missing_symbols：这些符号应该由组件自己的 .c 定义"
+            "（buff 的 mdk_trace_buff_blob 在 mdk_trace_buff.c、swd 的 mdk_trace_swd_blob 在 mdk_trace_swd.c）",
+            "用返回的 sources（= component_sources）核对工程里到底有没有把这些 .c 加进编译",
+            "补全后用 overwrite=true 重跑 trace_instrument，再看 self_check 是否 ok",
+        ],
+    },
     "project-open-in-keil": {
         "text": "工程正被 Keil 打开着，此时改 .uvprojx 会触发模态弹窗并堵住调试通道",
         "next_actions": [

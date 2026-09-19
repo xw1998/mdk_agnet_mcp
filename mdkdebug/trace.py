@@ -1368,6 +1368,115 @@ def list_components() -> dict:
     return {"ok": True, "dir": COMPONENT_DIR, "count": len(files), "files": files}
 
 
+# ============================ 组件部署后的链接自检
+#
+# 「拷进去了」不等于「编得过、链得上」。批次55 加 buff 后端时，头文件写了
+# `extern mdk_trace_buff_blob_t mdk_trace_buff_blob;`，却没有任何 .c 定义它；
+# 同族的 SWD 后端在 mdk_trace_swd.c 里有定义，是 buff 漏了。主机的 mock 用例
+# 只造替身符号，照样全绿——少一个定义也能"通过"，直到用户第一次真编译才炸出
+# `L6218E: Undefined symbol mdk_trace_buff_blob`。
+#
+# 所以部署完就地把组件真编一遍再链接：空壳提供 CMSIS 内在函数与入口，缺任何符号
+# 都会在链接期以 undefined reference 现形——正是用户会撞到的那个报错的等价物，
+# 而且发生在部署当场，不是他第一次 build 的时候。
+
+_COMPONENT_BACKEND_MACRO = {
+    "itm": "MDK_TRACE_BACKEND_ITM",
+    "rtt": "MDK_TRACE_BACKEND_RTT",
+    "uart": "MDK_TRACE_BACKEND_UART",
+    "buff": "MDK_TRACE_BACKEND_BUFF",
+    "swd": "MDK_TRACE_BACKEND_SWD",
+    "none": "MDK_TRACE_BACKEND_NONE",
+}
+
+_COMPONENT_STUB_C = """/* mdkdebug link self-check stub: CMSIS intrinsics + entry point, nothing else.
+ * It exists so the component can be linked on its own; any symbol it does NOT
+ * provide must come from the component, or the check fails right here. */
+#include <stdint.h>
+uint32_t __get_PSP(void) { return 0u; }
+uint32_t __get_MSP(void) { return 0u; }
+uint32_t __get_PRIMASK(void) { return 0u; }
+void __set_PRIMASK(uint32_t x) { (void)x; }
+void __disable_irq(void) { }
+void __enable_irq(void) { }
+int main(void) { return 0; }
+"""
+
+def component_sources(backend: str) -> list:
+    """该后端真正需要加入编译的组件源文件（next 清单与自检共用同一份）。"""
+    b = (backend or "itm").strip().lower()
+    srcs = ["mdk_trace.c"]
+    if b in ("rtt", "uart"):
+        srcs.append("mdk_trace_rtt.c")
+    if b == "buff":
+        srcs.append("mdk_trace_buff.c")
+    if b == "swd":
+        srcs.append("mdk_trace_swd.c")
+    return srcs
+
+def component_link_check(backend: str = "itm", src_dir: str = "",
+                         family: str = "arm-none-eabi", cpu: str = "cortex-m4",
+                         timeout: float = 240.0, keep_temp: bool = False) -> dict:
+    """把该后端的组件源文件真编一遍并链接：缺符号（如没人定义的 blob）当场报出来。
+
+    `checked` 与 `ok` 分开：找不到 C 编译器时 checked=False 且 ok=None（**没查**，
+    不等于通过），调用方必须如实转述，不能把「没检查」说成「没问题」。
+    """
+    import shutil
+    import tempfile
+
+    from . import toolchain as _tc
+
+    b = (backend or "itm").strip().lower()
+    d = os.path.abspath(src_dir or COMPONENT_DIR)
+    files = component_sources(b)
+    missing_files = [f for f in files if not os.path.isfile(os.path.join(d, f))]
+    if missing_files:
+        return {"ok": False, "checked": True, "backend": b, "sources": files,
+                "missing_symbols": [], "errors": [],
+                "reason": "组件源文件缺失：%s" % ", ".join(missing_files)}
+    gcc = _tc.find_tool(family, "gcc")
+    if not gcc:
+        return {"ok": None, "checked": False, "backend": b, "sources": files,
+                "missing_symbols": [], "errors": [],
+                "reason": "找不到 %s 的 C 编译器，未做链接自检" % family}
+    tmp = tempfile.mkdtemp(prefix="mdk_trace_link_")
+    try:
+        stub = os.path.join(tmp, "_mdk_link_stub.c")
+        with open(stub, "w", encoding="utf-8", newline="\n") as f:
+            f.write(_COMPONENT_STUB_C)
+        out = os.path.join(tmp, "out.elf")
+        argv = ["-mcpu=%s" % cpu, "-mthumb", "-std=c99", "-O1",
+                "-nostartfiles", "--specs=nosys.specs",
+                "-I", d, "-DMDK_TRACE_ENABLE=1"]
+        macro = _COMPONENT_BACKEND_MACRO.get(b)
+        if macro:
+            argv.append("-D%s=1" % macro)
+        argv += [os.path.join(d, f) for f in files] + [stub, "-o", out]
+        r = _tc.run_tool(gcc, argv, timeout=timeout)
+        text = (r.get("stdout") or "") + "\n" + (r.get("stderr") or "")
+        missing = sorted(set(re.findall(r"undefined reference to [`'\"]([^`'\"]+)", text)))
+        ok = bool(r.get("ok")) and not missing
+        res = {"ok": ok, "checked": True, "backend": b, "sources": files,
+               "compiler": gcc, "missing_symbols": missing,
+               "errors": [ln.strip() for ln in text.splitlines()
+                          if "error" in ln.lower()][:6],
+               "command": r.get("cmd") or (" ".join([gcc] + argv))}
+        if ok:
+            res["elf"] = out
+        else:
+            res["reason"] = ("组件缺符号：%s" % ", ".join(missing) if missing
+                             else (r.get("error") or "编译/链接失败"))
+            res["hint"] = ("缺的符号应该由组件自己的 .c 定义（buff 的 mdk_trace_buff_blob、"
+                           "swd 的 mdk_trace_swd_blob 都在各自 .c 里）；确认 component_sources "
+                           "列出的文件都进了编译，再重跑 trace_instrument。")
+        if keep_temp:
+            res["temp_dir"] = tmp
+        return res
+    finally:
+        if not keep_temp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
                      rtt_up: int = 2, rtt_down: int = 1, rtt_buf: int = 1024,
                      coreclk: int = 0, overwrite: bool = False,
@@ -1376,8 +1485,12 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
                      buff_clear_on_init: bool = False,
                      swd_bytes: int = 8192, swd_ts_shift: int = 0,
                      swd_clear_on_init: bool = True,
-                     fault_frame: bool = True) -> dict:
-    """把插桩组件拷进工程，并生成 mdk_trace_config.h + 构建片段。"""
+                     fault_frame: bool = True, link_check: bool = True) -> dict:
+    """把插桩组件拷进工程，并生成 mdk_trace_config.h + 构建片段。
+
+    复制完会就地做一次**编译 + 链接**自检（link_check，默认开）：组件缺符号
+    （如某个后端忘了定义自己的 blob）当场报出来，而不是等用户第一次 build
+    撞 L6218E。"""
     if not target_dir:
         return {"ok": False, "error": "target_dir 不能为空"}
     src = COMPONENT_DIR
@@ -1422,13 +1535,7 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
             f.write(mk)
         copied.append("mdk_trace.mk")
     b = (backend or "itm").strip().lower()
-    sources = ["mdk_trace.c"]
-    if b == "rtt":
-        sources.append("mdk_trace_rtt.c")
-    if b == "buff":
-        sources.append("mdk_trace_buff.c")
-    if b == "swd":
-        sources.append("mdk_trace_swd.c")
+    sources = component_sources(b)
     nxt = ["把 %s 加入工程编译" % " / ".join(sources),
            "include mdk_trace.mk（Make）或 add_subdirectory（CMake）",
            "在初始化处调 mdk_trace_init()；用 MDK_TRACE_SCOPE() 打点",
@@ -1438,9 +1545,14 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
            "任务 / 线程切换处调 MDK_TRACE_SCHED(from, to)"]
     if b == "buff":
         nxt += ["buff 模式：目标跑完或出事后 trace_buff_dump(elf=你的.axf) 一次性读回",
-                "buff 模式不需要 SWO 引脚、不需要主机实时跟读，但缓冲写满会覆盖最旧的"]
+                "buff 模式不需要 SWO 引脚、不需要主机实时跟读，但缓冲写满会覆盖最旧的",
+                "buff 的存储由 mdk_trace_buff.c 定义（符号 mdk_trace_buff_blob，主机就靠这"
+                "一个符号定位控制块与记录区）——这个 .c 必须进编译，漏了会报 "
+                "L6218E: Undefined symbol mdk_trace_buff_blob"]
     elif b == "swd":
-        nxt += ["swd 模式：反复 trace_swd_read(elf=你的.axf) 把已录的那段搬走；"
+        nxt += ["swd 的存储由 mdk_trace_swd.c 定义（符号 mdk_trace_swd_blob），"
+                "这个 .c 必须进编译；buff/swd 是各自独立的 blob，不要只加其中一个",
+                "swd 模式：反复 trace_swd_read(elf=你的.axf) 把已录的那段搬走；"
                 "主机平均搬运速度跟得上事件产生速度，就能一直录下去且零丢失",
                 "swd 模式只要 SWD 两线：不要 SWO 引脚、不抢目标时间、不停机；"
                 "背压而不是覆盖 —— 跟不上时目标丢新事件并计入 lost_events",
@@ -1448,9 +1560,25 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
     else:
         nxt += ["SWO 通路：trace_swo_start + 目标侧 MDK_TRACE_BACKEND_ITM",
                 "RTT 通路：trace_rtt_attach(elf=你的.elf)"]
-    return {"ok": True, "target_dir": dst, "copied": copied, "skipped": skipped,
-            "backend": b, "itm_port": itm_port, "next": nxt,
-            "skip_note": "已存在的文件默认不覆盖（overwrite=true 才覆盖）"}
+    out = {"ok": True, "target_dir": dst, "copied": copied, "skipped": skipped,
+           "backend": b, "itm_port": itm_port, "next": nxt, "sources": sources,
+           "skip_note": "已存在的文件默认不覆盖（overwrite=true 才覆盖）"}
+    if link_check:
+        chk = component_link_check(backend=b, src_dir=dst)
+        out["self_check"] = chk
+        if chk.get("checked") and not chk.get("ok"):
+            out["ok"] = False
+            out["error_code"] = "component-link-failed"
+            out["error"] = ("组件链接自检失败：%s —— 工程按现状接进构建会在链接期报 "
+                            "undefined reference，先补全组件源码再继续。"
+                            % (chk.get("reason") or "未知原因"))
+            out["missing_symbols"] = chk.get("missing_symbols") or []
+        elif not chk.get("checked"):
+            out["self_check_note"] = ("未做链接自检（%s）——这不等于组件没问题"
+                                      % (chk.get("reason") or "未提供原因"))
+    else:
+        out["self_check"] = {"checked": False, "reason": "link_check=false（调用方关闭）"}
+    return out
 
 
 def _gen_config_h(backend: str, itm_port: int, rtt_up: int, rtt_down: int,
@@ -1512,10 +1640,14 @@ def _gen_make_fragment() -> str:
         "# 由 mdkdebug 的 trace_instrument 生成：把插桩组件接进 Makefile",
         "# 用法：在你的 Makefile 里 `include path/to/mdk_trace.mk`",
         "MDK_TRACE_DIR ?= $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))",
-        "# 三个源文件都可无脑编：未选中的后端会编成空目标文件（内容裹在 #if 里）",
-        "# 只有 buff 模式会用 mdk_trace_buff.c，只有 rtt 模式会用 mdk_trace_rtt.c",
+        "# 四个源文件都可无脑编：未选中的后端会编成空目标文件（内容裹在 #if 里）",
+        "# 每个后端自己的 blob（主机定位用的那个符号）就定义在它自己的 .c 里：",
+        "#   buff -> mdk_trace_buff_blob（mdk_trace_buff.c）",
+        "#   swd  -> mdk_trace_swd_blob（mdk_trace_swd.c）",
+        "# 漏掉对应 .c 会在链接期报 undefined reference，不是运行时才出问题",
         "MDK_TRACE_SRCS := $(MDK_TRACE_DIR)/mdk_trace.c \\",
         "                  $(MDK_TRACE_DIR)/mdk_trace_buff.c \\",
+        "                  $(MDK_TRACE_DIR)/mdk_trace_swd.c \\",
         "                  $(MDK_TRACE_DIR)/mdk_trace_rtt.c",
         "C_SOURCES  += $(MDK_TRACE_SRCS)",
         "C_INCLUDES += -I$(MDK_TRACE_DIR)",
@@ -3487,6 +3619,12 @@ def register(server, js=None) -> int:
             "swd 的旋钮：swd_bytes（环字节数 = 静态 RAM，默认 8192）、swd_ts_shift（0 = 每周期）、"
             "swd_clear_on_init（**默认 true**，与 buff 相反——无缝流主机是从游标往 head 读，"
             "环里留着上一次运行的字节会把两段无关运行无缝拼在一起，没有可见接缝，最危险）。\n"
+            "**部署后自检**：返回里带 self_check —— 就地用 arm-none-eabi-gcc 把该后端的"
+            "组件源文件真编一遍并链接（空壳提供 CMSIS 内在函数与入口），缺符号当场报 "
+            "undefined reference，就是 build 时那个 L6218E 的等价物。缺符号时整体 ok=false、"
+            "error_code=component-link-failed，并给出 missing_symbols 与 sources（该进编译的"
+            "文件清单）。本机没有 C 编译器时 self_check.checked=false —— 那是**没查**，"
+            "不等于组件没问题，别把它当成通过。\n"
             "该往哪儿插桩见 trace_guide(topic=\"instrument_points\")。"
         ),
     )
@@ -3502,7 +3640,8 @@ def register(server, js=None) -> int:
                                fault_frame: bool = True,
                                swd_bytes: int = 8192,
                                swd_ts_shift: int = 0,
-                               swd_clear_on_init: bool = True) -> str:
+                               swd_clear_on_init: bool = True,
+                               link_check: bool = True) -> str:
         try:
             return _js(deploy_component(target_dir, backend=backend,
                                         itm_port=int(itm_port), rtt_up=int(rtt_up),
@@ -3516,7 +3655,8 @@ def register(server, js=None) -> int:
                                         fault_frame=bool(fault_frame),
                                         swd_bytes=int(swd_bytes),
                                         swd_ts_shift=int(swd_ts_shift),
-                                        swd_clear_on_init=bool(swd_clear_on_init)))
+                                        swd_clear_on_init=bool(swd_clear_on_init),
+                                        link_check=bool(link_check)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "target_dir": target_dir, "error": str(e)})
     n += 1

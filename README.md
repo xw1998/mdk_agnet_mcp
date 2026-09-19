@@ -504,7 +504,7 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 | `trace_scope_read` | 看 scope 现状：每变量 min/max/最后值/变化次数、真实生效采样率、丢点次数；只回最近 `limit` 条样本，不把上万条塞回上下文 | `limit?` |
 | `trace_scope_stop` | 停掉后台轮询线程并汇总（忘了停会一直占 SWD 带宽） | — |
 | `trace_pcsample` | **DWT 硬件 PC 采样（同样不 halt 目标）**：开 `DEMCR.TRCENA`+`DWT_CTRL.PCSAMPLENA`，主机只轮询 `DWT_PCSR`，按函数聚合。与 `trace_profile` 的本质区别是**不停核、不扰动实时性**。采样器不工作（部分芯片 errata）或采样值几乎不变时会**明确报错**，不给一份看着像样的分布；默认结束恢复 `DEMCR`/`DWT_CTRL` 原值 | `samples?`、`interval_ms?`、`elf?`、`top?`、`enable_dwt?`、`restore?`、`timeout?`、`link?` |
-| `trace_instrument` | **把目标侧插桩组件部署进你的工程**（见下）：按 `backend` 生成配置、拷贝组件源码与 `.mk`，已有文件默认 SKIP 不覆盖 | `target_dir`、`backend?`、`itm_port?`、`rtt_up?`、`rtt_down?`、`rtt_buf?`、`coreclk?`、`overwrite?`、`swo_baud?`、`dbgmcu_cr?` |
+| `trace_instrument` | **把目标侧插桩组件部署进你的工程**（见下）：按 `backend` 生成配置、拷贝组件源码与 `.mk`，已有文件默认 SKIP 不覆盖；**部署后就地做一次编译+链接自检**，组件缺符号当场报 `component-link-failed`（`link_check?` 默认开） | `target_dir`、`backend?`、`itm_port?`、`rtt_up?`、`rtt_down?`、`rtt_buf?`、`coreclk?`、`overwrite?`、`swo_baud?`、`dbgmcu_cr?`、`link_check?` |
 | `coverage_start` | **代码覆盖率（PC 采样法，不停目标）**：开 `DEMCR.TRCENA` + `DWT_CTRL.PCSAMPLENA`，主机只轮询 `DWT_PCSR`，按 `.axf` 的 DWARF 把 PC 归到**函数**与**行**。函数/行**总数是静态事实**（调试信息里就有），触达来自硬件采样器。**三种情形拒绝编数据**：采样器不工作（`sampler_active=false`）/ 没有符号表 / scope 匹配不到任何函数。结论只说 `unseen`（**没看到**）而不是 `uncovered`（未覆盖）——采不到 ≠ 没执行过 | `interval_ms?`、`elf?`、`scope?`、`link?`、`max_samples?`、`duration_s?`、`enable_dwt?`、`restore?`、`timeout?` |
 | `coverage_read` | 看当前快照：`hit/total/percent`、按命中次数排序的 `top`、以及**没看到过的**函数/行 `unseen`；另给 `pc_attribution.mapped/unmapped`，PC 采到但归不到任何函数的比例一目了然 | `top?`、`unseen?` |
 | `coverage_stop` | 停掉后台采样线程并出最终报告（默认把 `DEMCR`/`DWT_CTRL` 恢复原值，`restore=false` 可保留） | `restore?`、`top?`、`unseen?` |
@@ -572,7 +572,7 @@ trace 不能只靠主机侧「猜」目标行为，需要在被调试代码里�
 | `mdk_trace_config_default.h` | 全部 `#ifndef` 兜底：什么都不配也能编，且**只在四个后端都没定义时才默认 ITM**，不会双后端打架 |
 | `mdk_trace.c` | DWT/`mcycle` 时间戳、MTF 组帧（CRC8）、三种后端的发送实现 |
 | `mdk_trace_rtt.c` / `.h` | SEGGER 兼容的 RTT 控制块与环形缓冲（**目标侧绝不写 RdOff**，由主机侧推进） |
-| `mdk_trace_buff.c` / `.h` | **目标侧静态环形缓冲后端**：控制块 80 B + 记录区（定长 12 B/条）放在**一个连续 blob** 里，主机只认一个符号 `mdk_trace_buff_blob`；暖启动保留复位前记录（看门狗咬/HardFault 复位后的唯一证据） |
+| `mdk_trace_buff.c` / `.h` | **目标侧静态环形缓冲后端**：控制块 80 B + 记录区（定长 12 B/条）放在**一个连续 blob** 里，主机只认一个符号 `mdk_trace_buff_blob`；暖启动保留复位前记录（看门狗咬/HardFault 复位后的唯一证据）。**符号由 `mdk_trace_buff.c` 自己定义**——这个 `.c` 必须进编译，漏了会 `L6218E` |
 | `CMakeLists.txt` / `README.md` | 静态库 `mdk_trace` 的构建与使用说明 |
 
 典型用法（更多见组件内 README）：

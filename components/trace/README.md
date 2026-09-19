@@ -180,6 +180,11 @@ trace_buff_dump(elf="build/app.axf", out_file="trace.json",
 80 字节控制块，紧接着就是记录区（固定在 `ctrl + 80`）。**只需要一个符号**，
 不需要翻 map 文件找第二个地址。
 
+这个符号由 `mdk_trace_buff.c` 自己定义（同族的 swd 后端由 `mdk_trace_swd.c`
+定义 `mdk_trace_swd_blob`）：只拷头文件、或者漏掉那个 `.c`，链接期就会报
+`undefined reference to mdk_trace_buff_blob`。`trace_instrument` 部署后会就地
+把该后端的源文件编一遍并链接，把这类缺符号在部署当场报出来，而不是等你第一次 build。
+
 ```c
 typedef struct {
     char     magic[8];    /* 0   "MDKTBUF1"  */

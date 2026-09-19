@@ -25,6 +25,7 @@
 - [十九、AC5（ARMCC 5）：编译成功 ≠ 那行代码生效（批次56 实测）](#十九ac5armcc-5编译成功--那行代码生效批次56-实测)
 - [二十、宿主 Python 变量泄漏进外部工具子进程（批次57）](#二十宿主-python-变量泄漏进外部工具子进程批次57)
 - [二十一、Keil 窗口与文件时序：模态框会堵死调试通道（批次57）](#二十一keil-窗口与文件时序模态框会堵死调试通道批次57)
+- [二十二、部署完 ≠ 能链接：组件承诺提供符号却没人定义（批次57 实测）](#二十二部署完--能链接组件承诺提供符号却没人定义批次57-实测)
 
 ## 一、真实 Keil 实测要点
 
@@ -1550,3 +1551,75 @@ env = winutil.child_env(base=env, extra={"PATH": ...})   # 已有环境再剥一
   无 `project` 时拒绝），`tests/test_batch57.py` 的 C、D 段覆盖 `uvprojx_edit` 守卫与 server 层透传；
 - 另外把 `test_batch21` 补进闸门（它原先没设 `MDKDEBUG_TOOLSETS=all`，
   工具面默认精简后 `flash_debug` 根本不在表里，单独跑必挂——**闸门漏网比测试失败更危险**）。
+
+## 二十二、部署完 ≠ 能链接：组件承诺提供符号却没人定义（批次57 实测）
+
+**现象**：把 buff 后端接进真实工程，第一次编译就报 `L6218E: Undefined symbol
+mdk_trace_buff_blob`。
+
+**根因在组件，不在工具**：`components/trace/mdk_trace_buff.h` 里写了
+
+```c
+extern mdk_trace_buff_blob_t mdk_trace_buff_blob;
+```
+
+却没有任何 `.c` 定义它。同族的 SWD 后端有对称的一行
+（`mdk_trace_swd.c`：`mdk_trace_swd_blob_t mdk_trace_swd_blob;`），是 buff 漏了。
+两个后端的契约完全一样（头文件注释、README、PITFALLS 都写「blob 在 `.bss`、
+链接后地址固定、主机只靠一个符号定位」）——SWD 自己提供了存储，buff 忘了。
+
+也不是「生成物没入库」：`.gitignore` 里没有任何 blob / 生成文件规则，定义从来没进过仓库。
+
+**为什么三层防线都没挡住（这才是教训）**
+
+| 层 | 现状 | 后果 |
+|---|---|---|
+| 单测 | `test_batch55` 把 `_elf_symbol` / `read_mem_words` / `_write_mem` 全换成替身 | 只验「主机能不能解包」，从不编译 C 代码 —— 少个定义照样全绿 |
+| 工具 | `trace_instrument` 只做「拷文件 + 生成配置头 / mk 片段」，next 里没提「存储谁定义」 | 没有「能不能链接」这一步，编译期错误被推迟到用户第一次真编译 |
+| 文档 | §17 与 `components/trace/README` 只描述设计（blob 在 `.bss`、一个符号定位…） | 用户没有兜底线索，只能自己撞 |
+
+注释里反复写「编译成功 ≠ 那行代码生效」，这条教训这次正好落在自己身上：
+**测试全绿 ≠ 用户能编译**。
+
+**修法**
+
+1. **组件侧**：`mdk_trace_buff.c` 补上与 SWD 对称的定义。定义跟着后端走，
+   Keil / CMake / Make 任何集成方式都直接可用，不依赖工具去改用户的工程文件。
+2. **构建清单对齐**：`mdk_trace.mk` 与 `components/trace/CMakeLists.txt` 都漏了
+   `mdk_trace_swd.c`（CMake 连 swd 的 `MDK_TRACE_BACKEND_SWD` 分支都没有）——
+   同一类「承诺与清单不一致」，一起补。
+3. **工具侧**：`trace_instrument` 部署后**就地编译 + 链接**做自检
+   （`link_check`，默认开）。空壳提供 CMSIS 内在函数与入口，缺任何符号都在链接期
+   以 `undefined reference` 现形（= `L6218E` 的等价物）。返回 `self_check`；
+   缺符号时整体 `ok=false` + `error_code=component-link-failed`，并给出
+   `missing_symbols` 与 `sources`（该进编译的文件清单）。
+   **本机没有 C 编译器时 `self_check.checked=false`** —— 那是「没查」，
+   不等于组件没问题，必须如实转述，不能当成通过。
+4. **闸门**：`tests/test_component_link.py` 对五个后端各真编一遍并链接，含**反证**
+   （删掉 blob 定义必须失败并点名该符号），已纳入 `tools/run_all_tests.py`。
+   §19 那类「编译期静默」（AC5 `__has_include` 悄悄跳过配置头）能被同一道门禁一起挡。
+
+**自查一句话**：只要组件新增了「主机靠符号定位」的东西，就必须有人定义它，
+而且要**真编一遍再链接**才算验证过 —— 主机侧的 mock 再全绿都证明不了链接成立。
+
+
+### 22.1 核查：批次55 的 buff「真机实测」到底编过没有
+
+§17 的标题写着「F401 + SVCrtOS 实测」，但这个缺陷按理会让那次链接不出来。
+本轮把证据翻了一遍（不猜）：
+
+| 证据 | 结果 |
+|---|---|
+| 仓库历史里是否出现过定义 | `git log --all -S "mdk_trace_buff_blob_t mdk_trace_buff_blob;"` **零命中** —— 定义从来没进过仓库 |
+| `D:\工作\git_project` 下有几份 `mdk_trace_buff.c` | 只有仓库那一份（`find` 全目录），不存在「本地手加定义」的副本 |
+| SVCrtOS 工程里部署的是哪个后端 | `svcrtos_new/kernelsrc/components/mdk_trace/` 只有 `mdk_trace.c/.h` + `mdk_trace_swd.c/.h` + 平台头 —— **没有 buff 的文件** |
+| 那台 F401 的编译产物 | `example/stm32f401/.../SVCRTOS_TEST/MDK-ARM/SVCRTOS_TEST/` 里只有 `mdk_trace.o` 与 `mdk_trace_swd.o`，**没有 `mdk_trace_buff.o`** |
+| `example_mdk_project/mdk_test` | 从未部署过组件，`mdk_test.uvprojx` 的源文件清单里也没有 `mdk_trace*.c` |
+
+**结论**：批次55 的 buff 后端**从来没有在真机上编译过**。当时 SVCrtOS 上部署并编译的是
+批次56 的 swd 后端 —— 这也正好解释了为什么 swd 的定义在（它编过），而 buff 的缺定义
+一直没人撞到（它没编过）。§17 里关于 buff 的段落是**设计约定**（blob 布局、`ctrl+80`、
+暖启动保留记录）与主机侧解码行为的说明，不是「buff 固件在 F401 上跑过」的记录。
+
+**教训**：文档标题里的「实测」要写清实测的是**哪条通路**——不同后端的编译验证不能互相顶替；
+一个后端编过，不等于另一个后端的源文件齐全。
