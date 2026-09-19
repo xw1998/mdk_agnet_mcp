@@ -317,7 +317,7 @@ serial_read(since=上次 next_seq)                  # 长响应可继续增量�
 | 下断参数 | 真机结果 |
 | --- | --- |
 | `BS 0x8000DB4`（偶地址，即 `&main` 的原值） | 成功 |
-| `BS 0x8000DB5`（即 `&main \| 1`） | `*** error 57: illegal address (0x08000DB5)` |
+| `BS 0x8000DB5`（即 `&main` 按位或 `1`） | `*** error 57: illegal address (0x08000DB5)` |
 | `set_breakpoint("main")` | 成功（符号路径先 `calc_expression("&main")`，拿到的是**偶地址**） |
 
 - 根因：函数指针 / `&符号 \| 1` 得到的值带 Thumb 位（bit0=1），Keil 的 `BS`
@@ -1003,7 +1003,7 @@ mock 的 `UV_DBG_STATUS` 过去**退出调试后仍回成功**，于是 `run`/`s
 |---|---|---|---|
 | `monitor targets` | `invalid command name "monitor"` | ok=true | ok=false |
 | `definitely_no_such_cmd_xyz` | `invalid command name "..."` | ok=true | ok=false |
-| `wp 0x20000000` | `wp [address length [('r'\|'w'\|'a') [value [mask]]]]` | ok=true | ok=false |
+| `wp 0x20000000` | `wp [address length [('r'/'w'/'a') [value [mask]]]]` | ok=true | ok=false |
 | `read_memory 0xZZZZ 4` | `read_memory address width count ['phys']` | ok=true | ok=false |
 | `reset nonsense_mode` | `cortex_m reset_config [...]` 等一串命令列表 | ok=true | ok=false |
 | `reg no_such_reg_xyz` | `register X not found in current target` | ok=true | ok=false |

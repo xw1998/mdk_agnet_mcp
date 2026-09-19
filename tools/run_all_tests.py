@@ -162,14 +162,35 @@ def discover_ungated():
     return out
 
 
+def _cell_pipes(line):
+    """返回 (列分隔符个数, 反斜杠转义竖线的个数)。转义的竖线不算列分隔符。"""
+    sep = 0
+    esc = 0
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line) and line[i + 1] == "|":
+            esc += 1
+            i += 2
+            continue
+        if ch == "|":
+            sep += 1
+        i += 1
+    return sep, esc
+
+
 def scan_md_tables():
-    """扫仓库里的 Markdown 表格：同一张表内各行的列分隔数必须一致。
+    r"""扫仓库里的 Markdown 表格：列数必须一致，且单元格里不许出现竖线。
 
-    一个单元格里出现**未转义**的 `|`（例如 `link=auto|keil|ocd`），GFM 会把它当成分隔符，
-    整行会被切成多余列、尾部内容溢出表格——渲染出来只是"表格看着怪"，不报错，属静默的格式腐烂。
-    正解是写成 `\\|`。
+    两类写法都会让表格"看着怪"而不报错，属静默的格式腐烂：
+      1. 单元格里出现**未转义**的 `|`（例 `link=auto|keil|ocd`）→ 被当列分隔符，整行切成多余列、
+         尾部内容溢出表外（markdown-it 实测该行只剩 2 个 <td>）
+      2. 单元格里用反斜杠逃逸竖线 → GFM 认这个逃逸，但 **Gitee 不认**：人家在页面上原样显示
+         反斜杠（用户 2026-09 在 gitee 看到 `link=auto\|keil\|ocd`），表格该裂还是裂
+    约定：表格单元格里不出现竖线，"或"写成 `/` 或 `、`（例 `link` 参数（`auto`/`keil`/`ocd`））。
 
-    返回 [(相对路径, 行号, 该行列分隔数, 同表多数行的列分隔数, 该行内容), ...]
+    返回 {"misaligned": [(相对路径, 行号, 该行列数, 同表多数行列数, 该行), ...],
+          "escaped":    [(相对路径, 行号, 该行), ...]}
     """
     skip = {".git", "__pycache__", ".venv", "node_modules", "build", "out", ".lingxi"}
     targets = []
@@ -179,8 +200,8 @@ def scan_md_tables():
             if fn.endswith(".md"):
                 targets.append(os.path.relpath(os.path.join(d, fn), ROOT))
 
-    pipe = re.compile(r"(?<!\\)\|")
     out = []
+    escaped = []
     for rel in targets:
         path = os.path.join(ROOT, rel)
         if not os.path.exists(path):
@@ -198,12 +219,15 @@ def scan_md_tables():
 
         for i, line in enumerate(dec(open(path, "rb").read()).splitlines(), 1):
             if line.strip().startswith("|"):
-                block.append((i, len(pipe.findall(line)), line))
+                sep, esc = _cell_pipes(line)
+                block.append((i, sep, line))
+                if esc:
+                    escaped.append((rel, i, line.strip()))
             else:
                 flush()
                 block = []
         flush()
-    return out
+    return {"misaligned": out, "escaped": escaped}
 
 def consistency():
     print("== 一致性检查 ==")
@@ -231,16 +255,22 @@ def consistency():
         bad += 1
         print("  [不一致] README 没扫到工具数描述，检查扫描规则是否失效")
 
-    tbad = scan_md_tables()
-    if tbad:
-        bad += len(tbad)
-        print("Markdown 表格列数一致性：发现 %d 处裂行（单元格内有未转义的 |）" % len(tbad))
-        for rel, no, c, majority, line in tbad:
-            print("  [表格裂开] %s:%d 该行列分隔 %d 个，同表多数行 %d 个\n            %s"
-                  % (rel, no, c, majority, line[:110]))
-        print("             修法：把单元格里的 | 写成 \\|（GFM 会在单元格内还原成 |）")
+    tabs = scan_md_tables()
+    tbad, tesc = tabs["misaligned"], tabs["escaped"]
+    if tbad or tesc:
+        bad += len(tbad) + len(tesc)
+        if tbad:
+            print("Markdown 表格列数：发现 %d 处裂行（单元格里有未转义的竖线）" % len(tbad))
+            for rel, no, c, majority, line in tbad:
+                print("  [表格裂开] %s:%d 该行列分隔 %d 个，同表多数行 %d 个\n            %s"
+                      % (rel, no, c, majority, line[:110]))
+        if tesc:
+            print("Markdown 表格单元格：发现 %d 处用反斜杠逃逸竖线（Gitee 会原样显示反斜杠，等于没修）" % len(tesc))
+            for rel, no, line in tesc:
+                print("  [逃逸不管用] %s:%d\n            %s" % (rel, no, line[:110]))
+        print('             修法：表格单元格里不写竖线，"或"改用 / 或 、（例 `auto`/`keil`/`ocd`）')
     else:
-        print("Markdown 表格列数一致性：通过（全仓 Markdown 无裂行）")
+        print("Markdown 表格检查：通过（全仓 Markdown 无裂行、无竖线逃逸）")
 
     ungated = discover_ungated()
     if ungated:
