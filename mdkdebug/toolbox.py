@@ -130,6 +130,8 @@ TOOLSETS = {
         "trace_buff_status", "trace_buff_dump", "trace_buff_reset",
         # SWD 无缝流后端（批次56）：目标压缩入环 + 主机增量搬走，未读区永不覆盖。
         "trace_swd_status", "trace_swd_read", "trace_swd_reset",
+        # 任务名解析（批次64）：读内核 svcrt_task_table + ELF 符号，调度事件才有名字。
+        "trace_swd_tasks",
     },
     # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组。
     "rtos": {

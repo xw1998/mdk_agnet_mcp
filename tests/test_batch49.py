@@ -15,7 +15,7 @@
   ④ 同类复查：通用工具里不许写死型号/内存布局（本轮修掉 is_code_address 的
      0x08000000..0x081FFFFF 与 query_memory_map 缺设备守卫）。
 
-   A 工具面：注册总数 188 / 三新工具归组 / 注解覆盖 / 默认仍只暴露 42
+   A 工具面：注册总数 189 / 三新工具归组 / 注解覆盖 / 默认仍只暴露 42
    B rtrecord 纯逻辑：函数区间表 / 事件分类 / caller / 栈深 / CYCCNT 回绕 / 环形缓冲
    C chipid 系列比对：三种 verdict、置信度不足不当结论
    D chipid 芯片身份：单候选 high、多候选 low、读不到 unknown、内核-系列矛盾降级
@@ -303,9 +303,9 @@ def use_attr(obj, name, val):
 def section_a():
     print("A. 工具面与注解")
     total = sum(len(v) for v in TB.TOOLSETS.values()) + len(TB.ALWAYS)
-    check("A1 注册总数 188（分组表 180 + 常驻 6）", total == 188, total)
-    check("A2 trace_record 归 trace 组（批次55 加 3 个 buff 到 30，批次56 再加 3 个 swd 到 33）",
-          "trace_record" in (TB.TOOLSETS.get("trace") or []) and gsize("trace") == 33,
+    check("A1 注册总数 189（分组表 180 + 常驻 6）", total == 189, total)
+    check("A2 trace_record 归 trace 组（批次55 加 3 个 buff 到 30，批次56 再加 3 个 swd 到 33，批次64 再加 1 个任务表到 34）",
+          "trace_record" in (TB.TOOLSETS.get("trace") or []) and gsize("trace") == 34,
           gsize("trace"))
     check("A3 env_check 归 core 组（组规模 33->36）",
           "env_check" in (TB.TOOLSETS.get("core") or []) and gsize("core") == 36,
@@ -326,12 +326,12 @@ def section_a():
     for v in TB.TOOLSETS.values():
         allnames |= set(v)
     bad = A.check_surface(sorted(allnames))
-    check("A8 check_surface 在 188 个工具上无问题", not bad, bad)
+    check("A8 check_surface 在 189 个工具上无问题", not bad, bad)
     # 默认面：core + ALWAYS，其余收起
     exposed = gsize("core") + len(TB.ALWAYS)
     check("A9 默认暴露 core 36 + 常驻 6 = 42（新增工具进 core 后自动生效）",
           exposed == 42, exposed)
-    check("A10 默认收起 146（188-40）", 188 - exposed == 146, 188 - exposed)
+    check("A10 默认收起 147（189-40）", 189 - exposed == 147, 189 - exposed)
 
 
 def section_b():

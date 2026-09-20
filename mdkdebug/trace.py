@@ -164,6 +164,323 @@ def func_of(pc: int, funcs: list) -> str:
     return best[1] if best else "?"
 
 
+_ELF_FUNCS_CACHE = {}          # (路径, mtime) -> [(addr, name)]，按 mtime 失效
+
+def _elf_funcs_cached(elf: str) -> list:
+    try:
+        key = (os.path.abspath(elf), os.path.getmtime(elf))
+    except OSError:
+        return elf_funcs(elf)
+    hit = _ELF_FUNCS_CACHE.get(key)
+    if hit is None:
+        hit = elf_funcs(elf)
+        if len(_ELF_FUNCS_CACHE) > 4:
+            _ELF_FUNCS_CACHE.clear()
+        _ELF_FUNCS_CACHE[key] = hit
+    return hit
+
+# ================================================================ SVCrtOS 任务名
+#
+# 流里的调度事件只带**任务序号**（0..14，0xF 是 idle），看上去就是一堆数字。
+# 序号本身在板子上没有名字，但内核的 svcrt_task_table 里每一项都有 entry
+# （void (*)(void)）——「这个槽位从哪个函数开始跑」就是一个稳定的取名字段，
+# 再把入口地址翻回 ELF 里的函数名，任务名就出来了。
+#
+# 序号宽度是 4 bit：svcrt_trace.h 里 0..14 是任务表下标、0xF 是 idle。
+# 表本身可能比 15 大（实测 SVCRT_TASK_MAX_NUM=48），但编号 15 被 idle 占用，
+# **下标 15 永远不会出现在流里**，所以只给前 15 项取名字，不拿它冒充任务。
+
+_SVCRT_TABLE_SYM = "svcrt_task_table"
+_SVCRT_TCB_TYPE = "svcrt_task_t"
+_SVCRT_TRACE_TASKS = 15        # 编号 0..14
+_SVCRT_IDLE_ID = 0xF
+
+def _svcrt_task_names(elf: str = "", link: str = "auto", halt: bool = False,
+                      refresh: bool = False) -> dict:
+    """把 svcrt_task_table 里每个槽位的 entry 解成函数名。
+
+    取名字要三样东西，少一样就**明说给不出来**，不编：
+      ① ELF 里 svcrt_task_table 的地址；
+      ② svcrt_task_t 的 sizeof 与 entry 的成员偏移（从 DWARF 取，不靠猜）；
+      ③ 一个能读目标的链路。
+
+    快照可信度是**校验过才声明**的：整段若是伪值（全 0 / 全 FF / 同一个字重复）
+    直接拒绝给名字；**入口地址必须是这个 .axf 里某个函数的首地址**（精确匹配，
+    不拿「最近的下方符号」顶——那会把别的镜像里的代码硬安上一个像样的名字）。
+
+    但**跨镜像的入口是合法的**：SVCrtOS 的应用/驱动是另外下发的镜像，它们的任务
+    入口地址根本不在这份内核 .axf 的符号表里。那种槽位一律**留空**（不是编个
+    `sub_XXXXXXXX`），并在 `unmapped` / `hint` 里说清楚「想给它们取名就把 elf
+    指到那个镜像的 .axf，或用 names= 手给」。只有当**所有**非空槽都落不到符号
+    表里（一份名字都给不出来，说明这次读大概不可信）才整批拒绝。
+
+    halt=True 会停下来读（TCB 每切换一次就被调度器改写，停机读是一份自洽快照），
+    读完放回运行态；默认全速读，代价是「快照可能跨在两次切换之间」，所以两项
+    校验一个都不省。每个会话只做一次（refresh=True 才重做）。
+    """
+    elf = str(elf or "").strip() or _session_axf()
+    if not elf:
+        return {"ok": False, "error_code": "tasks-need-elf",
+                "error": "没给 elf，也不知道会话的符号文件，无法定位任务表",
+                "hint": "给 elf=你的.axf（首选），或先 set_symbol_file。"}
+    if not os.path.isfile(elf):
+        return {"ok": False, "error_code": "tasks-elf-missing",
+                "error": "ELF 不存在：%s" % elf,
+                "hint": "烧录后 .axf 被挪过？给当前工程实际编译出的那个。"}
+    try:
+        from .rtos import get_index
+    except Exception as e:                                        # noqa: BLE001
+        return {"ok": False, "error_code": "tasks-no-dwarfinfo",
+                "error": "取不到 DWARF 索引：%s" % e}
+    ix = get_index(elf)
+    if ix.error:
+        return {"ok": False, "error_code": "tasks-no-dwarfinfo", "error": ix.error,
+                "hint": "任务表布局从 DWARF 取（不靠猜），所以 .axf 必须带调试信息"
+                        "（-g / Debug 配置）。"}
+    base = ix.addr_of(_SVCRT_TABLE_SYM)
+    if base is None:
+        return {"ok": False, "error_code": "tasks-table-missing",
+                "error": "ELF 里没有符号 %s" % _SVCRT_TABLE_SYM,
+                "hint": "这个内核没有可命名的任务表（或符号被裁剪）；"
+                        "用 names= 手工给名字，或关掉任务名解析。"}
+    st = ix.struct(_SVCRT_TCB_TYPE)
+    if not st or st.get("size") is None or ix.field(_SVCRT_TCB_TYPE, "entry") is None:
+        return {"ok": False, "error_code": "tasks-layout-missing",
+                "error": "取不到 %s 的布局（sizeof / entry 偏移）" % _SVCRT_TCB_TYPE,
+                "hint": "该 .axf 的 DWARF 里没有这个类型（内核没参与本次构建？）。"}
+    tcb_size = int(st["size"])
+    entry_off = int(ix.field(_SVCRT_TCB_TYPE, "entry"))
+    vk = ix.var_kind(_SVCRT_TABLE_SYM) or {}
+    count = int(vk.get("count") or 0) or _SVCRT_TRACE_TASKS
+    n_slots = max(1, min(count, _SVCRT_TRACE_TASKS))
+
+    lk, lerr = _link.pick(link, who="读任务表取名")
+    if lk is None:
+        return {"ok": False, "error_code": "tasks-link-failed",
+                "error": (lerr or {}).get("error") or "取不到链路，无法读任务表",
+                "hint": (lerr or {}).get("hint")}
+    did_halt = False
+    if halt:
+        r = lk.halt() or {}
+        if not r.get("ok"):
+            return {"ok": False, "error_code": "tasks-halt-failed",
+                    "error": "读任务表前停机失败：%s"
+                             % (r.get("error") or r.get("status_text") or "未知"),
+                    "hint": "停机读是为了拿一份自洽的 TCB 快照；停不了就按全速读来，"
+                            "或本次不给任务名。"}
+        did_halt = True
+    nbytes = n_slots * tcb_size
+
+    def _one_read(stop_first=False):
+        """读一次任务表；返回 (raw, meta)。停机读要记得放回运行态。"""
+        try:
+            if stop_first:
+                lk.halt()
+            return _read_mem_words(base, nbytes, link=link, raw=True)
+        finally:
+            if stop_first:
+                _swd_resume(lk)
+
+    raw, meta = _one_read()
+    attempts = 1
+    fake = _swd_fake_kind(raw) if raw else None
+    if raw is None or fake or len(raw) < nbytes:
+        # 已知坑两枚：① 停机后紧跟的第一次读可能读到脏帧；② 目标全速运行时读 SRAM
+        # 可能整段读回同一个字。两者都会让「快照」看着像样却是错的——**重读一次**
+        # 是划算的（一次链路往返换一个可能的好结果），第二次还不行才如实报失败。
+        raw2, meta2 = _one_read(stop_first=not did_halt)
+        attempts = 2
+        if raw2 is not None:
+            fake2 = _swd_fake_kind(raw2)
+            if not fake2 and len(raw2) >= nbytes:
+                raw, meta, fake = raw2, meta2, None
+            else:
+                fake = fake2 or fake
+                raw, meta = raw2, meta2
+    if raw is None:
+        return {"ok": False, "error_code": "tasks-read-failed",
+                "error": (meta or {}).get("error") or "读任务表失败",
+                "at": "0x%X" % base, "attempts": attempts}
+    if len(raw) < nbytes:
+        return {"ok": False, "error_code": "tasks-read-short",
+                "error": "任务表只读到 %d 字节（需要 %d）" % (len(raw), nbytes),
+                "at": "0x%X" % base, "attempts": attempts}
+    if fake:
+        # 宁可给不出名字，也不把一份错快照取名成「像样」的结果
+        return {"ok": False, "error_code": "tasks-read-untrusted",
+                "error": "任务表读回的是伪值（%s，%d 字节）：读了两遍都不可信"
+                         % (fake, len(raw)), "at": "0x%X" % base,
+                "attempts": attempts,
+                "hint": "这属于「全速运行时读 SRAM 不可靠」；" 
+                        "可重试，或让调用方带 halt=True 停机读。"}
+
+    funcs = _elf_funcs_cached(elf)
+    if not funcs:
+        return {"ok": False, "error_code": "tasks-no-funcs",
+                "error": "ELF 里读不到任何函数符号，无法把入口地址翻成名字",
+                "hint": "用 strip 过的 .axf 就只能看到地址；换带符号的那个。"}
+    # 入口指针 = 函数首地址，做**精确**匹配；不拿"最近的下方符号"顶替，
+    # 否则跨镜像的地址会被安上一个随便的（看着像样的）名字。
+    exact = {}
+    for a, n in funcs:
+        exact.setdefault(int(a), n)
+    names, slots, unnamed = {}, {}, []
+    for i in range(n_slots):
+        off = i * tcb_size + entry_off
+        e = struct.unpack_from("<I", raw, off)[0]
+        slots[i] = {"entry": "0x%08X" % e}
+        if e in (0, 0xFFFFFFFF):
+            slots[i]["name"] = None
+            slots[i]["note"] = "空槽（entry=%s）" % slots[i]["entry"]
+            continue
+        # entry 是**函数指针**，Thumb 状态的那个低比特（bit0=1）是正常的，
+        # 不是错误值——ARMCC 把函数地址存进表里时就是带这个位的，先清掉。
+        addr = e & ~1
+        slots[i]["entry_addr"] = "0x%08X" % addr
+        nm = exact.get(addr)
+        if nm is None:
+            # 不给名字，也**不编**占位名：这个地址不属于本次给的那个 .axf。
+            slots[i]["name"] = None
+            slots[i]["note"] = ("入口 %s 不在本次的符号表里——多半是已安装的 app/驱动"
+                                "镜像里的函数（也可能被裁剪的静态函数）"
+                                % slots[i]["entry"])
+            unnamed.append(i)
+            continue
+        slots[i]["name"] = nm
+        names[i] = nm
+    nonempty = [i for i in slots
+                if slots[i]["entry"] not in ("0x00000000", "0xFFFFFFFF")]
+    if nonempty and not names:
+        # 一个名字都给不出来：这份快照要么是伪值、要么全是别的镜像的入口。
+        # 整批拒绝——部分给名字会让人以为剩下的也是好的。
+        return {"ok": False, "error_code": "tasks-snapshot-inconsistent",
+                "error": "任务表快照给不出任何名字：%d 个非空槽（%s）的入口都落不到"
+                         "这份 .axf 的函数符号上" % (len(nonempty), nonempty),
+                "at": "0x%X" % base,
+                "unmapped_slots": nonempty,
+                "hint": "要么这次读的是伪值（重试一次，或用 halt=True 停机读），"
+                        "要么这些任务全来自别的镜像（那就把 elf 指到那个镜像的 .axf）。"}
+    out = {"ok": True, "elf": os.path.abspath(elf),
+           "table_addr": "0x%X" % base, "table_count": count,
+           "named_slots": n_slots, "tcb_size": tcb_size, "entry_off": entry_off,
+           "read_mode": "halt" if did_halt else "run",
+           "tasks": slots, "names": names, "idle_name": "idle",
+           "slots_read": n_slots, "named": len(names),
+           "nonempty": len(nonempty),
+           "idle_id": _SVCRT_IDLE_ID,
+           "read_meta": {k: (meta or {}).get(k) for k in
+                         ("read_confidence", "while_running", "degenerate")
+                         if k in (meta or {})} or None}
+    if count > _SVCRT_TRACE_TASKS:
+        out["note"] = ("任务表有 %d 项，但流里的任务号只有 4 bit（0..14 是表下标、"
+                       "0xF 是 idle），所以只给前 %d 项取名字——表里下标 15 及以后的"
+                       "项**不会出现在流里**，不要拿它当任务。" % (count, _SVCRT_TRACE_TASKS))
+    if unnamed:
+        out["unmapped_slots"] = unnamed
+        out["partial"] = True
+        out["unmapped"] = [{"slot": i, "entry": slots[i]["entry"]}
+                           for i in unnamed]
+        out["hint"] = ("槽位 %s 的入口不在这个 .axf 的符号表里（任务可能来自已安装的"
+                       "app/驱动镜像），它们**保持无名、不编**。想给它们取名：把 elf "
+                       "指到对应镜像的 .axf，或用 names= 按任务号手工指定。"
+                       % unnamed)
+    return out
+
+def _apply_task_names(evs: list, names: dict, idle_name: str = "idle") -> int:
+    """给事件补上 from_name / to_name / task_name。返回命中条数。
+
+    names 是 {任务序号: 名字}。序号 0xF 是 idle，名字由 idle_name 给。
+    只补**能确定**的：查不到的序号不动，也不编一个占位名。
+    """
+    if not names:
+        return 0
+    def nm(v):
+        if v is None or not isinstance(v, int):
+            return None
+        if v == _SVCRT_IDLE_ID:
+            return idle_name or None
+        return names.get(v)
+    n = 0
+    for ev in evs:
+        typ = ev.get("type")
+        if typ == "sched":
+            f, t = nm(ev.get("from")), nm(ev.get("to"))
+            if f:
+                ev["from_name"] = f
+            else:
+                ev.pop("from_name", None)
+            if t:
+                ev["to_name"] = t
+            else:
+                ev.pop("to_name", None)
+            if f or t:
+                n += 1
+        elif ev.get("id") in _TASK_ARG_EV:
+            v = ev.get("arg")
+            v = v & 0xF if isinstance(v, int) else None
+            got = nm(v)
+            if got:
+                ev["task_name"] = got
+                n += 1
+            else:
+                ev.pop("task_name", None)
+    return n
+
+# svcrt_trace.h 里 arg 是任务号的系统事件
+_TASK_ARG_EV = {0x11: "wait", 0x12: "ready", 0x13: "create", 0x14: "exit"}
+
+def _swd_tasks_for_session(s: dict, elf: str, link: str, tasks: str) -> dict:
+    """会话内只解析一次任务表；tasks=off 就一次都不解析。
+
+    失败也**记下来**（连原因一起），不是每次调用都重试一遍：一次读不到的表，
+    连读十次还是读不到，而每次重试都要花掉一次链路往返。
+    """
+    spec = str(tasks or "").strip().lower()
+    if spec in ("off", "none", "0", "false", "no"):
+        return {"ok": False, "skipped": True, "why": "调用方关掉了任务名解析（tasks=off）"}
+    cached = s.get("tasks")
+    if cached is not None and spec not in ("refresh", "reload") and not s.get("tasks_stale"):
+        return cached
+    r = _svcrt_task_names(elf=elf, link=link)
+    if not r.get("ok"):
+        r = dict(r)
+        r["why"] = r.get("error")
+    s["tasks"] = r
+    return r
+
+
+def _swd_tasks_brief(tn) -> dict:
+    """给返回体的任务名摘要（不把整张表塞进每次 read 的返回里）。"""
+    tn = tn or {}
+    if tn.get("ok"):
+        out = {"ok": True, "source": tn.get("table_addr"),
+               "slots_read": tn.get("slots_read"),
+               "named": tn.get("named"), "nonempty": tn.get("nonempty"),
+               "names": {str(k): v for k, v in (tn.get("names") or {}).items()},
+               "idle": tn.get("idle_name")}
+        if tn.get("partial"):
+            out["partial"] = True
+            out["unmapped_slots"] = tn.get("unmapped_slots")
+            out["hint"] = tn.get("hint")
+        return out
+    if tn.get("skipped"):
+        return {"ok": False, "skipped": True, "why": tn.get("why")}
+    return {"ok": False, "error_code": tn.get("error_code"),
+            "error": tn.get("error") or tn.get("why"),
+            "hint": tn.get("hint")}
+
+
+def _swd_sched_count(evs: list) -> dict:
+    """这一批里调度事件的命名情况：有多少条、多少条真带上了名字。"""
+    tot = named = 0
+    for e in evs:
+        if e.get("type") != "sched":
+            continue
+        tot += 1
+        if e.get("from_name") or e.get("to_name"):
+            named += 1
+    return {"sched_events": tot, "with_names": named}
+
 # ================================================================ 事件缓冲
 
 def _push(ev: dict) -> None:
@@ -2364,7 +2681,8 @@ def _swd_session(addr: int) -> dict:
 
 
 def _swd_fold(s: dict, items: list, ts_shift: int, cpu_hz: int,
-              names: dict, dt_unit: int = 0, ts_off: bool = False) -> list:
+              names: dict, dt_unit: int = 0, ts_off: bool = False,
+              task_names: dict = None, idle_name: str = "idle") -> list:
     """把解码出的 token 序列折成带时间的事件列表，并推进会话的时间累计。
 
     gap / sync 要按**流里的先后**插进事件序列（因此用 Decoder.items 而不是把
@@ -2416,9 +2734,19 @@ def _swd_fold(s: dict, items: list, ts_shift: int, cpu_hz: int,
         nm = names.get(i)
         if nm:
             ev["id_name"] = nm
-        if typ == "sched" and i == 0:
-            ev["from"] = (a >> 4) & 0xF
-            ev["to"] = a & 0xF
+        if typ == "sched":
+            # 真实 token：id = from，arg = to（目标侧 mdk_trace_sched(from, to) ->
+            # mdk_trace_swd_event(SCHED, K_POINT, from, to)）。目标是应用任务号：
+            # 0..14 是任务表下标，0xF 是 idle。
+            # 旧代码按「arg = from << 4 | to」解、且只在 id == 0 时解——那是
+            # SVCRT_TR_SW_PACK 那套从没用上的编码，结果就是**几乎每条上下文切换都
+            # 没有 from/to**，时间轴上整个任务维度等于不存在。buff 路径一直解的是
+            # id/arg，两条路现在一致。
+            ev["from"] = i
+            ev["to"] = a
+            if i > 0xF or a > 0xF:
+                ev["warn"] = ("调度事件的 from/to 超出 0..15（id=%d arg=%d）："
+                              "这条 token 可能不是上下文切换" % (i, a))
         elif typ == "fault" and _swd.FAULT_BASE <= i < _swd.FAULT_BASE + 0x100:
             ev["fault_class"] = _swd.FAULT_CLASS.get(i - _swd.FAULT_BASE, "unknown")
             ev["cfsr"] = "0x%08X" % a
@@ -2433,6 +2761,10 @@ def _swd_fold(s: dict, items: list, ts_shift: int, cpu_hz: int,
             if cur_fault is not None and ev["reg"] not in cur_fault["registers"]:
                 cur_fault["registers"][ev["reg"]] = ev["value_hex"]
         out.append(ev)
+    if task_names is not None:
+        # 名字在这里一次性补上：事件里存的是**原始** id/arg/from/to，所以即使
+        # 名字是后到的（会话中途才解析出任务表），也能回头重补（见 _swd_rename）。
+        _apply_task_names(out, task_names, idle_name)
     return out
 
 
@@ -2629,6 +2961,7 @@ def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
 def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
              names: str = "", link: str = "auto", reset_session: bool = False,
              granularity: str = "", consistent: str = "halt",
+             tasks: str = "auto",
              max_session_events: int = _SWD_MAX_SESSION_EVENTS) -> dict:
     """无缝流的**核心动作**：把 [drained, head) 搬走 → 解码 → 把 drained 推上去。
 
@@ -2648,6 +2981,14 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
     直接报 swd-granularity-mismatch（一段流里混两种单位，时间轴换算出来就是错的）。
     改粒度请用 trace_swd_reset(granularity=...)——它会写完粒度后重开一段录制。
     会话里记下的粒度若与控制块不符（谁在背后改过），也报错而不是照算。
+
+    tasks= 决定要不要给调度事件补**任务名**（默认 auto）：
+      * auto（默认）：会话内解析一次 svcrt_task_table，把每个槽位的入口函数
+        （TCB 的 entry 字段，偏移从 DWARF 取）翻成 ELF 里的函数名，于是流里
+        的数字 0..15 变成真实任务名；解析成功后**历史上已解过的事件也会回头
+        重补名字**。解析不出来就在 task_names 里如实说明原因（不给假名字）。
+      * refresh：手工重解析一次（换了固件/换了 .axf 后用）。
+      * off：完全不解析。
     """
     mode = (consistent or "halt").strip().lower()
     if mode not in ("halt", "run", "auto"):
@@ -2896,12 +3237,23 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         s["cpu_hz"] = info["cpu_hz"]
     s["ts_shift"], s["dt_unit"], s["ts_off"] = cur_gran
 
+    # ---- 任务名（序号 -> 名字）：会话内解析一次，解析出来之后连**历史上已经解过的**
+    # 事件一起重补名字——否则名字只能从「解析成功之后」的那一段开始有，时间轴前半段
+    # 还是数字，看起来就像“任务只出现在后半段”。
+    tn = _swd_tasks_for_session(s, elf, link, tasks)
+    tnames = (tn or {}).get("names") if (tn or {}).get("ok") else None
+
     new_items = dec.items[base_it:]
     evs = _swd_fold(s, new_items, s["ts_shift"], s["cpu_hz"],
                     _buff_parse_names(names), dt_unit=s["dt_unit"] or 0,
-                    ts_off=bool(s["ts_off"]))
+                    ts_off=bool(s["ts_off"]),
+                    task_names=(tnames if tnames is not None else None),
+                    idle_name=(tn or {}).get("idle_name") or "idle")
     if s["anchor_cycle"] is not None and not s["ts_off"]:
         _swd_anchor(s, s["anchor_cycle"], s["cpu_hz"], evs)
+    if tnames is not None:
+        # 已存事件回头重补（幂等：只写它算得准的字段）
+        _apply_task_names(s["events"], tnames, (tn or {}).get("idle_name") or "idle")
     s["events"].extend(evs)
     if len(s["events"]) > int(max_session_events or 0) > 0:
         drop = len(s["events"]) - int(max_session_events)
@@ -2942,6 +3294,8 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         "truncated": view["truncated"],
         "consistent": "halt" if did_halt else "run",
         "halt_ms": round(halt_ms, 2) if halt_ms is not None else None,
+        "task_names": _swd_tasks_brief(tn),
+        "sched_decoded": _swd_sched_count(evs),
         "read_meta": {k: rmeta.get(k) for k in ("read_confidence", "while_running")
                       if k in rmeta} or None,
         "next": ["连续录：反复调 trace_swd_read，每次它只搬走新增的那一段",
@@ -4038,7 +4392,13 @@ def register(server, js=None) -> int:
             "（背压不覆写），代价是每搬一次停几毫秒；run=全速搬，但实测有的目标/地址段会"
             "整片读回伪值（全 0 / 全 FF / 整段重复同一个 4 字节字），碰到伪值直接报 "
             "swd-read-untrusted 而不是拿去解码；auto=先全速读，发现伪值自动停机重读一次。"
-            "返回里的 consistent / halt_ms 说明这一块实际是怎么搬的。"
+            "返回里的 consistent / halt_ms 说明这一块实际是怎么搬的。\n"
+            "**任务名（tasks=，默认 auto）**：调度事件在流里只带任务序号（0..14，0xF=idle），"
+            "默认会读一次内核的 svcrt_task_table，用每个槽位的 entry 函数地址反查 ELF 符号，"
+            "把序号变成真实任务名（事件里多出 from_name / to_name / task_name）；"
+            "同一会话只解析一次，解析出来后历史上已解过的事件也会回头重补名字。"
+            "取不到就只在 task_names 里如实说明原因，**不编名字**（宁可没名字，也不要错名字）。"
+            "tasks=refresh 强制重解析，tasks=off 完全关掉。"
         ),
     )
     async def trace_swd_read(elf: str = "", addr: str = "", limit: int = 200,
@@ -4046,13 +4406,45 @@ def register(server, js=None) -> int:
                              link: str = "auto",
                              reset_session: bool = False,
                              granularity: str = "",
-                             consistent: str = "halt") -> str:
+                             consistent: str = "halt",
+                             tasks: str = "auto") -> str:
         try:
             return _js(swd_read(elf=elf, addr=addr, limit=int(limit),
                                 out_file=out_file, names=names, link=link,
                                 reset_session=bool(reset_session),
                                 granularity=granularity,
-                                consistent=consistent))
+                                consistent=consistent, tasks=tasks))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_swd_tasks",
+        title="swd 无缝流：把任务序号解成任务名（调度事件可读的前提）",
+        description=(
+            "流里的调度事件只带**任务序号**（4 bit：0..14 是任务表下标、0xF 是 idle），"
+            "看上去就是一堆数字。本工具把序号翻成名字，办法是读内核的 svcrt_task_table："
+            "每一项的 entry（void (*)(void)）就是这个槽位从哪个函数开始跑，"
+            "再拿入口地址反查 ELF 的函数符号。（TCB 里没有名字字段，这是能稳定取到"
+            "「任务叫什么」的字段；TCB 的 sizeof 与 entry 偏移从 DWARF 取，不靠猜。）\n"
+            "**只认精确符号**：入口地址必须是这份 .axf 里某个函数的首地址。**不拿"
+            "「最近的下方符号」顶**——跨镜像的地址会被硬安上一个像样的错名字。\n"
+            "**跨镜像的入口是合法的**：SVCrtOS 的 app/驱动是另外下发的镜像，它们的任务"
+            "入口根本不在这份内核 .axf 的符号表里，这种槽位一律**留空**（不编 sub_XXXX），"
+            "并在 unmapped_slots / hint 里说清楚怎么给它们取名。整段读回伪值（全 0/全 FF/"
+            "同一个字重复）→ 拒绝；**所有**非空槽都落不到符号表里（一个名字都给不出）→ "
+            "整批拒绝（报 tasks-snapshot-inconsistent），不拿半张表冒充好结果。\n"
+            "**下标 15 不给名**：编号 15 被 idle 占用，表里下标 15 及以后的项永远"
+            "不出现在流里（内核 TCB 表实测 48 项，但流只能看见前 15 项）。\n"
+            "halt=True 会停机读（TCB 每次切换都被改写，停机读是一份自洽快照），"
+            "读完放回运行态；默认全速读。trace_swd_read 默认会自动调它一次。"
+        ),
+    )
+    async def trace_swd_tasks(elf: str = "", link: str = "auto",
+                              halt: bool = False, refresh: bool = False) -> str:
+        try:
+            return _js(_svcrt_task_names(elf=elf, link=link, halt=bool(halt),
+                                         refresh=bool(refresh)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

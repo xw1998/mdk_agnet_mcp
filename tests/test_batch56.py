@@ -2,7 +2,7 @@
 """批次56 mock 测试：小上下文下的工具面（描述分层 + nano 档 + 装卸元工具）。
 
 背景：用户反馈「上下文较小的大模型装不全 MCP 工具」。工具数只是成本的一半，
-另一半是**每个工具的描述**（188 个工具 ~9.5 万字符，八成是参考手册式长文）。
+另一半是**每个工具的描述**（189 个工具 ~9.5 万字符，八成是参考手册式长文）。
 本批给三条路：
 
   * **描述分层**：常驻层只留一句话 + 【输出控制】/【参数】块，长正文归档，
@@ -10,7 +10,7 @@
   * **`nano` 档位**：19 个工具（15 个最短入口 + 6 个元工具），自动用 `min` 描述档。
   * **两个装卸元工具**：`tools_groups` / `tools_load`（参数比 `toolset` 更少）。
 
-  A 工具面：注册总数 188 / 常驻元工具 6 / 默认暴露 42 / nano 19
+  A 工具面：注册总数 189 / 常驻元工具 6 / 默认暴露 42 / nano 19
   B 组名解析：nano 是已知档位（不再被误报未知组），真未知组照旧报出
   C 描述档位：full 是默认、nano 走 min、认不出的写法按默认并告警
   D 瘦身不变量：结构化尾块整段保留、尾部关键告警保留、归档可逐字取回、full 档不动
@@ -94,13 +94,13 @@ def section_a():
     print("A. 工具面规模")
     srv = fresh(toolsets="all")
     allnames = names(srv)
-    check("A1 注册总数 188", len(allnames) == 188, len(allnames))
+    check("A1 注册总数 189", len(allnames) == 189, len(allnames))
     check("A2 常驻元工具 6 个（含 tools_groups/tools_load）",
           TB.ALWAYS == {"list_tools", "get_version", "capabilities", "toolset",
                         "tools_groups", "tools_load"}, sorted(TB.ALWAYS))
     check("A3 两个新元工具确实注册了",
           "tools_groups" in allnames and "tools_load" in allnames)
-    check("A4 annotate 对全部 188 个工具无问题",
+    check("A4 annotate 对全部 189 个工具无问题",
           not A.check_surface(allnames), A.check_surface(allnames)[:3])
     check("A5 tools_groups 标只读、tools_load 标可写",
           A.annotations_for("tools_groups").get("readOnlyHint") is True
@@ -117,9 +117,9 @@ def section_a():
         check("A8 默认不含 trace 组工具（按需装载）",
               "trace_swd_read" not in dn and "ocd_start" not in dn)
         st = call_sync(d, "toolset", {"action": "status"})
-        check("A9 status 自述一致（暴露 42 / 收起 146 / 注册 188）",
-              st.get("exposed") == 42 and st.get("hidden") == 146
-              and st.get("total_registered") == 188, st)
+        check("A9 status 自述一致（暴露 42 / 收起 147 / 注册 189）",
+              st.get("exposed") == 42 and st.get("hidden") == 147
+              and st.get("total_registered") == 189, st)
     finally:
         if saved is not None:
             os.environ["MDKDEBUG_TOOLSETS"] = saved
@@ -397,11 +397,11 @@ def section_i():
           "nano" in readme and "MDKDEBUG_DESC" in readme, "")
     check("I2 README 写了两个新元工具",
           "tools_groups" in readme and "tools_load" in readme, "")
-    check("I3 README 工具数同步为 188（188 个 + 收起 146）",
-          "188 个" in readme and "146 个" in readme and "184 个" not in readme, "")
+    check("I3 README 工具数同步为 189（189 个 + 收起 147）",
+          "189 个" in readme and "147 个" in readme and "184 个" not in readme, "")
     check("I4 SKILL 写了 nano 档与描述分层",
           "nano" in skill and "MDKDEBUG_DESC" in skill and "mdk_guide" in skill, "")
-    check("I5 SKILL 工具数同步为 188", "188 个工具" in skill and "184 个工具" not in skill, "")
+    check("I5 SKILL 工具数同步为 189", "189 个工具" in skill and "184 个工具" not in skill, "")
 
 def main():
     for fn in (section_a, section_b, section_c, section_d, section_e,

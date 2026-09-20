@@ -55,6 +55,7 @@ BATCHES = [
     "test_batch61",
     "test_batch62",
     "test_batch63",
+    "test_batch64",
     "test_viz",
     "test_component_link",
 ]
@@ -66,7 +67,8 @@ FAST_SET = ["test_e2e", "test_mcp", "test_batch33", "test_batch35", "test_batch3
             "test_batch45", "test_batch46",
             "test_batch47", "test_batch48", "test_batch49",
             "test_batch53", "test_batch54", "test_batch55", "test_batch56",
-            "test_batch63"]
+            "test_batch63",
+            "test_batch64"]
 
 # 并发禁区：这些模块共用同一个「守卫端口」，同时跑会互相干扰（真检查过端口占用）：
 #   test_batch29 断言 14999 没在监听，test_batch35 的子进程会去 bind 14999

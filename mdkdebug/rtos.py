@@ -47,6 +47,11 @@ class ElfIndex:
         self.structs = {}      # 结构体真名 -> {"size": n, "fields": {成员名: 偏移}, "_arrlen": {...}}
         self.typedefs = {}     # typedef 名 -> 结构体真名（List_t -> xLIST、TCB_t -> tskTaskControlBlock）
         self.vars = {}         # 全局变量名 -> {"kind", "type", "count", "size", "type_die"}
+        # 匿名结构体（`typedef struct {...} svcrt_task_t;` 这种）在 DWARF 里
+        # **没有 DW_AT_name**，按名字建索引等于永远查不到它。这里先按 DIE 偏移
+        # 存住，等 typedef 那一跳把它挂到 typedef 名下（SVCrtOS 的 TCB 就是这种写法）。
+        self._anon_structs = {}   # DIE 偏移 -> 结构体记录
+        self._td_anon = {}        # typedef 名 -> 目标匿名结构体的 DIE 偏移
         self._load()
 
     # ---------------------------------------------------------- 载入
@@ -101,6 +106,12 @@ class ElfIndex:
         for name, v in list(self.vars.items()):
             if v.get("_die") is not None:
                 v.update(self._resolve(di, v.pop("_die")))
+        # 匿名结构体要在**全部 DIE 走完之后**才能挂名：结构体 DIE 一般排在 typedef
+        # 之前，但 DWARF 不保证顺序，靠顺序会偶发查不到。
+        for td_name, off in self._td_anon.items():
+            rec = self._anon_structs.get(off)
+            if rec is not None:
+                self.structs.setdefault(td_name, rec)
 
     # ---- 类型解析工具 ----
     def _ref(self, die, attr):
@@ -111,11 +122,11 @@ class ElfIndex:
 
     def _add_struct(self, di, die):
         nm = die.attributes.get("DW_AT_name")
-        if nm is None:
-            return
-        name = nm.value
-        if isinstance(name, bytes):
-            name = name.decode("utf-8", "replace")
+        name = None
+        if nm is not None:
+            name = nm.value
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", "replace")
         sz = die.attributes.get("DW_AT_byte_size")
         fields = {}
         arrlen = {}
@@ -128,6 +139,10 @@ class ElfIndex:
         # 前向声明（`struct tskTaskControlBlock;`）在 DWARF 里同样带名字但成员为空，
         # 若不管是先来后到就会把真正的定义挡在外面。只认有成员的，且更完整的胜出。
         if not fields:
+            return
+        if name is None:
+            # 匿名结构体：先按 DIE 偏移存着，等 typedef 把它认领
+            self._anon_structs[die.offset] = rec
             return
         prev = self.structs.get(name)
         if prev is None or len(prev.get("fields") or {}) < len(fields):
@@ -257,6 +272,13 @@ class ElfIndex:
         if t is None or t.tag not in ("DW_TAG_structure_type", "DW_TAG_union_type",
                                       "DW_TAG_typedef"):
             return
+        if t.tag in ("DW_TAG_structure_type", "DW_TAG_union_type"):
+            # 匿名结构体没有名字，typedef 名就是它**唯一**的名字
+            # （SVCrtOS：typedef struct {...} svcrt_task_t;）。挂到 typedef 名下，
+            # 否则按 svcrt_task_t 查布局恒为空——而 TCB 的成员偏移正是取任务名的关键。
+            if t.attributes.get("DW_AT_name") is None:
+                self._td_anon.setdefault(name, t.offset)
+                return
         tn = t.attributes.get("DW_AT_name")
         if tn is None:
             return

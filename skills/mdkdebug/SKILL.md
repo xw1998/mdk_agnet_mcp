@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 188 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 189 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -167,7 +167,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 42 个（`core` 36 个 + 6 个元工具），其余 146 个按需装载——
+- **工具面默认精简**：默认只暴露 42 个（`core` 36 个 + 6 个元工具），其余 147 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。
@@ -236,6 +236,16 @@ trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0,
   的先后不可分辨**。`trace_swd_read(granularity=...)` 只做校验，不符会报
   `swd-granularity-mismatch` / `-changed` / `-invalid`。失步报 `swd-stream-desync`，
   正解是 `trace_swd_reset` 重对齐（别硬解，字典不同步会解出看着合理的错误 key）。
+- **任务名是主机侧「用 DWARF 反查」出来的，固件一个字节都不用改**：`trace_swd_read(tasks=auto)`
+  会按 `svcrt_task_table` 的元素类型（`svcrt_task_t`，**匿名 typedef 结构体**）取出 `entry`
+  字段偏移，逐槽读 TCB 入口指针、反查 ELF 函数符号，给 `sched`/`wait`/`ready`/`create`/
+  `exit` 事件补上 `from_name`/`to_name`/`task_name`/`name`（数字 id 原样保留，`task_names`
+  给出整张表）。**名字后到会回头补**：解析成功那一刻之前的历史事件也会被重命名一遍。
+  **只认精确符号**（入口地址 = 函数首地址）：跨镜像的入口（SVCrtOS 的 app/驱动是
+  另外下发的镜像，任务入口不在这份内核 `.axf` 里）**合法但无名**——这种槽位留空不编，
+  给 `unmapped_slots` + `hint` 说明怎么取名；名字查不到就**不写名字**（不是写 `?`），
+  只有**所有**非空槽都落不到符号表里才整批拒绝（`tasks-snapshot-inconsistent`）。
+  `trace_swd_tasks` 单独看这张表为什么没名字（`read_mode`/`errors`/逐槽 `entry`）。
 
 **桩该插在哪儿**（`trace_guide(topic="instrument_points")` 有完整版）：异常 handler 第一条指令
 （`MDK_TRACE_FAULT_CAPTURE()`，一次拿到 PC/LR/SP/xPSR + CFSR，性价比最高）→ 喂狗点与复位原因

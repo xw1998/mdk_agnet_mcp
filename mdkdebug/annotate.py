@@ -67,7 +67,7 @@ READONLY = {
     "trace_buff_status", "trace_buff_dump",
     # SWD 无缝流（批次56）：status/read 只读目标 RAM 控制块与环，并把搬走的字节
     # 通过写 drained 回报目标——写的是**读数游标**（协议自身的一部分），不动用户数据。
-    "trace_swd_status", "trace_swd_read",
+    "trace_swd_status", "trace_swd_read", "trace_swd_tasks",
     "trace_rtt_find", "trace_swo_read",
     # 可视化说明（批次59）：纯返回文本，不写任何文件。
     "view_guide",
