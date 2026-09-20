@@ -78,6 +78,24 @@ def _name_of(names: dict, ident, fallback=None):
     return fallback
 
 
+def _irq_names_from_payload(payload) -> dict:
+    """把 trace_swd_read 返回里的 ``irq_names`` 归一成 {异常号(int): 处理函数名}。
+
+    为什么要单独转一道：键在 JSON 往返后会变成字符串（"53"），而后面查表是按 int
+    查的——不归一就等于整份表失效，图上照旧显示 IRQ53，还是「看着有名字」的假象。
+    取不到名的原因（``irq_names_note``）由调用方负责透出，这里不编名字。
+    """
+    raw = (payload or {}).get("irq_names") or {}
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[int(str(k), 0)] = str(v)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
 def _task_names_from(payload, names: dict = None):
     """把「返回体里已经带的任务名」凑成 {任务号(int): 名字}。
 
@@ -304,6 +322,7 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
     # 返回体里已经带的任务名（trace_swd_read/ tasks 的返回）直接拿来用：
     # 采集时是按符号表精确匹到的名，比事后让调用方再拼一遍靠谱。
     names_in = names or {}          # 调用方显式给的（给中断号起名用的就是这份）
+    irq_in = _irq_names_from_payload(payload)   # 采集时按镜像向量表反查到的中断名
     names, idle_name, idle_id, name_why = _task_names_from(payload, names)
     times, has_time, unit_note = _rel_times(evs, payload, names)
     # 有 t_us 字段 ≠ 时间轴能用：粒度比事件间隔粗时（目标把每次除法的**余数**丢掉了），
@@ -384,6 +403,7 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
         grouped.setdefault(ident, []).append((str(e.get("kind") or ""), t))
         if e.get("id_name") and not isr_evname.get(ident):
             isr_evname[ident] = str(e["id_name"])
+    unnamed_irq = []
     for ident, seq in grouped.items():
         pairs, opened, unpaired = [], None, 0
         for kind, t in seq:
@@ -402,12 +422,21 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
         # 中断号与任务号不是一个命名空间：这里只认事件自带的名字/显式 names/
         # Cortex-M 异常表，**不用**从任务表凑出来的名字（否则 0xF=idle 会把 SysTick 改名）
         nm = (isr_evname.get(ident) or _name_of(names_in, ident, None)
+              or _name_of(irq_in, ident, None)
               or _CM_EXC.get(ident) or ("IRQ%s" % ident))
+        if ident is not None and ident >= 16 and _name_of(irq_in, ident) is None \
+                and not isr_evname.get(ident) and _name_of(names_in, ident) is None:
+            unnamed_irq.append(ident)
         sub = "%d 段进出" % len(pairs) + ("，%d 个落单（没配成对，未画）" % unpaired if unpaired else "")
         add({"id": "isr-%s" % ident, "name": str(nm), "sub": sub,
              "type": "intervals", "pairs": pairs, "count": len(pairs), "toggle": True})
         if unpaired:
             extras.append("%s 有 %d 个落单的进/出事件（没配成对，图上没画）" % (nm, unpaired))
+    if unnamed_irq:
+        extras.append("中断号 %s 没取到处理函数名（按 IRQn 显示）：%s"
+                      % (", ".join(str(x) for x in sorted(set(unnamed_irq))),
+                         str((payload or {}).get("irq_names_note")
+                             or "这份数据里没带 irq_names，采集时用的是老版本或不认识的镜像")))
 
     # --- 异常发生点 ---
     for i, e in enumerate(evs):

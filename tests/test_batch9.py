@@ -60,7 +60,7 @@ async def main():
         # 1. 新工具已注册（64 → 66）
         check("read_console_output 已注册", "read_console_output" in tools, "")
         check("read_async_messages 已注册", "read_async_messages" in tools, "")
-        check("工具总数=189", len(tools) == 189, f"实际 {len(tools)}")
+        check("工具总数=190", len(tools) == 190, f"实际 {len(tools)}")
 
         # 2. server 层：set_breakpoint 发 BS 命令，其命令输出可经 read_console_output 读到
         sb = load(await call(server, "set_breakpoint", {"expr": "main"}))

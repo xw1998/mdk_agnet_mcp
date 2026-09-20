@@ -179,6 +179,142 @@ def _elf_funcs_cached(elf: str) -> list:
         _ELF_FUNCS_CACHE[key] = hit
     return hit
 
+# ================================================================ 中断号取名
+#
+# 流里的 isr 事件只带**中断号**，看上去就是一堆数字（实测出现过 17 / 5 / 4）。
+# SVCrtOS 那边用的是 Cortex-M 的**异常号**：0..15 是内核异常（SVC=11、PendSV=14、
+# SysTick=15），外设从 16 起算（16+n 就是 IRQn）。
+#
+# 中断号在板子上没有名字，但**向量表**就是「异常号 → 处理函数」的权威映射：
+# 表项 index == 异常号。向量表就在 ELF 里（.isr_vector 段 / __Vectors 符号），
+# 因此**纯主机侧**就能反查，不需要碰目标——拿到的是工程里真实的 XXX_IRQHandler。
+#
+# 只覆盖外设那一段（>= 16）：内核异常 0..15 由 viz 的 _CM_EXC 给通用名，
+# 这里不抢它的活。查不到就如实留空，**不按 STM32 的 IRQn 顺序表编名字**。
+
+_IRQ_VEC_SYMS = ("__Vectors", "g_pfnVectors", "_vectors", "__vector_table",
+                 "vector_table")
+_IRQ_VEC_SECS = (".isr_vector",)
+_IRQ_EXC_BASE = 16            # 异常号 0..15 是内核，外设 IRQn 从异常号 16 起
+_IRQ_VEC_MAX = 256            # 向量表最多 16+240 项（Cortex-M 的异常号上限）
+                              # 必须设上界：MDK 把整块 ROM 合成一个段，__Vectors 的
+                              # st_size 常常只有 4，按「段尾」当表尾会一路读进代码
+                              # 里，把代码字节当函数地址解析出一堆看着像样的名字。
+_IRQ_NAMES_CACHE = {}         # (路径, mtime) -> {异常号: 处理函数名}
+
+
+def _elf_vector_bytes(e) -> bytes | None:
+    """取向量表的原始字节：优先 .isr_vector 段，其次按 __Vectors 符号所在段切片。"""
+    for sec in e.iter_sections():
+        if sec.name in _IRQ_VEC_SECS:
+            try:
+                return sec.data()
+            except Exception:  # noqa: BLE001
+                return None
+    for sec in e.iter_sections():
+        if sec.name not in (".symtab", ".dynsym"):
+            continue
+        for sym in sec.iter_symbols():
+            if sym.name not in _IRQ_VEC_SYMS or not sym["st_value"]:
+                continue
+            a = int(sym["st_value"]) & ~1
+            for s2 in e.iter_sections():
+                try:
+                    lo = int(s2["sh_addr"] or 0)
+                    hi = lo + int(s2["sh_size"] or 0)
+                except Exception:  # noqa: BLE001
+                    continue
+                if s2["sh_type"] == "SHT_NOBITS" or not (lo <= a < hi):
+                    continue
+                try:
+                    return s2.data()[a - lo:]
+                except Exception:  # noqa: BLE001
+                    return None
+    return None
+
+
+def _irq_names_from_elf(elf: str) -> dict:
+    """从 ELF 的向量表反查 {异常号: 处理函数名}（只给外设那一段）。
+
+    纯主机侧（读的是 ELF 文件本身）。读不到向量表 / 没有符号表 → 返回 {}，
+    调用方据此如实说「这份镜像里查不到」，而不是编一套名字。
+    """
+    if not elf or not os.path.isfile(elf):
+        return {}
+    try:
+        key = (os.path.abspath(elf), os.path.getmtime(elf))
+    except OSError:
+        key = None
+    if key is not None and key in _IRQ_NAMES_CACHE:
+        return _IRQ_NAMES_CACHE[key]
+    out = {}
+    try:
+        from elftools.elf.elffile import ELFFile
+        with open(elf, "rb") as f:
+            e = ELFFile(f)
+            vec = _elf_vector_bytes(e)
+            if vec:
+                fn = {}
+                for sec in e.iter_sections():
+                    if sec.name not in (".symtab", ".dynsym"):
+                        continue
+                    for sym in sec.iter_symbols():
+                        if sym["st_info"]["type"] != "STT_FUNC" or not sym["st_value"]:
+                            continue
+                        fn.setdefault(int(sym["st_value"]) & ~1, []).append(sym.name)
+                for i in range(_IRQ_EXC_BASE, min(_IRQ_VEC_MAX, len(vec) // 4)):
+                    a = int.from_bytes(vec[i * 4:i * 4 + 4], "little")
+                    if a == 0:
+                        continue      # 向量表里的空项：这个异常号没人用，留空
+                    names = fn.get(a & ~1) or []
+                    if not names:
+                        # 表尾之后的字节是**代码**：一旦出现「非 0 又不是任何函数
+                        # 首地址」的值就该收手，再往下读就是在拿指令字节当函数地址。
+                        break
+                    # 一个地址挂着多个处理函数名 = 链接器把一堆「空桩」折成了同一段代码
+                    # （Keil 的 __weak xxx_IRQHandler 常态）。这时**分不清这一项到底是
+                    # 哪一个**，取名就等于编名字——宁可留空。
+                    if len(names) != 1:
+                        continue
+                    out[i] = names[0]
+    except Exception:  # noqa: BLE001
+        return {}
+    if key is not None:
+        if len(_IRQ_NAMES_CACHE) > 4:
+            _IRQ_NAMES_CACHE.clear()
+        _IRQ_NAMES_CACHE[key] = out
+    return out
+
+
+def irq_names_for(elf: str, exc_ids) -> tuple:
+    """给一组异常号取名。返回 (名字表, 为什么没有名的说明)。
+
+    只有**向量表里真有处理函数**的号才会出现在名字表里；其余如实留空，
+    并把「哪些号没取到」写进说明——不拿顺序表凑一个像样的名字。
+    """
+    ids = sorted({int(i) for i in exc_ids if i is not None})
+    if not ids:
+        return {}, "本次没有中断事件，无需取名"
+    e = elf or _session_axf()
+    if not e:
+        return {}, "没给 elf（会话也没 set_symbol_file 过），中断号取不到名字"
+    m = _irq_names_from_elf(e)
+    if not m:
+        return {}, ("这份镜像里没读到向量表（没有 .isr_vector 段 / __Vectors 符号，"
+                    "或没有符号表），中断号只能按号显示")
+    got = {i: m[i] for i in ids if i in m}
+    core = [i for i in ids if i < _IRQ_EXC_BASE and i not in got]
+    miss = [i for i in ids if i >= _IRQ_EXC_BASE and i not in got]
+    why = "中断号 → 处理函数名取自镜像的向量表（异常号 >= %d 的外设段）" % _IRQ_EXC_BASE
+    if core:
+        why += "；%s 是内核异常号，按异常名显示" % ", ".join(str(x) for x in core)
+    if miss:
+        why += ("；%s 在向量表里是空项、指向的不是符号表里的函数、或者那个地址挂着"
+                "多个处理函数名（链接器把一堆空的 *_IRQHandler 折成了同一段代码，"
+                "分不清是哪一个），一律如实留空" % ", ".join(str(x) for x in miss))
+    return got, why
+
+
 # ================================================================ SVCrtOS 任务名
 #
 # 流里的调度事件只带**任务序号**（0..14，0xF 是 idle），看上去就是一堆数字。
@@ -2983,6 +3119,9 @@ def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
             err["note"] = ("控制块读到了字段但不自洽——先看 seq 是不是变了"
                            "（目标重开会把游标归零）")
         return err
+    bc = _swd_blob_check(info, loc)
+    if bc:
+        return bc
     out = dict(info)
     out["ok"] = True
     out["locate"] = loc
@@ -3026,6 +3165,237 @@ def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
     if info["reset_req"]:
         out.setdefault("warnings", []).append(
             "控制块里的 reset_req 还是 1：目标还没执行它（下一条事件写入时才处理）")
+    return out
+
+
+# ---------------------------------------------------------------- 环容量交叉校验
+#
+# 8192 B 的环是**编译期常量**（blob 结构里跟着一个定长数组），宿主改不了。
+# 但「宿主以为的容量」和「板上真正的容量」必须一致：换了固件/换了 .axf 之后
+# 两边不同源时，读环就会**静默错位**——解出来一堆看着像事件的垃圾。
+#
+# 控得住的那一半在这里做：ELF 里的 blob 尺寸 = ctrl(80) + cap + 尾巴对齐。
+# 与板上控制块自述的 cap 对不上，就说明这份符号不是板上那份固件，直接报错。
+# （运行期可配容量要改固件重编重烧，没做——校验能挡住它要防的那类静默错位。）
+
+
+def _swd_blob_check(info: dict, loc) -> dict | None:
+    """ELF 符号尺寸 vs 控制块自述：不符就是「符号与板上固件不同源」。"""
+    bb = (loc or {}).get("blob_bytes")
+    if not bb:
+        return None               # addr= 直接指地址时没有符号尺寸，这层校验跳过
+    cap = int(info.get("cap") or 0)
+    want = _swd.CTRL_BYTES + cap
+    if want <= int(bb) <= want + 7:      # 允许结构体尾部对齐的一点填充
+        return None
+    return {
+        "ok": False, "error_code": "swd-blob-size-mismatch",
+        "error": ("这份 ELF 里 %s 是 %d 字节，而板上控制块自述 ctrl(%d)+cap(%d)=%d "
+                  "字节 —— 两者不是同一次构建"
+                  % (_swd.SYMBOL, int(bb), _swd.CTRL_BYTES, cap, want)),
+        "blob_bytes_in_elf": int(bb), "blob_bytes_expected": want, "cap_on_target": cap,
+        "addr": info.get("addr"),
+        "hint": ("ELF 与板上固件的环容量不一致：① 用与刚烧固件同源的 .axf"
+                 "（batch62 起烧录会自动把符号重钉到刚烧的那份）；② 确认两边用的是"
+                 "同一个 MDK_TRACE_SWD_BYTES；③ 只是想按地址读就传 addr=0x...，"
+                 "这会跳过本校验（也就放弃这层保护）。"),
+    }
+
+
+# ---------------------------------------------------------------- 节拍预算（A3）
+#
+# 环会满、宿主搬得慢就会丢事件，而「还能录多久」以前只能靠试。这里把它算出来：
+# 两次读控制块（间隔 sample_ms），用 head 的差值测出**真实**写入速率，再除以
+# 剩余的环空间。速率是**测出来的**，不是拿事件率猜的——测不出就如实说测不出。
+
+_SWD_PACE_SAFETY = 8.0        # 建议节拍 = 环写满所需时间 ÷ 安全系数
+_SWD_NEXT_SAMPLE_MS = 300     # 默认测速取样窗口
+_SWD_NEXT_SAMPLE_MAX = 5000
+
+
+def _swd_budget(info0: dict, info1: dict, dt_s: float,
+                safety: float = _SWD_PACE_SAFETY, round_ms: float = 0,
+                batch_events: int = 0) -> dict:
+    """两次取样之间的写入量 → 「还能录多久 / 该多久搬一次」。**纯算术，不碰目标。**
+
+    d_bytes 取自 head 的差值（head 是目标侧单调递增的字节游标，U32 回绕靠掩码）。
+    """
+    cap = int(info1.get("cap") or 0)
+    pending = int(info1.get("pending") or 0)
+    headroom = max(0, cap - pending)
+    out = {
+        "ok": True, "addr": info1.get("addr"),
+        "cap": cap, "pending": pending, "headroom_bytes": headroom,
+        "sample_s": round(dt_s, 4), "safety": safety,
+        "already_lost_events": int(info1.get("lost_events") or 0),
+    }
+    if int(info1.get("seq") or 0) != int(info0.get("seq") or 0):
+        return {"ok": False, "error_code": "swd-sample-restarted",
+                "error": "取样期间目标重开过录制（seq %s -> %s），这次速率不可用"
+                         % (info0.get("seq"), info1.get("seq")),
+                "hint": "等目标跑稳一点再测一次（重开录制会把游标归零，算出来的速率会离谱）"}
+    d_bytes = (int(info1["head"]) - int(info0["head"])) & _swd.U32
+    d_events = int(info1.get("events") or 0) - int(info0.get("events") or 0)
+    if d_events < 0:
+        return {"ok": False, "error_code": "swd-sample-restarted",
+                "error": "取样期间事件计数倒退了（%d -> %d），这次速率不可用"
+                         % (info0.get("events"), info1.get("events")),
+                "hint": "同上：目标重启过或换了一段录制，重测"}
+    if dt_s <= 0:
+        return {"ok": False, "error_code": "invalid-argument",
+                "error": "取样间隔是 %.3f s，算不出速率" % dt_s,
+                "hint": "把 sample_ms 调到 100 以上再测"}
+    bps = d_bytes / dt_s
+    out["sampled"] = {"bytes": d_bytes, "events": d_events,
+                      "bytes_per_s": round(bps, 1),
+                      "events_per_s": round(d_events / dt_s, 1)}
+    if d_events > 0:
+        out["bytes_per_event_now"] = round(d_bytes / float(d_events), 2)
+        if headroom and bps > 0:
+            out["headroom_events"] = int(headroom / (d_bytes / float(d_events)))
+    if info1.get("events"):
+        # 整体口径只作参考：粒度中途改过就不代表现在
+        out["bytes_per_event_overall"] = round(float(info1["head"]) / info1["events"], 2)
+    warn = []
+    near_full = bool(cap and pending * 4 >= cap * 3)
+    if headroom == 0:
+        out["window_ms"] = 0
+        out["stalled"] = "ring-full"
+        warn.append("环已经满了（pending=cap=%d）：目标此刻**每条事件都在丢**，"
+                    "先搬一次再谈节拍" % cap)
+    elif d_bytes <= 0:
+        out["window_ms"] = None
+        if near_full:
+            # 真机上撞到的坑：环快满时目标被背压憋住，head 一动不动，而文案却说
+            # 「目标没在跑」——方向完全错（目标跑得好好的，是环不够写）。
+            out["stalled"] = "ring-nearly-full"
+            warn.append("取样 %s s 内 head 一个字节都没动，而环已经用到 %d/%d（>= 3/4）："
+                        "**很可能是背压**——快满了，目标写不进新字节、正在丢事件。"
+                        "这与「目标没在跑」是两回事：先 trace_swd_read 搬一次，"
+                        "搬完 pending 又立刻涨回满就是背压（该调粗粒度 / 少插桩 / 把环改大），"
+                        "一直不动才是没在跑或没插桩。"
+                        % (out["sample_s"], pending, cap))
+        else:
+            out["stalled"] = "no-writes"
+            warn.append("取样 %s s 内目标一个字节都没写：**测不出还能录多久**"
+                        "（目标没在跑 / 这块没插桩 / 已经录完了）。这不是「窗口无限大」。"
+                        % out["sample_s"])
+    else:
+        window_ms = headroom / bps * 1000.0
+        out["window_ms"] = int(round(window_ms))
+        if window_ms < 1.0:
+            # 真机上量到过：剩余空间只剩 1 B，窗口 0.09 ms。这时给「建议节拍 10 ms」
+            # 比窗口本身还大，等于教人按必然丢事件的节拍走——如实说「没有可调的节拍」。
+            out["suggest_pace_ms"] = 0
+            out["note"] = ("剩余空间只剩 %d B，按实测速率 %.1f B/s 只够 %.2f ms："
+                           "**没有可调的节拍**，先 trace_swd_read 搬一次"
+                           "（这段时间目标确实在丢事件）"
+                           % (headroom, bps, window_ms))
+        else:
+            out["suggest_pace_ms"] = int(max(10, round(window_ms / safety)))
+            out["note"] = ("窗口 %d ms、建议节拍 %d ms（窗口 ÷ 安全系数 %.0f）——"
+                           "节拍指「两次 trace_swd_read 之间最多隔多久」"
+                           % (out["window_ms"], out["suggest_pace_ms"], safety))
+    if out["already_lost_events"]:
+        warn.append("这次录制已经丢过 %d 条事件：下面算出来的窗口**偏乐观**"
+                    "（丢事件意味着目标写得更快、或环早就转过一圈）"
+                    % out["already_lost_events"])
+    if near_full and not out.get("stalled"):
+        warn.append("环已经用到 %d/%d（>= 3/4）：留给你搬运的余量不多了" % (pending, cap))
+    if round_ms:
+        try:
+            rm = float(round_ms)
+        except (TypeError, ValueError):
+            rm = 0
+        if rm > 0:
+            pace = out.get("suggest_pace_ms")
+            if pace is None and out.get("window_ms") == 0:
+                out["round_budget"] = {
+                    "round_ms": rm, "ok": False, "margin_ms": 0,
+                    "why": ("窗口就是 0（环已经满了、目标此刻每条都在丢），"
+                            "单轮成本 %g ms 再快也追不上——先搬一次再谈节拍" % rm)}
+            elif pace is None:
+                out["round_budget"] = {"round_ms": rm, "ok": None,
+                                       "why": "窗口测不出来，单轮成本也就无从比较"}
+            else:
+                out["round_budget"] = {
+                    "round_ms": rm, "ok": rm < pace,
+                    "margin_ms": int(round(pace - rm)),
+                    "why": ("单轮搬运成本 %g ms %s 建议节拍 %d ms"
+                            % (rm, "<" if rm < pace else ">=", pace)),
+                }
+                if rm >= pace:
+                    warn.append("单轮搬运成本 %g ms 已经 >= 建议节拍 %d ms："
+                                "**环太小 / 事件太密，按这个节拍也追不上**——"
+                                "要么调粗粒度（少写字节），要么少插桩，"
+                                "要么把环改大重编重烧" % (rm, pace))
+    if batch_events:
+        try:
+            be = int(batch_events)
+        except (TypeError, ValueError):
+            be = 0
+        if be > 0 and out.get("bytes_per_event_now"):
+            out["batch_estimate"] = {
+                "events": be,
+                "bytes": int(round(be * out["bytes_per_event_now"])),
+                "accumulate_ms": (int(round(be * out["bytes_per_event_now"] / bps * 1000.0))
+                                  if bps > 0 else None),
+            }
+    if warn:
+        out["warnings"] = warn
+    out["next"] = ["按 suggest_pace_ms 的节拍反复调 trace_swd_read（它只搬新增的那一段）",
+                   "要长时间录制就把 max_session_events 调小，别把整个会话塞回对话",
+                   "想看整体健康度用 trace_swd_status（更便宜）"]
+    return out
+
+
+def swd_next(elf: str = "", addr="", link: str = "auto",
+             sample_ms: int = _SWD_NEXT_SAMPLE_MS, safety: float = _SWD_PACE_SAFETY,
+             round_ms: float = 0, batch_events: int = 0) -> dict:
+    """测一次写入速率 → 回「环还能录多久 / 该多久搬一次」。
+
+    **只读**：读两次控制块，不搬字节、不动游标、不停机，所以随时可以问。
+    """
+    try:
+        smp = int(sample_ms)
+    except (TypeError, ValueError):
+        return {"ok": False, "error_code": "invalid-argument",
+                "error": "sample_ms 不是整数：%r" % (sample_ms,)}
+    if smp < 0 or smp > _SWD_NEXT_SAMPLE_MAX:
+        return {"ok": False, "error_code": "invalid-argument",
+                "error": "sample_ms 要在 0~%d 之间（收到 %r）"
+                         % (_SWD_NEXT_SAMPLE_MAX, sample_ms)}
+    try:
+        safety = float(safety)
+    except (TypeError, ValueError):
+        return {"ok": False, "error_code": "invalid-argument",
+                "error": "safety 不是数字：%r" % (safety,)}
+    if safety < 1:
+        return {"ok": False, "error_code": "invalid-argument",
+                "error": "safety 必须 >= 1（实测取 4~10 比较稳），收到 %r" % (safety,)}
+    a, loc = _swd_locate(elf=elf, addr=addr)
+    if a is None:
+        return loc
+    info0, err = _swd_read_ctrl(a, link=link)
+    if info0 is None:
+        return err
+    bc = _swd_blob_check(info0, loc)
+    if bc:
+        return bc
+    t0 = time.monotonic()
+    if smp:
+        time.sleep(smp / 1000.0)
+    info1, err = _swd_read_ctrl(a, link=link)
+    if info1 is None:
+        return err
+    out = _swd_budget(info0, info1, time.monotonic() - t0,
+                      safety=safety, round_ms=round_ms, batch_events=batch_events)
+    if out.get("ok"):
+        out["locate"] = loc
+        out["granularity"] = _swd_gran_desc(info1)
+        if info1["ts_off"]:
+            out.setdefault("warnings", []).append(
+                "这段流是 TS_OFF（不记时间戳）：省字节，但也换不到时间轴")
     return out
 
 
@@ -3085,6 +3455,9 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
     info, err = _swd_read_ctrl(a, link=link)
     if info is None:
         return err
+    bc = _swd_blob_check(info, loc)
+    if bc:
+        return bc
     s = _swd_session(a)
     notes = []
 
@@ -3349,6 +3722,9 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
     view = _swd_session_view(s, limit=limit)
     if only_new:
         view = dict(view, events=list(evs), truncated=False)
+    _irq_got, _irq_why = irq_names_for(
+        elf, [e.get("id") for e in view["events"]
+              if isinstance(e, dict) and str(e.get("type")) == "isr"])
     out = {
         "ok": True, "addr": "0x%X" % a, "locate": loc,
         "ctrl": {k: info[k] for k in ("version", "cap", "ring_off", "head",
@@ -3383,6 +3759,8 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         "consistent": "halt" if did_halt else "run",
         "halt_ms": round(halt_ms, 2) if halt_ms is not None else None,
         "task_names": _swd_tasks_brief(tn),
+        "irq_names": _irq_got or None,
+        "irq_names_note": _irq_why,
         "sched_decoded": _swd_sched_count(evs),
         "read_meta": {k: rmeta.get(k) for k in ("read_confidence", "while_running")
                       if k in rmeta} or None,
@@ -4467,6 +4845,43 @@ def register(server, js=None) -> int:
                                link: str = "auto") -> str:
         try:
             return _js(swd_status(elf=elf, addr=addr, link=link))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_swd_next",
+        title="swd 无缝流：环还能录多久 / 该多久搬一次（节拍预算）",
+        description=(
+            "回答「这一轮该隔多久来搬一次」——把以前只能试错的节拍变成算出来的数。\n"
+            "做法：读两次控制块（间隔 sample_ms，默认 300），用 head 的差值测出**真实**的"
+            "写入速率，再除以剩余的环空间。返回 headroom_bytes（环里还能写多少字节）、"
+            "window_ms（按当前速率**还能录多久**）、suggest_pace_ms（建议的搬运节拍"
+            "＝窗口 ÷ safety，safety 默认 8）。\n"
+            "**只读**：不搬字节、不动游标、不停机，随时可以问。\n"
+            "三条如实披露：① 速率是**测出来的**——目标这段时间一个字节都没写就"
+            "**测不出窗口**（返回 window_ms=null 并说明），不会拿容量除一个猜的事件率；"
+            "这里还会区分两件事：环已经用到 >= 3/4 却一个字节没进，那是**背压**"
+            "（快满了、写不进去、正在丢事件，先搬一次），不是「目标没在跑」——"
+            "stalled 字段写明是 ring-full / ring-nearly-full / no-writes；"
+            "② 取样期间目标重开过录制（seq 变了/计数倒退）时这次取样作废"
+            "（swd-sample-restarted），不硬算；③ 取样期间目标在跑，控制块可能整片读回 0"
+            "（swd-read-degenerate），这时先 halt 再问。\n"
+            "可选 round_ms=你实测的单轮搬运成本（真机约 450~670 ms）：给了就会对比"
+            "建议节拍，追不上时明说「环太小/事件太密，调粗粒度或少插桩，"
+            "或把环改大重编重烧」，而不是让你反复调参。\n"
+            "batch_events=N 还会估算「搬 N 条要多少字节、要攒多久」。\n"
+            "环已经满（pending=cap）时 window_ms=0 并直说目标此刻每条都在丢——"
+            "这时先搬一次，再谈节拍。"
+        ),
+    )
+    async def trace_swd_next(elf: str = "", addr: str = "", link: str = "auto",
+                             sample_ms: int = 300, safety: float = 8.0,
+                             round_ms: float = 0, batch_events: int = 0) -> str:
+        try:
+            return _js(swd_next(elf=elf, addr=addr, link=link, sample_ms=sample_ms,
+                                safety=safety, round_ms=round_ms,
+                                batch_events=batch_events))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

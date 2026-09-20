@@ -464,7 +464,7 @@ def section_e():
     if asyncio.iscoroutine(tl):
         tl = asyncio.run(tl)
     names = sorted(t.name for t in tl)
-    check("E1 注册工具总数 189（154 + Modbus 7）", len(names) == 189, len(names))
+    check("E1 注册工具总数 190（154 + Modbus 7）", len(names) == 190, len(names))
     check("E2 7 个 Modbus 工具全部注册",
           MODBUS_TOOLS <= set(names), sorted(MODBUS_TOOLS - set(names)))
     check("E3 7 个 Modbus 工具都登记在 serial 组",
