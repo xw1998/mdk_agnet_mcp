@@ -1219,12 +1219,14 @@ def _rebind_symbol_to_flashed(axf: str, reason: str = "") -> dict:
 def _symbol_switch_actions(server=None) -> list:
     """「把符号切到与板上固件同源的那份」的可执行动作清单（含必要的工具面装卸步骤）。
 
-    为什么动作里必须显式带上「装 symbol 组」：报符号不一致的 env_check 在**默认可见的
-    core 组**，而唯一的修复手段 set_symbol_file 在**默认不暴露的 symbol 组**
-    （toolbox.DEFAULT_GROUPS=("core",)）。旧文案只说「set_symbol_file 切到…」，调用方
-    照做只会撞「未知工具」——而「要先装 symbol 组」这条线索当时只写在 toolset 工具的
-    描述里，不在报错里、也不在体检结论里。检测器与修复手段不在同一个工具面上时，
-    「怎么把手段拿到手」必须和手段写在同一条动作里，否则等于递了把打不开的钥匙。
+    「检测器与修复手段不在同一个工具面上」这个坑：报符号不一致的 env_check 在 core 组，
+    而唯一的修复手段 set_symbol_file 以前只在默认收起的 symbol 组，调用方照着「切到…」做
+    只会撞「未知工具」——所以旧版动作清单里必须显式带上「装 symbol 组」这一步。
+
+    批次67 起：set_symbol_file / list_symbol_projects 已上移到 core（toolbox.TOOLSETS["core"]），
+    **默认面上就能切符号**，默认动作清单只剩「切符号」一条。装卸分支仍然保留，只是改由
+    「启动时把 core 收起来的裁剪面」（如 MDKDEBUG_TOOLSETS=mem）触发——坑的形状没变，
+    只是默认配置不再踩它。旧的 symbol 组仍可装载（组内还有 find_symbol / parse_map 等）。
 
     set_symbol_file 是否真的不在面上，按当前工具面**账面**判断（不猜）：账本查得到才
     断言「已被收起」；查不到（None）时按「可能不在」措辞，并如实说明这是未知而非已知。
@@ -1234,13 +1236,13 @@ def _symbol_switch_actions(server=None) -> list:
     if hid is True:
         acts.append(
             '先 toolset(action="load", toolsets="symbol") 把符号组装进工具面'
-            "（本服务默认只暴露 core 组，set_symbol_file / list_symbol_projects 都不在"
-            "默认面上，不装的话下一步会报「未知工具」；装完若客户端仍报未知工具，"
+            "（当前工具面里没有 set_symbol_file，多半是启动时用 MDKDEBUG_TOOLSETS 把 core"
+            "组收起来了；不装的话下一步会报「未知工具」；装完若客户端仍报未知工具，"
             "先重拉一次 tools/list）")
     elif hid is None:
         acts.append(
-            'set_symbol_file 若不在当前工具面上（本服务默认只暴露 core 组），先调 '
-            'toolset(action="load", toolsets="symbol") 把它装上再调')
+            'set_symbol_file 若不在当前工具面上（启动时用 MDKDEBUG_TOOLSETS 收起 core 组'
+            '时会如此），先调 toolset(action="load", toolsets="symbol") 把它装上再调')
     acts.append("set_symbol_file 切到与刚烧录固件同源的 .axf")
     return acts
 
@@ -1575,6 +1577,95 @@ def _symbol_stale_hint(client=None) -> str:
     except Exception:  # noqa: BLE001
         return ""
     return st.get("symbol_stale_note") or ""
+
+
+def _proj_key(p: str) -> str:
+    """把工程/符号路径归一成可比较的短名：basename 去掉 .uvprojx/.axf/.map 再小写。"""
+    if not p:
+        return ""
+    b = os.path.basename(str(p).strip().strip('"'))
+    low = b.lower()
+    for ext in (".uvprojx", ".uvproj", ".axf", ".map", ".elf"):
+        if low.endswith(ext):
+            b = b[: -len(ext)]
+            break
+    return b.strip().lower()
+
+
+def _symbol_project_hint() -> dict:
+    """当前符号文件属于哪个**已登记**工程（按 .axf 路径匹配注册表）。
+
+    匹配不上就如实说 matched_by=None（例如 set_symbol_file 指到注册表外的 .axf）——
+    这样下游的「链路工程 vs 符号工程」对照才知道自己有没有依据。
+    """
+    axf = (_symbol_cfg or {}).get("axf") or ""
+    key = os.path.normcase(os.path.abspath(axf)) if axf else ""
+    for p in (_SYMBOL_PROJECTS or []):
+        pa = p.get("axf") or ""
+        if key and pa and os.path.normcase(os.path.abspath(pa)) == key:
+            return {"name": p.get("name"), "axf": axf, "matched_by": "axf-path"}
+    return {"name": None, "axf": axf or None, "matched_by": None}
+
+
+def _binding_state(port=None) -> dict:
+    """「这条 UVSOCK 链路服务的是哪个 Keil 实例/工程」与「当前符号来自哪个工程」的对照。
+
+    真机反馈（另一台机器）：4823 被一个加载了**别的工程**的旧 Keil 实例占着，之后即使重开
+    正确的工程窗口，调试仍然连到旧实例——符号解析、断点、单步全部落在错误的镜像上
+    （表现为「假符号 + error 57 + 单步退化成指令级」）。以前**没有任何工具能看出这一点**，
+    只能靠人猜；这一层就是把它变成可查的事实。
+
+    两条**如实披露**：① 端口归属查不到 / 实例没有窗口标题时，owner_project 留空并说明，
+    不拿符号文件名去顶替；② 链路工程与符号工程不一致**不等于**出错——正在调 App 时符号
+    本来就该是 App 的 .axf（见 set_reloc_delta），所以文案里必须给出这条例外。
+    """
+    try:
+        pt = int(port) if port is not None else int(getattr(_client, "port", 0) or 0)
+    except Exception:  # noqa: BLE001
+        pt = 0
+    if not pt:
+        pt = winutil.DEFAULT_UVSOCK_PORT
+    try:
+        out = dict(winutil.uvsock_binding(pt))
+    except Exception as e:  # noqa: BLE001
+        return {"port": pt, "state": "unknown",
+                "note": "端口归属查询失败：%s" % e, "mismatch": None}
+    sym = _symbol_project_hint()
+    out["symbol_file"] = (_symbol_cfg or {}).get("axf")
+    out["symbol_project"] = sym.get("name")
+    out["symbol_project_matched_by"] = sym.get("matched_by")
+    owner_key = _proj_key(out.get("owner_project"))
+    sym_key = _proj_key(sym.get("name")) or _proj_key(sym.get("axf"))
+    out["owner_project_key"] = owner_key or None
+    out["symbol_project_key"] = sym_key or None
+    out["mismatch"] = None
+    if owner_key and sym_key and owner_key != sym_key:
+        out["mismatch"] = "instance-vs-symbol"
+        out["warning"] = (
+            "这条 UVSOCK 链路（端口 %d）由 PID=%s 的 Keil 实例服务，它打开的工程是 %s；"
+            "而当前符号文件来自工程 %s。两者对不上时，PC/断点/单步都会被解析到**另一套固件**"
+            "的符号——真机上就表现为「假符号 + error 57 illegal address + 单步退化成指令级」，"
+            "排查会一直被带偏。先判这两件事谁是对的：若链路连错了实例（常见成因：端口被一个"
+            "**旧的** Keil 实例占着，重开正确工程也不会顶掉它），用 list_uvision_instances 看清"
+            "实例，close_uvision(keep=\"oldest\") 收掉占位的那个，再 launch_uvision(project=...) "
+            "重开目标工程；若符号是被有意切走的（例如正在调 App，符号就该是 App 的 .axf），"
+            "忽略本条即可。" % (int(pt), out.get("owner_pid"),
+                             out.get("owner_project") or "(未知)",
+                             sym.get("name") or (sym.get("axf") or "(未知)")))
+        out["next_actions"] = [
+            "list_uvision_instances 看有几个 Keil 实例、分别开着什么工程"
+            "（持 UVSOCK %d 端口的是**最早**那个实例）" % int(pt),
+            "确认要调的是哪个工程后收敛窗口：close_uvision(keep=\"oldest\")，"
+            "再 launch_uvision(project=\"...\")",
+            "只是有意用另一份符号（如 App 侧）：set_symbol_file(path=\"...\") 后本条可忽略",
+        ]
+    elif not owner_key:
+        out["note"] = (out.get("note") or "") + (
+            " 工程名取不到，无法与符号来源对照（owner_project 为空）。")
+    elif not sym_key:
+        out["note"] = (out.get("note") or "") + (
+            " 当前未加载符号（或符号不在已登记工程里），无法与链路工程对照。")
+    return out
 
 
 def _serialization_fields() -> dict:
@@ -2169,6 +2260,309 @@ def _bp_clear_note(n_cleared: int) -> str:
     else:
         note += "仅当断点超出硬件槽位落到 Flash 软件断点、或使用模拟器时才需重新烧录。"
     return note
+
+# ---------------- FPB（Flash Patch & Breakpoint）硬件断点寄存器核对 ----------------
+# 为什么要有这一节：`BK *` 只清 Keil 自己的逻辑断点表，清不掉调试器已经写进
+# **硬件断点单元**的比较器。J-Link 遇到这种情况会一直报
+# "two breakpoints at the same address"，之后所有断点状态都被污染——
+# 而主机侧此前的 `real_after.count == 0` 会给出「已经清干净了」的假象。
+#
+# Cortex-M3/M4/M7：FPB @0xE0002000
+#   FP_CTRL   @+0x00   bit0 ENABLE；bits[7:4] NUM_CODE；bits[11:8] NUM_LIT
+#   FP_COMP0  @+0x08   每个代码比较器 4 字节：bit0 ENABLE，bits[31:1] 为地址
+_FPB_BASE = 0xE0002000
+_FPB_COMP0 = 0xE0002008
+
+_FPB_NOTE = {
+    "clean": "FPB 里没有启用的代码比较器（硬件断点寄存器是干净的）",
+    "residue": ("FPB 里仍有**启用**的代码比较器：BK * 只清 Keil 自己的逻辑表，"
+                "清不掉调试器留在硬件断点单元里的项（J-Link 会一直报 "
+                "\"two breakpoints at the same address\"）"),
+    "unavailable": "读不到 FPB 状态，无法判定是否干净（没测 ≠ 没有）",
+}
+
+
+def _fpb_decode(ctrl, comps):
+    """把 FP_CTRL / FP_COMPn 的读数解成结构。纯函数，离线可校对。
+
+    字段语义：NUM_CODE 记为「代码比较器个数 - 1」（Cortex-M4 上读到 0x00000251
+    → bits[7:4]=5 → 6 个代码比较器，与本仓 `_FPB_SLOTS = 6` 一致；bits[11:8]=2
+    → 3 个字面量比较器）。字段为 0 时「1 个」与「未实现」两种解释都说得通，
+    故一律按 unavailable 处理——**宁可不判定，也不假装干净**。
+
+    真机发现（2026-09-20，STM32F427 + DAPLink）：FP_CTRL 稳定读到 0x00000260
+    （NUM_CODE=6 / NUM_LIT=2）。按「字段 = 个数 - 1」口径是 7 代码 / 3 字面量，而 F4 的
+    FPB 通常记作 6 代码 + 2 字面量比较器——两种解释只差 1，寄存器读数**不足以**断言
+    「有几个比较器」。所以槽位数只当**推导值**给，并附 counts_note 声明口径与不确定性；
+    「有没有残留」只看比较器条目的 enabled 位（不依赖槽位数）。
+
+    比较器条目读失败（comps 里缺项/None）时同样不肯说 clean：
+    只读到一部分就宣布「没有残留」，正是「没测 ≠ 没有」那类错答案。
+    """
+    if ctrl is None:
+        return {"check": "unavailable", "reason": "FP_CTRL 读不到",
+                "note": _FPB_NOTE["unavailable"]}
+    out = {"fp_ctrl": "0x%08X" % (ctrl & 0xFFFFFFFF),
+           "unit_enabled": bool(ctrl & 0x1),
+           "num_code_field": (ctrl >> 4) & 0xF,
+           "num_lit_field": (ctrl >> 8) & 0xF}
+    if out["num_code_field"] == 0:
+        out["check"] = "unavailable"
+        out["reason"] = "FP_CTRL.NUM_CODE 字段为 0，代码比较器个数无法确认"
+        out["note"] = _FPB_NOTE["unavailable"]
+        return out
+    n_code = out["num_code_field"] + 1
+    out["code_slots"] = n_code
+    out["lit_slots"] = out["num_lit_field"] + 1
+    # 真机（STM32F427）读到 NUM_CODE=6，按「个数 - 1」口径得 7，而 F4 的 FPB 通常记作
+    # 6 个代码比较器：两个口径差 1。槽位数只是推导值，别拿它当权威结论。
+    out["counts_note"] = (
+        "槽位数由 FP_CTRL 推导（NUM_CODE=%d / NUM_LIT=%d，按「字段 = 个数 - 1」口径）："
+        "代码 %d 个 / 字面量 %d 个。真机上该字段也可能按「字段即个数」解释（差 1），"
+        "别拿它当「有几个比较器」的权威结论——是否残留只由比较器的 enabled 位决定。"
+        % (out["num_code_field"], out["num_lit_field"], n_code, out["lit_slots"]))
+    items, enabled, missing = [], [], []
+    for i in range(n_code):
+        v = comps[i] if i < len(comps) else None
+        if v is None:
+            items.append({"index": i, "read_ok": False})
+            missing.append(i)
+            continue
+        it = {"index": i, "read_ok": True, "raw": "0x%08X" % (v & 0xFFFFFFFF),
+              "enabled": bool(v & 0x1), "addr": "0x%08X" % (v & 0xFFFFFFFE)}
+        items.append(it)
+        if it["enabled"]:
+            enabled.append(it)
+    out["comparators"] = items
+    out["enabled_count"] = len(enabled)
+    out["enabled_addrs"] = [it["addr"] for it in enabled]
+    if enabled:
+        out["check"] = "residue"
+    elif missing:
+        out["check"] = "unavailable"
+        out["reason"] = "有 %d 个比较器寄存器读失败，无法判定是否干净" % len(missing)
+    else:
+        out["check"] = "clean"
+    out["note"] = _FPB_NOTE[out["check"]]
+    if out["check"] == "residue":
+        out["error_code"] = "breakpoint-residue"
+    return out
+
+
+def _as_int(v):
+    """把 0x 前缀字符串/十进制字符串/整数统一成 int；认不出返回 None。"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if not isinstance(v, str):
+        return None
+    t = v.strip().lower()
+    if not t:
+        return None
+    try:
+        return int(t, 16) if t.startswith("0x") else int(t)
+    except ValueError:
+        return None
+
+
+def _fpb_orphans(hw, real):
+    """FPB 里启用、但 Keil 逻辑断点表里对不上的地址——这类项 BK * 清不掉。
+
+    返回 None 表示**无法对照**（没读到真实断点表），而不是「没有孤儿」。
+    """
+    if not isinstance(hw, dict) or hw.get("check") != "residue":
+        return None
+    if not isinstance(real, dict) or not real.get("ok"):
+        return None
+    known = set()
+    for b in (real.get("breakpoints") or []):
+        n = _as_int(b.get("address") or b.get("addr"))
+        if n is not None:
+            known.add(n & 0xFFFFFFFE)
+    orphans = []
+    for a in (hw.get("enabled_addrs") or []):
+        n = _as_int(a)
+        if n is None:
+            continue
+        if (n & 0xFFFFFFFE) not in known:
+            orphans.append(a)
+    return orphans
+
+
+def _fpb_state(client):
+    """读 FPB 寄存器现状。
+
+    两台已知坑都按「不轻信」处理：halt 后紧跟的首次 read_mem 会读到全 0 脏帧
+    （FPB 正常时 FP_CTRL 的 NUM_CODE 字段不会是 0），故读到 0 就重读一次复核；
+    仍为 0 时返回 unavailable，不当作「干净」。
+    """
+    def _rd(addr):
+        try:
+            r = client.read_mem(addr, 4)
+            if not r.get("ok"):
+                return None
+            return int.from_bytes(bytes.fromhex(r["data_hex"]), "little")
+        except Exception:  # noqa: BLE001
+            return None
+
+    ctrl = _rd(_FPB_BASE)
+    stale = False
+    if ctrl == 0:
+        ctrl = _rd(_FPB_BASE)
+        stale = True
+    out = _fpb_decode(ctrl, [])
+    # 注意：空 comps 首解必然是 unavailable（缺项），所以这里按 **code_slots 是否存在**
+    # 决定要不要读比较器——不能拿 check != unavailable 当门槛，那会导致一次都不读。
+    n_code = out.get("code_slots")
+    if n_code:
+        comps = [_rd(_FPB_COMP0 + 4 * i) for i in range(n_code)]
+        out = _fpb_decode(ctrl, comps)
+    out["reg_base"] = "0x%08X" % _FPB_BASE
+    out["registers"] = {"fp_ctrl": "0x%08X" % _FPB_BASE,
+                        "fp_comp0": "0x%08X" % _FPB_COMP0}
+    if stale:
+        out["reread"] = True
+        if ctrl == 0:
+            out["note"] = (out.get("note", "") +
+                           "（FP_CTRL 首读为全 0、重读仍为全 0：可能是 halt 后的脏读帧，"
+                           "也可能是该核没有 FPB）").strip()
+    return out
+
+
+# ---------------- 复位循环判定（批次67 P2） ----------------
+# 起因：外部反馈里最误导的一条——断点「再次命中」其实是**复位循环在重跑启动**，
+# 看的人当成正常命中，白绕一圈。主机侧此前的信号只有 repeat_warning，而它的语义
+# 恰好相反（「疑似 halt 残留值，别当反复复位看」）。两者必须各带可证前提、分开说。
+
+def _image_base(loc=None):
+    """镜像基址（= 向量表所在地址）：取 ELF 可执行段的最小起始地址。
+
+    取不到（无符号文件 / 节头被裁）返回 None——**不拿 0x08000000 猜**：
+    锚点错一个字节，复位循环的结论就完全是错的。
+    """
+    loc = loc if loc is not None else _get_locator()
+    if loc is None:
+        return None
+    try:
+        rs = loc._exec_ranges() or []
+    except Exception:  # noqa: BLE001
+        return None
+    if not rs:
+        return None
+    try:
+        return int(min(int(s0) for s0, _e in rs))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _reset_anchor(client, loc=None):
+    """读向量表头两个字：word0 = initial SP、word1 = Reset_Handler。
+
+    这是**启动锚点**：命中地址等于 Reset_Handler、或 SP 等于 initial SP，就说明
+    刚刚从复位走出来。合法校验收敛（任一条不满足即 ok=False）：
+      * word0 需 4 字节对齐且落在 SRAM（0x2000_0000~0x3FFF_FFFF）；
+      * word1 的 bit0 需为 1（Cortex-M 复位向量是 Thumb 地址）且落在本 .axf 的可执行段内。
+    读不出/校验不过就如实说取不到——比拿两个随机字当锚点强。
+    """
+    base = _image_base(loc)
+    if base is None:
+        return {"ok": False,
+                "reason": "取不到镜像基址（无符号文件或节头被裁），无法用向量表判定"}
+    try:
+        r = client.read_mem(base, 8)
+        if not r.get("ok"):
+            return {"ok": False,
+                    "reason": "读向量表失败：%s" % (r.get("error") or "未知原因")}
+        raw = bytes.fromhex(r["data_hex"])
+        if len(raw) < 8:
+            return {"ok": False, "reason": "向量表只读到 %d 字节（需 8）" % len(raw)}
+        sp = int.from_bytes(raw[0:4], "little")
+        rh = int.from_bytes(raw[4:8], "little")
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "读向量表异常：%s" % e}
+    # 显示用地址统一补零成 0x%08X（hex() 会给出 '0x8000000'，读起来容易数错位）
+    out = {"ok": True, "image_base": "0x%08X" % base,
+           "initial_sp": "0x%08X" % sp, "reset_handler": "0x%08X" % rh,
+           "initial_sp_int": sp, "reset_handler_int": rh}
+    if (sp & 0x3) or not _ram_region(sp):
+        out["ok"] = False
+        out["reason"] = ("向量表 word0=%s 不像栈顶（需 4 字节对齐且落在 SRAM "
+                         "0x20000000~0x3FFFFFFF），向量表位置可能不对" % sp)
+        return out
+    if not (rh & 1):
+        out["ok"] = False
+        out["reason"] = ("向量表 word1=%s 的 bit0 不是 1（Cortex-M 复位向量应为 "
+                         "Thumb 地址）" % rh)
+        return out
+    try:
+        l2 = loc if loc is not None else _get_locator()
+        inside = bool(l2.is_code_address(rh)) if l2 is not None else None
+    except Exception:  # noqa: BLE001
+        inside = None
+    out["reset_handler_in_image"] = inside
+    if inside is False:
+        out["ok"] = False
+        out["reason"] = "向量表 word1=%s 不在本 .axf 的可执行段内" % hex(rh)
+    return out
+
+
+def _reset_loop_judge(stats_item, sp=None, anchor=None, hit_addr=None):
+    """三态判定「这次反复命中是不是复位循环」。纯函数，离线可核对。
+
+    - `suspected=True` ：有复位证据（命中在 Reset_Handler / SP==initial SP / CYCCNT 回退）
+    - `suspected=False`：窗口内没达到「短时间反复命中」的阈值（<3 次）
+    - `suspected=None` ：反复命中了，但**主机侧分不清复位循环与正常热循环**——
+      中间这一档必须存在：硬算成 True 会制造假警报（正常热循环被说成复位），
+      算成 False 又会把真复位循环当成「正常命中」（用户正是这样多绕了一圈）。
+    """
+    hits = stats_item.get("hits") if isinstance(stats_item, dict) else None
+    if not hits or hits < 3:
+        return {"suspected": False, "hits": int(hits or 0),
+                "note": ("窗口内同一断点命中 %s 次（阈值 3），不像复位循环。"
+                         % (hits if hits is not None else "?"))}
+    ev, unchecked = [], []
+    if isinstance(hit_addr, int) and isinstance(anchor, dict) and anchor.get("ok"):
+        rh = anchor.get("reset_handler_int")
+        if rh is not None and (int(hit_addr) & 0xFFFFFFFE) == (int(rh) & 0xFFFFFFFE):
+            ev.append("命中的就是向量表里的 Reset_Handler(%s)" % anchor.get("reset_handler"))
+        isp = anchor.get("initial_sp_int")
+        if isp is not None and isinstance(sp, int) and (int(sp) & 0xFFFFFFFF) == (int(isp) & 0xFFFFFFFF):
+            ev.append("SP 等于向量表里的 initial SP(%s)：栈被重新装载过"
+                      % anchor.get("initial_sp"))
+    else:
+        unchecked.append("向量表锚点取不到（%s）"
+                         % ((anchor or {}).get("reason") or "未提供"))
+    if isinstance(stats_item, dict):
+        if stats_item.get("cyccnt_backwards") is True:
+            ev.append("CYCCNT 回退：DWT 周期计数器除溢出外只增，回退说明内核复位过")
+        elif stats_item.get("cyccnt_backwards") is None:
+            unchecked.append("CYCCNT 没读到或样本不足，这条证据缺位")
+    out = {"hits": hits,
+           "span_s": (stats_item or {}).get("span_s") if isinstance(stats_item, dict) else None,
+           "evidence": ev, "not_checked": unchecked,
+           "note_vs_repeat_warning": ("这与 read_cpu_registers 的 repeat_warning 是两回事："
+                                     "repeat_warning 说的是「同一 PC 连续出现，疑似 halt 残留值、"
+                                     "别当反复复位看」；本字段说的是「短时间内反复命中同一断点」，"
+                                     "两者的前提与结论都不同，不要互相顶替。")}
+    if ev:
+        out["suspected"] = True
+        out["note"] = ("同一断点 %d 次短时间命中，且有复位证据：%s。**别把这次命中当成"
+                       "正常执行到该处**——先核对启动时序。"
+                       % (hits, "；".join(ev)))
+        out["next_actions"] = [
+            "看 hit_address 是不是启动路径上的点（Reset_Handler / SystemInit / main 之前）",
+            "用 read_variable 看初始化计数（如 stat_flow_init）是否被多次复位反复累加",
+            "用 serial_monitor_start 看串口是否在反复输出上电信息",
+            "怀疑看门狗复位：read_registers / read_mem 看 RCC 复位标志（RCC_RSR）是否被置位",
+        ]
+    else:
+        out["suspected"] = None
+        out["note"] = ("同一断点 %d 次短时间命中，但**主机侧分不清复位循环与正常热循环**"
+                       "（没有复位证据：%s）。若这个断点本不该反复命中，请人工核对启动时序；"
+                       "想要硬证据，可另设一个 Reset_Handler 断点，看它是否也反复命中。"
+                       % (hits, "；".join(unchecked) or "轨迹里没有可用的锚点"))
+    return out
 
 
 # 常见参数名 -> 示例值（生成"调用示例"用；未收录的按 JSON 类型给占位值）
@@ -2962,6 +3356,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             # 批次29：符号文件路径/时间戳 + 陈旧判定；串行化与并发竞争视图
             out.update(_symbol_state(debugging=out.get('debugging')))
             out['serialization'] = _serialization_fields()
+            # 批次67：这条 UVSOCK 链路到底服务的是哪个 Keil 实例/哪个工程
+            try:
+                bstate = _binding_state()
+                out["uvsock_binding"] = bstate
+                if bstate.get("mismatch"):
+                    out["binding_warning"] = bstate.get("warning")
+            except Exception as e:  # noqa: BLE001
+                out["uvsock_binding"] = {"error": str(e)}
             if out.get('symbol_stale'):
                 out['symbol_stale_warning'] = out.get('symbol_stale_note')
             if (out.get('serialization') or {}).get('warning'):
@@ -3982,7 +4384,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                      "设置值（.uvoptx 的 break_if_rcount），**不随命中递增**，不能当命中次数用。"
                      "real 才是板上实际生效的断点：.uvoptx 持久化断点、"
                      "数据观察点都会出现在这里。注意清除数据观察点必须按 Keil 编号（按地址会报 error 72）。"
-                     "另附 uvoptx 字段暴露工程里 BK 清不掉、下次进调试会自动恢复的持久化断点。"),
+                     "另附 uvoptx 字段暴露工程里 BK 清不掉、下次进调试会自动恢复的持久化断点。"
+                     "③ hardware 字段：直接读 Cortex-M 的硬件断点单元 FPB（FP_CTRL@0xE0002000 / "
+                     "FP_COMP0@0xE0002008），给出 check（clean/residue/unavailable）、启用的比较器与地址。"
+                     "real 是 Keil 的**逻辑**表、hardware 是**硬件**里实际写着的项——两者是两回事："
+                     "BK * 之后 real 可能为空、FPB 里却还留着，J-Link 会一直报 "
+                     "\"two breakpoints at the same address\"。hardware.orphans 给出「硬件里有、real 里"
+                     "查不到」的地址（这类就是清不掉的残留）；读不到 FPB 时为 unavailable，"
+                     "**不当作「干净」**（没测 ≠ 没有）。"),
     )
     async def list_breakpoints() -> str:
         try:
@@ -4010,6 +4419,26 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 out["note"] += (f" 另：工程 .uvoptx 有 {uv['count']} 个持久化断点"
                                 "（BK 清不掉、下次进调试自动恢复），见 uvoptx 字段，"
                                 "可用 clear_uvoptx_breakpoints 清除。")
+            # 硬件断点寄存器（FPB）现状：Keil 的逻辑表与调试器写进硬件的项是两回事，
+            # BK * 之后逻辑表可能是空的、硬件里却还留着，J-Link 会一直报
+            # "two breakpoints at the same address"。
+            try:
+                hw = _fpb_state(_get_client())
+                if hw.get("check") == "residue":
+                    hw["orphans"] = _fpb_orphans(hw, out.get("real"))
+                    if hw["orphans"] is None:
+                        hw["orphans_note"] = ("无法对照：没读到 Keil 真实断点表，"
+                                             "因此分不清这些项是残留还是正常在用的断点")
+                out["hardware"] = hw
+                if hw.get("check") == "residue":
+                    out["note"] += (" 硬件断点寄存器(FPB)里还有 %d 个启用的比较器 %s；"
+                                    "若 real 里查不到它们，就是 BK * 清不掉的残留。"
+                                    % (hw.get("enabled_count", 0),
+                                       ",".join(hw.get("enabled_addrs") or [])))
+                elif hw.get("check") == "unavailable":
+                    out["note"] += " 硬件断点寄存器(FPB)读不到，无法判定是否有残留（没测 ≠ 没有）。"
+            except Exception as e:  # noqa: BLE001
+                out["hardware"] = {"check": "unavailable", "reason": str(e)}
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -4024,6 +4453,10 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "清除不涉及改写 Flash，无需重新烧录；仅当断点数量超出硬件槽位而落到 Flash 软件断点、"
             "或使用模拟器(Simulator)时才需重新烧录恢复原指令。"
             "清理 .uvoptx 需 Keil 已关闭（否则被内存断点回写覆盖）。"
+            "hard=True 走 BK * 之后会**复核硬件断点单元(FPB)**（fpb 字段）：Keil 的逻辑表干净了、"
+            "硬件里还留着启用项时，本工具不会报 ok——那正是 J-Link 一直报 "
+            "\"two breakpoints at the same address\" 的成因（error_code=breakpoint-residue，"
+            "含 enabled_addrs 与 next_actions）。FPB 读不到时如实标 unavailable，不当成清干净。"
         ),
     )
     async def clear_all_breakpoints(include_uvoptx: bool = False,
@@ -4058,6 +4491,34 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     out["real_after"] = {"count": real.get("count", 0)}
                 except Exception as e:  # noqa: BLE001
                     out["real_after"] = {"error": str(e)}
+                # BK * 只清 Keil 的逻辑表；硬件断点单元（FPB）里的启用项要单独核。
+                # 有残留就**不能**报 ok——否则「已清干净」是假象，J-Link 会一直
+                # 报 "two breakpoints at the same address" 污染后续所有断点状态。
+                try:
+                    hw = _fpb_state(_get_client())
+                    hw["orphans"] = _fpb_orphans(hw, real)
+                    out["fpb"] = hw
+                    if hw.get("check") == "residue":
+                        out["ok"] = False
+                        out["error"] = ("BK * 之后硬件断点寄存器(FPB)里仍有 %d 个启用的"
+                                        "比较器：%s"
+                                        % (hw.get("enabled_count", 0),
+                                           ",".join(hw.get("enabled_addrs") or [])))
+                        out["error_code"] = "breakpoint-residue"
+                        out.setdefault("warnings", [])
+                        out["warnings"].append(
+                            "Keil 的逻辑断点表是空的，但硬件里还留着——这两者是两回事："
+                            "J-Link 会持续报 \"two breakpoints at the same address\"。")
+                        out["note"] += (" 硬件断点单元仍有启用项，未真正清干净；"
+                                        "见 fpb 字段。")
+                    elif hw.get("check") == "clean":
+                        out["note"] += " 已复核硬件断点寄存器(FPB)：没有启用的比较器。"
+                    else:
+                        out["note"] += (" 硬件断点寄存器(FPB)读不到（%s），"
+                                        "无法确认是否清干净（没测 ≠ 没有）。"
+                                        % (hw.get("reason") or "原因未知"))
+                except Exception as e:  # noqa: BLE001
+                    out["fpb"] = {"check": "unavailable", "reason": str(e)}
                 if not hard_result or not hard_result.get("ok"):
                     out["ok"] = False
                     out["error"] = ("BK * 未确认成功：%s" % (hard_result or {}))
@@ -5651,6 +6112,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     server=server)
             except Exception as e:  # noqa: BLE001
                 out["firmware_symbol"] = {"verdict": "unknown", "error": str(e)}
+            # 4b) 链路归属：这条 UVSOCK 由哪个 Keil 实例服务、它开着哪个工程
+            try:
+                out["uvsock_binding"] = _binding_state()
+            except Exception as e:  # noqa: BLE001
+                out["uvsock_binding"] = {"error": str(e)}
             # 5) D-Cache
             if client is not None:
                 try:
@@ -5671,6 +6137,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 problems.append({"what": "symbol-as-firmware",
                                  "detail": fs.get("warning")})
                 actions.extend(fs.get("next_actions") or [])
+            bs = out.get("uvsock_binding") or {}
+            if bs.get("mismatch"):
+                problems.append({"what": "link-binding", "detail": bs.get("warning"),
+                                 "error_code": "binding-mismatch"})
+                actions.extend(bs.get("next_actions") or [])
             if not chip.get("series"):
                 problems.append({"what": "chip-identity", "detail": chip.get("reason"),
                                  "error_code": "chip-unknown"})
@@ -5899,6 +6370,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "以及在无其他候选时取 Keil 真实断点表（list_breakpoints.real）中的执行断点；"
             "若本该命中却一直不停，先用 list_breakpoints / list_uvoptx_breakpoints 确认断点存在且启用"
             "（App 侧重定位后运行时地址与符号地址不同，应传实际运行地址）。需已进入调试。"
+            "另附 reset_loop 字段（批次67）：同一断点在 3 秒内命中 ≥3 次时，判定「这是不是复位循环"
+            "在重跑启动」——suspected=true 表示有复位证据（命中在 Reset_Handler / SP 等于向量表里的 "
+            "initial SP / CYCCNT 回退），false 表示没到阈值，**null 表示反复命中了但主机侧分不清"
+            "复位循环与正常热循环**（这时要人工核对启动时序，别硬猜）。判据来自镜像基址处的向量表"
+            "（anchor 字段给出 image_base / initial_sp / reset_handler 及合法性校验）。"
+            "**与 repeat_warning 不是一回事**：repeat_warning 说的是「同一 PC 连续出现，疑似 halt "
+            "残留值，别当反复复位看」，两者前提与结论都不同，不可互相顶替。"
         ),
     )
     async def wait_breakpoint(symbol: str = "", address: str | int = "",
@@ -5975,6 +6453,29 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     for k in ("file", "line", "source", "address", "display_path", "callstack"):
                         if k in info:
                             out[k] = info[k]
+            if r.get("hit") and r.get("hit_address"):
+                # 同一断点短时间内反复命中 → 可能是复位循环在重跑启动（批次67 P2）。
+                # 只在**反复命中**时才去读向量表，免得每次命中都多打一趟 UVSOCK。
+                try:
+                    ha = int(str(r["hit_address"]), 16)
+                    st = client.rapid_hit_stats(ha, window_s=3.0)
+                    item = (st.get("checked") or {}).get(hex(ha & 0xFFFFFFFE))
+                    _rg = r.get("registers")
+                    sp = _rg.get("sp") if isinstance(_rg, dict) else None
+                    anchor = None
+                    if item and (item.get("hits") or 0) >= 3:
+                        anchor = _reset_anchor(client)
+                    j = _reset_loop_judge(item, sp=sp, anchor=anchor, hit_addr=ha)
+                    if anchor is not None:
+                        j["anchor"] = anchor
+                    out["reset_loop"] = j
+                    if j.get("suspected") is True:
+                        out.setdefault("warnings", [])
+                        out["warnings"].append(
+                            "疑似复位循环：%s" % (j.get("note") or "")[:160])
+                except Exception as e:  # noqa: BLE001
+                    out["reset_loop"] = {"suspected": None, "error": str(e),
+                                         "note": "复位循环判定不可用，本次未下结论"}
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -5987,13 +6488,28 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "「这个断点到底命中过几次」「App 有没有走到过某函数」。"
             "注意：只统计经 wait_breakpoint 观察到的命中，服务重启即清零；"
             "在此之前发生的历史命中无法回溯——需要历史请用数据断点(watch)或自行埋点。"
+            "另附 rapid 字段（批次67）：最近 3 秒内的命中分布，含每个地址的命中次数、跨度与"
+            "CYCCNT 是否回退；rapid_addrs 是「短时间内 ≥3 次」的地址——反复命中同一断点"
+            "可能是复位循环在重跑启动，用 wait_breakpoint 的 reset_loop 字段判定。"
         ),
     )
     async def breakpoint_stats() -> str:
         try:
-            hits = _get_client().breakpoint_hits()
-            return _js({"ok": True, "count": len(hits), "hits": hits,
-                        "note": "计数自本进程启动起累计，仅含 wait_breakpoint 观察到的命中"})
+            client = _get_client()
+            hits = client.breakpoint_hits()
+            out = {"ok": True, "count": len(hits), "hits": hits,
+                   "note": "计数自本进程启动起累计，仅含 wait_breakpoint 观察到的命中"}
+            try:
+                rapid = client.rapid_hit_stats(window_s=3.0)
+                out["rapid"] = rapid
+                if rapid.get("rapid_addrs"):
+                    out["note"] += (" 注意：%s 在最近 %.1fs 内命中 ≥3 次（rapid 字段），"
+                                    "反复命中同一断点可能是复位循环，"
+                                    "用 wait_breakpoint 的 reset_loop 字段判定。"
+                                    % (",".join(rapid["rapid_addrs"]), rapid.get("window_s", 3.0)))
+            except Exception as e:  # noqa: BLE001
+                out["rapid"] = {"ok": False, "error": str(e)}
+            return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 
@@ -9261,6 +9777,12 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             ctx["project"] = {"available": False,
                               "note": "本服务未配置默认工程（启动参数 --default-project 可指定）"}
         ctx["uv4"] = _builder_cfg.get("uv4")
+        # 链路归属（哪个 Keil 实例在服务这条 UVSOCK、它开着哪个工程）：跨会话接续时，
+        # 「上次调试是在哪个工程上做的」比「符号文件叫什么」更接近事实。
+        try:
+            ctx["uvsock_binding"] = _binding_state()
+        except Exception as e:  # noqa: BLE001
+            ctx["uvsock_binding"] = {"error": str(e)}
         loc = (_symbol_cfg or {}).get("locator")
         axf = (_symbol_cfg or {}).get("axf")
         if axf or (_symbol_cfg or {}).get("source_type"):

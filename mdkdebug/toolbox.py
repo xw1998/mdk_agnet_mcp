@@ -51,6 +51,11 @@ TOOLSETS = {
         # 环境一致性体检（批次49）：核对外设型号/SVD/符号固件/D-Cache 是否与板上真实一致。
         # 放在 core 是因为「默认面上就能看到」是它的价值——跨仓库调试踩坑时才想得起用。
         "env_check",
+        # 符号工程「看候选 + 切过去」（批次67）：原来这两个只在 symbol 组（默认收起），
+        # 于是出现「检测器在默认面上、修复手段不在」——真机反馈里 4823 被旧 Keil 实例占着、
+        # 符号是别的工程的 mdk_test.axf，调用方**看到了** mismatch 警告却切不了符号。
+        # 修法就是把这个钥匙放到默认面上（代价：默认面 42 → 44）。
+        "list_symbol_projects", "set_symbol_file",
         # 可视化人机交互（批次59）：把采集结果渲染成人能看懂的单文件网页。
         # 放 core 的理由与 env_check 同：**默认面上就能看到是它的价值**——
         # 它的存在意义就是「别再手写 HTML」，藏起来就没机会被想到。
@@ -63,7 +68,9 @@ TOOLSETS = {
         "dcache_maintain",
     },
     "symbol": {
-        "set_symbol_file", "list_symbol_projects", "find_symbol", "address_for_line",
+        # 批次67：set_symbol_file / list_symbol_projects 已上移到 core（默认面上就能切符号），
+        # 一个工具只归一个组，此处不再重复登记（否则 D1 重复归属、分组表总数会对不上）。
+        "find_symbol", "address_for_line",
         "get_current_location", "run_to_line", "disassemble", "parse_map",
         # 重定位偏移校验/推导（批次48）：符号地址与实际运行地址之间的 delta 是否还对得上
         "reloc_check",

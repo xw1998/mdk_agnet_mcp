@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""批次61 mock 测试：符号修复手段不在默认工具面上时，报错必须把「怎么装」一起说清楚。
+"""批次61 mock 测试：报错给的「切符号」动作必须按**真实工具面**决定带不带装卸步骤。
+
+批次67 追加（这条教训的最终落点）：`set_symbol_file` / `list_symbol_projects` 已上移到
+`core`，**默认面上就能切符号**，所以默认动作清单不再有装卸那一步；装卸分支保留，改由
+「启动时把 core 收起来的裁剪面」（如 `MDKDEBUG_TOOLSETS=mem`）覆盖——坑的形状没变，
+只是默认配置不再踩它。
 
 问题来源（用户转述某个 AI 的三层分析，我按代码逐条核对后确认的那一层）：
   env_check 在**默认可见的 core 组**，职责就含「符号与板上固件是否同源」的核对；
@@ -50,16 +55,20 @@ def call(srv, name, args):
 
 
 def main():
-    print("批次61：符号修复手段不在默认工具面上 → 指引必须带上装卸步骤")
+    print("批次61：切符号指引必须按真实账面带（或不带）装卸步骤")
 
     # ============ A. tool_hidden 三态 ============
     print("A. toolbox.tool_hidden：已收起 / 在面上 / 拿不到账本（三态不混用）")
     srv_core = SV.create_server(port=PORT, toolsets="core")
     srv_all = SV.create_server(port=PORT + 1, toolsets="all")
+    srv_mem = SV.create_server(port=PORT + 2, toolsets="mem")   # core 被收起的裁剪面
 
-    check("A1 默认面（core）：set_symbol_file 已被收起 → True",
-          TB.tool_hidden("set_symbol_file", srv_core) is True,
+    check("A1 默认面（core）：set_symbol_file 已在面上 → False（批次67 起它属于 core）",
+          TB.tool_hidden("set_symbol_file", srv_core) is False,
           TB.tool_hidden("set_symbol_file", srv_core))
+    check("A1b 裁剪面（只装 mem / core 被收起）：set_symbol_file 已被收起 → True",
+          TB.tool_hidden("set_symbol_file", srv_mem) is True,
+          TB.tool_hidden("set_symbol_file", srv_mem))
     check("A2 默认面（core）：env_check 在面上 → False（检测器默认可见＝问题所在）",
           TB.tool_hidden("env_check", srv_core) is False,
           TB.tool_hidden("env_check", srv_core))
@@ -83,9 +92,11 @@ def main():
     print("B. _symbol_switch_actions：按真实账面给步骤，不猜")
     a_core = SV._symbol_switch_actions(srv_core)
     a_all = SV._symbol_switch_actions(srv_all)
-    check("B1 默认面：第一步就是装卸（含 toolsets=\"symbol\" 与「默认只暴露 core 组」）",
-          'toolsets="symbol"' in a_core[0] and "默认只暴露 core 组" in a_core[0],
-          a_core)
+    a_mem = SV._symbol_switch_actions(srv_mem)
+    check("B1 默认面：不需要装卸，直接给切符号（手段已在 core 面上）",
+          a_core == ["set_symbol_file 切到与刚烧录固件同源的 .axf"], a_core)
+    check("B1b 裁剪面（core 被收起）：第一步就是装卸（含 toolsets=\"symbol\"）",
+          'toolsets="symbol"' in a_mem[0] and len(a_mem) == 2, a_mem)
     check("B2 末步仍是「切符号」本身（装卸只是前置，不替换动作）",
           a_core[-1] == "set_symbol_file 切到与刚烧录固件同源的 .axf", a_core)
     check("B3 全开面：不再啰嗦装卸，只给切符号这一步",
@@ -116,9 +127,10 @@ def main():
         SV._symbol_cfg.update({"locator": "stub", "axf": r"D:\fwB\b.axf",
                                "source_type": "axf"})
         sc = SV._symbol_source_check(deep="false", server=srv_core)
-        check("C1 different 分支：next_actions 第一条就是「装 symbol 组」",
+        check("C1 different 分支：第一条就是切符号（默认面上手段已可用，不再前置装卸）",
               sc.get("verdict") == "different"
-              and 'toolsets="symbol"' in sc["next_actions"][0], sc.get("next_actions"))
+              and sc["next_actions"][0] == "set_symbol_file 切到与刚烧录固件同源的 .axf",
+              sc.get("next_actions"))
         check("C2 装完（all 面）再问同一问题：指引自动收敛，不再出现装卸步骤",
               SV._symbol_source_check(deep="false", server=srv_all)["next_actions"][0]
               == "set_symbol_file 切到与刚烧录固件同源的 .axf",
@@ -129,8 +141,8 @@ def main():
         sc = SV._symbol_source_check(deep="false", server=srv_core)
         check("C3 no-symbols 分支：补上了 next_actions（旧版只有 warning，没给动作）",
               sc.get("verdict") == "no-symbols"
-              and isinstance(sc.get("next_actions"), list)
-              and 'toolsets="symbol"' in sc["next_actions"][0], sc)
+              and isinstance(sc.get("next_actions"), list) and sc["next_actions"]
+              and sc["next_actions"][0].startswith("set_symbol_file 切到"), sc)
 
         # -- C4：内容指纹判「不是板上那份」（content-mismatch） --
         SV._symbol_cfg.update({"locator": "stub", "axf": r"D:\fwC\c.axf",
@@ -139,22 +151,30 @@ def main():
         SV._chipid.firmware_match = lambda client, ref, delta: {
             "verdict": "firmware-mismatch", "note": "指纹一条都没中"}
         sc = SV._symbol_source_check(client=object(), deep="auto", server=srv_core)
-        check("C4 content-mismatch 分支：同样带上装卸步骤（假符号场景最常见）",
+        check("C4 content-mismatch 分支：第一条同样是切符号（假符号场景最常见）",
               sc.get("verdict") == "content-mismatch"
-              and 'toolsets="symbol"' in sc["next_actions"][0], sc.get("next_actions"))
+              and sc["next_actions"][0] == "set_symbol_file 切到与刚烧录固件同源的 .axf",
+              sc.get("next_actions"))
         check("C5 content-mismatch 的 next_actions 保留原有的后两条动作（没被覆盖掉）",
               any("flash_debug" in a for a in sc["next_actions"])
               and any("env_check" in a for a in sc["next_actions"]), sc["next_actions"])
 
         # -- D：端到端「装了就闭嘴」：真的调 toolset 装 symbol 组 --
-        r = call(srv_core, "toolset", {"action": "load", "toolsets": "symbol"})
-        check("D1 toolset(action=load, toolsets=symbol) 真把工具装上了",
+        r = call(srv_mem, "toolset", {"action": "load", "toolsets": "core"})
+        check("D1 裁剪面上 load core 真把 set_symbol_file 装上了（装卸分支端到端可用）",
               r.get("ok") is True and "set_symbol_file" in (r.get("loaded") or []),
               r)
-        check("D2 装完后 tool_hidden 立刻变 False（状态跟随真实工具面）",
+        r2 = call(srv_mem, "toolset", {"action": "load", "toolsets": "symbol"})
+        check("D1b symbol 组仍可单独装载（组内还有 7 个，set_symbol_file 已不在此组）",
+              r2.get("ok") is True and "find_symbol" in (r2.get("loaded") or [])
+              and "set_symbol_file" not in (r2.get("loaded") or []), r2)
+        check("D1c 默认面上 set_symbol_file 本来就在（不靠装 symbol 组）",
               TB.tool_hidden("set_symbol_file", srv_core) is False,
               TB.tool_hidden("set_symbol_file", srv_core))
-        sc = SV._symbol_source_check(client=object(), deep="auto", server=srv_core)
+        check("D2 裁剪面装回 core 后 tool_hidden 立刻变 False（状态跟随真实工具面）",
+              TB.tool_hidden("set_symbol_file", srv_mem) is False,
+              TB.tool_hidden("set_symbol_file", srv_mem))
+        sc = SV._symbol_source_check(client=object(), deep="auto", server=srv_mem)
         check("D3 装完后再报同一问题：指引不再说「会报未知工具」，只给切符号",
               sc["next_actions"][0]
               == "set_symbol_file 切到与刚烧录固件同源的 .axf", sc["next_actions"])

@@ -365,9 +365,44 @@ F427 实测：4 个槽位拿到名字，3 个跨镜像槽位如实留空（它�
 | `43c07c0` | trace(swd)：运行态读 SRAM 伪值拦截 + 停机一致搬运 |
 | `aad0a94` | 调度事件带上任务名（跨镜像入口留空不编名） |
 | `b080398` | 多份镜像联合取名（跨镜像名字要过内容核对）+ viz 计数口径修正 |
+| `1ae523b` | 批次67：链路↔符号对照（`uvsock_binding` / `binding-mismatch` / 两个符号工具上移 core）+ `BK *` 后 FPB 校验（`hardware` / `fpb` / `breakpoint-residue`）+ 复位循环三态（`reset_loop` / `rapid`） |
 | `279ff41` | 批次66：节拍预算 `trace_swd_next`（`A3`）+ 中断名反查（`C3`）+ 环尺寸交叉校验（`C1`）；含真机撞到的「背压被说成没在跑」「建议节拍比窗口还大」两处文案修正 |
 | `562acf1` | 时间轴冻结要报出来 + `events` 口径开关（`only_new`） |
 | `44383c9` | 台账 #4/#5 真缺陷修复（`max_session_events` 接出、链路选择层主动建链）+ 两处文案纠偏 |
 
 相关文档：`docs/swd-trace-improvements.md`（改进清单与实测数据）、
 `docs/PITFALLS.md` 第二十六 / 二十七 / 二十八条。
+
+---
+
+## 八、批次67：另一个 AI 的 H7 + J-Link 反馈（2026-09-20）
+
+来源：用户转述另一 AI 在 H7 + J-Link + Modbus 现场的复盘。它列的「最有价值的三件事」是：
+`set_symbol_file` 暴露出来、`BK *` 后校验 J-Link 硬件断点寄存器、检测「同一断点短时间反复命中」
+并提示可能是复位循环。三条的共同点是——**MCP 给的信号本身诚实**（`firmware-mismatch`、
+`degenerate` 都触发了），但「错误符号绑定 + 断点残留 + 缓存脏读」叠在一起会掩盖真相。
+
+| # | 现象（对方现场） | 机理 | 处置 | 状态 |
+|---|---|---|---|---|
+| 1 | 4823 被一个加载 `mdk_test` 的旧 Keil 实例占着；重开正确工程后 `get_status` 仍报 `symbol_file: mdk_test.axf` + `firmware-mismatch`，符号解析全落在错误镜像上（假符号 `usart.c:143`、裸地址下断点 error 57） | 链路与符号**可能来自不同实例**，而工具面没有「这条链路是谁的」这一事实；`set_symbol_file` 又在默认收起的 `symbol` 组——看到了问题也切不了符号 | ① `get_status.uvsock_binding`：4823 的监听者 PID / 窗口标题 / 工程路径（`GetExtendedTcpTable`，取不到留空并说明「无法对照」，不拿符号文件名顶替）；② `_binding_state` 把「链路工程 ↔ 符号工程」不一致报成 `binding-mismatch`（带例外条款：调 App 时不一致本就正常）；③ `set_symbol_file` / `list_symbol_projects` 上移到 `core`（默认面 42→44）——教训页「修复手段不在默认工具面上」的最终落点 | 已修 · 真机复核通过（4823 → PID 22508 → `SVCRTOS_TEST.uvprojx`） |
+| 2 | `BK *` 清不干净，J-Link 反复报 "two breakpoints at the same address"，后续断点状态全被污染 | Keil 的 `BK *` 只清**逻辑**表，清不掉调试器留在 FPB 里的硬件比较器 | `list_breakpoints.hardware` / `clear_all_breakpoints(hard=True).fpb`：读 `FP_CTRL` + `FP_COMPn`；有启用的比较器 → `check=residue` + `error_code=breakpoint-residue` + **`ok=false`**（否则「已清干净」是假象），并给与 Keil 逻辑表的差集 `orphans`；**读不到一律 `unavailable`**（没测 ≠ 没有） | 已修 · 真机复核通过（`0x00000260`、0 启用 → `clean`） |
+| 3 | `stat_flow_init` 断点「再次命中」其实是复位循环在重跑启动，被当成正常命中，多绕一圈 | 「短时间反复命中」没有专门的信号，而现成的 `repeat_warning` 语义**恰好相反**（疑似 halt 残留值、别当反复复位看） | `wait_breakpoint.reset_loop` + `breakpoint_stats.rapid`：窗口 3 s 内命中 ≥3 次才判定；有复位证据（命中 Reset_Handler / SP == 向量表初始 SP / CYCCNT 回退）→ `suspected=true` 并给下一步；只是反复命中 → **`null`**（主机侧分不清复位循环与正常热循环）并附人工核对手段 | 已修 · 真机只复核到「未命中 / 未判定」路径（见下） |
+
+**真机复核（2026-09-20，F427 + DAPLink，Keil PID 22508 = `SVCRTOS_TEST`）**：
+
+- `uvsock_binding`：`state=bound`、`owner_pid=22508`、`owner_project=…\SVCRTOS_TEST.uvprojx`；
+  本会话未加载符号时如实报 `symbol_file=null` + note「无法与链路工程对照」，**不拿链路工程名顶替**。
+- FPB：`FP_CTRL=0x00000260`（连读两次一致）、全部比较器条目为 0 → `check=clean`、`enabled_addrs=[]`；
+  `clear_all_breakpoints(hard=True)` 复核仍 `clean` 且 `ok=true`；**退出调试后 FPB 不可读 → `unavailable`**（不是 clean）。
+- 槽位口径：真机 `NUM_CODE=6 / NUM_LIT=2`，按「字段 = 个数 - 1」得 7 代码 / 3 字面量，而 F4 的 FPB
+  通常记作 6 代码 + 2 字面量——两个口径差 1。故槽位数只当**推导值**给，新增 `counts_note` 声明口径与
+  不确定性（不把推导值说成权威结论；判残留只看 `enabled` 位）。
+- `rapid`：`hist_len=0` / `rapid_addrs=[]` / `checked={}`，如实报「窗口内无命中」。
+- **未复核**：`reset_loop.suspected=true` 那条路径——没在真机上制造复位循环，也没抢到一次真命中
+  （`wait_breakpoint` 5 s 超时）。此路目前只由 mock（`tests/test_batch67.py` F 组）覆盖，
+  **别把它当「真机验证通过」**。
+- 真机小观察（只记录，未改动）：一次 `wait_breakpoint` 超时后紧跟的 `exit_debug` 返回 `ok=false`
+  （`error` 为空），补一次 `stop` 后 `exit_debug` 成功——怀疑与「目标仍在运行态时退调试」有关，尚未定位。
+
+回归用例：`tests/test_batch67.py`（89 项）；`tests/test_batch61.py` 改写为「默认面已可见 → 不再前置装卸，
+装卸分支由裁剪面（`MDKDEBUG_TOOLSETS=mem`）覆盖，坑的形状没变」。

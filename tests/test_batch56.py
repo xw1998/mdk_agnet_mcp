@@ -10,7 +10,7 @@
   * **`nano` 档位**：19 个工具（15 个最短入口 + 6 个元工具），自动用 `min` 描述档。
   * **两个装卸元工具**：`tools_groups` / `tools_load`（参数比 `toolset` 更少）。
 
-  A 工具面：注册总数 190 / 常驻元工具 6 / 默认暴露 42 / nano 19
+  A 工具面：注册总数 190 / 常驻元工具 6 / 默认暴露 44 / nano 19
   B 组名解析：nano 是已知档位（不再被误报未知组），真未知组照旧报出
   C 描述档位：full 是默认、nano 走 min、认不出的写法按默认并告警
   D 瘦身不变量：结构化尾块整段保留、尾部关键告警保留、归档可逐字取回、full 档不动
@@ -111,14 +111,14 @@ def section_a():
     try:
         d = fresh(toolsets=None)
         dn = names(d)
-        check("A6 默认暴露 42 个（core 36 + 常驻 6）", len(dn) == 42, len(dn))
+        check("A6 默认暴露 44 个（core 38 + 常驻 6）", len(dn) == 44, len(dn))
         check("A7 默认面上有 6 个元工具",
               set(TB.ALWAYS) <= set(dn), sorted(set(TB.ALWAYS) - set(dn)))
         check("A8 默认不含 trace 组工具（按需装载）",
               "trace_swd_read" not in dn and "ocd_start" not in dn)
         st = call_sync(d, "toolset", {"action": "status"})
-        check("A9 status 自述一致（暴露 42 / 收起 148 / 注册 190）",
-              st.get("exposed") == 42 and st.get("hidden") == 148
+        check("A9 status 自述一致（暴露 44 / 收起 146 / 注册 190）",
+              st.get("exposed") == 44 and st.get("hidden") == 146
               and st.get("total_registered") == 190, st)
     finally:
         if saved is not None:
@@ -397,8 +397,8 @@ def section_i():
           "nano" in readme and "MDKDEBUG_DESC" in readme, "")
     check("I2 README 写了两个新元工具",
           "tools_groups" in readme and "tools_load" in readme, "")
-    check("I3 README 工具数同步为 190（190 个 + 收起 148）",
-          "190 个" in readme and "148 个" in readme and "184 个" not in readme, "")
+    check("I3 README 工具数同步为 190（190 个 + 收起 146）",
+          "190 个" in readme and "146 个" in readme and "184 个" not in readme, "")
     check("I4 SKILL 写了 nano 档与描述分层",
           "nano" in skill and "MDKDEBUG_DESC" in skill and "mdk_guide" in skill, "")
     check("I5 SKILL 工具数同步为 190", "190 个工具" in skill and "184 个工具" not in skill, "")

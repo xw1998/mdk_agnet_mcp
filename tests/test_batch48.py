@@ -201,8 +201,8 @@ def section_a():
     print("A. 工具面与注解")
     total = sum(len(v) for v in TB.TOOLSETS.values()) + len(TB.ALWAYS)
     check("A1 注册工具总数 190（分组表 180 + 常驻 6）", total == 190, total)
-    check("A2 reloc_check 归在 symbol 组（组规模 8->9）",
-          "reloc_check" in (TB.TOOLSETS.get("symbol") or []) and gsize("symbol") == 9,
+    check("A2 reloc_check 归在 symbol 组（批次67 两个符号修复工具上移 core 后 9->7）",
+          "reloc_check" in (TB.TOOLSETS.get("symbol") or []) and gsize("symbol") == 7,
           gsize("symbol"))
     an = A.annotations_for("reloc_check")
     check("A3 reloc_check 标只读（只读 ELF + 读内存，不改状态）",

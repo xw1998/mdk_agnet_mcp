@@ -598,9 +598,9 @@ def section_f():
     check("F1 README 有 view_render（工具面/可读性入口）", "view_render" in readme, "")
     check("F2 SKILL 有 view_render 与 view_guide",
           "view_render" in skill and "view_guide" in skill, "")
-    check("F3 文档工具数同步为 190 / 收起 148",
-          "190 个" in readme and "148 个" in readme and
-          "190 个工具" in skill and "148 个" in skill, "")
+    check("F3 文档工具数同步为 190 / 收起 146",
+          "190 个" in readme and "146 个" in readme and
+          "190 个工具" in skill and "146 个" in skill, "")
 
 
 def main():

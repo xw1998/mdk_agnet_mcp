@@ -116,6 +116,9 @@ class UVClient:
         self.presence_extra = {}
         self._stop_pc_hist = []   # 最近几次停止点 PC，用于识别「同一地址反复出现」
         self._bp_hits = {}        # 断点命中计数 {addr: count}（本进程内累计）
+        # 批次67：命中**历史**（时刻, 地址, CYCCNT 或 None）。计数回答「命中过几次」，
+        # 历史回答「是不是短时间内反复命中同一处」——后者才是复位循环的征兆。
+        self._bp_hit_hist = []
         # 批次24：被观察地址的历史值（设点时 / 上一停止点读到的），作为数据观察点
         # 「本次运行窗口内是否被改写」的基线。真机实测：观察点打在频繁写入的变量上时，
         # run 后几微秒内变量就被写、目标随即被 Keil 停住，等待开始时的现场读取拿到的
@@ -1272,11 +1275,85 @@ class UVClient:
             r["pc_confidence"] = "high" if r.get("stable") else "low"
         return r
 
-    def note_breakpoint_hit(self, addr: int) -> int:
-        """记录一次断点命中，返回该地址在本进程内的累计命中次数。"""
+    #: DWT 周期计数器：复位后从 0 起，除溢出外**只会单调增**——它回退即内核复位过。
+    _DWT_CYCCNT = 0xE0001004
+
+    def _read_cyccnt(self):
+        """读 DWT_CYCCNT（0xE0001004）。读不到、或读到 0（未使能使能位）都返回 None。
+
+        注意 0 与「未使能」在本判据里等价处理：真的从 0 起算也没什么可判的，
+        返回 None 比返回一个会被当成「回退」的 0 更不容易造成假警报。
+        """
+        try:
+            r = self.read_mem(self._DWT_CYCCNT, 4)
+            if not r.get("ok"):
+                return None
+            v = int.from_bytes(bytes.fromhex(r["data_hex"]), "little")
+            return v or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def note_breakpoint_hit(self, addr: int, cyccnt=None) -> int:
+        """记录一次断点命中，返回该地址在本进程内的累计命中次数。
+
+        同时把 (时刻, 地址, CYCCNT) 压进命中历史（只留最近 64 条），
+        供 rapid_hit_stats 判断「同一断点短时间内反复命中」。
+        cyccnt 传 None 时会自己读一次；读不到就记 None，绝不编一个数。
+        """
         key = int(addr)
         self._bp_hits[key] = self._bp_hits.get(key, 0) + 1
+        try:
+            cc = int(cyccnt) if cyccnt is not None else self._read_cyccnt()
+        except Exception:  # noqa: BLE001
+            cc = None
+        hist = self._bp_hit_hist
+        hist.append((time.monotonic(), key, cc))
+        del hist[:-64]
         return self._bp_hits[key]
+
+    def rapid_hit_stats(self, addr=None, window_s: float = 3.0) -> dict:
+        """统计「短时间内反复命中同一断点」——复位循环的征兆（批次67 P2）。
+
+        只做**能证的事**：给出窗口内每个地址的命中次数、跨度，以及 CYCCNT 是否回退
+        （回退是内核复位过的硬证据）。是不是复位循环由调用方结合启动锚点判定——
+        主机侧单看「反复命中」分不清复位循环与正常热循环，这里绝不替它下结论。
+        """
+        try:
+            win = float(window_s)
+        except (TypeError, ValueError):
+            win = 3.0
+        now = time.monotonic()
+        want = None if addr is None else (int(addr) & 0xFFFFFFFE)
+        per: dict = {}
+        for t, a, cc in list(self._bp_hit_hist):
+            if now - t > win:
+                continue
+            if want is not None and (a & 0xFFFFFFFE) != want:
+                continue
+            per.setdefault(a & 0xFFFFFFFE, []).append((t, cc))
+        checked = {}
+        for a, lst in per.items():
+            ccs = [cc for _t, cc in lst if cc]
+            back = None
+            if len(ccs) >= 2:
+                back = any(ccs[i] < ccs[i - 1] for i in range(1, len(ccs)))
+            checked[hex(a)] = {
+                "hits": len(lst),
+                "span_s": round(lst[-1][0] - lst[0][0], 3),
+                "cyccnt_backwards": back,
+                "cyccnt_last": (hex(ccs[-1]) if ccs else None),
+                "cyccnt_note": (None if len(ccs) >= 2 else
+                                "样本不足（CYCCNT 未使能或没读到），无法据此判断复位"),
+            }
+        rapid = [k for k, v in checked.items() if v["hits"] >= 3]
+        out = {"ok": True, "window_s": win, "threshold": 3,
+               "checked": checked, "rapid_addrs": rapid,
+               "hist_len": len(self._bp_hit_hist),
+               "note": ("窗口 %.1fs 内命中 ≥3 次的地址：" % win) +
+                       (",".join(rapid) if rapid else "无")}
+        if addr is not None and not checked:
+            out["reason"] = "窗口内没有 %s 的命中记录" % hex(int(addr))
+        return out
 
     def breakpoint_hits(self) -> dict:
         """返回断点命中计数 {hex(addr): count}。"""

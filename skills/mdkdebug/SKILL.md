@@ -167,12 +167,13 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 42 个（`core` 36 个 + 6 个元工具），其余 148 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 146 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。
-  **符号修复手段都在 `symbol` 组**：`set_symbol_file` / `list_symbol_projects` 默认不在面上——
-  `env_check` 报「符号与固件不同源」时，它的 `next_actions` 会把「先 `toolset(action="load", toolsets="symbol")`」这一步一并写出来；
+  **符号修复手段 `set_symbol_file` / `list_symbol_projects` 已在默认面（`core` 组，批次67 起）**——
+  `env_check` 报「符号与固件不同源」时，`next_actions` 第一条就让你直接调 `set_symbol_file` 切到刚烧录的那份；
+  只有当你把 `core` 组从面上裁掉（如 `MDKDEBUG_TOOLSETS=mem`）时，它才会把「先 `toolset(action="load", toolsets="symbol")`」这一步补在最前面；
   自己手工切符号时也记得先装这一组，否则只会撞「未知工具」。
 - **上下文不够时的两把刀**：`nano` 极简档（`MDKDEBUG_TOOLSETS=nano`，19 个工具 / 约 4.6 千字符
   描述，自动用 `min` 描述档；含 `mdk_guide`，正文取回不用另外装）＋ **描述分层** `MDKDEBUG_DESC=full|lean|min`（默认 `full`，只有 `nano` 档自动用 `min`；要省上下文得显式选 `lean`/`min`）。

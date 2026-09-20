@@ -170,7 +170,36 @@ ERROR_CODES = {
     },
     "breakpoint-address-unresolved": {
         "text": "断点地址不在已加载镜像内（Keil 报 error 57）",
-        "next_actions": ["确认传入的是**运行地址**；裸地址需自带 Thumb 位（0x…401 这类奇数）或改用符号名", "用 find_symbol 先确认符号的地址与所在镜像段"],
+        "next_actions": [
+            "先分清两种成因：①地址写法不对（裸地址缺 Thumb 位、传了链接地址而实际要运行地址）；"
+            "②**这个地址根本不在当前调试会话加载的镜像里**——十有八九是链路连到了别的 Keil "
+            "实例/别的工程（旧实例占着 UVSOCK 端口时最典型，这也解释了「符号解析出的函数在别处」）",
+            "成因①：裸地址自带 Thumb 位（0x…401 这类奇数），App 重定位场景用 set_reloc_delta 换算运行地址",
+            "成因②：看 get_status 的 uvsock_binding / list_uvision_instances 确认端口是谁在服务"
+            "（持 UVSOCK 端口的是**最早**那个实例），必要时 close_uvision(keep=\"oldest\") 收敛窗口",
+            "用 find_symbol 确认符号地址落在哪个镜像段（address 与所在段一并核对）",
+        ],
+    },
+    "binding-mismatch": {
+        "text": "这条 UVSOCK 链路服务的 Keil 实例所打开的工程，与当前符号文件所属的工程对不上",
+        "next_actions": [
+            "list_uvision_instances 看有几个 Keil 实例、分别开着什么工程"
+            "（持 UVSOCK 端口的是**最早**那个实例，别按「留最新」关）",
+            "确认要对的是哪个工程后：close_uvision(keep=\"oldest\") 收掉占位实例，"
+            "再 launch_uvision(project=\"...\") 重开目标工程",
+            "确实要用另一份符号（例如正在调 App）：set_symbol_file(path=\"...\") 后本条可忽略",
+        ],
+    },
+    "breakpoint-residue": {
+        "text": ("清理之后硬件断点单元(FPB)里仍有启用的比较器：Keil 的逻辑断点表干净了，"
+                 "调试器写进硬件的项还在（J-Link 会一直报 two breakpoints at the same address）"),
+        "next_actions": [
+            "看 fpb.comparators / fpb.enabled_addrs：哪些比较器还启用着、地址是多少",
+            "对照 real（Keil 逻辑表）：硬件里有、real 里查不到的，就是 BK * 清不掉的残留",
+            '退出调试再进一次（或 close_uvision(keep="none") 收掉 Keil 后重开工程）'
+            "让调试器复位 FPB，然后再 get_status 复核",
+            "复核手段：clear_all_breakpoints(hard=True) 的 fpb 字段 / list_breakpoints 的 hardware 字段",
+        ],
     },
     "breakpoint-limit": {
         "text": "断点数量超出硬件限制（Keil 报 error 65）",

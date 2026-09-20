@@ -178,6 +178,149 @@ def uv4_instances() -> list:
     return out
 
 
+# ----------------------------------------------------------------------
+# UVSOCK 端口归属：4823 到底是谁在监听（哪个 UV4 实例、开着哪个工程）
+# ----------------------------------------------------------------------
+# 存在的理由（真机反馈）：4823 被一个**旧的** Keil 实例占着（那上面加载的是另一个工程），
+# 之后即使重开正确的工程窗口，调试依然连到旧实例上——于是符号解析、下断点、单步全都落在
+# 错误的镜像上（表现为「假符号 + error 57 + 单步退化成指令级」）。这类问题的第一问永远是
+# 「这条链路此刻服务的是哪个 PID / 哪个工程」，工具必须能直接回答，而不是让调用方自己猜。
+#
+# 不依赖 netstat（进程外命令慢、且沙箱里可能不可用）：走 iphlpapi 的
+# GetExtendedTcpTable(TCP_TABLE_OWNER_PID_LISTENER)，纯 ctypes。端口归属是**操作系统
+# 记账**，比看窗口标题可靠；工程名再按 PID 与 uv4_instances() 对齐得到。
+_TCP_TABLE_OWNER_PID_LISTENER = 3
+_AF_INET = 2
+
+
+class _MIB_TCPROW_OWNER_PID(ctypes.Structure):
+    _fields_ = [("dwState", wintypes.DWORD), ("dwLocalAddr", wintypes.DWORD),
+                ("dwLocalPort", wintypes.DWORD), ("dwRemoteAddr", wintypes.DWORD),
+                ("dwRemotePort", wintypes.DWORD), ("dwOwningPid", wintypes.DWORD)]
+
+
+def _listening_pids_v4(port: int) -> dict:
+    """IPv4 监听表里占着该端口的 PID 列表。
+
+    返回 {ok, pids, method} / {ok: False, reason}。**只查 IPv4 监听表**（如实声明）：
+    UVSOCK 监听 127.0.0.1，真机实测在 IPv4 表里；表里没有 ≠ 端口没人监听（只说明不是
+    IPv4 监听者），所以调用方还要用 port_listening 兜一下。
+    """
+    if sys.platform != "win32":
+        return {"ok": False, "reason": "仅 Windows 支持端口归属查询（iphlpapi）"}
+    try:
+        iphlpapi = ctypes.windll.iphlpapi
+        size = wintypes.DWORD(0)
+        ret = iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False,
+                                           _AF_INET, _TCP_TABLE_OWNER_PID_LISTENER, 0)
+        # 0 = 表为空（尺寸 0）；122 = ERROR_INSUFFICIENT_BUFFER（正常路径，带回所需尺寸）
+        if ret not in (0, 122):
+            return {"ok": False, "reason": "GetExtendedTcpTable 探测失败（返回 %d）" % ret}
+        if not size.value:
+            return {"ok": True, "pids": [], "method": "GetExtendedTcpTable-ipv4-listener"}
+        buf = ctypes.create_string_buffer(size.value)
+        ret = iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False,
+                                           _AF_INET, _TCP_TABLE_OWNER_PID_LISTENER, 0)
+        if ret != 0:
+            return {"ok": False, "reason": "GetExtendedTcpTable 失败（返回 %d）" % ret}
+        n = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0]
+        rows = ctypes.cast(ctypes.addressof(buf) + ctypes.sizeof(wintypes.DWORD),
+                           ctypes.POINTER(_MIB_TCPROW_OWNER_PID))
+        pids = []
+        for i in range(int(n)):
+            row = rows[i]
+            try:
+                # dwLocalPort 的端口号在低 16 位、且是网络字节序
+                local_port = socket.ntohs(int(row.dwLocalPort) & 0xFFFF)
+            except Exception:            # noqa: BLE001
+                continue
+            if local_port == int(port) and int(row.dwOwningPid):
+                pids.append(int(row.dwOwningPid))
+        return {"ok": True, "pids": pids, "method": "GetExtendedTcpTable-ipv4-listener"}
+    except Exception as e:               # noqa: BLE001
+        return {"ok": False, "reason": "端口归属查询异常：%s" % e}
+
+
+def uvsock_owner(port: int = DEFAULT_UVSOCK_PORT) -> dict:
+    """谁在监听 UVSOCK 端口：{ok, port, pid, pids, method} / {ok: False, reason}。
+
+    多个 PID 同时监听同一端口是可能的（SO_REUSEADDR / 多实例），故除首选的 pid 外
+    把 pids 也带出来——命令实际发给哪一个不受本工具控制，这一点必须如实暴露。
+    """
+    r = _listening_pids_v4(port)
+    if not r.get("ok"):
+        return {"ok": False, "port": int(port), "reason": r.get("reason")}
+    pids = list(r.get("pids") or [])
+    return {"ok": True, "port": int(port), "pid": (pids[0] if pids else None),
+            "pids": pids, "method": r.get("method")}
+
+
+def uvsock_binding(port: int = DEFAULT_UVSOCK_PORT) -> dict:
+    """当前 UVSOCK 链路的归属：端口 → 占用它的 UV4 实例（PID / 工程 / 窗口 / 启动时间）。
+
+    owner_project 来自该实例的主窗口标题（Keil 标题形如 "<工程全路径>.uvprojx - µVision"），
+    所以**无窗口的实例（后台/最小化启动）给不出工程名**——那时如实留空并说明，不猜。
+    """
+    owner = uvsock_owner(port)
+    try:
+        insts = uv4_instances()
+    except Exception:                    # noqa: BLE001
+        insts = []
+    me = None
+    if owner.get("ok") and owner.get("pid"):
+        for i in insts:
+            if int(i.get("pid") or 0) == int(owner["pid"]):
+                me = i
+                break
+    created = (me or {}).get("created")
+    out = {
+        "port": int(port),
+        "owner_pid": owner.get("pid") if owner.get("ok") else None,
+        "owner_pid_source": owner.get("method") if owner.get("ok") else None,
+        "owner_project": (me or {}).get("project") or None,
+        "owner_created": created,
+        "owner_created_str": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created))
+                              if created else None),
+        "owner_has_window": bool((me or {}).get("has_window")),
+        "instances": [{"pid": i.get("pid"), "project": i.get("project"),
+                       "has_window": bool(i.get("has_window"))} for i in insts],
+        "instances_total": len(insts),
+    }
+    if not owner.get("ok"):
+        out["state"] = "unknown"
+        out["note"] = ("拿不到端口归属（%s）：**无法判定这条链路服务的是哪个 Keil 实例**，"
+                       "别把符号/断点解析出来的东西当成板上事实。"
+                       % (owner.get("reason") or "未知原因"))
+    elif not owner.get("pids"):
+        listening = port_listening(port)
+        out["state"] = "not-listening" if not listening else "foreign-owner"
+        if not listening:
+            out["note"] = ("端口 %d 没有监听者：Keil 未运行或 UVSOCK 未开启"
+                           "（restart_keil 可一步拉起并等待就绪）。" % int(port))
+        else:
+            out["note"] = ("端口 %d 有服务在监听，但监听它的进程不是 UV4.exe：**可能有"
+                           "别的程序占着这个端口**，命令会被发给它或直接超时——"
+                           "用 keil_health 看诊断。" % int(port))
+    else:
+        out["state"] = "bound"
+        pids = owner.get("pids") or []
+        if len(pids) > 1:
+            out["note"] = ("有多个进程同时监听端口 %d（PID %s）：命令实际发给哪一个不受本工具"
+                           "控制，调试前先收敛到一个实例。"
+                           % (int(port), "、".join(str(p) for p in pids)))
+        elif not me:
+            out["note"] = ("监听者 PID=%s 不在 UV4 实例列表里（实例可能刚退出/刚启动）："
+                           "取不到它打开的工程。" % owner.get("pid"))
+        elif not (me or {}).get("project"):
+            out["note"] = ("监听者 PID=%s 没有可用的窗口标题：**取不到它打开的工程**"
+                           "（后台/最小化启动的实例常见）——工程名请以 Keil 界面为准。"
+                           % owner.get("pid"))
+        else:
+            out["note"] = ("这条 UVSOCK 链路由 PID=%s 的 Keil 实例服务，它打开的是 %s。"
+                           % (out["owner_pid"], out["owner_project"]))
+    return out
+
+
 def focus_window(hwnd) -> bool:
     """把窗口恢复并前置（复用已有实例时让用户看到"就是这一个窗口"）。"""
     if sys.platform != "win32" or not hwnd:
