@@ -246,6 +246,16 @@ trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0,
   给 `unmapped_slots` + `hint` 说明怎么取名；名字查不到就**不写名字**（不是写 `?`），
   只有**所有**非空槽都落不到符号表里才整批拒绝（`tasks-snapshot-inconsistent`）。
   `trace_swd_tasks` 单独看这张表为什么没名字（`read_mode`/`errors`/逐槽 `entry`）。
+- **要连 app/驱动的名字一起拿，就把多份 `.axf` 一起传**：`elf="内核.axf;app.axf"`
+  （`;` 或 `,` 分隔）。布局/任务表取**第一个具备者**，名字从所有镜像按精确首地址匹配，
+  命中不在第一份时记 `sym_from`；**跨镜像的名字必须过内容核对**（板上该地址的机器码 ==
+  那份 `.axf` 同地址的字节）才写上去——地址命中只说明「那地址在那份构建里是函数首地址」，
+  不说明**板上跑的就是那份构建**，核不过/核不了就丢名、计入 `unconfirmed_slots`。
+  任一路径不存在报 `tasks-elf-missing` 并点名。返回 `elf` 是第一份、`elfs` 是全部；
+  真实情况里「一个名字都补不上」很常见（镜像根本不在手上），那时照旧 `ctxN` + 说明。
+- **渲染不用自己喂任务名**：`view_render(data_file=…)` 会自己从返回体的 `task_names`
+  里取名字，任务泳道直接是人可读的名字；idle 按 `idle_id` 单独命名，中断轨道走
+  另一套命名（异常号），不会被任务名污染。
 
 **桩该插在哪儿**（`trace_guide(topic="instrument_points")` 有完整版）：异常 handler 第一条指令
 （`MDK_TRACE_FAULT_CAPTURE()`，一次拿到 PC/LR/SP/xPSR + CFSR，性价比最高）→ 喂狗点与复位原因

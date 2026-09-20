@@ -25,6 +25,12 @@ _CM_EXC = {
     12: "DebugMon", 13: "reserved", 14: "PendSV", 15: "SysTick",
 }
 
+# svcrt_trace.h 里 arg 是任务号的系统事件（只在 event 类事件没给名字时用来起名）
+_SVC_ARG_EV = {0x11: "wait", 0x12: "ready", 0x13: "create", 0x14: "exit"}
+
+# 事件类型的中文写法（只影响标题，不改判定）
+_TYP_CN = {"event": "事件", "sched": "调度", "isr": "中断", "fault": "异常"}
+
 _MAX_TRACKS = 24          # 轨道数上限（超出合并）
 _MAX_SPLIT = 10           # 同一类事件按 id 最多拆几条轨道
 
@@ -58,6 +64,10 @@ def parse_names(spec) -> dict:
     return {"names": out, "bad": bad}
 
 
+# svcrt_trace.h：流里的任务号只有 4 bit，0xF 是 idle（不是一个表项下标）
+_IDLE_ID_DEFAULT = 0xF
+
+
 def _name_of(names: dict, ident, fallback=None):
     try:
         key = int(str(ident), 0)
@@ -66,6 +76,85 @@ def _name_of(names: dict, ident, fallback=None):
     if key is not None and key in (names or {}):
         return names[key]
     return fallback
+
+
+def _task_names_from(payload, names: dict = None):
+    """把「返回体里已经带的任务名」凑成 {任务号(int): 名字}。
+
+    来源优先级：显式 names 参数 > 返回体的 task_names/names（采集时按符号表定的
+    名）> 事件自带的 from_name / to_name / task_name。显式参数与采集来的名合并，
+    不互相覆盖（同一个号谁先有值用谁）。
+
+    返回 (名字表, idle 名字, idle 号, why)：一个名字都拿不到就返回空表和 why
+    （说明为什么没有），**不编占位名**——图上显示 ctx5 好过显示一个编出来的名。
+    """
+    m, why = {}, []
+
+    def put(k, v):
+        k = _as_int(k)
+        if k is None or not isinstance(v, str) or not v.strip():
+            return
+        m.setdefault(k, v.strip())
+
+    for k, v in (names or {}).items():
+        put(k, v)
+
+    idle_name, idle_id = None, None
+    if isinstance(payload, dict):
+        for cand in (payload.get("task_names"), payload.get("tasks_meta")):
+            if not isinstance(cand, dict):
+                continue
+            rown = 0
+            for k, v in (cand.get("names") or {}).items():
+                put(k, v)
+                rown += 1
+            for row in (cand.get("tasks") or []):
+                if isinstance(row, dict) and row.get("name"):
+                    put(row.get("slot", row.get("id", row.get("index"))), row["name"])
+                    rown += 1
+            if cand.get("idle"):
+                idle_name = str(cand["idle"])
+            if cand.get("idle_id") is not None:
+                idle_id = _as_int(cand.get("idle_id"))
+            if cand.get("ok") is False and not rown:
+                why.append(str(cand.get("error") or cand.get("why") or "任务名没取到"))
+        if isinstance(payload.get("names"), dict):
+            for k, v in payload["names"].items():
+                put(k, v)
+        for row in (payload.get("tasks") or []):
+            if isinstance(row, dict) and row.get("name"):
+                put(row.get("slot", row.get("id", row.get("index"))), row["name"])
+        if payload.get("idle_id") is not None:
+            idle_id = _as_int(payload.get("idle_id"))
+        if payload.get("idle_name"):
+            idle_name = str(payload["idle_name"])
+        # 事件自带的名字（trace_swd_read 已经按序号补过）
+        for e in (payload.get("events") or []):
+            if not isinstance(e, dict):
+                continue
+            put(e.get("from"), e.get("from_name"))
+            put(e.get("to"), e.get("to_name"))
+            if e.get("task_name") is not None and e.get("arg") is not None:
+                a = _as_int(e.get("arg"))
+                put(None if a is None else (a & 0xF), e.get("task_name"))
+    elif isinstance(payload, list):
+        for e in payload:
+            if isinstance(e, dict):
+                put(e.get("from"), e.get("from_name"))
+                put(e.get("to"), e.get("to_name"))
+
+    if idle_id is None and (m or idle_name):
+        idle_id = _IDLE_ID_DEFAULT
+    if idle_name and idle_id is not None:
+        m.setdefault(idle_id, idle_name)
+    return m, idle_name, idle_id, why
+
+
+def _as_int(v):
+    try:
+        return int(str(v), 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def _num(x, default=None):
@@ -181,6 +270,18 @@ def _rel_times(evs, payload, names_note) -> tuple:
 
 # ---------------------------------------------------------------- timeline
 
+def _count_by_type(evs) -> dict:
+    """全量事件的类型计数（sched / isr / fault）——badge 上的口径就用这个。"""
+    c = {}
+    for e in evs or []:
+        if not isinstance(e, dict):
+            continue
+        t = str(e.get("type") or "")
+        if t in ("sched", "isr", "fault"):
+            c[t] = c.get(t, 0) + 1
+    return c
+
+
 def timeline_from_events(payload: dict, names: dict = None, title: str = "",
                          max_events: int = 200000) -> dict:
     """事件流 → timeline 模型（swd / buff / eventrec / 通用事件列表）。"""
@@ -189,15 +290,23 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
         return {"ok": False, "error_code": "view-empty-data",
                 "error": "这份数据里没有 events，画不了时间线",
                 "hint": "把 trace_swd_read / trace_buff_dump / trace_eventrec 的返回整个传进来"}
+    # 统计口径与绘图口径要分开：evs 后面会被抽稀（画不下那么多点），但 badge 上
+    # 报的条数必须是**真实总条数**。旧写法用 len(evs) * thinned 反推，没抽稀时
+    # thinned=0 直接报 0（满屏轨道配一个「事件 0」）；抽稀时又是估算值（8 条报成
+    # 10 条）。两处都是错数，这里先把真值留下来。
+    evs_all = evs
+    total_events = len(evs)
     thinned = 0
     if len(evs) > max_events:
         step = len(evs) // max_events + 1
         evs = evs[::step]
         thinned = step
+    # 返回体里已经带的任务名（trace_swd_read/ tasks 的返回）直接拿来用：
+    # 采集时是按符号表精确匹到的名，比事后让调用方再拼一遍靠谱。
+    names_in = names or {}          # 调用方显式给的（给中断号起名用的就是这份）
+    names, idle_name, idle_id, name_why = _task_names_from(payload, names)
     times, has_time, unit_note = _rel_times(evs, payload, names)
     tmax = max([t for t in times if t is not None] or [1.0]) or 1.0
-
-    names = names or {}
     tracks, markers, gaps, extras = [], [], [], []
     counts = {}
 
@@ -214,7 +323,10 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
         order = sorted(set([_int_or_none(e.get("from")) for _, e, _t in sched] +
                            [_int_or_none(e.get("to")) for _, e, _t in sched]) - {None})
         for k, tid in enumerate(order):
-            lanes[tid] = {"id": tid, "name": _name_of(names, tid, "ctx%s" % tid),
+            lanes[tid] = {"id": tid,
+                          "name": _name_of(names, tid,
+                                           idle_name if (idle_id is not None and tid == idle_id)
+                                           else "ctx%s" % tid),
                           "color": None, "spans": []}
         for n, (i, e, t) in enumerate(sched):
             tid = _int_or_none(e.get("to"))
@@ -239,6 +351,19 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
         add({"id": "switch", "name": "上下文切换", "sub": "每次切换一根竖线（放大后右侧显示切向谁）",
              "type": "marks", "marks": sw_marks, "targets": sw_targets,
              "count": len(sw_marks), "toggle": True})
+        unnamed_tids = [tid for tid in order
+                        if _name_of(names, tid) is None
+                        and not (idle_id is not None and tid == idle_id)]
+        if unnamed_tids:
+            if names:
+                extras.append("任务号 %s 取不到名字（图上按 ctxN 显示）：它们的入口符号不在"
+                              "这次解析的镜像里，不等于它们没在跑。"
+                              % ", ".join(str(x) for x in unnamed_tids))
+            else:
+                extras.append("这段流里的任务号**没有名字**（%s）：横轴上只有编号，"
+                              "不要把 ctxN 当成任务名。"
+                              % ("; ".join(name_why) if name_why else
+                                 "这份数据里没带任务名，采集时可能用了 tasks=off"))
         # from 的颜色信息附在 marks 上（JS 里 fallback 到轨道色）
         for mk, (i, e, t) in zip(sw_marks, sched):
             frm = _int_or_none(e.get("from"))
@@ -248,10 +373,12 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
     # --- 中断 / 异常：enter/exit 配对成区间 ---
     isr_ev = [(i, e, times[i]) for i, e in enumerate(evs)
               if isinstance(e, dict) and str(e.get("type")) == "isr" and times[i] is not None]
-    grouped = {}
+    grouped, isr_evname = {}, {}
     for i, e, t in isr_ev:
         ident = _int_or_none(e.get("id"))
         grouped.setdefault(ident, []).append((str(e.get("kind") or ""), t))
+        if e.get("id_name") and not isr_evname.get(ident):
+            isr_evname[ident] = str(e["id_name"])
     for ident, seq in grouped.items():
         pairs, opened, unpaired = [], None, 0
         for kind, t in seq:
@@ -267,7 +394,10 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
                     opened = None
         if opened is not None:
             unpaired += 1
-        nm = _name_of(names, ident, _CM_EXC.get(ident) or ("IRQ%s" % ident))
+        # 中断号与任务号不是一个命名空间：这里只认事件自带的名字/显式 names/
+        # Cortex-M 异常表，**不用**从任务表凑出来的名字（否则 0xF=idle 会把 SysTick 改名）
+        nm = (isr_evname.get(ident) or _name_of(names_in, ident, None)
+              or _CM_EXC.get(ident) or ("IRQ%s" % ident))
         sub = "%d 段进出" % len(pairs) + ("，%d 个落单（没配成对，未画）" % unpaired if unpaired else "")
         add({"id": "isr-%s" % ident, "name": str(nm), "sub": sub,
              "type": "intervals", "pairs": pairs, "count": len(pairs), "toggle": True})
@@ -313,22 +443,33 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
         if times[i] is None:
             continue
         ident = e.get("id") if "id" in e else None
-        buckets.setdefault((typ, ident), []).append((times[i], e))
+        # 同一类系统事件可能来自不同任务（WAIT/READY 的 arg 就是任务号）：
+        # 按任务名再分一层轨道，否则一整个「wait」看不出是谁在等。
+        tname = e.get("task_name") or None
+        buckets.setdefault((typ, ident, tname), []).append((times[i], e))
     ranked = sorted(buckets.items(), key=lambda kv: -len(kv[1]))
     shown = ranked[:_MAX_SPLIT]
     rest = ranked[_MAX_SPLIT:]
-    for (typ, ident), items in shown:
+    for (typ, ident, tname), items in shown:
         nm = None
         for _t, e in items:
             nm = e.get("id_name") or nm
             break
         nm = nm or _name_of(names, ident, None)
-        label = str(nm) if nm else ("%s%s" % (typ, "" if ident is None else " id=%s" % ident))
+        if nm:
+            label = str(nm)
+        elif tname:
+            label = "%s · %s" % (_SVC_ARG_EV.get(ident) or typ, tname)
+        else:
+            label = "%s%s" % (typ, "" if ident is None else " id=%s" % ident)
+        idnote = "" if ident is None else "（id=%s）" % (
+            "0x%X" % ident if isinstance(ident, int) else ident)
         marks = [[t, None] for t, _e in items]
         dense = len(marks) > 3000
-        add({"id": "%s-%s" % (typ, ident), "name": label, "sub": "%d 个%s" % (len(items), typ),
-             "type": "density" if dense else "marks", "marks": marks,
-             "count": len(marks), "toggle": True})
+        add({"id": "%s-%s-%s" % (typ, ident, tname), "name": label,
+             "sub": "%d 个%s%s" % (len(items), _TYP_CN.get(typ, typ), idnote),
+             "type": "density" if dense else "marks",
+             "marks": marks, "count": len(marks), "toggle": True})
     if rest:
         allrest = []
         for _k, items in rest:
@@ -346,21 +487,28 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
     if not has_time:
         limits.append("源数据没有可用时间戳：横轴是**事件序号**，间距不代表时间间隔。")
     if thinned:
-        limits.append("事件 %d 条超过上限，每 %d 条抽 1 条绘制（统计口径仍是全量）。"
-                      % (len(evs) * thinned, thinned))
+        limits.append("事件 %d 条超过上限，每 %d 条抽 1 条**绘制**（总数与下面的计数"
+                      "仍是全量）。" % (total_events, thinned))
     limits.extend(extras)
     limits.append("图上没有的 = 没被记录/没插桩，不等于没发生。")
 
-    badges = [{"k": "事件", "v": "%d" % (len(evs) * thinned)},
+    # 计数一律按**全量**算：抽稀只影响画几个点，不影响「发生过几次」。
+    counts_full = _count_by_type(evs_all)
+    badges = [{"k": "事件", "v": "%d" % total_events},
               {"k": "轨道", "v": str(len(tracks))},
               {"k": "时长", "v": _fmt_us(tmax) if has_time else "—"},
               {"k": "时间轴", "v": "时间" if has_time else "序号",
                "level": "ok" if has_time else "warn"}]
     for typ in ("sched", "isr", "fault"):
-        if counts.get(typ):
+        if counts_full.get(typ):
             badges.append({"k": {"sched": "上下文切换", "isr": "中断进出", "fault": "异常"}[typ],
-                           "v": str(counts[typ]),
+                           "v": str(counts_full[typ]),
                            "level": "bad" if typ == "fault" else None})
+    if sched:
+        n_lane = [tid for tid in lanes if _name_of(names, tid) is not None]
+        badges.append({"k": "任务名", "v": "%d/%d" % (len(n_lane), len(lanes)),
+                       "level": "ok" if len(n_lane) == len(lanes)
+                                else ("warn" if n_lane else "bad")})
     if gaps:
         badges.append({"k": "丢失断口", "v": str(len(gaps)), "level": "bad"})
     lost = _num(payload.get("lost_events")) if isinstance(payload, dict) else None

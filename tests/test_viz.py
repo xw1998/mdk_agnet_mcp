@@ -113,6 +113,42 @@ BARS_ITEMS = {"items": [{"group": "A", "stat_slot": 1, "count": 2,
                          "total_ms": 1.5, "min_ms": 0.5, "max_ms": 1.0, "avg_ms": 0.75}],
               "link": "keil"}
 
+# trace_swd_read 的返回：任务名就在返回体里（采集时按符号表定的名）
+SWD_NAMED = {
+    "ctrl": {"cpu_hz": 16000000, "lost_events": 0},
+    "events": [
+        {"type": "sched", "from": 0, "to": 1, "t_us": 0, "to_name": "led_task"},
+        {"type": "isr", "kind": "enter", "id": 15, "t_us": 120, "id_name": "SysTick"},
+        {"type": "isr", "kind": "exit", "id": 15, "t_us": 140},
+        {"type": "isr", "kind": "enter", "id": 14, "t_us": 160},
+        {"type": "isr", "kind": "exit", "id": 14, "t_us": 180},
+        {"type": "event", "id": 0x12, "arg": 1, "t_us": 800, "task_name": "led_task"},
+        {"type": "event", "id": 0x11, "arg": 15, "t_us": 900, "task_name": "idle"},
+        {"type": "sched", "from": 1, "to": 15, "t_us": 1000},
+        {"type": "sched", "from": 15, "to": 0, "t_us": 1200},
+        # 有了它 tmax=1300，泳道 0 的最后一段才有宽度（零宽区间会被丢掉）
+        {"type": "sync", "kind": "point", "seq": 1, "t_us": 1300},
+    ],
+    "task_names": {"ok": True, "names": {"0": "shell_task", "1": "led_task"},
+                   "idle": "idle", "idle_id": 15, "named": 2, "nonempty": 2},
+}
+
+# 没有 task_names 摘要、只有事件自带的名字（老版本/dump 回来的数据）
+SWD_EVNAME = {"events": [
+    {"type": "sched", "from": 0, "to": 1, "t_us": 0, "from_name": "shell", "to_name": "led"},
+    {"type": "sched", "from": 1, "to": 0, "t_us": 500, "from_name": "led", "to_name": "shell"},
+    {"type": "sync", "kind": "point", "seq": 1, "t_us": 600},
+]}
+
+# 命名失败也要看得到原因
+SWD_NAMEFAIL = {
+    "events": [{"type": "sched", "from": 0, "to": 1, "t_us": 0},
+               {"type": "sched", "from": 1, "to": 0, "t_us": 100},
+               {"type": "sync", "kind": "point", "seq": 1, "t_us": 200}],
+    "task_names": {"ok": False, "error_code": "tasks-elf-missing",
+                   "error": "这份 .axf 没有 DWARF 行表，任务表布局取不到"},
+}
+
 REC = {"timeline": [{"kind": "enter", "func": "main", "cyc": 0},
                     {"kind": "enter", "func": "led_task", "cyc": 1600},
                     {"kind": "exit", "func": "led_task", "cyc": 3200},
@@ -174,6 +210,14 @@ def section_b():
     check("B8 badges 里报出上下文切换次数与异常次数",
           any(b["k"] == "上下文切换" for b in m.get("badges") or []) and
           any(b["k"] == "异常" for b in m.get("badges") or []), m.get("badges"))
+    # 反例：没抽稀时把 thinned=0 直接乘上条数 -> 「事件 0」配一屏轨道。
+    _bev = [b for b in m.get("badges") or [] if b["k"] == "事件"]
+    check("B8b 事件 badge 是真实条数（没抽稀时不能是 0）",
+          _bev and _bev[0]["v"] == str(len(SWD["events"])), m.get("badges"))
+    _mt = VZ.adapt(SWD, view="auto", max_events=2)
+    _bs = {b["k"]: b["v"] for b in ((_mt.get("model") or {}).get("badges") or [])}
+    check("B8c 抽稀时 badge 仍报全量条数（绘制抽稀 ≠ 统计口径变）",
+          _bs.get("事件") == str(len(SWD["events"])), _bs)
     check("B9 read_meta.unstable / warnings 原样进 limits（不加工成结论）",
           any("TS_OFF" in str(x) for x in m.get("limits") or []), m.get("limits"))
     check("B10 时间轴口径写进 subtitle（这次有时间戳）",
@@ -251,6 +295,49 @@ def section_b():
     check("B30 names 里的坏项单独报出来",
           AD.parse_names("0x10=switch,abc")["bad"] == ["abc"],
           AD.parse_names("0x10=switch,abc"))
+
+    # --- 任务名：返回体带来的名字直接用，取不到就不编 ---
+    rn = VZ.adapt(SWD_NAMED, view="timeline")
+    mn = rn.get("model") or {}
+    tnames = {t["id"]: t.get("name") for t in (mn.get("tracks") or [])}
+    check("B31 返回体 task_names 里的名字直接当泳道名",
+          tnames.get("lane-1") == "led_task", tnames)
+    check("B32 泳道 0 用 task_names 的名（而不是 ctx0）",
+          tnames.get("lane-0") == "shell_task", tnames)
+    check("B33 idle 号（0xF）显示 idle 名而不是 ctx15",
+          tnames.get("lane-15") == "idle", tnames)
+    check("B34 badge 报出任务名覆盖率",
+          any(b["k"] == "任务名" and b["v"] == "3/3" for b in mn.get("badges") or []),
+          mn.get("badges"))
+    check("B35 中断轨道不吃任务名（0xF 的 SysTick 还叫 SysTick、0xE 兑 PendSV）",
+          any(v == "SysTick" for k, v in tnames.items() if k.startswith("isr-15")) and
+          any("PendSV" in str(v) for k, v in tnames.items() if k.startswith("isr-14")),
+          tnames)
+    check("B36 ARG 类事件按任务名分开成轨，且名字看得出是什么事（wait · led_task）",
+          tnames.get("event-18-led_task") == "ready · led_task" and
+          tnames.get("event-17-idle") == "wait · idle", tnames)
+
+    rn2 = VZ.adapt(SWD_EVNAME, view="timeline")
+    tn2 = {t["id"]: t.get("name") for t in ((rn2.get("model") or {}).get("tracks") or [])}
+    check("B37 只有事件自带 from_name/to_name 时也能命名泳道",
+          tn2.get("lane-1") == "led" and tn2.get("lane-0") == "shell", tn2)
+
+    rn3 = VZ.adapt(SWD, view="timeline")
+    mn3 = rn3.get("model") or {}
+    tn3 = {t["id"]: t.get("name") for t in (mn3.get("tracks") or [])}
+    check("B38 没有任务名时泳道仍是 ctxN（不编名字）",
+          tn3.get("lane-1") == "ctx1", tn3)
+    check("B39 没有任务名就在 limits 里说清为什么",
+          any("没有名字" in str(x) for x in mn3.get("limits") or []), mn3.get("limits"))
+
+    rn4 = VZ.adapt(SWD_NAMEFAIL, view="timeline")
+    mn4 = rn4.get("model") or {}
+    check("B40 命名失败把原因写进 limits（不静默）",
+          any("DWARF" in str(x) or "tasks-elf-missing" in str(x)
+              for x in mn4.get("limits") or []), mn4.get("limits"))
+    check("B41 命名失败时 badge 任务名不是 ok 级",
+          any(b["k"] == "任务名" and b.get("level") == "bad" for b in mn4.get("badges") or []),
+          mn4.get("badges"))
 
 
 def section_c():

@@ -52,7 +52,53 @@ class ElfIndex:
         # 存住，等 typedef 那一跳把它挂到 typedef 名下（SVCrtOS 的 TCB 就是这种写法）。
         self._anon_structs = {}   # DIE 偏移 -> 结构体记录
         self._td_anon = {}        # typedef 名 -> 目标匿名结构体的 DIE 偏移
+        self._segs = None         # 可加载段（按需建，用于取某地址的机器码做内容核对）
         self._load()
+
+    # ---------------------------------------------------------- 内容核对
+    def _segments(self) -> list:
+        """可加载段 [(vaddr, filesz, fileoff)]，用于「取某虚拟地址处的字节」。"""
+        if self._segs is not None:
+            return self._segs
+        segs = []
+        try:
+            from elftools.elf.elffile import ELFFile
+            with open(self.path, "rb") as f:
+                elf = ELFFile(f)
+                for seg in elf.iter_segments():
+                    if seg["p_type"] != "PT_LOAD" or not seg["p_filesz"]:
+                        continue
+                    segs.append((int(seg["p_vaddr"]), int(seg["p_filesz"]),
+                                 int(seg["p_offset"])))
+        except Exception:                                     # noqa: BLE001
+            segs = []
+        self._segs = segs
+        return segs
+
+    def bytes_at(self, vaddr: int, n: int):
+        """取该虚拟地址处的**文件内容**（机器码）。取不到返回 None。
+
+        取不到就是「没法核对」，**不拿别的地址/邻段的字节顶上**——内容核对全凭
+        这一条，顶上就等于把核对做成了走过场。
+        """
+        try:
+            vaddr, n = int(vaddr), int(n)
+        except (TypeError, ValueError):
+            return None
+        if n <= 0:
+            return None
+        for va, sz, off in self._segments():
+            if va <= vaddr < va + sz:
+                avail = min(n, va + sz - vaddr)
+                if avail <= 0:
+                    return None
+                try:
+                    with open(self.path, "rb") as f:
+                        f.seek(off + (vaddr - va))
+                        return f.read(avail)
+                except OSError:
+                    return None
+        return None
 
     # ---------------------------------------------------------- 载入
     def _load(self):

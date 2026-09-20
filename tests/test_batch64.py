@@ -21,6 +21,9 @@
   D4 跨镜像入口：留空不编名（app 的任务入口不在内核 .axf 里是合法的）
   E 会话内只解析一次；tasks=off 完全不碰
   F 真实 .axf 的 DWARF 路径（无目标，纯本地解析；文件不在则跳过）
+  H 多份镜像（内核;app）联合取名：任何一份的入口都能配上名字，但**跨镜像**的名字
+    必须过内容核对（板上机器码 == .axf 同地址字节）——地址对上不等于板上跑的是
+    这份构建；核不过/核不了就丢名并记 unconfirmed_slots
 
 运行：python -m tests.test_batch64
 """
@@ -170,14 +173,23 @@ def patch_pick(fake):
 # ======================================================================
 class FakeIndex:
     def __init__(self, base=TBL, count=48, tcb=None, entry_off=ENTRY_OFF,
-                 struct_size=TCB_SIZE, no_table=False, no_layout=False):
+                 struct_size=TCB_SIZE, no_table=False, no_layout=False,
+                 code=None):
         self._base = None if no_table else base
         self._count = count
         self._tcb = tcb
         self._entry_off = entry_off
         self._size = struct_size
         self._no_layout = no_layout
+        self._code = dict(code or {})      # vaddr -> 该 .axf 里那个地址的字节
         self.error = None
+
+    def bytes_at(self, vaddr, n):
+        """模拟 ElfIndex.bytes_at：取不到就 None（跨镜像名字的内容核对靠它）。"""
+        blob = self._code.get(int(vaddr))
+        if blob is None:
+            return None
+        return bytes(blob)[:int(n)]
 
     def addr_of(self, name):
         return self._base if name == TRC._SVCRT_TABLE_SYM else None
@@ -210,11 +222,20 @@ def patch_elf(index, funcs=FUNCS):
         TRC._elf_funcs_cached = old_f
     return undo
 
-def patch_read_mem(table_bytes):
-    """把 _read_mem_words 拦在任务表地址上（其他地址照常走假链路）。"""
+def patch_read_mem(table_bytes, code=None):
+    """把 _read_mem_words 拦在任务表地址上（其他地址照常走假链路）。
+
+    code 给 {vaddr: bytes}：那些地址按字节返回，用来喂跨镜像名字的**内容核对**——
+    核对要求「板上机器码 == .axf 同地址字节」，这里就是那个「板上机器码」。
+    """
     real = TRC._read_mem_words
     hits = []
+    code = dict(code or {})
     def fake(addr, n, link="auto", raw=False, **kw):
+        if int(addr) in code:
+            hits.append((int(addr), int(n)))
+            blob = code[int(addr)]
+            return bytes(blob[:int(n)]), {"link": "keil", "read_mode": "single"}
         if TBL <= int(addr) < TBL + len(table_bytes):
             hits.append((int(addr), int(n)))
             off = int(addr) - TBL
@@ -477,6 +498,97 @@ def main():
         vk = ix.var_kind(TRC._SVCRT_TABLE_SYM) or {}
         check("F2 任务表符号与元素个数都能取到",
               ix.addr_of(TRC._SVCRT_TABLE_SYM) and (vk.get("count") or 0) >= 15, vk)
+
+    print("== H 多份镜像（内核;app）联合取名 ==", flush=True)
+    h = tempfile.mkstemp(suffix="_k.axf")
+    os.close(h[0])
+    h2 = tempfile.mkstemp(suffix="_a.axf")
+    os.close(h2[0])
+    K, AP = h[1], h2[1]
+    KFUNCS = [(0x08000200, "bled_task")]
+    AFUNCS = [(0x08000400, "app_task_entry")]
+    # 跨镜像名字要过内容核对（板上机器码 == .axf 同地址字节），两边都给一份可比的
+    KCODE = {0x08000200: bytes(range(0x10, 0x20))}
+    ACODE = {0x08000400: bytes(range(0x20, 0x30))}
+    ENTRY2 = {0: 0x08000201, 1: 0x08000401}          # 0=内核任务 1=app 任务
+    old_i, old_f = RTOS.get_index, TRC._elf_funcs_cached
+    _, hh, undo = scenario(SCHED_EV)          # 先跑夹具，再把镜像映射换成两份
+    _ = hh
+    try:
+        tb = task_table_bytes(ENTRY2, n_slots=15)
+        both_code = dict(KCODE)
+        both_code.update(ACODE)
+        hits2, undo_r = patch_read_mem(tb, code=both_code)
+        RTOS.get_index = lambda p: (FakeIndex(code=KCODE) if p == K
+                                    else FakeIndex(code=ACODE, no_table=True))
+        TRC._elf_funcs_cached = lambda p: list(KFUNCS if p == K else AFUNCS)
+        try:
+                r1 = TRC._svcrt_task_names(elf=K)
+                check("H1 只给内核 .axf：app 任务的槽位保持无名（不编）",
+                      r1.get("ok") and r1["names"] == {0: "bled_task"}
+                      and r1.get("unmapped_slots") == [1],
+                      {k: r1.get(k) for k in ("names", "unmapped_slots", "error")})
+                r2 = TRC._svcrt_task_names(elf="%s;%s" % (K, AP))
+                check("H2 给了两份：app 任务也带上了名字（入口落在 app 符号上）",
+                      r2.get("ok") and r2["names"] == {0: "bled_task", 1: "app_task_entry"},
+                      {k: r2.get(k) for k in ("names", "error")}) 
+                check("H3 名字标明来自哪份镜像（sym_from 只在自己不是第一份时给）",
+                      (r2["tasks"][1] or {}).get("sym_from") == os.path.basename(AP)
+                      and "sym_from" not in r2["tasks"][0],
+                      (r2["tasks"][0], r2["tasks"][1]))
+                check("H4 elfs 字段列出全部符号来源，elf 仍是第一份",
+                      len(r2.get("elfs") or []) == 2 and r2["elf"] == os.path.abspath(K),
+                      (r2.get("elf"), r2.get("elfs")))
+                check("H5 单份时不多出 sym_from（老行为不变）",
+                      "sym_from" not in r1["tasks"][0], r1["tasks"][0])
+                check("H5b 核过的跨镜像名字标出 content-confirmed",
+                      r2["tasks"][1].get("sym_verified") == "content-confirmed",
+                      r2["tasks"][1])
+                # 核对不过就丢名：地址精确匹配只证明「那个地址在这份 .axf 里是
+                # 函数首地址」，不证明板上跑的就是这份构建。
+                bad = dict(KCODE)
+                bad[0x08000400] = bytes(range(0x30, 0x40))
+                _, undo_b = patch_read_mem(tb, code=bad)
+                try:
+                    r5 = TRC._svcrt_task_names(elf="%s;%s" % (K, AP))
+                    check("H8 跨镜像名字对不上机器码 -> 丢名记 unconfirmed（不硬安）",
+                          r5.get("ok") and r5["names"] == {0: "bled_task"}
+                          and (r5.get("unconfirmed_slots") or [{}])[0].get("name")
+                          == "app_task_entry"
+                          and r5.get("partial") is True,
+                          {k: r5.get(k) for k in ("names", "unconfirmed_slots", "partial")})
+                finally:
+                    undo_b()
+                # 核不了（.axf 里取不到该地址字节）也不等于核过——一样不给名字。
+                RTOS.get_index = lambda p: (FakeIndex(code=KCODE) if p == K
+                                            else FakeIndex(code={}, no_table=True))
+                r6 = TRC._svcrt_task_names(elf="%s;%s" % (K, AP))
+                check("H9 核不了（.axf 取不到字节）也不给名字",
+                      r6.get("ok") and r6["names"] == {0: "bled_task"}
+                      and r6.get("unconfirmed_slots"),
+                      {k: r6.get(k) for k in ("names", "unconfirmed_slots")})
+                RTOS.get_index = lambda p: (FakeIndex(code=KCODE) if p == K
+                                            else FakeIndex(code=ACODE, no_table=True))
+        finally:
+            RTOS.get_index, TRC._elf_funcs_cached = old_i, old_f
+            undo_r()
+            undo()
+        r3 = TRC._svcrt_task_names(elf="%s;%s" % (K, "/tmp/does-not-exist-64.axf"))
+        check("H6 点了不存在的镜像就报 tasks-elf-missing（不默默少给名字）",
+              r3.get("error_code") == "tasks-elf-missing" and "does-not-exist-64" in str(r3.get("error")),
+              r3)
+        RTOS.get_index = lambda p: FakeIndex(no_table=True)
+        r4 = TRC._svcrt_task_names(elf="%s;%s" % (K, AP))
+        check("H7 两份都没有任务表 -> 报第一份的原因（tasks-table-missing）",
+              r4.get("error_code") == "tasks-table-missing", r4)
+    finally:
+        RTOS.get_index, TRC._elf_funcs_cached = old_i, old_f
+        for p in (K, AP):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        TRC._T["swd"] = None
 
     print("== G 工具面 ==", flush=True)
     import asyncio

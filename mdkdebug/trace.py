@@ -218,36 +218,55 @@ def _svcrt_task_names(elf: str = "", link: str = "auto", halt: bool = False,
     读完放回运行态；默认全速读，代价是「快照可能跨在两次切换之间」，所以两项
     校验一个都不省。每个会话只做一次（refresh=True 才重做）。
     """
-    elf = str(elf or "").strip() or _session_axf()
-    if not elf:
+    elf_spec = str(elf or "").strip() or _session_axf()
+    if not elf_spec:
         return {"ok": False, "error_code": "tasks-need-elf",
                 "error": "没给 elf，也不知道会话的符号文件，无法定位任务表",
                 "hint": "给 elf=你的.axf（首选），或先 set_symbol_file。"}
-    if not os.path.isfile(elf):
+    # 多份镜像（内核;app;驱动）用 ; 分隔：任务表与布局只有内核有，名字可以来自任意一份。
+    # app/驱动的任务是另外下发的镜像，入口根本不在这份内核 .axf 里——一起传进来才认得出。
+    elfs = [p.strip() for p in re.split(r"[;,]", elf_spec) if p.strip()]
+    missing = [p for p in elfs if not os.path.isfile(p)]
+    if missing:
         return {"ok": False, "error_code": "tasks-elf-missing",
-                "error": "ELF 不存在：%s" % elf,
-                "hint": "烧录后 .axf 被挪过？给当前工程实际编译出的那个。"}
+                "error": "ELF 不存在：%s" % "；".join(missing),
+                "hint": "路径写错/烧录后被挪过？多份用 ; 分隔，如 elf=\"内核.axf;app.axf\"。"}
     try:
         from .rtos import get_index
     except Exception as e:                                        # noqa: BLE001
         return {"ok": False, "error_code": "tasks-no-dwarfinfo",
                 "error": "取不到 DWARF 索引：%s" % e}
-    ix = get_index(elf)
-    if ix.error:
-        return {"ok": False, "error_code": "tasks-no-dwarfinfo", "error": ix.error,
-                "hint": "任务表布局从 DWARF 取（不靠猜），所以 .axf 必须带调试信息"
-                        "（-g / Debug 配置）。"}
-    base = ix.addr_of(_SVCRT_TABLE_SYM)
-    if base is None:
-        return {"ok": False, "error_code": "tasks-table-missing",
-                "error": "ELF 里没有符号 %s" % _SVCRT_TABLE_SYM,
-                "hint": "这个内核没有可命名的任务表（或符号被裁剪）；"
-                        "用 names= 手工给名字，或关掉任务名解析。"}
-    st = ix.struct(_SVCRT_TCB_TYPE)
-    if not st or st.get("size") is None or ix.field(_SVCRT_TCB_TYPE, "entry") is None:
+
+    def _why_not(p):
+        """这份镜像为什么给不出任务表布局（原样保留单份时的错误码）。"""
+        i2 = get_index(p)
+        if i2.error:
+            return {"ok": False, "error_code": "tasks-no-dwarfinfo", "error": i2.error,
+                    "hint": "任务表布局从 DWARF 取（不靠猜），所以 .axf 必须带调试信息"
+                            "（-g / Debug 配置）。"}
+        if i2.addr_of(_SVCRT_TABLE_SYM) is None:
+            return {"ok": False, "error_code": "tasks-table-missing",
+                    "error": "ELF 里没有符号 %s" % _SVCRT_TABLE_SYM,
+                    "hint": "这个内核没有可命名的任务表（或符号被裁剪）；"
+                            "用 names= 手工给名字，或关掉任务名解析。"}
         return {"ok": False, "error_code": "tasks-layout-missing",
                 "error": "取不到 %s 的布局（sizeof / entry 偏移）" % _SVCRT_TCB_TYPE,
                 "hint": "该 .axf 的 DWARF 里没有这个类型（内核没参与本次构建？）。"}
+
+    ix = base = st = None
+    for p in elfs:
+        cand = get_index(p)
+        if cand.error:
+            continue
+        b = cand.addr_of(_SVCRT_TABLE_SYM)
+        s2 = cand.struct(_SVCRT_TCB_TYPE)
+        if b is None or not s2 or s2.get("size") is None \
+                or cand.field(_SVCRT_TCB_TYPE, "entry") is None:
+            continue                       # 这份镜像没有任务表：只当名字来源
+        ix, base, st = cand, b, s2
+        break
+    if ix is None:
+        return _why_not(elfs[0])
     tcb_size = int(st["size"])
     entry_off = int(ix.field(_SVCRT_TCB_TYPE, "entry"))
     vk = ix.var_kind(_SVCRT_TABLE_SYM) or {}
@@ -314,17 +333,40 @@ def _svcrt_task_names(elf: str = "", link: str = "auto", halt: bool = False,
                 "hint": "这属于「全速运行时读 SRAM 不可靠」；" 
                         "可重试，或让调用方带 halt=True 停机读。"}
 
-    funcs = _elf_funcs_cached(elf)
-    if not funcs:
-        return {"ok": False, "error_code": "tasks-no-funcs",
-                "error": "ELF 里读不到任何函数符号，无法把入口地址翻成名字",
-                "hint": "用 strip 过的 .axf 就只能看到地址；换带符号的那个。"}
-    # 入口指针 = 函数首地址，做**精确**匹配；不拿"最近的下方符号"顶替，
-    # 否则跨镜像的地址会被安上一个随便的（看着像样的）名字。
+    # 名字来源是**所有给的镜像**：入口落在哪一份的函数首地址上就用哪一份的名字
+    # （先给的优先）。跨镜像的入口在单份内核 .axf 里查不到，一起传才认得出来。
     exact = {}
-    for a, n in funcs:
-        exact.setdefault(int(a), n)
-    names, slots, unnamed = {}, {}, []
+    for p in elfs:
+        for a, n in (_elf_funcs_cached(p) or []):
+            exact.setdefault(int(a), (n, p))
+    if not exact:
+        return {"ok": False, "error_code": "tasks-no-funcs",
+                "error": "给的镜像里读不到任何函数符号，无法把入口地址翻成名字",
+                "hint": "用 strip 过的 .axf 就只能看到地址；换带符号的那个。"}
+    def _confirm_code(src, addr, n=16):
+        """板上机器码 vs .axf 里同地址的字节。返回 (True/False/None, 说明)。
+
+        跨镜像取名字**必须过这一关**：地址精确匹配只证明「这个地址在那份 .axf 里
+        是个函数首地址」，不证明板上跑的就是那份镜像——同一个地址在另一个构建里
+        可能是别的函数。核不了（读不到/伪值/文件里取不到字节）也**不给名字**。
+        """
+        try:
+            exp = get_index(src).bytes_at(int(addr), int(n))
+        except Exception as e:                                    # noqa: BLE001
+            return None, "核不了（取 .axf 字节失败：%s）" % e
+        if not exp:
+            return None, "核不了（这份 .axf 里取不到该地址的字节）"
+        got, meta = _read_mem_words(int(addr), len(exp), link=link, raw=True)
+        if got is None:
+            return None, "核不了（读目标失败：%s）" % ((meta or {}).get("error") or "未知")
+        fake = _swd_fake_kind(got)
+        if fake:
+            return None, "核不了（读回伪值：%s）" % fake
+        if bytes(got[:len(exp)]) != exp:
+            return False, "不符（板上机器码与 .axf 同地址的字节不一致）"
+        return True, "content-confirmed"
+
+    names, slots, unnamed, cross_slots = {}, {}, [], {}
     for i in range(n_slots):
         off = i * tcb_size + entry_off
         e = struct.unpack_from("<I", raw, off)[0]
@@ -337,7 +379,8 @@ def _svcrt_task_names(elf: str = "", link: str = "auto", halt: bool = False,
         # 不是错误值——ARMCC 把函数地址存进表里时就是带这个位的，先清掉。
         addr = e & ~1
         slots[i]["entry_addr"] = "0x%08X" % addr
-        nm = exact.get(addr)
+        hit = exact.get(addr)
+        nm, nm_src = (hit if hit else (None, None))
         if nm is None:
             # 不给名字，也**不编**占位名：这个地址不属于本次给的那个 .axf。
             slots[i]["name"] = None
@@ -347,7 +390,26 @@ def _svcrt_task_names(elf: str = "", link: str = "auto", halt: bool = False,
             unnamed.append(i)
             continue
         slots[i]["name"] = nm
+        if nm_src and os.path.abspath(nm_src) != os.path.abspath(elfs[0]):
+            slots[i]["sym_from"] = os.path.basename(nm_src)
+            cross_slots[i] = nm_src          # 这份名字要过内容核对才作数
         names[i] = nm
+    # 从**别的镜像**（非第一份）来的名字，先内容核对再用；核不过就当没这个名字。
+    unconfirmed = []
+    for i, src in sorted(cross_slots.items()):
+        okc, why = _confirm_code(src, int(str(slots[i]["entry_addr"]), 0))
+        if okc:
+            slots[i]["sym_verified"] = why
+            continue
+        unconfirmed.append({"slot": i, "name": names.pop(i),
+                            "from": os.path.basename(src), "why": why})
+        slots[i]["name"] = None
+        slots[i].pop("sym_from", None)
+        slots[i]["note"] = ("入口 %s 在 %s 里是个函数首地址，但%s——**不拿它当名字**。"
+                            % (slots[i]["entry"], os.path.basename(src), why))
+        if i not in unnamed:
+            unnamed.append(i)
+    unnamed.sort()
     nonempty = [i for i in slots
                 if slots[i]["entry"] not in ("0x00000000", "0xFFFFFFFF")]
     if nonempty and not names:
@@ -359,8 +421,10 @@ def _svcrt_task_names(elf: str = "", link: str = "auto", halt: bool = False,
                 "at": "0x%X" % base,
                 "unmapped_slots": nonempty,
                 "hint": "要么这次读的是伪值（重试一次，或用 halt=True 停机读），"
-                        "要么这些任务全来自别的镜像（那就把 elf 指到那个镜像的 .axf）。"}
-    out = {"ok": True, "elf": os.path.abspath(elf),
+                        "要么这些任务全来自别的镜像（那就把那个镜像的 .axf 也用 ; "
+                        "一起传给 elf）。"}
+    out = {"ok": True, "elf": os.path.abspath(elfs[0]),
+           "elfs": [os.path.abspath(p) for p in elfs],
            "table_addr": "0x%X" % base, "table_count": count,
            "named_slots": n_slots, "tcb_size": tcb_size, "entry_off": entry_off,
            "read_mode": "halt" if did_halt else "run",
@@ -375,15 +439,18 @@ def _svcrt_task_names(elf: str = "", link: str = "auto", halt: bool = False,
         out["note"] = ("任务表有 %d 项，但流里的任务号只有 4 bit（0..14 是表下标、"
                        "0xF 是 idle），所以只给前 %d 项取名字——表里下标 15 及以后的"
                        "项**不会出现在流里**，不要拿它当任务。" % (count, _SVCRT_TRACE_TASKS))
+    if unconfirmed:
+        out["unconfirmed_slots"] = unconfirmed
+        out["partial"] = True
     if unnamed:
         out["unmapped_slots"] = unnamed
         out["partial"] = True
         out["unmapped"] = [{"slot": i, "entry": slots[i]["entry"]}
                            for i in unnamed]
-        out["hint"] = ("槽位 %s 的入口不在这个 .axf 的符号表里（任务可能来自已安装的"
-                       "app/驱动镜像），它们**保持无名、不编**。想给它们取名：把 elf "
-                       "指到对应镜像的 .axf，或用 names= 按任务号手工指定。"
-                       % unnamed)
+        out["hint"] = ("槽位 %s 的入口不在给的这些 .axf 的符号表里（任务可能来自已安装的"
+                       "app/驱动镜像），它们**保持无名、不编**。想给它们取名：把对应镜像的"
+                       ".axf 也用 ; 一起传给 elf（如 elf=\"内核.axf;app.axf\"），"
+                       "或用 names= 按任务号手工指定。" % unnamed)
     return out
 
 def _apply_task_names(evs: list, names: dict, idle_name: str = "idle") -> int:
@@ -454,13 +521,17 @@ def _swd_tasks_brief(tn) -> dict:
     tn = tn or {}
     if tn.get("ok"):
         out = {"ok": True, "source": tn.get("table_addr"),
+               "elfs": [os.path.basename(x) for x in (tn.get("elfs") or [])],
                "slots_read": tn.get("slots_read"),
                "named": tn.get("named"), "nonempty": tn.get("nonempty"),
                "names": {str(k): v for k, v in (tn.get("names") or {}).items()},
-               "idle": tn.get("idle_name")}
+               "idle": tn.get("idle_name"), "idle_id": tn.get("idle_id"),
+               "table_count": tn.get("table_count"),
+               "read_mode": tn.get("read_mode")}
         if tn.get("partial"):
             out["partial"] = True
             out["unmapped_slots"] = tn.get("unmapped_slots")
+            out["unmapped"] = tn.get("unmapped")
             out["hint"] = tn.get("hint")
         return out
     if tn.get("skipped"):
@@ -4398,6 +4469,8 @@ def register(server, js=None) -> int:
             "把序号变成真实任务名（事件里多出 from_name / to_name / task_name）；"
             "同一会话只解析一次，解析出来后历史上已解过的事件也会回头重补名字。"
             "取不到就只在 task_names 里如实说明原因，**不编名字**（宁可没名字，也不要错名字）。"
+            "**elf 可以给多份**（; 分隔，如 \"内核.axf;app.axf\"）：任务表只有内核有，"
+            "名字从所有给的镜像里找，这样 app/驱动的任务也带得上名字。"
             "tasks=refresh 强制重解析，tasks=off 完全关掉。"
         ),
     )
@@ -4429,6 +4502,9 @@ def register(server, js=None) -> int:
             "「任务叫什么」的字段；TCB 的 sizeof 与 entry 偏移从 DWARF 取，不靠猜。）\n"
             "**只认精确符号**：入口地址必须是这份 .axf 里某个函数的首地址。**不拿"
             "「最近的下方符号」顶**——跨镜像的地址会被硬安上一个像样的错名字。\n"
+            "**elf 可以给多份**（用 ; 分隔，如 \"内核.axf;app.axf\"）：任务表与布局只有"
+            "内核有，名字则从所有给的镜像里找（入口落在哪一份的函数首地址上就用哪一份的），"
+            "这样 app/驱动的任务也能带上名字。\n"
             "**跨镜像的入口是合法的**：SVCrtOS 的 app/驱动是另外下发的镜像，它们的任务"
             "入口根本不在这份内核 .axf 的符号表里，这种槽位一律**留空**（不编 sub_XXXX），"
             "并在 unmapped_slots / hint 里说清楚怎么给它们取名。整段读回伪值（全 0/全 FF/"
