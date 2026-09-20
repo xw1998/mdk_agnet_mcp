@@ -19,8 +19,8 @@
 | 1 | trace 可信度 | **时间轴冻在原点** | 页面报「时长 44 s / 上下文切换 12081」，泳道里只有 1~2 段 | 已修 `562acf1` |
 | 2 | trace 口径 | **`events` 是会话尾部，不是本批新增** | 拼出来的「轨迹」是 N 个互相重叠的窗口，同一段时间被数很多遍 | 已修 `562acf1` |
 | 3 | trace 性能 | **`limit` 给大反而更容易丢事件** | 前 10 轮不丢、第 11 轮起丢且加速（lost 增量 664→…→5207） | 已修（文档+`only_new`），机制上仍待 `A3` |
-| 4 | 工具面 | **`max_session_events` 在 MCP 面上不存在** | 传了直接 `参数名不被接受`（Python 签名里有，工具包装没暴露） | 已修 `44383c9` |
-| 5 | 会话建立 | **`reset_connection` 之后直接用 trace 报「没有活着的调试会话」** | 要先随便读一次（预热）才能选到链路；错误信息没给这一步 | 已修 `44383c9` |
+| 4 | 工具面 | **`max_session_events` 在 MCP 面上不存在** | 传了直接 `参数名不被接受`（Python 签名里有，工具包装没暴露） | 已修 `44383c9`（真机复核通过 2026-09-20） |
+| 5 | 会话建立 | **`reset_connection` 之后直接用 trace 报「没有活着的调试会话」** | 要先随便读一次（预热）才能选到链路；错误信息没给这一步 | 已修 `44383c9`（真机复核通过 2026-09-20） |
 | 6 | trace 模式 | **`consistent="run"` 在真机上基本不可用** | 全速读回 `repeated_word` 伪值 → `swd-read-untrusted` | 已缓解（默认转 halt）+ 描述写明实测结论 `44383c9`，模式本身仍不可用 |
 | 7 | trace 节拍 | **没有「还能录多久」的预算工具** | 停机一轮 ~0.45~0.67 s、可持续 ~6~9 KB/s，节拍只能自己试 | 未做（`A3`） |
 | 8 | 任务名 | **任务泳道全是裸序号** | 时间轴上只有 0..15，看不出谁在跑 | 已修 `aad0a94` |
@@ -137,6 +137,12 @@ s_last_cycles = now;
 压 `limit` 只治标」。回归用例 `tests/test_batch65.py` B 组钉住「包装签名里有、
 能透传、描述里提了」。
 
+**真机复核（2026-09-20，F427 + SVCRTOS_TEST）**：默认面（core，42 个工具）里
+`trace_swd_read` **不在面上**，调用报 `Unknown tool`——那是第 12 条的配置问题，不是本条。
+`toolset(action="load", toolsets="trace")` 之后工具数 42→76，`inputSchema` 的
+`properties` 里出现 `max_session_events`（`{"default": 500000, "type": "integer"}`）；
+真机带 `max_session_events=100000` 调一次被正常接受并返回事件（不再报「参数名不被接受」）。
+
 ### 5. `reset_connection` 之后直接用 trace 工具会报「没有活着的调试会话」
 
 **现象**：按下述顺序调用
@@ -165,6 +171,19 @@ set_symbol_file → reset_connection → trace_swd_reset
 不碰目标**，与其余工具首次调用时的行为一致。
 `reset_connection` 的返回文案也一并改成「下次调用会**自动重新建立**（不必先做一次
 读来预热）」。回归用例见 `tests/test_batch65.py` A 组。
+
+**真机复核（2026-09-20，F427 + SVCRTOS_TEST，UVSOCK@4823）**：与 `171d2d3`（修复前）
+在同样状态下做对照——
+
+| 步骤 | `171d2d3`（修复前） | `3ba2feb`（修复后） |
+| --- | --- | --- |
+| `reset_connection` 后 `phy.is_connected` | `False` | `False` |
+| **紧接着第一次**调用 `trace_swd_read`（不做任何预热读） | `swd-read-failed：两个链路都没有活着的调试会话，无法读目标内存`，之后仍是 `False`（没建链） | 日志 `已连接到 UVSOCK @ 127.0.0.1:4823` → `ok:true`，`new_events=2466`，`is_connected` 变 `True` |
+| 事件内容 | — | `counts_by_type` 为 `gap:9 / isr:1889 / sched:378 / event:190`；`sched` 事件带真名（`svcrt_shell_task → idle`）；blob 由 `elf_symbol` 定位到 `0x200020C8` |
+
+即「不预热直接 trace」从「报错并把人带去查硬件」变成「静默建链后正常读到事件」。
+（附带一条当时踩到的现象：目标**全速运行**时读控制块会整片回 `0x00`，工具如实报
+`swd-read-degenerate` 而不是当成「没有事件」；`halt` 后再读即 2466 条——与第 6 条同一族。)
 
 ### 6. `consistent="run"` 在真机上基本不可用
 
