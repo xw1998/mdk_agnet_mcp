@@ -275,16 +275,12 @@ def _try_keil():
     # 不去实测（守卫静默失效）。这里先主动连一次：连 UVSOCK 只是开 TCP 与握手，
     # **不进调试、不 halt、不碰目标**，与其余工具首次调用时的行为一致，无副作用。
     try:
-        from . import server as _server
-        c = getattr(_server, "_client", None)
+        # 主动建链统一在 linkio.keil_client 里（batch65 起 linkio / rtos 也走它）——
+        # 三处各写一份的代价就是漏掉一处就复现「reset_connection 之后必须预热」。
+        from . import linkio as _linkio
+        c, err = _linkio.keil_client()
         if c is None:
-            return None, "本进程还没有 Keil 客户端实例（先创建 MCP 服务）"
-        if not c.phy.is_connected:
-            try:
-                c._ensure_connected()
-            except Exception as e:  # noqa: BLE001
-                # 连不上就是真不可用；异常里已带端口/Keil 进程的体检结论，原样透出
-                return None, "连不上 Keil UVSOCK：%s" % e
+            return None, err
         b = KeilBackend(c)
         if b.available():
             return b, None

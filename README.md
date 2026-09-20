@@ -838,10 +838,10 @@ python -m tests.mock_openocd --port 4444         # 模拟 OpenOCD telnet（打�
 | 看故障 | `CFSR`/`HFSR` 是粘滞位，`fault_report` 用 `fault_timing.timeliness` 区分 `current`（正在 fault handler 里）/ `sticky`（历史残位）/ `none` | `timeliness=sticky` 时别当当前故障处理。确证新异常：`clear_faults()` → `run()` → `fault_report()` |
 | 并发调用 | 所有 UVSOCK 命令经统一闸门串行化（进程内 `RLock` + 跨进程锁文件），多实例竞争会在 `keil_health` / `get_status` 里报出来 | 同一台调试器上跑多个 MCP 实例时，写入可能被静默覆盖；需要严格顺序的多步写入请用 `batch` 一次提交 |
 | 输出裁剪 | 受控工具支持 `compact` / `max_lines` / `full`，**裁了就报**：丢过东西必有 `output.truncated` / `dropped` / `hint`，计数字段仍是全量 | `output.truncated=true` 时别当这就是全部；要全量用 `full=true`（细节见上节「高输出工具的输出控制」） |
-
-真机调试里**已经撞到过**的工具问题（现象 / 机理 / 影响 / 处置 / 仍未修的都照实）汇总在 [**docs/mcp-issues.md**](./docs/mcp-issues.md)。
 | Modbus 端口独占 | Modbus 会话与串口日志监听**互斥**：serial_monitor 正占着同口时 `modbus_*` 明确报 `modbus-port-held-by-monitor` 并让你先 `serial_monitor_stop`（**不抢口**——抢来的「成功」会收到错数据）；同口同参数**复用不重开**，避免 DTR 抖动复位目标板 | Modbus 是二进制帧协议，别拿按行切分的日志监听接它 |
 | 串口占用 | 调试结束 / 烧录 / 关 Keil 时自动释放端口（**释放只还口、日志保留**），另有空闲超时与进程退出兜底 | 同一个串口别被两处同时打开（本服务 + Keil 串口窗口会互相抢占，`WinError=5`） |
+
+真机调试里**已经撞到过**的工具问题（现象 / 机理 / 影响 / 处置 / 仍未修的都照实）汇总在 [**docs/mcp-issues.md**](./docs/mcp-issues.md)。
 
 **串口可收也可发**：端口按可读可写打开，收与发共用同一句柄；拿不到写权限时退回只读并置
 `can_write=false`。`serial_monitor_start` 会**等端口就绪再返回**，其 `port_ready` / `can_write`

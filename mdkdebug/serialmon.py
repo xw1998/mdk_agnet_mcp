@@ -1052,12 +1052,26 @@ def _release_on_exit() -> None:
 
 atexit.register(_release_on_exit)
 
+def _port_hint(prefix: str) -> str:
+    """提示里要出现端口号时，优先写**本机真实存在的口**，而不是一个写死的示例号。
+
+    真机反馈：提示写死 port="COM9"，而同一份返回里的 available_ports 明明是 COM3——
+    文案与事实不符，照着做只会再失败一次（属于「看似权威的错答案」）。有真值就用真值，
+    一个口都没有时才退回「先 list_ports 看看」的说法。
+    """
+    names = [str(p.get("port")) for p in list_ports()
+             if isinstance(p, dict) and p.get("port")]
+    if names:
+        return "%s（本机可用：%s）" % (prefix, "、".join(names[:4]))
+    return "%s；先用 serial_list_ports 确认本机有哪个口" % prefix
+
+
 def read_lines(max_items: int = 200, clear: bool = False,
                since: int | None = None) -> dict:
     m = _monitor
     if m is None:
         return {"ok": False, "error": "当前没有串口监听在运行",
-                "hint": "先调 serial_monitor_start(port=\"COM9\", baud=115200) 启动监听",
+                "hint": _port_hint("先调 serial_monitor_start(port=..., baud=115200) 启动监听"),
                 "available_ports": list_ports()}
     out = m.read(max_items=max_items, clear=clear, since=since)
     out["ok"] = True
@@ -1073,8 +1087,8 @@ def write_bytes(data: bytes, wait_ms: int = 300, max_items: int = 200,
     m = _monitor
     if m is None:
         return {"ok": False, "error": "当前没有串口监听在运行",
-                "hint": "serial_write 依赖监听持有端口（收与发用同一个句柄）："
-                        "先调 serial_monitor_start(port=\"COM9\", baud=115200) 再下发",
+                "hint": _port_hint("serial_write 依赖监听持有端口（收与发用同一个句柄）："
+                                   "先调 serial_monitor_start(port=..., baud=115200) 再下发"),
                 "available_ports": list_ports()}
     m.touch()
     before = m.rb.stats()["next_seq"]

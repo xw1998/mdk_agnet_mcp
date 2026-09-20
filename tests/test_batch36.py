@@ -53,6 +53,13 @@ REAL_AXF = os.path.join(ROOT, "example_mdk_project", "mdk_test", "MDK-ARM",
 REAL_PROJ = os.path.join(ROOT, "example_mdk_project", "mdk_test", "MDK-ARM")
 PASS, FAIL = [], []
 TMPROOT = tempfile.mkdtemp(prefix="mdkdebug_b36_")
+# UVSOCK 端口：**故意指向没人监听的端口**。
+# 本批测的是「不用 Keil」的非 MDK 链路，Keil 侧就该是不可用——用 mock.port 会出事：
+# OpenOCD mock 的 telnet 口是**会接受 TCP 但不讲 UVSOCK 协议**的，一旦有代码路径
+# 主动建链（batch65 起 linkio.keil_client 就是这么做的），就会卡在握手等回包上，
+# 每一处探测白等一个 UVSOCK 超时（实测把本模块从 80s 拖到跑不完）。
+# 指向没人听的端口则是一秒内 ECONNREFUSED，与真机「Keil 没起」同形。
+UVSOCK_PORT = 14913
 
 
 def check(name, ok, detail=""):
@@ -824,7 +831,7 @@ def main():
     print("=" * 72)
     mock = MOC.MockOpenOCD()
     sess = MOC.attach(mock)
-    server = create_server(host="127.0.0.1", port=mock.port, idle_timeout=5.0,
+    server = create_server(host="127.0.0.1", port=UVSOCK_PORT, idle_timeout=5.0,
                            uv4_path=None, default_project=REAL_PROJ,
                            axf_path=REAL_AXF if os.path.isfile(REAL_AXF) else None)
     try:

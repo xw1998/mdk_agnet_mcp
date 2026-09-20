@@ -207,7 +207,7 @@ class UVClient:
             health = None
         return {"ok": True, "action": "重置 UVSOCK 连接",
                 "reason": reason or "手动复位",
-                "msg": "连接已丢弃，下次调用会重新建立；若仍异常可用 restart_keil 重启 Keil",
+                "msg": "连接已丢弃，下次调用会**自动重新建立**（不必先做一次读来预热；batch65 起链路选择会主动建链）；若仍异常可用 restart_keil 重启 Keil",
                 "keil": health}
 
     def serialization_snapshot(self) -> dict:

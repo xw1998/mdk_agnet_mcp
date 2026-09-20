@@ -217,9 +217,9 @@ ERROR_CODES = {
     "modbus-no-session": {
         "text": "还没有打开的 Modbus 会话，且本次没给 port",
         "next_actions": [
-            "带上 port（如 port=\"COM9\"）与 baud / serial_format 重新调用",
+            "带上 port（口以 serial_list_ports 的结果为准，别照抄示例号）与 baud / serial_format 重新调用",
             "不确定是哪个口：先 serial_list_ports 看端口与芯片推断",
-            "想先确认能打开：modbus_session(action=\"open\", port=\"COM9\", baud=9600)",
+            "想先确认能打开：modbus_session(action=\"open\", port=<上一步看到的那个口>, baud=9600)",
         ],
     },
     "modbus-no-port": {

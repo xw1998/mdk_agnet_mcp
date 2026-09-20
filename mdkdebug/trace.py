@@ -4486,6 +4486,11 @@ def register(server, js=None) -> int:
             "否则 events.extend(out[\"events\"]) 拼出来的是 N 个互相重叠的窗口，"
             "看着条数很壮观，其实是同一段时间被数了很多遍。两种口径下 counts_by_type / "
             "top_ids / faults 都按**整个会话**统计，与 events 给哪一段无关。\n"
+            "**max_session_events（默认 500000）是会话内存上限**：超了就丢**最旧**的，"
+            "丢了多少记在 session_events_dropped。长时间录制想压内存/压单轮开销就调它——"
+            "这比压 limit 对症：limit 只管**返回**多少条，给得很大反而每轮都要把整个会话"
+            "序列化回来，搬运变慢、环被写满、丢事件（真机实测 limit=200000 时 lost 增量"
+            "664→5207，且是正反馈：丢一条→目标清字典→下一条必是 LIT→更快填满）。\n"
             "事件里 auto 带出 gap（丢了一段）、sync（目标重开了录制段）、fault（异常，含 CFSR 拆位"
             "与寄存器现场）。\n"
             "**宿主一侧没有「从半路接上」的办法**：HIT token 只带槽号，字典一旦漂移就会解出错误的 id，"
@@ -4500,6 +4505,8 @@ def register(server, js=None) -> int:
             "（背压不覆写），代价是每搬一次停几毫秒；run=全速搬，但实测有的目标/地址段会"
             "整片读回伪值（全 0 / 全 FF / 整段重复同一个 4 字节字），碰到伪值直接报 "
             "swd-read-untrusted 而不是拿去解码；auto=先全速读，发现伪值自动停机重读一次。"
+            "**实测结论（F427 + DAPLink）：只要目标在跑，run 就稳定报 swd-read-untrusted"
+            "（整片 repeated_word），等于不可用——别为了省那几毫秒去选它，用默认 halt。**"
             "返回里的 consistent / halt_ms 说明这一块实际是怎么搬的。\n"
             "**任务名（tasks=，默认 auto）**：调度事件在流里只带任务序号（0..14，0xF=idle），"
             "默认会读一次内核的 svcrt_task_table，用每个槽位的 entry 函数地址反查 ELF 符号，"
@@ -4518,14 +4525,18 @@ def register(server, js=None) -> int:
                              granularity: str = "",
                              consistent: str = "halt",
                              tasks: str = "auto",
-                             only_new: bool = False) -> str:
+                             only_new: bool = False,
+                             max_session_events: int = _SWD_MAX_SESSION_EVENTS) -> str:
         try:
+            # 两层签名原先不一致：swd_read 有 max_session_events，包装没接出来——
+            # 调用方从工具面上看不到、也传不进来（真机反馈：传了报「参数名不被接受」）。
             return _js(swd_read(elf=elf, addr=addr, limit=int(limit),
                                 out_file=out_file, names=names, link=link,
                                 reset_session=bool(reset_session),
                                 granularity=granularity,
                                 consistent=consistent, tasks=tasks,
-                                only_new=bool(only_new)))
+                                only_new=bool(only_new),
+                                max_session_events=int(max_session_events or 0)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

@@ -372,10 +372,42 @@ class OcdLink(Link):
 
 # ==================================================================== 选路
 
-def _try_keil():
+def keil_client(prepare: bool = True):
+    """取本进程的 Keil 客户端；prepare=True 时先主动把 UVSOCK 连上。
+
+    为什么要 prepare：UVClient 的 socket 是**懒连接**（首次真正用到才开），而
+    `reset_connection` / 空闲超时之后 `phy.is_connected` 又是 False——只看它就会把
+    「还没连」误报成「链路不可用」。真机实测（F427 一轮 SWD trace）：按
+    set_symbol_file -> reset_connection -> trace_swd_reset 调用，后面几次全报
+    「两个链路都没有活着的调试会话」，而 keil_health / read_mem 都正常——错误信息把人
+    带去查硬件、查 Keil、重启调试会话，排查方向完全错；随便读一次就恢复。
+
+    主动建链只是开 TCP + 握手，**不进调试、不 halt、不碰目标**，与其余工具首次调用时的
+    行为一致（同一修法在 rtrace 已验证过，见那里的 batch50 记录）。
+
+    返回 (client, err)；client 为 None 时 err 是可直接透出的原因。
+    """
     try:
         from . import server as _server
         c = getattr(_server, "_client", None)
+    except Exception as e:                                          # noqa: BLE001
+        return None, "取 Keil 会话失败：%s" % e
+    if c is None:
+        return None, "本进程还没有 Keil 客户端实例（先创建 MCP 服务）"
+    if prepare and not getattr(c.phy, "is_connected", False):
+        try:
+            c._ensure_connected()
+        except Exception as e:                                      # noqa: BLE001
+            # 连不上就是真不可用；异常里已带端口/Keil 进程的体检结论，原样透出
+            return None, "连不上 Keil UVSOCK：%s" % e
+    return c, None
+
+
+def _try_keil():
+    c, err = keil_client()
+    if c is None:
+        return None, err
+    try:
         lk = KeilLink(c)
         if lk.available():
             return lk, None

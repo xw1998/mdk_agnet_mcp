@@ -1056,12 +1056,14 @@ def _pick_reader(link: str = "auto"):
     keil, kerr = None, None
     if want in ("auto", "keil"):
         try:
-            from . import server as _server
-            c = getattr(_server, "_client", None)
-            if c is not None and getattr(c.phy, "is_connected", False):
+            from . import linkio as _linkio
+            # 别裸判 phy.is_connected：UVSOCK 是懒连接，reset_connection 之后它是 False，
+            # 会把「还没连」当成「链路不可用」（与 linkio.keil_client 同一处坑）。
+            c, cerr = _linkio.keil_client()
+            if c is not None:
                 keil = _keil_reader(c)
             else:
-                kerr = "Keil 侧的 UVSOCK 会话没连着（先 enter_debug 或确认 Keil 已启动）"
+                kerr = cerr or "Keil 侧的 UVSOCK 会话没连着（先 enter_debug 或确认 Keil 已启动）"
         except Exception as e:                                 # noqa: BLE001
             kerr = "取 Keil 会话失败：%s" % e
 
