@@ -6,7 +6,7 @@ mdkdebug —— 可被 AI 工具调用的 Keil uVision 调试服务。
 暴露调试能力（读变量、读写内存、运行控制、状态查询）。
 """
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 from .client import UVClient
 from . import uvsock, interface
