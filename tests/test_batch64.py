@@ -24,6 +24,10 @@
   H 多份镜像（内核;app）联合取名：任何一份的入口都能配上名字，但**跨镜像**的名字
     必须过内容核对（板上机器码 == .axf 同地址字节）——地址对上不等于板上跑的是
     这份构建；核不过/核不了就丢名并记 unconfirmed_slots
+  I 时间轴冻结：粒度比事件间隔粗时，目标算 dt 丢掉余数 → 每条都是 0 → 宿主累加
+    出来的时间轴冻在原点，必须当场报 time_axis_frozen 而不是画一条平平的轴
+  J events 口径：默认给会话尾部（含前几次调用的事件、互相重叠），only_new=true
+    才只给本批新增——自己拼线性轨迹时搞错就会把同一段时间数很多遍
 
 运行：python -m tests.test_batch64
 """
@@ -247,15 +251,19 @@ def patch_read_mem(table_bytes, code=None):
     return hits, undo
 
 def scenario(events, tbl_entries=None, no_table=False, no_layout=False,
-             table_bytes=None, count=48, extra=None):
-    """一段含 sync + 事件的合法流，外加一张任务表。"""
+             table_bytes=None, count=48, extra=None, flags=None):
+    """一段含 sync + 事件的合法流，外加一张任务表。
+
+    flags 默认带 TS_OFF（老夹具都是「没有时间轴」那种流）；要看**有时间戳**
+    的行为（例如 dt 全 0 的冻结轴）就传 SWD.FLAG_ENABLED。
+    """
     enc = SWD.Encoder()
     stream = enc.sync(1) + enc.encode(events)
     ring = bytearray(8192)
     ring[0:len(stream)] = stream
     addr = 0x200020C8
     ctrl = build_ctrl(addr, head=len(stream), tokens=len(events),
-                      events=len(events))
+                      events=len(events), flags=flags)
     lk = FakeSwdLink(addr, ctrl, ring, extra=extra)
     idx = FakeIndex(no_table=no_table, no_layout=no_layout, count=count)
     tb = table_bytes if table_bytes is not None else task_table_bytes(
@@ -590,6 +598,69 @@ def main():
                 pass
         TRC._T["swd"] = None
 
+    print("== I 粒度比事件密：时间轴冻结要报出来 ==", flush=True)
+    # 真机上就是这么撞的：500 µs 粒度 + 约 6700 事件/s，目标按「与上一条的差 ÷ 粒度」
+    # 算 dt 并丢掉余数，于是每条都算 0，宿主累加出来的时间轴**冻在原点**。
+    # 页面当时照样画出了一条平平的「时间轴」，看着像模像样——这类必须有话说。
+    evs_flat = [(SWD.make_key(10, 2, i % 8, (i + 1) % 8), 0) for i in range(300)]
+    lk, hits, undo = scenario(evs_flat, flags=SWD.FLAG_ENABLED)
+    try:
+        out = TRC.swd_read(elf="", addr=BLOB_ADDR, limit=10)
+        check("I1 dt 全是 0（粒度比事件密）-> 报 time_axis_frozen，不装看不见",
+              out.get("ok") and (out.get("time_axis_frozen") or {}).get("events"),
+              {k: out.get(k) for k in ("ok", "error", "time_axis_frozen")})
+        check("I2 警告里说清是「冻」的、并指向换细粒度重录",
+              any("冻" in str(w) for w in out.get("warnings") or [])
+              and any("granularity" in str(w) for w in out.get("warnings") or []),
+              out.get("warnings"))
+        check("I3 事件顺序仍然照常给（冻结的是时间，不是解码）",
+              len(out.get("events") or []) == 10, len(out.get("events") or []))
+    finally:
+        undo()
+
+    print("== J events 口径：会话尾部 vs 本批新增 ==", flush=True)
+    # 真机上就是这么录错的：events.extend(out["events"]) 看上去条数很壮观，
+    # 其实是 N 个互相重叠的窗口——同一段时间被数了很多遍。
+    evs_j = [(SWD.make_key(10, 2, 0, 1), 0) for _ in range(300)]
+    # 复用同一个编码器对象：scenario 里是同一串事件、同一个确定性编码器，
+    # 所以下面 append() 接上去的那一段与环里已有的那段字典是连续的（HIT 才解得对）。
+    enc_j = SWD.Encoder()
+    enc_j.sync(1) + enc_j.encode(evs_j)
+    lk, hits, undo = scenario(evs_j, flags=SWD.FLAG_ENABLED)
+    try:
+        o1 = TRC.swd_read(elf="", addr=BLOB_ADDR, limit=10)
+        check("J1 默认口径：events 是会话尾部（被 limit 截到 10），new_events 报本批新增",
+              o1.get("new_events") >= 300 and len(o1.get("events") or []) == 10
+              and o1.get("events_scope") == "session",
+              {k: o1.get(k) for k in ("new_events", "events_scope", "truncated")})
+
+        def append(evs_n):
+            """在同一个编码器状态上再接一段流（字典连续），并把环指针推过去。"""
+            chunk = enc_j.encode([(SWD.make_key(10, 2, 2, 5), 0)] * evs_n)
+            head = struct.unpack_from("<I", lk.ctrl, SWD.OFF_HEAD)[0]
+            lk.ring[head:head + len(chunk)] = chunk
+            n_ev = struct.unpack_from("<I", lk.ctrl, SWD.OFF_EVENTS)[0] + evs_n
+            n_tk = struct.unpack_from("<I", lk.ctrl, SWD.OFF_TOKENS)[0] + evs_n
+            struct.pack_into("<I", lk.ctrl, SWD.OFF_HEAD, head + len(chunk))
+            struct.pack_into("<I", lk.ctrl, SWD.OFF_EVENTS, n_ev)
+            struct.pack_into("<I", lk.ctrl, SWD.OFF_TOKENS, n_tk)
+
+        append(7)
+        o2 = TRC.swd_read(elf="", addr=BLOB_ADDR, limit=100)
+        check("J2 默认口径下第二次仍给会话尾部：100 条里只有 7 条是新的（重叠陷阱）",
+              o2.get("new_events") == 7 and len(o2.get("events") or []) == 100,
+              {k: o2.get(k) for k in ("new_events", "events_scope")}
+              | {"len(events)": len(o2.get("events") or [])})
+        append(5)
+        o3 = TRC.swd_read(elf="", addr=BLOB_ADDR, limit=100, only_new=True)
+        check("J3 only_new=true：只给本批新增的那 5 条，拼线性轨迹才是对的",
+              o3.get("new_events") == 5 and len(o3.get("events") or []) == 5
+              and o3.get("events_scope") == "new",
+              {k: o3.get(k) for k in ("new_events", "events_scope")}
+              | {"len(events)": len(o3.get("events") or [])})
+    finally:
+        undo()
+
     print("== G 工具面 ==", flush=True)
     import asyncio
     from mdkdebug import server as SV
@@ -598,9 +669,9 @@ def main():
     names = [t.name for t in tools]
     check("G1 trace_swd_tasks 已注册", "trace_swd_tasks" in names, len(names))
     t_read = [t for t in tools if t.name == "trace_swd_read"][0]
-    check("G2 trace_swd_read 多了 tasks 参数",
-          "tasks" in (t_read.input_schema.get("properties") or {}),
-          list((t_read.input_schema.get("properties") or {})))
+    _props = t_read.input_schema.get("properties") or {}
+    check("G2 trace_swd_read 多了 tasks 参数", "tasks" in _props, list(_props))
+    check("G3 trace_swd_read 多了 only_new 参数", "only_new" in _props, list(_props))
 
     print()
     print("通过 %d，失败 %d，跳过 %d" % (len(PASS), len(FAIL), len(SKIP)))

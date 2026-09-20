@@ -230,12 +230,24 @@ trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0,
 - **读环必须停机**：目标全速跑时读 SRAM 可能整片读回 0（如实报 `swd-read-degenerate`）——
   **丢的是「没读到」，不是「没有」**。停机搬走不会丢数据（背压保证任何时刻已录的那段都完整，
   丢的只是事件，不是结构）。
-- **时间粒度可调**：`trace_swd_reset(granularity=...)` 是唯一入口（`cycle` / `500us` /
-  `none` / `1ms` / `1us`…，见 `trace_guide(topic="time_granularity")`），实测
-  **3.69 / 1.61 / 1.60 字节每事件**。调粗只损时间分辨力：**事件顺序完整，但同一量化窗口内
-  的先后不可分辨**。`trace_swd_read(granularity=...)` 只做校验，不符会报
+- **时间粒度可调，但它决定的不只是分辨力，还有「录不录得下来」**：
+  `trace_swd_reset(granularity=...)` 是唯一入口（`cycle` / `500us` / `none` / `1ms` /
+  `1us` / 直接给微秒数，见 `trace_guide(topic="time_granularity")`）。实测每事件字节数：
+  `500us` ≈ **1.01 B**、`10us` ≈ **1.31 B**、`1us` ≈ **2.33 B**、`cycle` ≈ **3.33 B**。
+  环只有 8 KB、停机搬运一轮 ~1 s，可持续搬运有限（实测约 6~9 KB/s）：
+  **粒度调得比事件间隔粗，dt 会整批算成 0，时间轴冻在原点**（宿主报 `time_axis_frozen`，
+  渲染 badge 报「冻结」）——那不是「事件同时发生」，是量化把余数丢了；
+  **调得太细，每事件字节数上去，一旦超过搬运能力就会一路丢**（丢一条 ⇒ 清字典 ⇒
+  下一条必是 LIT ⇒ 更快填满，正反馈）。F427 上的实测甜点是 `10us`。
+  要真时间轴又不想丢，正解是**把 `limit` 压到刚好盖住本批**（给太大反而每轮序列化
+  整个会话、越调越慢）并把节拍调紧，而不是继续抠别的。
+  `trace_swd_read(granularity=...)` 只做校验，不符会报
   `swd-granularity-mismatch` / `-changed` / `-invalid`。失步报 `swd-stream-desync`，
   正解是 `trace_swd_reset` 重对齐（别硬解，字典不同步会解出看着合理的错误 key）。
+- **`events` 默认是「会话尾部」，不是「本批新增」**：自己写循环录一段、要离线回放时，
+  `events.extend(out["events"])` 会把前几次调用的事件重复收集（拼出来是 N 个重叠窗口，
+  条数好看但是重复计数）。**拼线性轨迹要传 `only_new=true`**，那样 `events` 只给本批的
+  `new_events` 条。`counts_by_type` / `top_ids` / `faults` 始终按**整个会话**统计。
 - **任务名是主机侧「用 DWARF 反查」出来的，固件一个字节都不用改**：`trace_swd_read(tasks=auto)`
   会按 `svcrt_task_table` 的元素类型（`svcrt_task_t`，**匿名 typedef 结构体**）取出 `entry`
   字段偏移，逐槽读 TCB 入口指针、反查 ELF 函数符号，给 `sched`/`wait`/`ready`/`create`/

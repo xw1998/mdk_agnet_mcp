@@ -218,6 +218,17 @@ def section_b():
     _bs = {b["k"]: b["v"] for b in ((_mt.get("model") or {}).get("badges") or [])}
     check("B8c 抽稀时 badge 仍报全量条数（绘制抽稀 ≠ 统计口径变）",
           _bs.get("事件") == str(len(SWD["events"])), _bs)
+    # 反例：有时间戳字段 ≠ 时间轴能用。粒度比事件密时（目标把除法的余数丢了）
+    # 每条 dt 都是 0，横轴冻在原点——不能再画一条平平的、看着像模像样的轴。
+    _fz = {"events": [{"type": "sched", "kind": "point", "id": 0, "arg": 1,
+                       "from": 0, "to": 1, "t_us": 0.0} for _ in range(60)]}
+    _mz = VZ.adapt(_fz, view="auto")
+    _bz = {b["k"]: b for b in ((_mz.get("model") or {}).get("badges") or [])}
+    check("B8d 时间戳全是 0 -> 「时间轴」badge 报冻结（level=bad），不假装有时间轴",
+          _bz.get("时间轴", {}).get("v") == "冻结"
+          and _bz["时间轴"].get("level") == "bad"
+          and any("冻结" in str(x) for x in (_mz["model"].get("limits") or [])),
+          (_bz.get("时间轴"), _mz["model"].get("limits")))
     check("B9 read_meta.unstable / warnings 原样进 limits（不加工成结论）",
           any("TS_OFF" in str(x) for x in m.get("limits") or []), m.get("limits"))
     check("B10 时间轴口径写进 subtitle（这次有时间戳）",

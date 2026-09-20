@@ -3032,7 +3032,7 @@ def swd_status(elf: str = "", addr="", link: str = "auto") -> dict:
 def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
              names: str = "", link: str = "auto", reset_session: bool = False,
              granularity: str = "", consistent: str = "halt",
-             tasks: str = "auto",
+             tasks: str = "auto", only_new: bool = False,
              max_session_events: int = _SWD_MAX_SESSION_EVENTS) -> dict:
     """无缝流的**核心动作**：把 [drained, head) 搬走 → 解码 → 把 drained 推上去。
 
@@ -3046,7 +3046,15 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
       * auto：先全速读，发现伪值自动停机重读一次（读得快又不会静默错）。
 
     多次调用会累加成一个连续的时间线（会话状态留在进程内）。
-    返回 events 只给最新 limit 条；全量用 out_file 落盘。
+
+    **返回的 events 是哪一段，取决于 only_new**：
+      * False（默认）：会话**尾部**最多 limit 条——它包含**前面调用的**事件，
+        多次调用之间会大面积重叠。只看「现在长什么样」用它最省事。
+      * True：只给**本批新增**的那 new_events 条。要拼一条线性的、可离线回放
+        的轨迹就只能用它——否则 events.extend(out["events"]) 拼出来的是 N 个
+        互相重叠的窗口，看着条数很多，其实是同一段时间被数了很多遍。
+    两种口径下 new_events 都是本批条数；counts_by_type / top_ids / faults 始终
+    按**整个会话**统计（与 events 给哪一段无关）。全量落盘用 out_file。
 
     granularity= 是**校验**不是设置：给了就要求控制块当前的粒度与它一致，不一致
     直接报 swd-granularity-mismatch（一段流里混两种单位，时间轴换算出来就是错的）。
@@ -3325,6 +3333,12 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
     if tnames is not None:
         # 已存事件回头重补（幂等：只写它算得准的字段）
         _apply_task_names(s["events"], tnames, (tn or {}).get("idle_name") or "idle")
+    # 时间轴冻结检测：目标算 dt 是「与上一条的差 ÷ 粒度」并**丢掉余数**（不是把余数
+    # 累加进下一次），所以粒度比事件间隔粗时，每条的 dt 都被算成 0，宿主累加出来的
+    # 时间就永远停在原地——**看着有时间轴，其实是一条竖线**。这属于「看得见的错答案」：
+    # 页面上会画出一条平平的、像模像样的轴，而不是报错。这里如实报出来。
+    timed = [e for e in evs if e.get("dt_cycles") is not None]
+    frozen = bool(timed) and len(timed) >= 200 and not any(e.get("dt_cycles") for e in timed)
     s["events"].extend(evs)
     if len(s["events"]) > int(max_session_events or 0) > 0:
         drop = len(s["events"]) - int(max_session_events)
@@ -3333,6 +3347,8 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
     s["bytes_read"] += len(data)
 
     view = _swd_session_view(s, limit=limit)
+    if only_new:
+        view = dict(view, events=list(evs), truncated=False)
     out = {
         "ok": True, "addr": "0x%X" % a, "locate": loc,
         "ctrl": {k: info[k] for k in ("version", "cap", "ring_off", "head",
@@ -3362,6 +3378,7 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         "top_ids": view["top_ids"],
         "faults": view["faults"],
         "events": view["events"],
+        "events_scope": "new" if only_new else "session",
         "truncated": view["truncated"],
         "consistent": "halt" if did_halt else "run",
         "halt_ms": round(halt_ms, 2) if halt_ms is not None else None,
@@ -3372,6 +3389,21 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         "next": ["连续录：反复调 trace_swd_read，每次它只搬走新增的那一段",
                  "想看整体健康度用 trace_swd_status（更便宜）"],
     }
+    if frozen:
+        _unit = "（1 周期/单位）" if not s.get("dt_unit") else (
+            "≈ %.0f µs" % (s["dt_unit"] * 1e6 / (s.get("cpu_hz") or 1)))
+        out["time_axis_frozen"] = {
+            "events": len(timed), "dt_unit_cycles": s.get("dt_unit") or 0,
+            "ts_shift": s.get("ts_shift") or 0}
+        out["warnings"] = out.get("warnings", []) + [
+            "本批 %d 条事件的量化时间增量**全是 0**（粒度 = %s 周期 %s）：目标按"
+            "「与上一条的差 ÷ 粒度」算 dt 并**丢掉余数**，事件比粒度密时每条都算 0，"
+            "宿主累加出来的时间轴会**冻在原地**——这条轴上「时长 / 间隔 / 谁先谁后"
+            "之间的间隔」都不成立，事件**顺序**仍是对的。要真时间轴就换细粒度重录："
+            "trace_swd_reset(granularity=\"cycle\" 或 \"1us\")，代价是每事件字节数"
+            "变大、环能装的事件变少（节拍要相应调紧）。"
+            % (len(timed), s.get("dt_unit") or ("1<<%s" % (s.get("ts_shift") or 0)),
+               _unit)]
     if notes:
         out["notes"] = notes
     if not pending:
@@ -4447,8 +4479,13 @@ def register(server, js=None) -> int:
             "目标因此可以循环使用那块环，主机反复调这个工具就能一直录下去。\n"
             "与 buff 的关键区别：**未读区永不被覆盖**。宿主跟不上时目标丢**新**事件并计入 "
             "lost_events（权威计数），已经录下的那部分始终是完整可读的。\n"
-            "多次调用会累加成一个连续时间线（会话状态在进程内）；返回的 events 只给最新 limit 条，"
-            "全量用 out_file 落盘——几万条不要往对话里塞。\n"
+            "多次调用会累加成一个连续时间线（会话状态在进程内）；返回的 events **默认给会话尾部**"
+            "最多 limit 条（**含前几次调用的事件，会重叠**），全量用 out_file 落盘——"
+            "几万条不要往对话里塞。**要自己拼一条线性轨迹（离线回放/存盘）就必须传 "
+            "only_new=true**：那样 events 只给**本批新增**的那 new_events 条；"
+            "否则 events.extend(out[\"events\"]) 拼出来的是 N 个互相重叠的窗口，"
+            "看着条数很壮观，其实是同一段时间被数了很多遍。两种口径下 counts_by_type / "
+            "top_ids / faults 都按**整个会话**统计，与 events 给哪一段无关。\n"
             "事件里 auto 带出 gap（丢了一段）、sync（目标重开了录制段）、fault（异常，含 CFSR 拆位"
             "与寄存器现场）。\n"
             "**宿主一侧没有「从半路接上」的办法**：HIT token 只带槽号，字典一旦漂移就会解出错误的 id，"
@@ -4480,13 +4517,15 @@ def register(server, js=None) -> int:
                              reset_session: bool = False,
                              granularity: str = "",
                              consistent: str = "halt",
-                             tasks: str = "auto") -> str:
+                             tasks: str = "auto",
+                             only_new: bool = False) -> str:
         try:
             return _js(swd_read(elf=elf, addr=addr, limit=int(limit),
                                 out_file=out_file, names=names, link=link,
                                 reset_session=bool(reset_session),
                                 granularity=granularity,
-                                consistent=consistent, tasks=tasks))
+                                consistent=consistent, tasks=tasks,
+                                only_new=bool(only_new)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

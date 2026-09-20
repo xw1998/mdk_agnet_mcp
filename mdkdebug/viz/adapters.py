@@ -306,7 +306,12 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
     names_in = names or {}          # 调用方显式给的（给中断号起名用的就是这份）
     names, idle_name, idle_id, name_why = _task_names_from(payload, names)
     times, has_time, unit_note = _rel_times(evs, payload, names)
-    tmax = max([t for t in times if t is not None] or [1.0]) or 1.0
+    # 有 t_us 字段 ≠ 时间轴能用：粒度比事件间隔粗时（目标把每次除法的**余数**丢掉了），
+    # 每条事件的量化增量都是 0，横轴会**冻成一条竖线**。这种轴必须报出来，
+    # 不能画成一条平平的、看着像模像样的时间轴。
+    timed = [t for t in times if t is not None]
+    t_frozen = bool(has_time and len(timed) >= 50 and not any(timed))
+    tmax = max(timed or [1.0]) or 1.0
     tracks, markers, gaps, extras = [], [], [], []
     counts = {}
 
@@ -486,6 +491,12 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
     notes, limits = collect_notes_limits(payload if isinstance(payload, dict) else {})
     if not has_time:
         limits.append("源数据没有可用时间戳：横轴是**事件序号**，间距不代表时间间隔。")
+    if t_frozen:
+        limits.append("**时间轴是冻结的**：%d 条事件的时间增量全是 0（目标按「与上一条的差 ÷ "
+                      "粒度」算 dt 并丢掉余数，事件比粒度密时每条都算 0）。横轴上「时长 / 间隔」"
+                      "都不成立，**事件顺序仍是对的**。要真时间轴就用更细的粒度重录"
+                      "（trace_swd_reset(granularity=\"cycle\")），代价是每事件字节数变大。"
+                      % len(timed))
     if thinned:
         limits.append("事件 %d 条超过上限，每 %d 条抽 1 条**绘制**（总数与下面的计数"
                       "仍是全量）。" % (total_events, thinned))
@@ -497,8 +508,8 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
     badges = [{"k": "事件", "v": "%d" % total_events},
               {"k": "轨道", "v": str(len(tracks))},
               {"k": "时长", "v": _fmt_us(tmax) if has_time else "—"},
-              {"k": "时间轴", "v": "时间" if has_time else "序号",
-               "level": "ok" if has_time else "warn"}]
+              {"k": "时间轴", "v": "冻结" if t_frozen else ("时间" if has_time else "序号"),
+               "level": "bad" if t_frozen else ("ok" if has_time else "warn")}]
     for typ in ("sched", "isr", "fault"):
         if counts_full.get(typ):
             badges.append({"k": {"sched": "上下文切换", "isr": "中断进出", "fault": "异常"}[typ],
