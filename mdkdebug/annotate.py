@@ -57,6 +57,9 @@ READONLY = {
     "core_list", "core_info",
     # ETM 探测：只读 ROM table / ID 块，不写任何目标寄存器。
     "trace_etm_probe",
+    # 代码结构索引（批次68）：查索引库 + 读本机源码文件，不碰目标、不写任何文件。
+    # （code_index 会建/删索引文件，所以它不在这里，排在下面的 MUTATING。）
+    "code_status", "code_files", "code_query", "code_node",
     "ocd_cfg_list", "ocd_status", "ocd_log", "ocd_probe", "ocd_flash_info",
     "ocd_read_mem",
     "trace_guide", "trace_status", "trace_decode", "trace_events",
@@ -171,6 +174,10 @@ MUTATING = {
     # 本机磁盘写一个 html（默认 ./mdkdebug_views/），按本文件口径（只读＝不改任何
     # 持久状态，含用户文件）不属于只读；out 也可能覆盖已有文件。
     "view_render",
+    # 代码索引维护（批次68）：build/sync 会建库写盘、drop 会删索引文件，属改状态。
+    # **不列入 DESTRUCTIVE**：它只动自己的索引库（~/.mdkdebug 或 <项目>/.mdkdebug），
+    # 一个字都不碰用户源码，且删了重建即可——所以 risk 是 medium 而不是 high。
+    "code_index",
 }
 
 # 本服务面向**本机**的开发环境（Keil 进程、调试探针、本地工具链、本地文件），

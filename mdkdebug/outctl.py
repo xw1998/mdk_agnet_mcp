@@ -65,6 +65,9 @@ HIGH_OUTPUT = {
     # 编译/烧录系列（批次48）：返回体里塞着 UV4 全量日志，属典型高输出工具
     "flash_debug", "build_project", "rebuild_project", "clean_project",
     "flash_download", "build_and_flash",
+    # 代码结构索引（批次68）：code_node 直接搬源码体、code_query/code_files 给
+    # 长清单、code_index 带 skipped_list——都给 compact/max_lines/full 三件套。
+    "code_index", "code_files", "code_query", "code_node",
 }
 
 #: 日志类工具（批次48）：**默认**摘录日志字段（唯一改变默认行为的地方，理由见模块 docstring）

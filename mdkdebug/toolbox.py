@@ -146,6 +146,13 @@ TOOLSETS = {
     "rtos": {
         "rtos_info", "rtos_tasks", "rtos_objects",
     },
+    # 代码结构索引（批次68）：C/C++ 符号表 + include 图 + 单符号源码体，
+    # 用 tree-sitter 解析、SQLite 落盘（~/.mdkdebug/codeindex/，不写用户工程）。
+    # 默认收起：它是「大工程省 token」的手段，不调就不占上下文；
+    # 只有 code_explore（批次70）进默认面，因为「默认面上就能看到」是它的价值。
+    "code": {
+        "code_index", "code_status", "code_files", "code_query", "code_node",
+    },
 }
 
 # 永远保留：这几个是「问工具面 / 装卸工具面」的入口，裁掉它们 AI 会
@@ -227,6 +234,7 @@ GROUP_NOTES = {
     "ocd": "OpenOCD：启停、命令直通、内存/寄存器/断点/烧录、GDB server",
     "trace": "trace：SWO/ITM、RTT、变量时间线、函数运行时线录制、DWT 计数、PC 采样、插桩",
     "rtos": "RTOS 任务感知：任务列表/状态、栈水位、队列信号量对象",
+    "code": "代码结构索引：建/同步索引、符号检索、单符号源码体、工程文件清单（C/C++）",
 }
 
 

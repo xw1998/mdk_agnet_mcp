@@ -22,13 +22,19 @@ dependencies = [
     "pydantic>=2.8",
     "pyelftools>=0.30",
     "capstone>=5.0",
+    # 代码结构索引层（可选能力：缺失时 code 组工具如实报 parser-missing，不降级成 grep）
+    "tree-sitter>=0.26",
+    "tree-sitter-c>=0.24",
+    "tree-sitter-cpp>=0.23",
 ]
 
 [project.scripts]
 mdkdebug = "mdkdebug.cli:main"
 
 [tool.setuptools]
-packages = ["mdkdebug"]
+# 子包必须显式列出来（原来只有 mdkdebug，viz 与 codeindex 都不会被装进 wheel）：
+# viz = 可视化渲染；codeindex = 代码结构索引（批次68）。
+packages = ["mdkdebug", "mdkdebug.viz", "mdkdebug.codeindex"]
 
 [tool.setuptools.package-data]
 mdkdebug = ["py.typed"]

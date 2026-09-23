@@ -530,7 +530,7 @@ def group_g():
 
     names = [t.name for t in __import__("asyncio").run(
         SV.create_server(toolsets="all").list_tools())]
-    check("G1 本批不新增工具（总数仍 190）", len(names) == 190, len(names))
+    check("G1 本批不新增工具（总数仍 195）", len(names) == 195, len(names))
 
     core = TB.TOOLSETS.get("core") or set()
     check("G2 两个符号工具提到默认面 core（钥匙要放在够得着的地方）",

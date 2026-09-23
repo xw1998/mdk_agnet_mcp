@@ -667,6 +667,69 @@ ERROR_CODES = {
             "输出目录只读时显式给 out=（绝对路径）",
         ],
     },
+    # ---- 代码结构索引（批次68）----
+    # 这一族的错都属「你不该继续猜」：解析器缺了、索引没建、索引落后了。
+    # 措辞一律指向**确定的下一步**，而不是「请检查环境」。
+    "parser-missing": {
+        "text": "缺 tree-sitter 解析器（C/C++ 语法轮子没装），代码索引无法工作",
+        "next_actions": [
+            "pip install \"tree-sitter>=0.26\" \"tree-sitter-c>=0.24\" \"tree-sitter-cpp>=0.23\""
+            "（都是预编译轮子，不需要编译器）",
+            "装完调 code_index(action=\"build\", project=...) 建索引；"
+            "不想装就用常规的 grep/Read——本工具不会退化成 grep 假装成功",
+        ],
+    },
+    "no-index": {
+        "text": "这个项目还没有建代码索引（或索引已被删）",
+        "next_actions": [
+            "code_index(action=\"build\", project=<源码根目录>) 建一次"
+            "（只读源码，索引写在 ~/.mdkdebug/codeindex/，不往你工程目录里写）",
+            "先 code_status(project=...) 看解析器可用性与将落盘的索引路径",
+        ],
+    },
+    "index-stale": {
+        "text": "索引可能已落后于源码（有文件新增/改动/删除）",
+        "next_actions": [
+            "code_index(action=\"sync\", project=...) 增量刷新（只重解析真变了的文件）",
+            "只看结论不动索引也行：本工具不会自动重建，因为那样「读到的是哪个版本」不可知",
+        ],
+    },
+    "index-schema-mismatch": {
+        "text": "索引库结构与当前程序版本不匹配（旧版索引）",
+        "next_actions": [
+            "code_index(action=\"drop\", project=...) 删掉后用 build 重建",
+            "或改用别的索引位置：in_project=true / 设 MDKDEBUG_CODEINDEX_DIR 换根目录",
+        ],
+    },
+    "index-write-failed": {
+        "text": "写代码索引失败（本次改动已回滚，索引保持原样）",
+        "next_actions": [
+            "核对索引目录可写与磁盘空间（用 code_status 看 index 路径）",
+            "换索引根目录重试：设环境变量 MDKDEBUG_CODEINDEX_DIR 指到可写盘",
+        ],
+    },
+    "index-drop-failed": {
+        "text": "删除索引文件失败（文件被其它进程占用或只读）",
+        "next_actions": [
+            "关掉可能占用索引的进程（另一个 mdkdebug 会话）后重试",
+            "仍失败则手工删掉 index.db / index.db-wal / index.db-shm",
+        ],
+    },
+    "config-bad": {
+        "text": "项目根的 codeindex.json 配置有问题（本次结果可能不完整）",
+        "next_actions": [
+            "按 error 原文修正 codeindex.json（exclude/include 必须是字符串数组，"
+            "extensions 必须是 {扩展名: 语言}）",
+            "不想要这份配置就直接删掉该文件：没有它时按扩展名默认规则索引",
+        ],
+    },
+    "symbol-not-found": {
+        "text": "索引里没有这个符号名",
+        "next_actions": [
+            "code_query(name=\"前缀\", mode=\"prefix\") 找真实名字（符号名区分大小写）",
+            "可能只是没索引到：宏定义/局部变量不在符号表；公共库头文件也被跳过",
+        ],
+    },
     "unknown-error": {
         "text": "未归类的失败",
         "next_actions": ["调 keil_health 看 Keil 侧状态", "用 read_async_messages 读 Keil 的异步报错原文"],
