@@ -15,7 +15,7 @@
   ④ 同类复查：通用工具里不许写死型号/内存布局（本轮修掉 is_code_address 的
      0x08000000..0x081FFFFF 与 query_memory_map 缺设备守卫）。
 
-   A 工具面：注册总数 195 / 三新工具归组 / 注解覆盖 / 默认仍只暴露 44
+   A 工具面：注册总数 197 / 三新工具归组 / 注解覆盖 / 默认仍只暴露 44
    B rtrecord 纯逻辑：函数区间表 / 事件分类 / caller / 栈深 / CYCCNT 回绕 / 环形缓冲
    C chipid 系列比对：三种 verdict、置信度不足不当结论
    D chipid 芯片身份：单候选 high、多候选 low、读不到 unknown、内核-系列矛盾降级
@@ -303,7 +303,7 @@ def use_attr(obj, name, val):
 def section_a():
     print("A. 工具面与注解")
     total = sum(len(v) for v in TB.TOOLSETS.values()) + len(TB.ALWAYS)
-    check("A1 注册总数 195（分组表 189 + 常驻 6）", total == 195, total)
+    check("A1 注册总数 197（分组表 191 + 常驻 6）", total == 197, total)
     check("A2 trace_record 归 trace 组（批次55 加 3 个 buff 到 30，批次56 再加 3 个 swd 到 33，批次64 再加 1 个任务表到 34，批次66 再加 1 个节拍到 35）",
           "trace_record" in (TB.TOOLSETS.get("trace") or []) and gsize("trace") == 35,
           gsize("trace"))
@@ -326,12 +326,12 @@ def section_a():
     for v in TB.TOOLSETS.values():
         allnames |= set(v)
     bad = A.check_surface(sorted(allnames))
-    check("A8 check_surface 在 195 个工具上无问题", not bad, bad)
+    check("A8 check_surface 在 197 个工具上无问题", not bad, bad)
     # 默认面：core + ALWAYS，其余收起
     exposed = gsize("core") + len(TB.ALWAYS)
     check("A9 默认暴露 core 38 + 常驻 6 = 44（新增工具进 core 后自动生效）",
           exposed == 44, exposed)
-    check("A10 默认收起 151（195-44）", 195 - exposed == 151, 195 - exposed)
+    check("A10 默认收起 153（197-44）", 197 - exposed == 153, 197 - exposed)
 
 
 def section_b():

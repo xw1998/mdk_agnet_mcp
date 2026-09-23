@@ -19,7 +19,7 @@ tree-sitter 解析（预编译轮子）+ SQLite 索引，落成 `mdkdebug/codein
   C 解析语义（C fixture）：include guard、条件编译、局部变量、fptr、calls_out、解析错误
   D 解析语义（C++ fixture）：class/namespace/field、调用、include 解析
   E 工具层：5 个工具端到端、错误码、注解、outctl、描述诚实边界、parser-missing
-  F 工具面：注册 195 / 默认面 44 / code 组 5 且默认收起 / 组数 12
+  F 工具面：注册 197 / 默认面 44 / code 组 7 且默认收起 / 组数 12
 
 运行：python -m tests.test_batch68
 """
@@ -61,7 +61,8 @@ PROJ_CPP = os.path.join(FIX, "proj_cpp")
 
 PORT_TOOL, PORT_DEF = 14980, 14981
 
-CODE_TOOLS = ("code_index", "code_status", "code_files", "code_query", "code_node")
+CODE_TOOLS = ("code_index", "code_status", "code_files", "code_query", "code_node",
+              "code_relations", "code_impact")
 
 PASS, FAIL = [], []
 
@@ -371,8 +372,12 @@ def group_c():
     check("C13 calls_out 每条带行号，且不冒充「谁调了它」",
           all(isinstance(c["line"], int) and c["line"] > 0 for c in nm["calls_out"])
           and not nm.get("callers") and not nm.get("calls_in"), nm.get("calls_out"))
-    check("C14 node 的 note 明说反向「谁调了它」是推断、本批不给",
-          "不给" in (ci_node(PROJ_C, name="main").get("note") or ""), None)
+    # 批次69 起反向关系由 code_relations 交付：node 自己**仍然不给**图，只在 note 里
+    # 明确「反向是推断」并指到那两个工具（不越权、也不留一个「谁调了它」的空承诺）
+    _n14 = ci_node(PROJ_C, name="main").get("note") or ""
+    check("C14 node 的 note 明说反向「谁调了它」是推断、不在这里给，并指到 code_relations",
+          "是推断" in _n14 and "code_relations" in _n14 and "code_impact" in _n14
+          and not ci_node(PROJ_C, name="main").get("callers"), _n14)
 
     fr = ci_node(PROJ_C, file="main.c")
     check("C15 file 模式给整文件带行号（Read-parity），并附该文件符号",
@@ -647,39 +652,39 @@ def group_f():
     srv_all = SV.create_server(port=PORT_TOOL, toolsets="all")
     na = tool_names(srv_all)
 
-    check("F1 注册总数 195", len(na) == 195, len(na))
+    check("F1 注册总数 197", len(na) == 197, len(na))
     check("F2 默认只暴露 44 个", len(nd) == 44, len(nd))
-    check("F3 code 组默认收起（5 个 code_* 都不在默认面）",
+    check("F3 code 组默认收起（4 个 code_* 都不在默认面）",
           not any(t.startswith("code_") for t in nd), [t for t in nd if t.startswith("code_")])
-    check("F4 code 组正好是那 5 个工具",
+    check("F4 code 组正好是那 7 个工具",
           TB.TOOLSETS.get("code") == set(CODE_TOOLS), TB.TOOLSETS.get("code"))
     check("F5 组数 12，且每个组都有用途说明",
           len(TB.TOOLSETS) == 12 and len(TB.GROUP_NOTES) == 12
           and "code" in TB.GROUP_NOTES, (len(TB.TOOLSETS), len(TB.GROUP_NOTES)))
-    check("F6 高输出工具 46 个（批次68 新增 4 个）", len(OC.HIGH_OUTPUT) == 46,
+    check("F6 高输出工具 48 个（批次68 +4、批次69 +2）", len(OC.HIGH_OUTPUT) == 48,
           len(OC.HIGH_OUTPUT))
     st = call_sync(srv_def, "toolset", {"action": "status"})
     grp = (st.get("groups") or {}).get("code") or {}
     check("F7 toolset(status) 列得出 code 组与规模",
-          grp.get("size") == 5, (st.get("groups") or {}).get("code"))
+          grp.get("size") == 7, (st.get("groups") or {}).get("code"))
     r = call_sync(srv_def, "toolset", {"action": "load", "toolsets": "code"})
-    check("F8 toolset(load, code) 能把 5 个装回来，暴露数 44→49",
-          r.get("ok") is True and len(r.get("loaded") or []) == 5
-          and r.get("exposed") == 49, r)
+    check("F8 toolset(load, code) 能把 7 个装回来，暴露数 44→51",
+          r.get("ok") is True and len(r.get("loaded") or []) == 7
+          and r.get("exposed") == 51, r)
     check("F9 装回后 code_query 立刻可调",
           "code_query" in tool_names(srv_def), None)
     # 用**新的**默认面服务器：srv_def 上刚 load 过 code，不再是「未装载」
     srv_fresh = SV.create_server(port=PORT_DEF + 2, toolsets=None)
     cap = call_sync(srv_fresh, "capabilities", {})
     surf = cap.get("tool_surface") or {}
-    check("F10 capabilities 的 tool_surface 里 code 组 5 个且列为「未装载」",
-          (surf.get("groups") or {}).get("code") == 5
+    check("F10 capabilities 的 tool_surface 里 code 组 7 个且列为「未装载」",
+          (surf.get("groups") or {}).get("code") == 7
           and "code" in (surf.get("not_loaded_groups") or [])
-          and surf.get("registered_total") == 195, surf)
+          and surf.get("registered_total") == 197, surf)
 
 
 def main():
-    print("批次68：自研 Python 代码索引层（tree-sitter + SQLite，5 个工具）")
+    print("批次68：自研 Python 代码索引层（tree-sitter + SQLite，7 个工具）")
     print("索引根：%s" % IDX_ROOT)
     group_a()
     group_b()

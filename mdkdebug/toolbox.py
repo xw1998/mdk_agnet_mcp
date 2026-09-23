@@ -152,6 +152,8 @@ TOOLSETS = {
     # 只有 code_explore（批次70）进默认面，因为「默认面上就能看到」是它的价值。
     "code": {
         "code_index", "code_status", "code_files", "code_query", "code_node",
+        # 批次69：带 basis/confidence 的近似关系（调用链、影响面）。
+        "code_relations", "code_impact",
     },
 }
 
@@ -234,7 +236,7 @@ GROUP_NOTES = {
     "ocd": "OpenOCD：启停、命令直通、内存/寄存器/断点/烧录、GDB server",
     "trace": "trace：SWO/ITM、RTT、变量时间线、函数运行时线录制、DWT 计数、PC 采样、插桩",
     "rtos": "RTOS 任务感知：任务列表/状态、栈水位、队列信号量对象",
-    "code": "代码结构索引：建/同步索引、符号检索、单符号源码体、工程文件清单（C/C++）",
+    "code": "代码结构索引：建/同步索引、符号检索、单符号源码体、文件清单、调用关系与影响面（C/C++）",
 }
 
 

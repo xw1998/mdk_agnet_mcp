@@ -60,6 +60,8 @@ READONLY = {
     # 代码结构索引（批次68）：查索引库 + 读本机源码文件，不碰目标、不写任何文件。
     # （code_index 会建/删索引文件，所以它不在这里，排在下面的 MUTATING。）
     "code_status", "code_files", "code_query", "code_node",
+    # 批次69：关系/影响面只查索引库 + 读本机源码，不碰目标、不写任何文件。
+    "code_relations", "code_impact",
     "ocd_cfg_list", "ocd_status", "ocd_log", "ocd_probe", "ocd_flash_info",
     "ocd_read_mem",
     "trace_guide", "trace_status", "trace_decode", "trace_events",

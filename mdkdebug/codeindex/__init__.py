@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
-"""代码索引：门面层（批次68）。
+"""代码索引：门面层（批次68/69）。
 
-一层薄门面，把 `walk`（遍历）/ `store`（SQLite）/ `parser`（tree-sitter）拼成
-调用方要的几个动作：`build` / `sync` / `status` / `drop` / `files` / `query` / `node`。
+一层薄门面，把 `walk`（遍历）/ `store`（SQLite）/ `parser`（tree-sitter）/ `resolve`（
+关系与置信度）拼成调用方要的动作：`build` / `sync` / `status` / `drop` / `files` /
+`query` / `node`（批次68，解析级事实）+ `relations` / `impact`（批次69，带 basis 的
+近似关系）。
 
 三条贯穿全模块的取向（与仓库其它模块一致）：
 
-1. **解析级事实与近似关系分开**。本批（68）只产出**解析级事实**：符号表、include 图、
-   单符号源码体、调用点。**调用点 → 定义** 的归属推断留给批次69（带 `basis`/`confidence`），
-   本批不做「猜一个像样的调用图」。
+1. **解析级事实与近似关系分开**。批次68 产出**解析级事实**：符号表、include 图、
+   单符号源码体、调用点。批次69 才给 **调用点 → 定义** 的归属推断（`relations`/`impact`），
+   且每条边都带 `basis`/`confidence`：`resolved` 只在 `exact` 时非空，猜测只进 `candidates`；
+   看不见的部分（函数指针/条件编译/无定义）只报规模与位置（`blind_spots`），不画一个像样的调用图。
 2. **索引不往用户项目里写**。默认落在 `~/.mdkdebug/codeindex/<路径哈希>/index.db`
    （可用 `MDKDEBUG_CODEINDEX_DIR` 覆盖根目录，测试用）；只有调用方显式要
    `in_project=true` 才写进 `<project>/.mdkdebug/index.db`。
@@ -23,6 +26,7 @@ import time
 
 from . import walk as _walk
 from . import parser as _parser
+from . import resolve as _resolve
 from .store import SCHEMA_VERSION, Store
 
 #: 索引根目录的环境变量覆盖（测试用；也方便把索引放到别的盘）
@@ -657,4 +661,162 @@ def node(project, name=None, file=None, max_lines=DEFAULT_NODE_LINES,
             "note": ("同名给全部候选（不猜）。两个字段别混：`calls_out` 是**该符号体内的"
                      "调用点**（谁被它调，解析级事实）；`refs` 只含**类型名与条件编译里的宏名**"
                      "的出现位置，不等于「谁引用了它」。反向的「谁调了它」是推断，"
-                     "本批不给（不猜一个像样的调用图）。")}
+                     "带 basis/confidence 后由 code_relations(direction=\"callers\") 给；"
+                     "改动影响面用 code_impact。")}
+
+
+# ------------------------------------------------------------------ 关系（批次69）
+
+def _sym_brief(s):
+    """符号行 → 精简条目（关系结果里列定义/声明用）。"""
+    return {"name": s["name"], "kind": s["kind"], "path": s["path"],
+            "line": s["start_line"], "end_line": s["end_line"],
+            "signature": s["signature"], "storage": s["storage"],
+            "is_definition": bool(s["is_definition"]),
+            "in_conditional": bool(s["in_conditional"])}
+
+
+def _pick_symbols(store, name, path=None, line=None):
+    """按 name（可加 path/line 限定）挑符号。返回 (syms, defs, error)。
+
+    没有符号名但有调用点时**不当错**：那正是「有人调了它、工程里没有定义」这个盲区结论，
+    用 symbol-not-found 把「谁在调它」一起吞掉就是把一个事实说没了。此时返回空符号集。
+    """
+    allsyms = store.symbols_by_name(name)
+    if not allsyms:
+        if not (path or line) and store.calls_to(name):
+            return [], [], None
+        return None, None, "索引里没有这个符号：%s" % name
+    syms = allsyms
+    if path:
+        syms = [s for s in syms if s["path"] == path]
+    if line:
+        try:
+            want = int(line)
+        except (TypeError, ValueError):
+            return None, None, "line 要是整数（符号的起始行）"
+        syms = [s for s in syms if int(s["start_line"] or 0) == want]
+    if not syms:
+        return None, None, "按 path/line 限定后没有匹配的符号（去掉限定拿全部候选）"
+    return syms, [s for s in syms if s["is_definition"]], None
+
+
+def relations(project, name=None, direction="callers", depth=1, path=None,
+              line=None, limit=200, in_project=False):
+    """调用关系：`callers`（谁调用了它）/ `callees`（它调用了谁）/ `both`。
+
+    每条边 = 一个**调用点**（解析级事实）＋ 该调用点对目标名的**解析结论**
+    （`basis`/`confidence`/`candidates`）。`basis=exact&confidence=high` 才是
+    「证明得到」；其余按 `include-visible`（medium）/ `name-only`（low）/ `blind`
+    如实降级。**`resolved` 只在 exact 时非空**，猜测一律只进 `candidates`。
+    """
+    project, err = ensure_project(project)
+    if err:
+        return {"ok": False, "error": err, "error_code": "project-required"}
+    name = (name or "").strip()
+    if not name:
+        return {"ok": False, "error": "name 不能为空", "error_code": "invalid-argument",
+                "hint": "先 code_query(name=...) 确认符号名"}
+    direction = (direction or "callers").strip().lower()
+    if direction not in ("callers", "callees", "both"):
+        return {"ok": False, "error": "direction 取 callers / callees / both",
+                "error_code": "invalid-argument",
+                "hint": "callers=谁调用了它；callees=它调用了谁；both=都要"}
+    store, err = _open(project, in_project=in_project, create=False)
+    if err:
+        return {"ok": False, "error": err, "error_code": "no-index",
+                "hint": "先 code_index(action=\"build\") 建一次索引"}
+    try:
+        rv = _resolve.Resolver(store)
+        syms, defs, serr = _pick_symbols(store, name, path=path, line=line)
+        if serr:
+            return {"ok": False, "error": serr, "error_code": "symbol-not-found",
+                    "hint": "先 code_query(name=...) 看有哪些候选（含 path/line）"}
+        out = {"ok": True, "project": project, "name": name,
+               "direction": direction, "depth": max(1, int(depth or 1)),
+               "symbols": [_sym_brief(s) for s in syms],
+               "definitions": [_sym_brief(s) for s in defs],
+               "callers": None, "callees": None}
+        if direction in ("callers", "both"):
+            edges, trunc = rv.callers(name, depth=depth, limit=limit)
+            out["callers"] = edges
+            out["callers_truncated"] = trunc
+        if direction in ("callees", "both"):
+            edges, trunc = [], False
+            for s in (defs or syms):
+                e, t = rv.callees(s, depth=depth, limit=limit)
+                edges.extend(e)
+                trunc = trunc or t
+            out["callees"] = edges
+            out["callees_truncated"] = trunc
+        out["blind_spots"] = rv.blind_spots(name)
+        out["summary"] = {
+            "callers": _resolve.summarize(out["callers"]) if out["callers"] is not None else None,
+            "callees": _resolve.summarize(out["callees"]) if out["callees"] is not None else None,
+        }
+        out["note"] = ("每条边的 basis 说明这条边凭什么：exact/high=证明得到（同文件唯一定义，"
+                       "或 TU 内可见声明且全工程唯一定义）；include-visible/medium=include 可达"
+                       "但有同名候选；name-only/low=只见同名、未证实可见性；blind=看不到"
+                       "（函数指针/查不到定义）。**resolved 只在 exact 时非空**，其余只给候选。"
+                       "「谁调用了它」这一侧的 caller 是解析级事实（同文件最内层函数），"
+                       "推断只发生在「这个名字对应哪个定义」。")
+        if not out["definitions"]:
+            out["note"] += (" 注意：这个符号名在索引里**没有定义**，下面列出的调用点"
+                            "（若有）都解析不到目标——这本身就是盲区结论，不是空结果。")
+        return out
+    finally:
+        store.close()
+
+
+def impact(project, name=None, path=None, line=None, depth=2, limit=300,
+           in_project=False):
+    """改动影响面：分 `direct`（exact/high）/ `possible`（medium+low）/ `unresolved`
+    （见到调用但解析不到定义）/ `indirect`（深度 >1 的间接调用者）四段，外加 `blind_spots`。
+    """
+    project, err = ensure_project(project)
+    if err:
+        return {"ok": False, "error": err, "error_code": "project-required"}
+    name = (name or "").strip()
+    if not name:
+        return {"ok": False, "error": "name 不能为空", "error_code": "invalid-argument",
+                "hint": "先 code_query(name=...) 确认符号名"}
+    store, err = _open(project, in_project=in_project, create=False)
+    if err:
+        return {"ok": False, "error": err, "error_code": "no-index",
+                "hint": "先 code_index(action=\"build\") 建一次索引"}
+    try:
+        rv = _resolve.Resolver(store)
+        syms, defs, serr = _pick_symbols(store, name, path=path, line=line)
+        if serr:
+            return {"ok": False, "error": serr, "error_code": "symbol-not-found",
+                    "hint": "先 code_query(name=...) 看有哪些候选（含 path/line）"}
+        edges, trunc = rv.callers(name, depth=max(1, int(depth or 1)), limit=limit)
+        direct = [e for e in edges if e["depth"] == 1 and e["basis"] == "exact"]
+        possible = [e for e in edges if e["depth"] == 1
+                    and e["basis"] in ("include-visible", "name-only")]
+        unresolved = [e for e in edges if e["depth"] == 1 and e["basis"] == "blind"]
+        indirect = [e for e in edges if e["depth"] > 1]
+        return {
+            "ok": True, "project": project, "name": name,
+            "depth": max(1, int(depth or 1)),
+            "symbols": [_sym_brief(s) for s in syms],
+            "definitions": [_sym_brief(s) for s in defs],
+            "direct": direct, "possible": possible,
+            "unresolved": unresolved, "indirect": indirect,
+            "blind_spots": rv.blind_spots(name),
+            "project_blind_spots": _resolve.project_blind_spots(store),
+            "truncated": trunc,
+            "summary": {
+                "direct": len(direct), "possible": len(possible),
+                "unresolved": len(unresolved), "indirect": len(indirect),
+                "direct_confidence": "high",
+                "possible_confidence": "medium+low",
+            },
+            "note": ("改这个符号要连带看的地方：`direct`（已证实，exact/high）最该先看，"
+                     "`possible`（include-visible/medium 或 name-only/low）要人工扫一眼，"
+                     "`unresolved` 是「有人调了这个名字但解析不到定义」（盲区），"
+                     "`indirect` 是深度 >1 的间接影响。**别把 possible/unresolved 当确定影响面**："
+                     "`blind_spots` 里的函数指针/条件编译调用是静态看不到的部分，它只报规模与位置。"),
+        }
+    finally:
+        store.close()

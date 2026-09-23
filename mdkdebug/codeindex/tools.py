@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
-"""代码索引工具族（批次68）：把 `codeindex` 门面暴露成 MCP 工具。
+"""代码索引工具族（批次68/69）：把 `codeindex` 门面暴露成 MCP 工具。
 
 与其它工具族（trace / coverage / ocd…）同一写法：server.py 的循环里调用
 `register(server, _js)`，失败只记日志，不影响其余工具。
 
-本批只暴露 5 个工具，全部是**解析级事实**（符号表 / include 图 / 单符号源码体）：
-`code_index`（建/同步/删/查状态）、`code_status`、`code_files`、`code_query`、`code_node`。
-近似关系（调用链、影响面）与 `code_explore` / `code_context` 留给批次69、70——
-本批**不猜调用图**：只给「该符号体内的调用点」（calls_out）与「类型名/宏名出现位置」
-（refs）这两个解析级事实，反向的「谁调了它」等推断带上 basis 后再说（批次69）。
+已暴露 7 个工具：
+- 批次68（**解析级事实**）：`code_index`（建/同步/删/查状态）、`code_status`、
+  `code_files`、`code_query`、`code_node`；
+- 批次69（**带 basis 的近似关系**）：`code_relations`（谁调用/被调用）、
+  `code_impact`（改动影响面，分 direct/possible/unresolved/indirect + blind_spots）。
+
+两者分开的理由：调用点、include 边、符号定义是语法树里读出来的事实；
+「这个名字对应哪个定义」是**推断**。推断必须带 `basis`/`confidence`，
+`resolved` 只在 `exact` 时非空，看不见的部分（函数指针/条件编译/无定义）
+只报规模与位置。`code_explore` / `code_context` 留给批次70。
 """
 from __future__ import annotations
 
@@ -20,9 +25,11 @@ from . import (
     db_path,
     drop,
     files as _files,
+    impact as _impact,
     index_root,
     node as _node,
     query as _query,
+    relations as _relations,
     status as _status,
     sync,
 )
@@ -43,7 +50,7 @@ def _default_js(obj) -> str:
 
 
 def register(server, js=None) -> int:
-    """把 5 个代码索引工具注册进 MCP server，返回注册数。"""
+    """把 7 个代码索引工具注册进 MCP server，返回注册数。"""
     _js = js or _default_js
     n = 0
 
@@ -200,6 +207,70 @@ def register(server, js=None) -> int:
                              start_line=(start_line or None),
                              end_line=(end_line or None),
                              in_project=in_project))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="code_relations",
+        title="代码索引：调用关系（谁调用了它 / 它调用了谁，每条边带置信度）",
+        description=(
+            "从**调用点**（语法事实）推出**关系**（推断），每条边都带「凭什么」：\n"
+            "  · `basis=exact` + `confidence=high` —— **证明得到**：同文件内唯一同名定义；"
+            "或调用点所在 TU（经 include 传递闭包）里看得见该符号的声明，且全工程唯一定义；\n"
+            "  · `include-visible` / `medium` —— include 链可达，但工程内有**多个**同名定义，"
+            "候选全列在 `candidates` 里让你自己挑；\n"
+            "  · `name-only` / `low` —— 只能靠名字匹配（未见 include 链），**未证实可见性**；\n"
+            "  · `blind` —— 静态看不到（函数指针调用 / 工程内查不到定义）。\n"
+            "参数：`name`（符号名，必填）、`direction`（callers / callees / both）、`depth`"
+            "（BFS 深度，1=只看直接一层）、`path`/`line`（同名多处时指定哪一个定义）。\n"
+            "两条别踩的线：① **`resolved` 只在 exact 时非空**——它是「证明得到」的那一个定义，"
+            "其余一律只进 `candidates`，不把一个像样的猜测填成结论；"
+            "② 「谁调用了它」里的 caller 是**解析级事实**（解析时按同文件最内层函数记下的），"
+            "推断只发生在「这个名字对应哪个定义」。\n"
+            "响应带 `blind_spots`：与该名相关的**看不见的部分**（函数指针调用、条件编译内的调用、"
+            "同名宏、工程内无定义）各有位置与计数——宁可说「这里我看不到」，不画一张像样的调用图。\n"
+            "先 `code_index(action=\"build\")` 建索引；没建会报 `no-index`。"
+        ),
+    )
+    async def code_relations(project: str = "", name: str = "",
+                             direction: str = "callers", depth: int = 1,
+                             path: str = "", line: int = 0, limit: int = 200,
+                             in_project: bool = False) -> str:
+        try:
+            return _js(_relations(project, name=(name or None), direction=direction,
+                                  depth=depth, path=(path or None),
+                                  line=(line or None), limit=limit,
+                                  in_project=in_project))
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="code_impact",
+        title="代码索引：改动影响面（direct 确定 / possible 存疑 / blind 看不见）",
+        description=(
+            "「改这个函数，要连带看哪些地方」——把**调用者**按置信度分段，而不是笼统给一张图：\n"
+            "  · `direct` —— 已证实（`exact`/high）的直接调用者，**最该先看**；\n"
+            "  · `possible` —— `include-visible`/medium 或 `name-only`/low 的直接调用者，"
+            "要人工扫一眼；\n"
+            "  · `unresolved` —— 有调用点叫这个名字、但**解析不到定义**（宏展开/系统函数/汇编），"
+            "属盲区；\n"
+            "  · `indirect` —— 深度 >1 的间接调用者（`depth` 默认 2）；\n"
+            "  · `blind_spots` / `project_blind_spots` —— 静态**看不到**的部分（函数指针调用、"
+            "条件编译内的调用、无定义的调用点）的规模与位置。\n"
+            "`depth` 只沿 `exact` 已证实的边往下钻（拿猜出来的边继续下钻，第二层起就全是假的）。\n"
+            "**别把 possible/unresolved 当确定影响面**：它们是「可能有影响」，不是「一定有」。\n"
+            "先 `code_index(action=\"build\")` 建索引；没建会报 `no-index`。"
+        ),
+    )
+    async def code_impact(project: str = "", name: str = "", depth: int = 2,
+                          path: str = "", line: int = 0, limit: int = 300,
+                          in_project: bool = False) -> str:
+        try:
+            return _js(_impact(project, name=(name or None), depth=depth,
+                               path=(path or None), line=(line or None),
+                               limit=limit, in_project=in_project))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1

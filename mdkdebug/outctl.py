@@ -68,6 +68,8 @@ HIGH_OUTPUT = {
     # 代码结构索引（批次68）：code_node 直接搬源码体、code_query/code_files 给
     # 长清单、code_index 带 skipped_list——都给 compact/max_lines/full 三件套。
     "code_index", "code_files", "code_query", "code_node",
+    # 批次69：关系/影响面会列出大量边（每条带候选清单），同属高输出。
+    "code_relations", "code_impact",
 }
 
 #: 日志类工具（批次48）：**默认**摘录日志字段（唯一改变默认行为的地方，理由见模块 docstring）

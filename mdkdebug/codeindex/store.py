@@ -424,3 +424,29 @@ class Store(object):
         return [dict(r) for r in self.conn.execute(
             "SELECT p.*, f.rel AS path FROM fptr p JOIN files f ON f.id=p.file_id "
             "WHERE p.name=?", (name,))]
+
+    # ---------------------------------------------------------- 关系层（批次69）
+
+    def include_edges(self):
+        """include 图原始边 [(src_rel, resolved_rel)]。
+
+        **只含唯一匹配上的**（系统头、项目内同名歧义头都是 NULL，不进图）——
+        歧义头不能当「可见」的证据，宁可当作没连上（批次69 的 include-visible 另说）。
+        """
+        rows = self.conn.execute(
+            "SELECT f.rel AS src, i.resolved_rel AS dst FROM includes i "
+            "JOIN files f ON f.id=i.file_id WHERE i.resolved_rel IS NOT NULL")
+        return [(r["src"], r["dst"]) for r in rows]
+
+    def calls_in_file(self, rel):
+        """某文件里的所有调用点（按行号）。"""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT c.*, f.rel AS path FROM calls c JOIN files f ON f.id=c.file_id "
+            "WHERE f.rel=? ORDER BY c.line", (rel,))]
+
+    def symbol_at(self, path, line):
+        """取某文件某起始行上的符号（定义优先）。用于把「解析出的候选」还原成符号行。"""
+        return self.conn.execute(
+            "SELECT s.*, f.rel AS path FROM symbols s JOIN files f ON f.id=s.file_id "
+            "WHERE f.rel=? AND s.start_line=? ORDER BY s.is_definition DESC LIMIT 1",
+            (path, int(line))).fetchone()

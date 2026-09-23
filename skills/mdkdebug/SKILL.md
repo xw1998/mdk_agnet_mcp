@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 195 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 197 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -167,7 +167,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 151 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 153 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。

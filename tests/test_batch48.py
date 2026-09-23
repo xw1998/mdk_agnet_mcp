@@ -9,7 +9,7 @@
   ④ 符号解析双轨不打通：read_variable 走 Keil 表达式挂了，find_symbol 走 ELF 却能查到
   ⑤ flash_debug 返回体过肥：几万字 build 日志埋掉 5 行关键结论
 
-   A 工具面：注册总数 195、reloc_check 归 symbol 组、只读注解、outctl 登记
+   A 工具面：注册总数 197、reloc_check 归 symbol 组、只读注解、outctl 登记
    B reloc 纯逻辑：段挑选避开退化块 / 指纹比对 / delta 反推
    C reloc.verify：confirmed / likely-wrong / unreadable / no-sample，且 ok 与 confirmed 分开
    D reloc.derive_from_pc：唯一命中算出 delta；多处命中不猜；找不到如实说；没有 PC 不冒充
@@ -200,7 +200,7 @@ def patch_segments(segs):
 def section_a():
     print("A. 工具面与注解")
     total = sum(len(v) for v in TB.TOOLSETS.values()) + len(TB.ALWAYS)
-    check("A1 注册工具总数 195（分组表 189 + 常驻 6）", total == 195, total)
+    check("A1 注册工具总数 197（分组表 191 + 常驻 6）", total == 197, total)
     check("A2 reloc_check 归在 symbol 组（批次67 两个符号修复工具上移 core 后 9->7）",
           "reloc_check" in (TB.TOOLSETS.get("symbol") or []) and gsize("symbol") == 7,
           gsize("symbol"))
@@ -211,7 +211,7 @@ def section_a():
     for v in TB.TOOLSETS.values():
         allnames |= set(v)
     bad = A.check_surface(sorted(allnames))
-    check("A4 annotate.check_surface 在 195 个工具上无问题", not bad, bad)
+    check("A4 annotate.check_surface 在 197 个工具上无问题", not bad, bad)
     check("A5 outctl 把编译/烧录系列登记为日志类工具",
           O.LOG_TOOLS == {"flash_debug", "build_project", "rebuild_project",
                           "clean_project", "flash_download", "build_and_flash"},
