@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""代码索引：门面层（批次68/69）。
+"""代码索引：门面层（批次68/69/70 + 批次71 可用性打磨）。
 
-一层薄门面，把 `walk`（遍历）/ `store`（SQLite）/ `parser`（tree-sitter）/ `resolve`（
-关系与置信度）拼成调用方要的动作：`build` / `sync` / `status` / `drop` / `files` /
-`query` / `node`（批次68，解析级事实）+ `relations` / `impact`（批次69，带 basis 的
-近似关系）。
+一层薄门面，把 `walk`（遍历）/ `store`（SQLite）/ `parser`（tree-sitter + 汇编行式）/ 
+`resolve`（关系与置信度）拼成调用方要的动作：`build` / `sync` / `rebuild` / `status` / 
+`drop` / `files` / `query` / `node`（批次68，解析级事实）+ `relations` / `impact`
+（批次69，带 basis 的近似关系）。
 
-三条贯穿全模块的取向（与仓库其它模块一致）：
+四条贯穿全模块的取向（与仓库其它模块一致）：
 
 1. **解析级事实与近似关系分开**。批次68 产出**解析级事实**：符号表、include 图、
    单符号源码体、调用点。批次69 才给 **调用点 → 定义** 的归属推断（`relations`/`impact`），
@@ -17,6 +17,12 @@
    `in_project=true` 才写进 `<project>/.mdkdebug/index.db`。
 3. **缺依赖/缺索引/索引过期都如实报**（`parser-missing` / `no-index` / `index-stale`），
    不静默降级成 grep、不假装有结果。`index-stale` 只报不自动重建。
+4. **`project` 可以省，但只省到「本机已经建过索引的工程」为止**（批次71）：多数工程
+   只有一个索引，逼调用方每次都手打一遍路径只是形式。所以省略 project 时**只从已有
+   索引里挑，且只在唯一时挑**，并在返回体里写 `project_source`/`project_inferred`
+   如实交代这个结论是谁的；多个候选或一个都没有时**列候选报错**——不凭空挑一个目录
+   去索引（那会得到「索引了 MDK-ARM/ 却只有 3 个符号」这种看似权威的错答案），
+   也不替调用方在多个工程之间决定。
 """
 from __future__ import annotations
 
@@ -70,6 +76,190 @@ def ensure_project(project):
     if not os.path.isdir(p):
         return None, "目录不存在：%s" % p
     return p, None
+
+
+#: project 是调用方显式给的
+SOURCE_EXPLICIT = "explicit"
+#: project 省略，用的是本机**唯一**一个已建索引的工程
+SOURCE_UNIQUE_INDEX = "unique-index"
+
+
+def known_projects(limit=50):
+    """本机**已经建过索引**的工程清单（读索引根目录里的 meta，不扫源码盘、不建索引）。
+
+    这是「project 省略时能不能替你挑」的唯一依据，也是给人看的清单。条目按最近构建
+    时间倒序：
+
+        {key, index, project, project_known, exists, built_at, build_kind,
+         schema_version, schema_ok, files}
+
+    `project` 取自库里的 `meta.project`（build/sync 时写入）。**老库或手工放进去的库
+    可能没这个键，那时 `project_known=False`**——不拿目录名反推一个路径（那是猜一个
+    像样的结果）。读不了的库（损坏/权限/不是 sqlite）单独进 `errors`，不静默丢。
+    """
+    root = index_root()
+    out, errors = [], []
+    if not os.path.isdir(root):
+        return {"root": root, "projects": [], "errors": [], "count": 0,
+                "truncated": False}
+    try:
+        names = sorted(os.listdir(root))
+    except OSError as exc:
+        return {"root": root, "projects": [], "count": 0, "truncated": False,
+                "errors": [{"index": root, "error": "列目录失败：%s" % exc}]}
+    for name in names[:400]:
+        path = os.path.join(root, name, "index.db")
+        if not os.path.isfile(path):
+            continue
+        entry = {"key": name, "index": path}
+        try:
+            store = Store(path).open()
+            try:
+                meta = store.meta_all()
+                proj = meta.get("project") or None
+                entry["project"] = proj
+                entry["project_known"] = bool(proj)
+                entry["exists"] = os.path.isdir(proj) if proj else None
+                entry["built_at"] = (float(meta["built_at"])
+                                     if meta.get("built_at") else None)
+                entry["build_kind"] = meta.get("build_kind")
+                entry["schema_version"] = meta.get("schema_version")
+                entry["schema_ok"] = (meta.get("schema_version") == str(SCHEMA_VERSION))
+                entry["files"] = store.conn.execute(
+                    "SELECT COUNT(*) AS n FROM files").fetchone()["n"]
+            finally:
+                store.close()
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"key": name, "index": path, "error": str(exc)})
+            continue
+        out.append(entry)
+    out.sort(key=lambda e: (e.get("built_at") or 0), reverse=True)
+    return {"root": root, "projects": out[:limit], "count": len(out),
+            "truncated": len(out) > limit, "errors": errors}
+
+
+def host_project_hints():
+    """宿主（server.py）当前关联的 Keil 工程线索 → [{"source","uvprojx","candidate",...}]。
+
+    惰性 import（与 builder / coverage / linkio 同一写法）：拿不到就回空表，不因此报错。
+    **只当线索用**：`.uvprojx` 所在目录不一定是源码根（常规布局是
+    `<仓库>/<工程>/MDK-ARM/x.uvprojx`），所以两者都列出来、标 `verified=False`，
+    只出现在「你没给 project」的报错里由你确认——**绝不自动采用**。
+    """
+    srcs = []
+    try:
+        from .. import server as _server
+    except Exception:  # noqa: BLE001
+        return srcs
+    lp = getattr(_server, "_last_project", "") or ""
+    if lp:
+        srcs.append(("本次会话用过的 Keil 工程", lp))
+    dp = (getattr(_server, "_builder_cfg", None) or {}).get("default_project") or ""
+    if dp and dp != lp:
+        srcs.append(("服务默认 Keil 工程", dp))
+    out, seen = [], set()
+    for src, proj in srcs:
+        d = os.path.dirname(os.path.abspath(proj))
+        for cand, what in ((d, "uvprojx 所在目录"), (os.path.dirname(d), "uvprojx 的上一级")):
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            out.append({"source": src, "uvprojx": proj, "candidate": cand,
+                        "what": what, "exists": os.path.isdir(cand),
+                        "verified": False})
+    return out
+
+
+def _project_error(reason, candidates=None, hint=None):
+    """「没给 project 又挑不出来」的统一错误体（不带 ok，由调用方补）。"""
+    out = {"error": reason, "error_code": "project-required"}
+    if hint:
+        out["hint"] = hint
+    if candidates is not None:
+        # 即使是空表也发：调用方需要区分「候选为空」与「这个字段根本不支持」
+        out["candidates"] = candidates
+    return out
+
+
+def _brief_known(entries):
+    """known_projects 条目的精简版（进 status 返回体，省 token）。
+
+    字段都留短：`project_known=False` 表示库里没记工程路径（老库/手工放的），`exists`
+    表示那个目录现在还在不在，`schema_ok=False` 表示这个索引是旧版本的（用之前得
+    `rebuild`）。三个布尔值看着像冗余，但它们恰好是「能不能用、能不能自动选」的全部依据。
+    """
+    out = []
+    for e in entries:
+        bt = e.get("built_at")
+        out.append({"project": e.get("project") or None,
+                    "project_known": e.get("project_known"),
+                    "exists": e.get("exists"),
+                    "schema_ok": e.get("schema_ok"),
+                    "built_at": (time.strftime("%Y-%m-%d %H:%M", time.localtime(bt))
+                                 if bt else None),
+                    "build_kind": e.get("build_kind")})
+    return out
+
+
+def resolve_project(project, in_project=False):
+    """把 project 归一成存在的目录，并**如实标注来源**。→ (abs_path, source, error)。
+
+    - 给了 project → 照旧校验（`source="explicit"`）；
+    - 没给 → **只从「已经建过索引的工程」里挑，且只在唯一可用时挑**
+      （`source="unique-index"`）；多候选/零候选一律报 `project-required` 并把候选
+      （含 Keil 工程线索）摊开——不凭空挑一个目录去索引，也不替调用方在多个工程之间决定。
+    - `in_project=True` 时索引分散在各工程目录里、无法枚举，所以「没给 project」直接报错。
+    """
+    if project and str(project).strip():
+        p, err = ensure_project(project)
+        if err:
+            return None, None, _project_error(err)
+        return p, SOURCE_EXPLICIT, None
+
+    if in_project:
+        return None, None, _project_error(
+            "没有指定 project（in_project=true 时索引在各工程目录里，无法替你枚举）",
+            hint=("传 project=<源码根目录>；或者改成默认位置建索引（in_project=false，"
+                  "索引落在 %s，之后 project 就可以省）" % index_root()))
+
+    known = known_projects()
+    usable = [e for e in known["projects"]
+              if e.get("project_known") and e.get("exists")]
+    if len(usable) == 1:
+        return usable[0]["project"], SOURCE_UNIQUE_INDEX, None
+
+    cands = [{"project": e.get("project"), "project_known": e.get("project_known"),
+              "exists": e.get("exists"), "index": e["index"],
+              "built_at": e.get("built_at")} for e in known["projects"]]
+    if len(usable) > 1:
+        reason = ("没有指定 project，本机有 %d 个已建索引的工程——不在它们之间替你挑"
+                  % len(usable))
+        hint = "把要用的那个传进来：project=<上面 candidates 里某个 project>"
+    else:
+        reason = "没有指定 project，本机也没有可用的已有索引"
+        hint = ("传 project=<**源码根目录**>——是含 .c/.h/.s 的那一层，"
+                "别指到 MDK-ARM/Objects 这类构建产物目录；"
+                "建完索引后 project 就可以省了")
+    err = _project_error(reason, candidates=cands, hint=hint)
+    err["index_root"] = known["root"]
+    if known["errors"]:
+        err["index_errors"] = known["errors"]
+    # 与 status 同口径：**字段总在**（空表 = 本机没有 Keil 工程线索），
+    # 调用方才能区分「没有线索」与「这个版本还不支持看线索」。
+    err["keil_project_hints"] = host_project_hints()
+    return None, None, err
+
+
+def _apply_source(out, source):
+    """把「这个结论是哪个工程的」写进返回体（project 是**推断**出来的时候尤其重要）。"""
+    if not isinstance(out, dict) or not out.get("ok"):
+        return out
+    out["project_source"] = source
+    if source == SOURCE_UNIQUE_INDEX:
+        out["project_inferred"] = True
+        out["project_hint"] = ("project 没给：我用了本机唯一一个已建索引的工程 %s。"
+                              "不是你要的那个就显式传 project=..." % out.get("project"))
+    return out
 
 
 # ------------------------------------------------------------------ 工具函数
@@ -186,9 +376,9 @@ def _run_parse(project, entries, store):
 
 def build(project, in_project=False):
     """全量重建：解析项目内全部候选文件（不删库，逐文件替换，保留其它元信息）。"""
-    project, err = ensure_project(project)
+    project, _source, err = resolve_project(project, in_project=in_project)
     if err:
-        return {"ok": False, "error": err, "error_code": "project-required"}
+        return {"ok": False, **err}
     ok, info = _parser.available()
     if not ok:
         return {"ok": False, "error": info.get("error"),
@@ -242,14 +432,14 @@ def build(project, in_project=False):
         out["error_code"] = "config-bad"
         out["error"] = cfg_err
     store.close()
-    return out
+    return _apply_source(out, _source)
 
 
 def sync(project, in_project=False):
     """增量同步：mtime/size 未变的不重解析；变了的重算 sha1（内容真变才重解析）。"""
-    project, err = ensure_project(project)
+    project, _source, err = resolve_project(project, in_project=in_project)
     if err:
-        return {"ok": False, "error": err, "error_code": "project-required"}
+        return {"ok": False, **err}
     ok, info = _parser.available()
     if not ok:
         return {"ok": False, "error": info.get("error"),
@@ -260,7 +450,8 @@ def sync(project, in_project=False):
     store, err = _open(project, in_project=in_project, create=False)
     if err:
         return {"ok": False, "error": err, "error_code": "no-index",
-                "hint": "先 code_index(action=\"build\") 建一次索引"}
+                "project": project,
+                "hint": "先 code_index(action=\"build\", project=...) 建一次索引"}
 
     t0 = time.time()
     have = store.file_map()
@@ -345,14 +536,14 @@ def sync(project, in_project=False):
         out["error_code"] = "config-bad"
         out["error"] = cfg_err
     store.close()
-    return out
+    return _apply_source(out, _source)
 
 
 def drop(project, in_project=False):
     """删除索引库（连同 -wal/-shm）。**这是不可逆操作**，工具层会先说明影响。"""
-    project, err = ensure_project(project)
+    project, _source, err = resolve_project(project, in_project=in_project)
     if err:
-        return {"ok": False, "error": err, "error_code": "project-required"}
+        return {"ok": False, **err}
     path = db_path(project, in_project=in_project)
     removed = []
     for suffix in ("", "-wal", "-shm"):
@@ -366,7 +557,37 @@ def drop(project, in_project=False):
                         "error_code": "index-drop-failed", "removed": removed}
     return {"ok": True, "action": "drop", "project": project,
             "index": path, "removed": removed,
-            "note": "索引已删除；源码未动。下次查询前需重新 code_index(action=\"build\")。"}
+            "note": ("索引已删除；源码未动。下次查询前需重新 "
+                     "code_index(action=\"build\")；想一步到位用 action=\"rebuild\"。")}
+
+
+def rebuild(project, in_project=False):
+    """一步「删旧索引 + 全量重建」（等价 drop → build，但只算一次调用）。
+
+    **为什么要有**：schema 变了（如批次70 加汇编）、索引被手工放脏、或就是想从头来一遍时，
+    「先 drop 再 build」本来就是**一个动作**；拆成两次调用会在中间留下一个「库已经没了」
+    的状态，让调用方以为还要先做点别的（现实里就报成过 `no-index` 的循环）。
+
+    仍然如实分两段报：`dropped` 列出真删掉的文件；**删不掉就不建**（不把「重建成功」
+    写在那个还没删掉的库上）。build 段失败照旧带 `index-write-failed`。
+    """
+    project, source, err = resolve_project(project, in_project=in_project)
+    if err:
+        return {"ok": False, **err}
+    dr = drop(project, in_project=in_project)
+    if not dr.get("ok"):
+        dr["action"] = "rebuild"
+        dr["stage"] = "drop"
+        return dr
+    out = build(project, in_project=in_project)
+    out["action"] = "rebuild"
+    out["dropped"] = dr.get("removed") or []
+    out["stages"] = {"drop": {"ok": True, "removed": len(out["dropped"])},
+                     "build": {"ok": bool(out.get("ok"))}}
+    if out.get("ok"):
+        out["note"] = ((out.get("note") or "") +
+                       " 本次是 rebuild：旧索引已删除后重建（不是增量）。")
+    return _apply_source(out, source)
 
 
 # ------------------------------------------------------------------ 状态
@@ -400,10 +621,52 @@ def stale_info(store, project):
 
 
 def status(project, in_project=False):
-    """项目/索引状态：有没有、多大、多少文件与符号、上次构建时间、是否落后。"""
-    project, err = ensure_project(project)
-    if err:
-        return {"ok": False, "error": err, "error_code": "project-required"}
+    """项目/索引状态：有没有、多大、多少文件与符号、上次构建时间、是否落后。
+
+    **project 可省**（批次71）：没给时，本机只有**一个**已建索引的工程就直接报它的状态
+    （带 `project_source`/`project_inferred`）；多个则列 `known_projects` 清单（`ok=true`，
+    不替你在它们之间挑）；一个都没有时按 `no-index` 如实报失败。
+    """
+    if not (project and str(project).strip()):
+        if in_project:
+            return {"ok": False, **_project_error(
+                "没有指定 project（in_project=true 时索引在各工程目录里，无法替你枚举）",
+                hint="传 project=<源码根目录>（带 in_project=true 调用过哪个就传哪个）")}
+        known = known_projects()
+        usable = [e for e in known["projects"]
+                  if e.get("project_known") and e.get("exists")]
+        if len(usable) != 1:
+            base = {"project": None, "project_source": "none",
+                    "in_project": False, "index_root": known["root"],
+                    "known_projects": _brief_known(known["projects"]),
+                    "known_projects_count": known["count"],
+                    "known_projects_truncated": known["truncated"]}
+            if known["errors"]:
+                base["index_errors"] = known["errors"]
+            if not known["projects"]:
+                return {"ok": False, **base,
+                        "error": "没有指定 project，本机也还没有任何代码索引",
+                        "error_code": "no-index",
+                        "hint": ("建一个：code_index(action=\"build\", "
+                                 "project=<源码根目录>)，之后 project 就可以省"),
+                        "keil_project_hints": host_project_hints()}
+            return {"ok": True, **base, "mode": "all-projects",
+                    "count": len(known["projects"]),
+                    "note": ("没有指定 project：下面是本机已建过索引的工程清单（按最近构建"
+                             "时间倒序，**不代表当前会话的工程**）。要看某一个的详情，把它的 "
+                             "project 传给 code_status；要腾地方用 "
+                             "code_index(action=\"drop\", project=...)；同一个工程要重来一遍用 "
+                             "code_index(action=\"rebuild\", project=...)。")}
+        project, _source = usable[0]["project"], SOURCE_UNIQUE_INDEX
+    else:
+        project, _source, err = resolve_project(project, in_project=in_project)
+        if err:
+            return {"ok": False, **err}
+    # 顺带列一下**本机已建索引的工程**：一来让「我是谁、还有谁」可核对（省 token 的前提是
+    # 知道自己在问哪个工程），二来让 project 省略这条路可被发现。条目很小（3~5 个字段）。
+    _known = known_projects()
+    _kcount = _known["count"]
+    _kbrief = _brief_known(_known["projects"])
     ok, info = _parser.available()
     path = db_path(project, in_project=in_project)
     cfg, cfg_err = _walk.load_config(project)
@@ -418,6 +681,8 @@ def status(project, in_project=False):
         "languages": sorted(set(_walk.supported_extensions(cfg).values())),
         "extensions": _walk.supported_extensions(cfg),
         "config_error": cfg_err,
+        "known_projects_count": _kcount,
+        "known_projects": _kbrief,
     }
     if cfg_err:
         out["ok"] = False
@@ -434,7 +699,7 @@ def status(project, in_project=False):
         out["note"] = ("上面的索引路径就是建完会落在哪儿；建一次用 "
                        "code_index(action=\"build\", project=...)。"
                        "建索引只读源码，索引写在用户目录，不往你工程目录里写。")
-        return out
+        return _apply_source(out, _source)
 
     store, err = _open(project, in_project=in_project, create=False)
     if err:
@@ -483,7 +748,7 @@ def status(project, in_project=False):
             out["warning_code"] = "index-stale"
     finally:
         store.close()
-    return out
+    return _apply_source(out, _source)
 
 
 # ------------------------------------------------------------------ 查询
@@ -494,9 +759,9 @@ def files(project, pattern=None, max_depth=None, in_project=False):
     max_depth：**路径层数上限**——`a.c` 为 1 层、`inc/util.h` 为 2 层；
     None 或 <=0 表示不限制（默认）。
     """
-    project, err = ensure_project(project)
+    project, _source, err = resolve_project(project, in_project=in_project)
     if err:
-        return {"ok": False, "error": err, "error_code": "project-required"}
+        return {"ok": False, **err}
     store, err = _open(project, in_project=in_project, create=False)
     if err:
         return {"ok": False, "error": err, "error_code": "no-index",
@@ -515,19 +780,20 @@ def files(project, pattern=None, max_depth=None, in_project=False):
         parts = r["rel"].split("/")
         for i in range(1, len(parts)):
             dirs.add("/".join(parts[:i]))
-    return {"ok": True, "project": project, "count": len(rows),
-            "pattern": pattern, "max_depth": max_depth,
-            "dirs": sorted(dirs),
-            "files": [{"rel": r["rel"], "lang": r["lang"], "lines": r["lines"],
-                       "symbols": r["n_sym"]} for r in rows]}
+    return _apply_source({"ok": True, "project": project, "count": len(rows),
+                          "pattern": pattern, "max_depth": max_depth,
+                          "dirs": sorted(dirs),
+                          "files": [{"rel": r["rel"], "lang": r["lang"],
+                                     "lines": r["lines"],
+                                     "symbols": r["n_sym"]} for r in rows]}, _source)
 
 
 def query(project, name, kind=None, limit=50, mode="auto",
           only_definitions=False, in_project=False):
     """符号检索（替代 `grep -rn` 的第一步）：只回位置与签名，不回源码体。"""
-    project, err = ensure_project(project)
+    project, _source, err = resolve_project(project, in_project=in_project)
     if err:
-        return {"ok": False, "error": err, "error_code": "project-required"}
+        return {"ok": False, **err}
     name = (name or "").strip()
     if not name:
         return {"ok": False, "error": "name 不能为空", "error_code": "invalid-argument"}
@@ -540,8 +806,8 @@ def query(project, name, kind=None, limit=50, mode="auto",
                                     only_definitions=only_definitions)
     finally:
         store.close()
-    return {"ok": True, "project": project, "name": name, "mode": mode,
-            "kind": kind, "count": len(rows),
+    return _apply_source({"ok": True, "project": project, "name": name, "mode": mode,
+                          "kind": kind, "count": len(rows),
             "symbols": [{"name": r["name"], "kind": r["kind"], "path": r["path"],
                          "line": r["start_line"], "end_line": r["end_line"],
                          "is_definition": bool(r["is_definition"]),
@@ -552,7 +818,8 @@ def query(project, name, kind=None, limit=50, mode="auto",
             "note": ("只回位置与签名；要看源码体用 code_node(name=...)。"
                      "检索默认走可预测的精确/前缀/子串（mode=auto），"
                      "mode=\"fts\" 是实验性的全文相关度排序——代码标识符用 FTS 反而容易意外。"
-                     "**不含局部变量**（只索引文件作用域符号），宏定义在 kind=macro。")}
+                     "**不含局部变量**（只索引文件作用域符号），宏定义在 kind=macro。")},
+                         _source)
 
 
 def _read_lines(project, rel, start, end):
@@ -577,9 +844,9 @@ def node(project, name=None, file=None, max_lines=DEFAULT_NODE_LINES,
 
     同名符号**给全部候选**（不猜哪一个），调用方按 path/line 自己挑。
     """
-    project, err = ensure_project(project)
+    project, _source, err = resolve_project(project, in_project=in_project)
     if err:
-        return {"ok": False, "error": err, "error_code": "project-required"}
+        return {"ok": False, **err}
     if not name and not file:
         return {"ok": False, "error": "要么给 name（符号）要么给 file（整文件）",
                 "error_code": "invalid-argument", "hint": "Read 整文件用 file=..."}
@@ -605,14 +872,16 @@ def node(project, name=None, file=None, max_lines=DEFAULT_NODE_LINES,
             if lerr:
                 return {"ok": False, "error": lerr, "error_code": "file-not-found"}
             syms = store.symbols_in_file(file)
-            return {"ok": True, "mode": "file", "project": project, "path": file,
-                    "start_line": lines[0][0], "end_line": lines[-1][0],
-                    "line_count": len(lines),
-                    "code": [{"line": i, "text": t} for i, t in lines],
-                    "symbols": [{"name": s["name"], "kind": s["kind"],
-                                 "line": s["start_line"], "end_line": s["end_line"],
-                                 "signature": s["signature"]} for s in syms],
-                    "note": "整文件带行号（Read-parity）。要看某个符号的体用 code_node(name=...)。"}
+            return _apply_source(
+                {"ok": True, "mode": "file", "project": project, "path": file,
+                 "start_line": lines[0][0], "end_line": lines[-1][0],
+                 "line_count": len(lines),
+                 "code": [{"line": i, "text": t} for i, t in lines],
+                 "symbols": [{"name": s["name"], "kind": s["kind"],
+                              "line": s["start_line"], "end_line": s["end_line"],
+                              "signature": s["signature"]} for s in syms],
+                 "note": ("整文件带行号（Read-parity）。要看某个符号的体用 "
+                          "code_node(name=...)。")}, _source)
 
         rows = store.symbols_by_name(name, kind=kind)
         if not rows:
@@ -658,14 +927,14 @@ def node(project, name=None, file=None, max_lines=DEFAULT_NODE_LINES,
             })
     finally:
         store.close()
-    return {"ok": True, "mode": "symbol", "project": project, "name": name,
-            "count": len(cands), "candidates": cands,
+    return _apply_source({"ok": True, "mode": "symbol", "project": project,
+                          "name": name, "count": len(cands), "candidates": cands,
             "truncated": truncated, "max_lines": budget,
             "note": ("同名给全部候选（不猜）。两个字段别混：`calls_out` 是**该符号体内的"
                      "调用点**（谁被它调，解析级事实）；`refs` 只含**类型名与条件编译里的宏名**"
                      "的出现位置，不等于「谁引用了它」。反向的「谁调了它」是推断，"
                      "带 basis/confidence 后由 code_relations(direction=\"callers\") 给；"
-                     "改动影响面用 code_impact。")}
+                     "改动影响面用 code_impact。")}, _source)
 
 
 # ------------------------------------------------------------------ 关系（批次69）
@@ -713,9 +982,9 @@ def relations(project, name=None, direction="callers", depth=1, path=None,
     「证明得到」；其余按 `include-visible`（medium）/ `name-only`（low）/ `blind`
     如实降级。**`resolved` 只在 exact 时非空**，猜测一律只进 `candidates`。
     """
-    project, err = ensure_project(project)
+    project, _source, err = resolve_project(project, in_project=in_project)
     if err:
-        return {"ok": False, "error": err, "error_code": "project-required"}
+        return {"ok": False, **err}
     name = (name or "").strip()
     if not name:
         return {"ok": False, "error": "name 不能为空", "error_code": "invalid-argument",
@@ -766,7 +1035,7 @@ def relations(project, name=None, direction="callers", depth=1, path=None,
         if not out["definitions"]:
             out["note"] += (" 注意：这个符号名在索引里**没有定义**，下面列出的调用点"
                             "（若有）都解析不到目标——这本身就是盲区结论，不是空结果。")
-        return out
+        return _apply_source(out, _source)
     finally:
         store.close()
 
@@ -776,9 +1045,9 @@ def impact(project, name=None, path=None, line=None, depth=2, limit=300,
     """改动影响面：分 `direct`（exact/high）/ `possible`（medium+low）/ `unresolved`
     （见到调用但解析不到定义）/ `indirect`（深度 >1 的间接调用者）四段，外加 `blind_spots`。
     """
-    project, err = ensure_project(project)
+    project, _source, err = resolve_project(project, in_project=in_project)
     if err:
-        return {"ok": False, "error": err, "error_code": "project-required"}
+        return {"ok": False, **err}
     name = (name or "").strip()
     if not name:
         return {"ok": False, "error": "name 不能为空", "error_code": "invalid-argument",
@@ -799,7 +1068,7 @@ def impact(project, name=None, path=None, line=None, depth=2, limit=300,
                     and e["basis"] in ("include-visible", "name-only")]
         unresolved = [e for e in edges if e["depth"] == 1 and e["basis"] == "blind"]
         indirect = [e for e in edges if e["depth"] > 1]
-        return {
+        return _apply_source({
             "ok": True, "project": project, "name": name,
             "depth": max(1, int(depth or 1)),
             "symbols": [_sym_brief(s) for s in syms],
@@ -819,7 +1088,8 @@ def impact(project, name=None, path=None, line=None, depth=2, limit=300,
                      "`possible`（include-visible/medium 或 name-only/low）要人工扫一眼，"
                      "`unresolved` 是「有人调了这个名字但解析不到定义」（盲区），"
                      "`indirect` 是深度 >1 的间接影响。**别把 possible/unresolved 当确定影响面**："
-                     "`blind_spots` 里的函数指针/条件编译调用是静态看不到的部分，它只报规模与位置。"),
-        }
+                     "`blind_spots` 里的函数指针/条件编译调用是静态看不到的部分，"
+                     "它只报规模与位置。"),
+        }, _source)
     finally:
         store.close()

@@ -13,6 +13,10 @@ tree-sitter 解析（预编译轮子）+ SQLite 索引，落成 `mdkdebug/codein
 2. **它没承诺的事一条都不给**——描述里不许出现拿不到的东西（`kind=fptr` 必须真能查到、
    描述里不许提未注册的工具名），且缺依赖/缺索引/坏配置一律**如实报错**，不静默降级。
 
+> 批次71 更新（仅断言口径，产品语义见 test_batch71）：`project` 可省后，B22 改为在
+> **空**索引根下验证「列候选报错、不猜当前目录」；E20 不再允许 code_node 描述声称
+> 「反向调用关系本批不给」（那是批次68 的事实、批次69 起就已过时）。
+
 分组：
   A 遍历与过滤（walk）：目录名排除 / .gitignore / codeindex.json exclude·include / 大文件
   B 生命周期：build → status（含落后判定）→ sync（增量·metadata_only·removed）→ drop
@@ -302,9 +306,19 @@ def group_b():
     check("B21 drop 后 status 立刻回到 no-index",
           ci_status(proj).get("error_code") == "no-index", None)
 
-    check("B22 没给 project → project-required（不猜当前目录）",
-          ci_build("").get("error_code") == "project-required"
-          and ci_status("").get("error_code") == "project-required", None)
+    # 批次71 起：project 省略只在「本机**唯一**一个已建索引的工程」时自动用（并在返回体里
+    # 写 project_source/project_inferred）；多个或一个都没有时列候选报错。这里把索引根换到
+    # 一个空目录，验证「一个都没有」这条路：build 列候选报 project-required，status 报 no-index。
+    _old_root = os.environ.get(ENV_ROOT)
+    os.environ[ENV_ROOT] = tempfile.mkdtemp(prefix="mdkidx_empty_")
+    try:
+        _b0, _s0 = ci_build(""), ci_status("")
+        check("B22 没给 project 且本机无可用索引 → 列候选报错（不猜当前目录）",
+              _b0.get("error_code") == "project-required" and _b0.get("candidates") == []
+              and "源码根目录" in (_b0.get("hint") or "")
+              and _s0.get("error_code") == "no-index", {"build": _b0, "status": _s0})
+    finally:
+        os.environ[ENV_ROOT] = _old_root
     check("B23 目录不存在 → project-required（带绝对路径）",
           ci_build(os.path.join(TMP_ROOT, "no_such_dir")).get("error_code")
           == "project-required", None)
@@ -623,9 +637,12 @@ def group_e():
           not ghost, ghost)
     check("E19b 描述里的 code_* 字段名只用已声明的（code_error 是响应字段，不是工具）",
           "code_error" in mentioned and "code_error" not in CODE_TOOLS, sorted(mentioned))
-    check("E20 描述明说本批只给解析级事实、反向调用关系不给（不猜调用图）",
-          any("不给" in ds[t] and "调用" in ds[t] for t in ("code_node", "code_index")),
-          None)
+    # 批次71：code_node 描述里那句「反向调用关系本批**不给**」是批次68 的事实、批次69 就
+    # 已经过时了（两种口径写在同一份描述里，读者只能挑一个信）。改成要求它**指向**
+    # code_relations / code_impact。
+    check("E20 code_node 描述把「谁调了它」交给 code_relations（不再声称不给）",
+          "code_relations" in ds["code_node"] and "code_impact" in ds["code_node"]
+          and "本批**不给**" not in ds["code_node"], None)
     check("E21 code_query 描述交代「不含局部变量」",
           "局部变量" in ds["code_query"], None)
     check("E22 code_status 描述交代「落后不会自动重建」",

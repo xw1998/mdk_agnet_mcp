@@ -697,7 +697,7 @@ ERROR_CODES = {
     "index-schema-mismatch": {
         "text": "索引库结构与当前程序版本不匹配（旧版索引）",
         "next_actions": [
-            "code_index(action=\"drop\", project=...) 删掉后用 build 重建",
+            "code_index(action=\"rebuild\", project=...) 一步删掉旧索引并重建（= drop + build）",
             "或改用别的索引位置：in_project=true / 设 MDKDEBUG_CODEINDEX_DIR 换根目录",
         ],
     },
@@ -932,6 +932,27 @@ def is_non_mdk_tool(tool_name: str) -> bool:
 # trace_* 是**双链路**工具族（Keil 与 OpenOCD 都能跑，见 trace_guide(topic=...)）：
 # 一律按 OpenOCD 给下一步，会把 Keil 链路上的用户指向 ocd_status —— 方向错。
 # 这里只给链路无关的动作：先查 trace_guide 讲清该链路支持到哪一步。
+# 代码索引族（`code_*`）是**独立链路**：它的 project 是「源码根目录」，与 Keil
+# 的 .uvprojx 不是一回事。直接套用通用 `project-required` 的下一步（「传入 project
+# （.uvprojx 完整路径）」）会把调用方指向错的东西——所以这里给码族自己的动作。
+_CODE_ACTIONS = {
+    "project-required": [
+        "传 project=<**源码根目录**>——是含 .c/.h/.s 的那一层，不是 .uvprojx，"
+        "也别指到 MDK-ARM/Objects 这类构建产物目录",
+        "本机已有索引时 project 可以省：code_index(action=\"status\") 会列出"
+        "已建过索引的工程，照抄其中一条即可",
+    ],
+    "no-index": [
+        "code_index(action=\"build\", project=<源码根目录>) 建一次"
+        "（只读源码，索引写在 ~/.mdkdebug/codeindex/，不往你工程目录里写）",
+        "先 code_status() 看本机已建索引的工程与解析器可用性（没给 project 就是列清单）",
+    ],
+    "index-schema-mismatch": [
+        "code_index(action=\"rebuild\", project=...) 一步删掉旧索引并重建",
+        "旧索引里没有汇编（.s/.asm）：重建后索引才是完整的",
+    ],
+}
+
 _TRACE_ACTIONS = {
     "unknown-error": [
         "先 trace_guide 看该链路（keil / ocd）支持到哪一步、缺什么前置条件",
@@ -951,6 +972,8 @@ def code_actions(tool_name: str, code: str) -> list:
         return list(_TRACE_ACTIONS[code])
     if is_non_mdk_tool(tool_name) and code in _NON_MDK_ACTIONS:
         return list(_NON_MDK_ACTIONS[code])
+    if str(tool_name or "").startswith("code_") and code in _CODE_ACTIONS:
+        return list(_CODE_ACTIONS[code])
     info = ERROR_CODES.get(code)
     return list(info["next_actions"]) if info else []
 

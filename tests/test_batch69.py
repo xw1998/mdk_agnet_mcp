@@ -404,9 +404,17 @@ def group_d():
     r = relations(PROJ_REL, name="dup_fn", line="abc")
     check("D16 line 不是整数 → symbol-not-found（带说明，不抛异常）",
           r.get("ok") is False and "整数" in (r.get("error") or ""), r)
-    r = relations("", name="main")
-    check("D17 没给 project → project-required",
-          r.get("ok") is False and r.get("error_code") == "project-required", r)
+    # 批次71：project 省略时**只**从已有索引里挑，且只在唯一时挑。这里把索引根换到空目录，
+    # 验证「无可用索引」这条路：列候选（空表）+ 指向源码根目录，而不是猜当前目录。
+    _old_root = os.environ.get(ENV_ROOT)
+    os.environ[ENV_ROOT] = tempfile.mkdtemp(prefix="mdkidx69_empty_")
+    try:
+        r = relations("", name="main")
+        check("D17 没给 project 且无可用索引 → project-required（列候选）",
+              r.get("ok") is False and r.get("error_code") == "project-required"
+              and r.get("candidates") == [], r)
+    finally:
+        os.environ[ENV_ROOT] = _old_root
 
     empty = mkproj("d_empty", {"x.c": "int x(void){return 0;}\n"})
     r = relations(empty, name="x")
@@ -469,9 +477,15 @@ def group_e():
           im["summary"]["direct_confidence"] == "high"
           and im["summary"]["possible_confidence"] == "medium+low", im["summary"])
 
-    r = impact("", name="main")
-    check("E14 impact 缺 project → project-required",
-          r.get("ok") is False and r.get("error_code") == "project-required", r)
+    _old_root = os.environ.get(ENV_ROOT)
+    os.environ[ENV_ROOT] = tempfile.mkdtemp(prefix="mdkidx69_empty_")
+    try:
+        r = impact("", name="main")
+        check("E14 impact 缺 project 且无可用索引 → project-required（列候选）",
+              r.get("ok") is False and r.get("error_code") == "project-required"
+              and r.get("candidates") == [], r)
+    finally:
+        os.environ[ENV_ROOT] = _old_root
     empty = mkproj("e_empty", {"x.c": "int x(void){return 0;}\n"})
     r = impact(empty, name="x")
     check("E15 impact 没建索引 → no-index",

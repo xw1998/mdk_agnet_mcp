@@ -189,6 +189,9 @@ AI 客户端通过 MCP 协议把用户/模型意图转成工具调用；`mdkdebu
 | `pydantic` | ≥ 2.8（验证于 2.13.5） | MCP 依赖的类型模型 |
 | `pyelftools` | ≥ 0.30（验证于 0.33） | 解析 `.axf` 调试符号，供 `get_current_location` / `run_to_line` / 断点位置定位使用 |
 | `capstone` | ≥ 5.0（验证于 5.0.9） | Thumb 反汇编，供 `disassemble` / `diagnose` 使用 |
+| `tree-sitter` | ≥ 0.26（验证于 0.26.0） | C/C++ 语法解析内核，供代码索引层（`code_*` 工具）使用（预编译轮子，不需要编译器） |
+| `tree-sitter-c` | ≥ 0.24（验证于 0.24.2） | C 语法轮子（代码索引层；缺失时 `code_*` 如实报 `parser-missing`，不降级成 grep） |
+| `tree-sitter-cpp` | ≥ 0.23（验证于 0.23.4） | C++ 语法轮子（代码索引层，同上） |
 
 安装（两种方式任选其一）：
 
@@ -904,5 +907,61 @@ Copyright (c) 2026 <春雫>
 
 ## 参考与致谢
 
+本项目站在不少开源项目的肩膀上。下面按「参考了什么」分组，尽量写明**具体参考点**
+（只列真的读过、并用上了的；参考了但没采纳的也注明，免得后来者走回头路）。
+
+### 协议与实现参考
+
 - [KeilAssistant](https://gitee.com/keyoushide/keil-assistant)：UVSOCK/TCP 协议参考实现
-- debug-keil-uvsc：uvsc DLL 封装，提供完整 `EXECCMD` / `SSTR` 结构定义与命令窗口断点语义
+- [debug-keil-uvsc](https://github.com/name11135/debug-keil-uvsc)：uvsc DLL 封装，提供完整的
+  `EXECCMD` / `SSTR` 结构定义与命令窗口断点语义
+
+### 同类开源项目（对照与吸收）
+
+- [zhinkgit/embeddedskills](https://github.com/zhinkgit/embeddedskills)：统一结果信封
+  （`status` / `next_actions`）、字符串错误码字典、companion SKILL.md 的写法
+- [Sir-YuanShuai/keil-project-tools](https://github.com/Sir-YuanShuai/keil-project-tools)
+  （[npm](https://www.npmjs.com/package/keil-project-tools)）：uvprojx 读写工具面、
+  UV4 `ERRORLEVEL` 完整码表、上下文长度控制
+- [Rance-OwO/Serial-Agent](https://github.com/Rance-OwO/Serial-Agent)：串口 `send_and_wait`
+  的拆分判据、SKILL.md 的任务模式三分
+- [xhw949/Keil_mcp](https://github.com/xhw949/Keil_mcp)：显式 attach/auto 模式命名、
+  「读失败 ≠ 读为零」的诚实口径
+- [ZMC1011/dsh-keil-mcp](https://github.com/ZMC1011/dsh-keil-mcp)：结构化编译错误
+  （file/line/col/code）与错误码知识库、探针互斥
+- [cunjun/McuBuddy](https://github.com/cunjun/McuBuddy)：按域裁剪工具面
+  （`MDKDEBUG_TOOLSETS` 的思路来源）、CMSIS-SVD 外设解码
+- [su32ub/keil-uvsc-mcp](https://github.com/su32ub/keil-uvsc-mcp)：纯 Simulator 路线，
+  以及 `exit_debug` 崩 UV4 之类的踩坑记录
+- [Rev-RoastedDuck/Keil-Tool](https://github.com/Rev-RoastedDuck/Keil-Tool)：uvprojx 的
+  include 路径 / 文件组增删
+- [Adancurusul/embedded-debugger-mcp](https://github.com/Adancurusul/embedded-debugger-mcp)：
+  「只报原始证据、不断言根因」的取向
+- [Klievan/jlink-mcp](https://github.com/Klievan/jlink-mcp)：工具面切分与 RTT 日志过滤的参照物
+- [royforlinux/openocd-mcu-mcp](https://github.com/royforlinux/openocd-mcu-mcp) /
+  [luiox/openocd-mcp](https://github.com/luiox/openocd-mcp) /
+  [microhenrio/openocd-mcp](https://github.com/microhenrio/openocd-mcp)：OpenOCD-only MCP
+  的能力边界对照
+- [agentic-hil/agentic-hil](https://github.com/agentic-hil/agentic-hil)：把真机当闸门的流程思路
+  （与「实现 → mock → 真机 → 提交」同源）
+
+> 另有 [SAP/mdk-mcp-server](https://github.com/SAP/mdk-mcp-server) 是按关键词搜到的，核对后
+> 与 Keil 无关，**没有参考**，列在这里只是为了不让后来者重复调查。
+
+### 代码索引层（批次68–71）
+
+- [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph)：本层的问题定义与选型参照——
+  「把 grep 一遍 + 读整个文件换成一次问结构」、单一探索式门面、假符号与盲区要暴露出来的取向。
+  最终**没有内嵌**它（Node/TS 运行时 + 平台相关单二进制），而是**全 Python 自研**，并补上它
+  没有的**汇编支持**
+- [tree-sitter](https://github.com/tree-sitter/tree-sitter) /
+  [tree-sitter-c](https://github.com/tree-sitter/tree-sitter-c) /
+  [tree-sitter-cpp](https://github.com/tree-sitter/tree-sitter-cpp)：C/C++ 语法解析
+  （用的是预编译轮子，用户不需要装编译器）
+
+### 底层库
+
+- [pyelftools](https://github.com/eliben/pyelftools)：`.axf` 调试符号解析
+- [capstone](https://github.com/capstone-engine/capstone)：Thumb 反汇编
+- [mcp](https://github.com/modelcontextprotocol/python-sdk) / 
+  [pydantic](https://github.com/pydantic/pydantic)：MCP Server 框架与类型模型

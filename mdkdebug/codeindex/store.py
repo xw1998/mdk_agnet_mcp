@@ -158,8 +158,12 @@ class Store(object):
             return None
         have = self.meta_get("schema_version")
         if have != str(SCHEMA_VERSION):
-            return ("索引库版本不匹配（库内 %s / 本程序 %d）。请用 "
-                    "code_index(action=\"drop\") 后重建，或换一个 --in-project 位置。"
+            # 恢复动作本来是「删了重建」**一个**动作，所以直接指向 rebuild（一步到位），
+            # 不再让调用方自己拼 drop → build 两步（中间态是一个「库已经没了」的空档）。
+            return ("索引库版本不匹配（库内 %s / 本程序 %d）。用 "
+                    "code_index(action=\"rebuild\", project=...) 一步删掉旧索引并重建；"
+                    "要换索引位置就 in_project=true（写进工程内）或设 "
+                    "MDKDEBUG_CODEINDEX_DIR（换索引根目录）。"
                     % (have, SCHEMA_VERSION))
         return None
 

@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""代码索引工具族（批次68/69）：把 `codeindex` 门面暴露成 MCP 工具。
+"""代码索引工具族（批次68/69/70 + 批次71 可用性打磨）：把 `codeindex` 门面暴露成 MCP 工具。
 
 与其它工具族（trace / coverage / ocd…）同一写法：server.py 的循环里调用
 `register(server, _js)`，失败只记日志，不影响其余工具。
 
-已暴露 7 个工具：
-- 批次68（**解析级事实**）：`code_index`（建/同步/删/查状态）、`code_status`、
+已暴露 7 个工具（数量不变）：
+- 批次68（**解析级事实**）：`code_index`（建/同步/重建/删/查状态）、`code_status`、
   `code_files`、`code_query`、`code_node`；
 - 批次69（**带 basis 的近似关系**）：`code_relations`（谁调用/被调用）、
   `code_impact`（改动影响面，分 direct/possible/unresolved/indirect + blind_spots）。
@@ -13,7 +13,12 @@
 两者分开的理由：调用点、include 边、符号定义是语法树里读出来的事实；
 「这个名字对应哪个定义」是**推断**。推断必须带 `basis`/`confidence`，
 `resolved` 只在 `exact` 时非空，看不见的部分（函数指针/条件编译/无定义）
-只报规模与位置。`code_explore` / `code_context` 留给批次70。
+只报规模与位置。`code_explore` / `code_context` 留给下一批（探索侧）。
+
+批次71 只改**可用性**，不加工具：① `project` 可以省——只在「本机唯一一个已建索引的
+工程」时自动用，并如实返回 `project_source`/`project_inferred`，多个或没有就列候选报错；
+② `code_index(action="rebuild")` 把「删了重建」收成一个动作；③ `code_status` 带
+`known_projects`，让「本机有哪些索引」可查（也给 project 省略这条路一个发现入口）。
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ from . import (
     db_path,
     drop,
     files as _files,
+    rebuild as _rebuild,
     impact as _impact,
     index_root,
     node as _node,
@@ -43,6 +49,13 @@ _NEXT_BY_ACTION = {
                     "code_query(name=\"前缀\", mode=\"prefix\") 或 code_files(pattern=...)"),
     "node": "code_node(file=\"相对路径\") 看整个文件",
 }
+
+#: `project` 省略这件事只说一遍，其余工具描述末尾引用它（避免 7 份各不相同的长文案）
+_PROJECT_OPTIONAL = (
+    "`project` 可省：本机只有**一个**已建索引的工程时直接用它的结果（返回里带 "
+    "`project_source=\"unique-index\"` 与 `project_inferred=true`，不静悄悄）；"
+    "多个/一个都没有时**列候选报错**，不替你挑（本机有哪些索引用 code_status() 看）。"
+)
 
 
 def _default_js(obj) -> str:
@@ -77,9 +90,16 @@ def register(server, js=None) -> int:
             "不会在后台偷偷建；\n"
             "  · `sync` —— 增量刷新：mtime/size 没动的文件不重解析，动了的重算 sha1，"
             "**内容真变才重解析**（`git checkout` 只改 mtime 时会走 metadata_only 快路）；\n"
+            "  · `rebuild` —— 删掉旧索引后全量重建（= `drop` + `build`，但只算一次调用）。"
+            "库版本不匹配（`index-schema-mismatch`）、索引被放脏、或就是想从头来一遍时用它；"
+            "**删不掉就不建**（不会把重建成功写在还没删掉的库上）；\n"
             "  · `drop` —— 删索引文件（**不可逆**，但只删索引，源码一个字不动）。\n"
-            "project：源码根目录（必填，别指到 `Objects/` 那种构建产物目录）。\n"
-            "in_project=true 才写进 `<项目>/.mdkdebug/index.db`，默认写用户目录。\n"
+            "project：源码根目录（别指到 `Objects/` 那种构建产物目录）。"
+            "**可省**：本机只有**一个**已建索引的工程时直接用它的结果并回 "
+            "`project_source=unique-index` / `project_inferred=true`；多个或一个都没有时"
+            "**列候选报错**，不凭空挑一个目录去索引。\n"
+            "in_project=true 才写进 `<项目>/.mdkdebug/index.db`，默认写用户目录"
+            "（写用户目录的索引才能被「省掉 project」自动认出来）。\n"
             "**如实报的几件事**：① 语法有错的文件照样索引已解析的部分，但计入 "
             "`parse_error_count` 并列出文件名（别把不完整的索引当全量）；"
             "② `skipped_list` 逐条给「哪些文件/目录被跳过、为什么」（构建产物、.gitignore、"
@@ -90,7 +110,8 @@ def register(server, js=None) -> int:
             "`code_impact`** —— 那两条是**推断**，所以每条结论都带 basis/confidence，并单独报出"
             "看不见的部分（盲区）：不先编一个像样的调用图。\n"
             "**索引库结构号（schema）为 3**：批次70 加了汇编，老索引（schema 2）里**没有汇编文件**，"
-            "那是「结构对得上、内容静默不全」的库，所以会报 `index-schema-mismatch` 让你 drop 重建。"
+            "那是「结构对得上、内容静默不全」的库，所以会报 `index-schema-mismatch`；"
+            "一条 `action=\"rebuild\"` 就能恢复（不必自己拼 drop→build）。"
         ),
     )
     async def code_index(action: str = "status", project: str = "",
@@ -103,13 +124,16 @@ def register(server, js=None) -> int:
                 return _js(build(project, in_project=in_project))
             if act in ("sync", "update", "refresh"):
                 return _js(sync(project, in_project=in_project))
+            if act in ("rebuild", "recreate", "reindex"):
+                return _js(_rebuild(project, in_project=in_project))
             if act in ("drop", "remove", "delete"):
                 # 不在这里写 `risk`：统一信封的 `risk` 是**等级**（medium/high），
                 # 业务文案写进去会被静默覆盖（一个键名一义）。风险说明走 `note`。
                 return _js(drop(project, in_project=in_project))
             return _js({"ok": False, "error": "不认识的 action：%s" % action,
                         "error_code": "invalid-argument",
-                        "hint": "action 取 status / build / sync / drop"})
+                        "hint": ("action 取 status / build / sync / rebuild / drop"
+                                 "（rebuild = 删掉旧索引后全量重建，一步到位）")})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
     n += 1
@@ -126,7 +150,13 @@ def register(server, js=None) -> int:
             "不代表没问题**），以及 tree-sitter 解析器能不能用（缺依赖时给装法，不装作能用）。\n"
             "**落后不会自动重建**：`stale.is_stale=true` 只说明该刷了，要刷显式 "
             "`code_index(action=\"sync\")`——自动重建会让「读到的到底是什么版本」变得不可知。\n"
-            "还没建索引时返回 `error_code=no-index`（不是 ok）并告诉你怎么建。"
+            "还没建索引时返回 `error_code=no-index`（不是 ok）并告诉你怎么建。\n"
+            "**`project` 可省**：没给就是「报本机有哪些索引」——返回 `known_projects`"
+            "（按最近构建时间倒序；只有**一个**可用时直接报它的详情并标 "
+            "`project_source=unique-index`，多个则 `mode=all-projects` 列清单，"
+            "一个都没有才报 `no-index`）。想要哪个工程的详情就把它的 `project` 传进来。\n"
+            "另：一个工程可能有两个索引位置（用户目录 / `in_project=true` 的工程内），"
+            "本工具只认你传的 `in_project` 对应的那一个；两边都建过就会各报各的。"
         ),
     )
     async def code_status(project: str = "", in_project: bool = False) -> str:
@@ -146,7 +176,8 @@ def register(server, js=None) -> int:
             "用途：找文件真实路径（`code_node(file=...)` 要的是索引里的 rel 路径）、"
             "看一个大工程长什么样，**不必先扫盘**。\n"
             "`dirs` 给目录集合。只看被索引的：被 .gitignore/构建产物排除的这里没有——"
-            "想看「为什么某个文件不在」用 `code_index(action=\"build\")` 的 `skipped_list`。"
+            "想看「为什么某个文件不在」用 `code_index(action=\"build\")` 的 `skipped_list`。\n"
+            + _PROJECT_OPTIONAL
         ),
     )
     async def code_files(project: str = "", pattern: str = "",
@@ -175,7 +206,8 @@ def register(server, js=None) -> int:
             "fts（**实验性**：按相关度排序，代码标识符用 FTS 反而容易出意外，比如 `foo_bar` "
             "会被切成两个词——要用请知道自己在赌什么）；\n"
             "  · `only_definitions=true` 只看定义，跳过声明。\n"
-            "**符号表不含局部变量**（只索引文件作用域符号）。要看某个符号的源码体用 `code_node`。"
+            "**符号表不含局部变量**（只索引文件作用域符号）。要看某个符号的源码体用 `code_node`。\n"
+            + _PROJECT_OPTIONAL
         ),
     )
     async def code_query(project: str = "", name: str = "", kind: str = "",
@@ -203,12 +235,12 @@ def register(server, js=None) -> int:
             "`max_lines` 限制单个符号回多少行（默认 %d），截断时 `truncated=true`。\n"
             "两个关系字段别混：`calls_out` 是**该符号体内的调用点**（谁被它调，解析级事实）；"
             "`refs` **只含类型名与条件编译里的宏名**的出现位置——它既不是「所有引用」"
-            "也不是「谁调用了它」。反向的「谁调了它」是**推断**，本批**不给**："
-            "要把它做成带 `basis`/`confidence` 的结论之后才会对外，先编一个像样的"
-            "调用图就是假的。\n"
-            "取源码时若文件已不在磁盘上，如实报 `code_error`/`file-not-found`，不返空体。"
+            "也不是「谁调用了它」。反向的「谁调了它」是**推断**，用 "
+            "`code_relations(direction=\"callers\")`（每条边带 `basis`/`confidence`，"
+            "`blind` 的另计）；改动影响面用 `code_impact`。\n"
+            "取源码时若文件已不在磁盘上，如实报 `code_error`/`file-not-found`，不返空体。\n"
             % DEFAULT_NODE_LINES
-        ),
+        ) + _PROJECT_OPTIONAL,
     )
     async def code_node(project: str = "", name: str = "", file: str = "",
                         kind: str = "", max_lines: int = DEFAULT_NODE_LINES,
@@ -248,7 +280,8 @@ def register(server, js=None) -> int:
             "推断只发生在「这个名字对应哪个定义」。\n"
             "响应带 `blind_spots`：与该名相关的**看不见的部分**（函数指针调用、条件编译内的调用、"
             "同名宏、工程内无定义）各有位置与计数——宁可说「这里我看不到」，不画一张像样的调用图。\n"
-            "先 `code_index(action=\"build\")` 建索引；没建会报 `no-index`。"
+            "先 `code_index(action=\"build\")` 建索引；没建会报 `no-index`。\n"
+            + _PROJECT_OPTIONAL
         ),
     )
     async def code_relations(project: str = "", name: str = "",
@@ -279,7 +312,8 @@ def register(server, js=None) -> int:
             "条件编译内的调用、无定义的调用点）的规模与位置。\n"
             "`depth` 只沿 `exact` 已证实的边往下钻（拿猜出来的边继续下钻，第二层起就全是假的）。\n"
             "**别把 possible/unresolved 当确定影响面**：它们是「可能有影响」，不是「一定有」。\n"
-            "先 `code_index(action=\"build\")` 建索引；没建会报 `no-index`。"
+            "先 `code_index(action=\"build\")` 建索引；没建会报 `no-index`。\n"
+            + _PROJECT_OPTIONAL
         ),
     )
     async def code_impact(project: str = "", name: str = "", depth: int = 2,
