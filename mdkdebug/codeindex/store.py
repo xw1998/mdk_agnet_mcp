@@ -14,7 +14,11 @@ import os
 import sqlite3
 import time
 
-SCHEMA_VERSION = 2
+#: 3 = 批次70：加了汇编（`.s`/`.S`/`.asm`）行式解析。
+#: **为什么必须 bump**：表结构没变，但老索引里没有汇编文件——那是一个“结构对得上、
+#: 内容静默不全”的库（启动文件、上下文切换、向量表全不在里面）。不 bump 的话它就
+#: 一直静静地少一半低层真相，而任何查询都不会报错。
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);

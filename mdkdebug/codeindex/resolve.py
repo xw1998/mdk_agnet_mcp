@@ -25,11 +25,23 @@
 
 「谁是调用者」这一侧同样是**解析级事实**：`calls.caller` 是解析时按「包含该调用点的
 最内层函数定义（同文件）」记下来的，不是推断；推断只发生在「这个调用名对应哪个定义」。
+
+**汇编（`asm_func` / `asm_import`）也在这套规则里**，但三处边界要记住：
+- 汇编文件不 `#include` C 头，所以「汇编调 C 函数」往往靠 `IMPORT`/`EXTERN` 这条**声明**
+  拿到 `exact`；没有 `IMPORT` 只有名字对得上，就是 `name-only`（未证实可见性）。
+- `LDR Rn, =sym` + `BLX Rn` 记成 `via_pointer=1`：名字是文本里给的，但**那只是线索**，
+  一律压成 `blind`（不因为“看起来像”就抬成 exact）。
+- 无名间接调用（`BLX Rn` 且寄存器来源不可证）**根本不产生调用点**，所以也不会出现在
+  `unresolved_names` 里——“少一条”远好于“编一个像 R2 这样的假名字”。
 """
 from __future__ import annotations
 
-#: 能作为调用目标的符号种类（宏函数也算——调用点可能被宏展开）
-CALLABLE_KINDS = ("function", "macro_fn", "fptr")
+#: 能作为调用目标的符号种类（宏函数也算——调用点可能被宏展开）。
+#: `asm_func` 是汇编里的函数（PROC/ENDP、`.type %function`、`.thumb_func`、被 bl 指向的标签）；
+#: `asm_import` 是汇编里 `IMPORT`/`EXTERN` 进来的外部符号——它是**一条真实的声明**，
+#: 有了它「汇编调 C 函数」这个调用点才能给出比 name-only 更硬的依据（而不是靠猜）。
+#: 汇编的普通标签 `asm_label` **不在此列**：那是数据/常量/分支目标，不是调用目标。
+CALLABLE_KINDS = ("function", "macro_fn", "fptr", "asm_func", "asm_import")
 
 #: basis → confidence（blind 不给置信度：它不是一个结论，是「看不到」）
 BASIS_CONFIDENCE = {"exact": "high", "include-visible": "medium",
@@ -109,7 +121,7 @@ class Resolver:
         allsyms = self.symbols_named(name)
         syms = [s for s in allsyms if s["kind"] in CALLABLE_KINDS]
         fn_defs = [s for s in syms
-                   if s["is_definition"] and s["kind"] in ("function", "macro_fn")]
+                   if s["is_definition"] and s["kind"] in ("function", "macro_fn", "asm_func")]
         fptr_defs = [s for s in syms
                      if s["is_definition"] and s["kind"] == "fptr"]
         decls = [s for s in syms if not s["is_definition"]]
@@ -128,6 +140,12 @@ class Resolver:
         if not defs and fptr_defs:
             info["note"] = ("目标是函数指针变量（间接调用）：真实被调者静态看不到——盲区，"
                             "不猜（候选里给的是这个指针变量的声明位置）")
+            return info
+        if not defs and any(s["kind"] == "asm_import" for s in syms):
+            # 汇编 IMPORT 了它，但全工程找不到定义：典型是汇编里手动跳过去的入口，
+            # 或目前只索引了部分目录。这时“能看到声明”不能当成“能看到目标”。
+            info["note"] = ("汇编里 IMPORT/EXTERN 了这个名字，但全工程查不到它的定义"
+                            "（只索引了一部分目录 / 真的在别的镜像里）——盲区，不猜")
             return info
 
         vis = self.visible_files(file)
@@ -319,6 +337,11 @@ def project_blind_spots(store):
     n_viaptr = q("SELECT COUNT(*) AS n FROM calls WHERE via_pointer=1").fetchone()["n"]
     n_cond = q("SELECT COUNT(*) AS n FROM calls WHERE in_conditional=1").fetchone()["n"]
     n_fptr = q("SELECT COUNT(*) AS n FROM fptr").fetchone()["n"]
+    # 把「取过地址」拆成汇编 / C 两侧：汇编里的 `LDR Rn, =sym` 与向量表/DCD 数据表
+    # 都会进 fptr 表，一个 CMSIS 启动文件的向量表就能带来 ~80 条——不拆开的话，
+    # 「fptr_declarations」这个数字会被向量表淹没，读者会以为 C 侧突然多了几百个函数指针。
+    n_fptr_asm = q("SELECT COUNT(*) AS n FROM fptr f JOIN files fl ON fl.id=f.file_id "
+                   "WHERE fl.lang='asm'").fetchone()["n"]
     kinds = ",".join("?" * len(CALLABLE_KINDS))
     n_unres = q("SELECT COUNT(*) AS n FROM calls c WHERE NOT EXISTS ("
                 "SELECT 1 FROM symbols s WHERE s.name=c.callee AND s.is_definition=1 "
@@ -331,11 +354,17 @@ def project_blind_spots(store):
         "via_pointer": n_viaptr,
         "in_conditional": n_cond,
         "fptr_declarations": n_fptr,
+        "fptr_declarations_asm": n_fptr_asm,
+        "fptr_declarations_c": n_fptr - n_fptr_asm,
         "unresolved_call_sites": n_unres,
         "unresolved_names": n_unres_names,
-        "note": ("via_pointer / fptr_declarations 是「间接调用」的规模；in_conditional 是"
-                 "落在条件编译分支里的调用点；unresolved 是 callee 在符号表里查不到定义的"
-                 "调用点（宏展开/系统函数/汇编/未索引）。这些是**看不全**的规模，不等于错误。"),
+        "note": ("via_pointer 是「通过函数指针调用」的调用点规模；fptr_declarations 是"
+                 "「取过地址」的记录数，**已拆成 asm/c 两侧**（汇编侧的 `LDR Rn, =sym`、"
+                 "`DCD`/`.word` 向量表都算，十几份 CMSIS 启动文件就能把它抬到几千条，"
+                 "所以不要把这个总数当成 C 侧的函数指针数）；in_conditional 是落在条件编译"
+                 "分支里的调用点；unresolved 是 callee 在符号表里查不到定义的调用点"
+                 "（宏展开/系统函数/没索引到的汇编/未索引）。这些是**看不全**的规模，"
+                 "不等于错误。"),
     }
 
 

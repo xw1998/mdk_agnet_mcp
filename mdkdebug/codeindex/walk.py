@@ -30,6 +30,11 @@ EXT_LANG = {
     ".hh": "cpp",
     ".hxx": "cpp",
     ".h++": "cpp",
+    # 汇编：`.S`/`.s` 经 splitext().lower() 都归到这里。方言（armasm / GNU / IAR）
+    # 不靠扩展名判定——同一工程里 `svcrt_context.S` 是 armasm、CMSIS 的 `.s` 是 GNU，
+    # 由 lang_asm 按文件内实际出现的指令认，认不出来按 armasm。
+    ".s": "asm",
+    ".asm": "asm",
 }
 
 # 永远不看的目录名（构建产物 / 三方件 / 工具目录）

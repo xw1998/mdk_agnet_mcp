@@ -4,6 +4,10 @@
 把一份源码变成「记录」：符号、include、调用点、引用、函数指针声明，外加一份
 **解析错误**标记（有语法错误的文件照样索引已解析出来的部分，但如实标出来）。
 
+汇编（`.s`/`.S`/`.asm`）没有可用的语法轮子，走 `lang_asm` 的**行式解析**：能证实的
+才记（标签/PROC-ENDP/BL·BLX/IMPORT/宏/取地址/数据表），证不了的一律不记，并给出
+`unparsed_lines` 与样本。它的 `parse_error` **恒为 0，且不代表这份汇编没问题**。
+
 诚实边界（写在这里也写给调用方看）：
 - 宏**不展开**，条件编译的**所有分支**都会被索引，只标 `in_conditional`；
 - 函数指针的**声明**能认出来（进 fptr 表当盲区证据，不区分作用域；文件作用域的那几个
@@ -19,7 +23,10 @@ try:
 except Exception as exc:                     # 依赖缺失：如实报缺，不静默降级成 grep
     _TS_OK, _TS_ERR = False, "%s: %s" % (type(exc).__name__, exc)
 
+#: 语法轮子语言（tree-sitter）
 LANG_MODULES = {"c": "mdkdebug.codeindex.lang_c", "cpp": "mdkdebug.codeindex.lang_cpp"}
+#: 行式解析语言（**不需要任何依赖**）：汇编没有可用的预编译语法轮子，走 lang_asm 的行式解析
+LINE_LANGS = {"asm": "mdkdebug.codeindex.lang_asm"}
 
 # 概念 → 符号种类（引用类概念不产符号）
 KIND_OF = {
@@ -47,7 +54,14 @@ _COND_TYPES = ("preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif",
 
 
 def available():
-    """tree-sitter 是否可用。缺依赖时给出装法（不猜、不降级）。"""
+    """解析器是否就绪。缺依赖时给出装法（不猜、不降级）。
+
+    注意：汇编走的是行式解析（`LINE_LANGS`，零依赖），但**整个索引层仍然要求
+    tree-sitter 在场**——一个只装了 `lang_asm` 的环境照样会被这里拦下，
+    因为 C/C++ 那份是索引的主体。这条约束写在返回体里，不藏：`languages` 列出
+    全部受支持的语言（含 asm），`versions` 里 asm 标注「行式解析（无依赖）」、
+    c/cpp 给出轮子版本——谁需要依赖、谁不需要，一眼可见。
+    """
     if not _TS_OK:
         return False, {"error": _TS_ERR,
                        "hint": "缺 tree-sitter 解析器：pip install "
@@ -66,7 +80,14 @@ def available():
         versions["tree_sitter"] = getattr(tree_sitter, "__version__", "?")
     except Exception:
         pass
-    return True, {"versions": versions, "languages": sorted(LANG_MODULES)}
+    for lang, mod in LINE_LANGS.items():
+        try:
+            importlib.import_module(mod)
+            versions[lang] = "行式解析（无依赖）"
+        except Exception as exc:               # 自己人坏了也要报，不静默少一门语言
+            return False, {"error": "行式解析器缺失（%s）：%s" % (lang, exc)}
+    return True, {"versions": versions,
+                  "languages": sorted(set(LANG_MODULES) | set(LINE_LANGS))}
 
 
 _cache = {}
@@ -251,7 +272,16 @@ def _blank_extern_c(src):
 
 
 def extract(src, rel, lang):
-    """解析一份源码 → 记录字典。src 为 bytes。"""
+    """解析一份源码 → 记录字典。src 为 bytes。
+
+    两条路：C/C++ 走 tree-sitter（`LANG_MODULES`），汇编走行式解析（`LINE_LANGS`）。
+    两者返回**同形状**的记录字典，所以上层（store / resolve / 工具层）完全不用分叉——
+    唯一的差别是汇编额外带回 dialect / unnamed_indirect_calls / unparsed_lines 这几个
+    诚实指标（见 lang_asm 的模块说明）。
+    """
+    if lang in LINE_LANGS:
+        mod = importlib.import_module(LINE_LANGS[lang])
+        return mod.parse(src, rel)
     src, normalized = _blank_extern_c(src)
     mod, language, parser, queries = _load(lang)
     tree = parser.parse(src)

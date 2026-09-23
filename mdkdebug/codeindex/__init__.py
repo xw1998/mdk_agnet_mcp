@@ -116,9 +116,12 @@ def _resolve_includes(store):
     只做「唯一匹配」——同名头文件出现多次时**不猜**（留 None，批次69 的 `include-visible`
     会把它当候选之一并如实报歧义）。系统头（`<...>`）不匹配。
     """
+    # 汇编也算：`GET x.s` / `.include "x.inc"` 是真实存在的 include 边（内核端口文件
+    # 就是指这样把配置拉进来的）。LIKE 对 ASCII 不区分大小写，所以 `.S` 也会被 `%.s` 命中。
     rows = store.conn.execute(
         "SELECT DISTINCT rel FROM files WHERE rel LIKE '%.h' OR rel LIKE '%.hpp' "
-        "OR rel LIKE '%.hh' OR rel LIKE '%.hxx' OR rel LIKE '%.inc'").fetchall()
+        "OR rel LIKE '%.hh' OR rel LIKE '%.hxx' OR rel LIKE '%.inc' "
+        "OR rel LIKE '%.s' OR rel LIKE '%.asm'").fetchall()
     by_base = {}
     for r in rows:
         by_base.setdefault(os.path.basename(r["rel"]).lower(), []).append(r["rel"])

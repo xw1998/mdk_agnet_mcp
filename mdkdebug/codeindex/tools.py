@@ -56,13 +56,20 @@ def register(server, js=None) -> int:
 
     @server.tool(
         name="code_index",
-        title="代码索引：建 / 增量同步 / 删除 / 看状态（C/C++ 结构索引）",
+        title="代码索引：建 / 增量同步 / 删除 / 看状态（C/C++/汇编 结构索引）",
         description=(
             "**大型工程的省 token 入口**：把「grep 一遍 + Read 整个文件」换成「一次问结构」。"
             "做法是用 tree-sitter（预编译轮子，不需要你装编译器）把 C/C++ 解析成"
             "**符号表 + include 图 + 单符号源码体**，落在 SQLite（`~/.mdkdebug/codeindex/`，"
             "**不往你的工程目录里写**）。建好之后 `code_query` / `code_node` / `code_files` "
             "都是查库，比扫盘 + 读文件快，也省 token。\n"
+            "**汇编（`.s`/`.S`/`.asm`）也进索引**：启动文件、上下文切换、SVC/PendSV 入口、"
+            "向量表都在这里。汇编走**行式解析**（零依赖），armasm / GNU / IAR 三种写法都认："
+            "标签与函数（PROC…ENDP、`.type %function`、`.thumb_func`）、`BL`/`BLX`、"
+            "`IMPORT`/`PUBWEAK`、宏、`LDR Rn,=sym` 与 `DCD` 数据表、条件汇编。符号种类是"
+            "`asm_func` / `asm_label` / `asm_import`（**不复用 C 的 `function`**——不假装汇编"
+            "标签就是 C 函数）。**它看不懂的行一律不记**，并在文件里给出 `unparsed_lines`："
+            "汇编的 `parse_error` **恒为 0，且不等于这份汇编没问题**，不要拿它当质量背书。\n"
             "action：\n"
             "  · `status`（默认）—— 有没有索引、多大、多少文件/符号、上次构建时间、"
             "**是否落后于源码**；\n"
@@ -79,8 +86,11 @@ def register(server, js=None) -> int:
             ">1 MB 当生成物），不静默吞；③ 缺 tree-sitter 依赖时报 `parser-missing` 并给装法，"
             "**不会退化成 grep 假装成功**。\n"
             "本批只产**解析级事实**：宏不展开、条件编译所有分支都进索引只标 `in_conditional`、"
-            "局部变量不入符号表、C++ 模板/重载/继承不覆盖。**调用链与影响面本批不给**——"
-            "那是推断，等把「能证到什么程度」写成 basis/confidence 之后才对外给，不先编一个像样的调用图。"
+            "局部变量不入符号表、C++ 模板/重载/继承不覆盖。**调用链与影响面用 `code_relations` / "
+            "`code_impact`** —— 那两条是**推断**，所以每条结论都带 basis/confidence，并单独报出"
+            "看不见的部分（盲区）：不先编一个像样的调用图。\n"
+            "**索引库结构号（schema）为 3**：批次70 加了汇编，老索引（schema 2）里**没有汇编文件**，"
+            "那是「结构对得上、内容静默不全」的库，所以会报 `index-schema-mismatch` 让你 drop 重建。"
         ),
     )
     async def code_index(action: str = "status", project: str = "",
@@ -112,7 +122,8 @@ def register(server, js=None) -> int:
             "**是否落后于源码**（changed/missing/added 三类计数 + 样本路径）、"
             "**索引完整度**（`parse_errors` / `parse_error_count`：解析器走过恢复态的文件，"
             "索引里这部分不可全信——别把部分解析的索引当全量），"
-            "以及 tree-sitter 解析器能不能用（缺依赖时给装法，不装作能用）。\n"
+            "支持的语言（含 **asm**：汇编是行式解析、零依赖，它的 `parse_error` **恒为 0 且"
+            "不代表没问题**），以及 tree-sitter 解析器能不能用（缺依赖时给装法，不装作能用）。\n"
             "**落后不会自动重建**：`stale.is_stale=true` 只说明该刷了，要刷显式 "
             "`code_index(action=\"sync\")`——自动重建会让「读到的到底是什么版本」变得不可知。\n"
             "还没建索引时返回 `error_code=no-index`（不是 ok）并告诉你怎么建。"
@@ -156,8 +167,10 @@ def register(server, js=None) -> int:
             "每条给 name / kind / path / line / end_line / is_definition / signature / parent。\n"
             "  · 一个名字多处定义（不同文件各有一份 static、或头里只有声明）→ **全给你**，"
             "不猜你要哪一个；\n"
-            "  · `kind` 过滤：function / macro / macro_fn / struct / class / union / enum / "
-            "enumerator / typedef / field / variable / namespace / fptr；\n"
+            "  · `kind` 过滤：C/C++ —— function / macro / macro_fn / struct / class / union / "
+            "enum / enumerator / typedef / field / variable / namespace / fptr；"
+            "汇编 —— asm_func（PROC/`.type %function`/被 bl 指向的标签）/ asm_label（其它标签、"
+            "EQU 常量，storage=constant）/ asm_import（`IMPORT`/`EXTERN` 声明的外部符号）；\n"
             "  · `mode`：auto（默认，精确 > 前缀 > 子串，可预测）/ exact / prefix / substring / "
             "fts（**实验性**：按相关度排序，代码标识符用 FTS 反而容易出意外，比如 `foo_bar` "
             "会被切成两个词——要用请知道自己在赌什么）；\n"
@@ -222,6 +235,11 @@ def register(server, js=None) -> int:
             "候选全列在 `candidates` 里让你自己挑；\n"
             "  · `name-only` / `low` —— 只能靠名字匹配（未见 include 链），**未证实可见性**；\n"
             "  · `blind` —— 静态看不到（函数指针调用 / 工程内查不到定义）。\n"
+            "**汇编侧**：`asm_func` 是可作调用目标的一类定义；`asm_import`（`IMPORT`/`EXTERN`）"
+            "是一条真实存在的声明，所以「汇编调 C 函数」能拿到比 name-only 更硬的依据。"
+            "但汇编里两件事看不到：`BLX Rn` 而寄存器来源不明（**不产生调用点**，不编名字）、"
+            "本文件内的 `B label`（那是循环/分支，不是调用）——所以调用图在汇编处会断，"
+            "这是如实呈现的边界，不是解析失败。\n"
             "参数：`name`（符号名，必填）、`direction`（callers / callees / both）、`depth`"
             "（BFS 深度，1=只看直接一层）、`path`/`line`（同名多处时指定哪一个定义）。\n"
             "两条别踩的线：① **`resolved` 只在 exact 时非空**——它是「证明得到」的那一个定义，"
