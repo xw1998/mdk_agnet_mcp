@@ -28,7 +28,8 @@
  *                         -> mdk_trace_svcrt_obj_signal(obj, cls)
  *                            mdk_trace_svcrt_mutex_acquire / _release(obj)
  *   5. fault handler      first statement of each fault handler
- *                         -> mdk_trace_svcrt_fault()
+ *                         -> MDK_TRACE_FAULT_CAPTURE()  (a macro, not a
+ *                         call - see the note at the bottom of this header)
  *
  * The call sites are deliberately in the *kernel*, not in the trace
  * component: a hook that lives outside the thing being scheduled can only
@@ -66,14 +67,22 @@ extern "C" {
 #define MDK_TRACE_SVCRT_CLASS_EVENT  3u
 #define MDK_TRACE_SVCRT_CLASS_FS     4u
 #define MDK_TRACE_SVCRT_CLASS_DEV    5u
+#define MDK_TRACE_SVCRT_CLASS_COND   6u   /* condition variable: sleeps on the cond, re-locks its mutex */
 
 /* class (3 bits) + index (10 bits) = the 13 bit object handle in the record. */
 #define MDK_TRACE_SVCRT_OBJ(cls, idx) \
     ((uint16_t)((((uint16_t)(cls) & 0x7u) << 10) | ((uint16_t)(idx) & 0x3FFu)))
 
-/* Event ids the adapter emits, with the task number in `arg`. These match the
+/* Event ids for TASK LIFECYCLE, with the task slot in `arg`. These match the
  * ids svcrt_trace.h already used, so the host's existing task-name lookup
- * applies to them unchanged. */
+ * applies to them unchanged.
+ *
+ * 0x11 (WAIT) and 0x12 (READY) are listed for completeness only: they are the
+ * kernel's own task-level events, and the adapter must NOT emit them from the
+ * object hooks. The host reads the arg of these four ids as a task slot, so an
+ * object index there would be shown as the name of an unrelated task. Object
+ * waits travel as sync records instead, where the object identity has a field
+ * of its own. */
 #define MDK_TRACE_SVCRT_EV_WAIT    0x11u
 #define MDK_TRACE_SVCRT_EV_READY   0x12u
 #define MDK_TRACE_SVCRT_EV_CREATE  0x13u
@@ -112,9 +121,20 @@ void mdk_trace_svcrt_isr_exit(uint32_t irq);
  * the allocator's internals. */
 void mdk_trace_svcrt_heap(uint32_t alloc_op, uint32_t size);
 
-/* 5. Fault snapshot. Call this as the FIRST statement of each fault handler
- * (see MDK_TRACE_FAULT_CAPTURE in mdk_trace.h for why it must be first). */
-void mdk_trace_svcrt_fault(void);
+/* 5. Fault snapshot - there is deliberately NO function here.
+ *
+ * A wrapper function cannot capture a fault. MDK_TRACE_FAULT_CAPTURE() reads
+ * the CURRENT function's LR (EXC_RETURN) and walks the exception stack frame
+ * from it. A call into this adapter runs first, which pushes a frame and
+ * replaces LR with the return address - so the macro would snapshot the
+ * adapter instead of the fault site, producing a plausible looking PC that is
+ * not where the fault happened. That is worse than no record at all.
+ *
+ * The fault hook is therefore the MACRO itself: write MDK_TRACE_FAULT_CAPTURE()
+ * as the FIRST statement of each fault handler. SVCrtOS already does this via
+ * its own SVCRT_TRACE_FAULT_CAPTURE(); on AC5 a bare macro degrades to
+ * "class + CFSR only", and an assembly vector thunk calling
+ * mdk_trace_fault_capture(exc, msp, psp) is what recovers the full frame. */
 
 /* True when MDK_TRACE_SVCRT_HOOKS is 1 and the traces are actually emitted.
  * A firmware can report this over its own shell instead of assuming. */

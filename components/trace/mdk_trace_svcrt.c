@@ -12,7 +12,12 @@
  * ASCII only, same reason as mdk_trace.h.
  */
 
-#include "mdk_trace_config_default.h"
+/* Include mdk_trace.h FIRST and let it pull in the config: it reads the
+ * project's mdk_trace_config.h before falling back to its own defaults, so a
+ * project that sets MDK_TRACE_SVCRT_HOOKS=1 is honoured. Including
+ * mdk_trace_config_default.h here instead would define the macro (and its
+ * #ifndef guard) at 0 first, and the project's later define would be dropped
+ * - the option would be silently ignored. */
 #include "mdk_trace.h"
 #include "mdk_trace_svcrt.h"
 
@@ -64,9 +69,13 @@ void mdk_trace_svcrt_task_exit(uint32_t slot)
 
 void mdk_trace_svcrt_obj_wait(uint16_t obj, uint8_t cls)
 {
+    /* Only the sync record. The host decodes the task-argument event ids
+     * (0x11/0x12/0x13/0x14) by reading `arg` as a TASK SLOT and resolving it
+     * to a task name, so emitting 0x11 here with an object index would label
+     * the event with whichever task happens to own that slot number - a wrong
+     * name presented as fact. Tasks that block are reported by the kernel's
+     * own wait event; what this call adds is the object that was waited on. */
     mdk_trace_sync(MDK_TRACE_SVCRT_OBJ(cls, obj), MDK_TRACE_SYNC_WAIT, 0u);
-    mdk_trace_event((uint16_t)MDK_TRACE_SVCRT_EV_WAIT, MDK_TRACE_KIND_POINT,
-                    (uint32_t)(obj & 0x3FFu));
 }
 
 void mdk_trace_svcrt_obj_timeout(uint16_t obj, uint8_t cls)
@@ -76,9 +85,8 @@ void mdk_trace_svcrt_obj_timeout(uint16_t obj, uint8_t cls)
 
 void mdk_trace_svcrt_obj_signal(uint16_t obj, uint8_t cls)
 {
+    /* Sync record only - see the note in mdk_trace_svcrt_obj_wait(). */
     mdk_trace_sync(MDK_TRACE_SVCRT_OBJ(cls, obj), MDK_TRACE_SYNC_SIGNAL, 0u);
-    mdk_trace_event((uint16_t)MDK_TRACE_SVCRT_EV_READY, MDK_TRACE_KIND_POINT,
-                    (uint32_t)(obj & 0x3FFu));
 }
 
 void mdk_trace_svcrt_mutex_acquire(uint16_t obj)
@@ -113,11 +121,6 @@ void mdk_trace_svcrt_heap(uint32_t alloc_op, uint32_t size)
 {
     mdk_trace_heap((uint8_t)(alloc_op ? MDK_TRACE_HEAP_FREE : MDK_TRACE_HEAP_ALLOC),
                    size);
-}
-
-void mdk_trace_svcrt_fault(void)
-{
-    MDK_TRACE_FAULT_CAPTURE();
 }
 
 int mdk_trace_svcrt_enabled(void)
@@ -158,7 +161,6 @@ void mdk_trace_svcrt_heap(uint32_t alloc_op, uint32_t size)
 {
     (void)alloc_op; (void)size;
 }
-void mdk_trace_svcrt_fault(void) { }
 int mdk_trace_svcrt_enabled(void) { return 0; }
 
 #endif /* MDK_TRACE_SVCRT_HOOKS && MDK_TRACE_ENABLE */

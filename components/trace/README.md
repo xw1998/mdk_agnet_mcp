@@ -269,8 +269,11 @@ SVCrtOS 内核已有的钩点上，内核侧只要在钩点里调一个函数，
 | 互斥所有权 | `mdk_trace_svcrt_mutex_acquire/release(obj)` | `sync` acquire / release |
 | 堆分配 / 释放 | `mdk_trace_svcrt_heap(op, size)` | `heap` alloc / free |
 
-异常路径：`mdk_trace_svcrt_fault()` 内部就是 `MDK_TRACE_FAULT_CAPTURE()`，
-放在 fault handler 首行即可。ISR 进出用 `mdk_trace_svcrt_isr_enter/exit(irq)`。
+异常路径**没有适配函数**：fault 现场必须在 handler 首行用宏
+`MDK_TRACE_FAULT_CAPTURE()` 直接抓（SVCrtOS 内核走自己的
+`SVCRT_TRACE_FAULT_CAPTURE()`）。不能经一层函数调用——调用会先把 LR 换成返回
+地址，快照下来的是适配器而不是故障点。ISR 进出用
+`mdk_trace_svcrt_isr_enter/exit(irq)`。
 
 **为什么钩点在核心里、而不是在组件里回调内核**：组件不持有任何内核头文件，
 内核换个版本也不会连带追踪组件不能编；而且「哪些点算阻塞」这件事只有内核自己
