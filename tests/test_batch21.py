@@ -16,6 +16,7 @@ import sys, os, json, time, asyncio, tempfile, shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+os.environ.setdefault("MDKDEBUG_DESC", "full")   # 批次74 起默认档为 lean；本模块的内容类断言按归档全文（mdk_guide 可取回）评估
 
 # 批次42 起工具面默认精简（只暴露 core 组），本批校验的是**全量**工具面里的 flash_debug
 # 等工具，必须显式要求不裁剪——否则单独跑本文件时 flash_debug 根本不在工具表里。

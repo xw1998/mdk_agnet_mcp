@@ -32,6 +32,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+os.environ.setdefault("MDKDEBUG_DESC", "full")   # 批次74 起默认档为 lean；本模块的内容类断言按归档全文（mdk_guide 可取回）评估
 
 from mdkdebug import server as SV            # noqa: E402
 from mdkdebug import toolbox as TB           # noqa: E402

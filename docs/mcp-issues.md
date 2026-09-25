@@ -406,3 +406,29 @@ F427 实测：4 个槽位拿到名字，3 个跨镜像槽位如实留空（它�
 
 回归用例：`tests/test_batch67.py`（89 项）；`tests/test_batch61.py` 改写为「默认面已可见 → 不再前置装卸，
 装卸分支由裁剪面（`MDKDEBUG_TOOLSETS=mem`）覆盖，坑的形状没变」。
+
+---
+
+## 批次74 · 工具面瘦身三刀（2026-09-26）
+
+**背景**：AI 反馈「工具规模太大，不利于上下文与注意力机制」。实测默认面（core 44 个工具）
+一次 tools/list 的 JSON 为 89,079 字节，其中 description 占 66%、inputSchema 18%（内含递归
+`title` 3,327 字节）、outputSchema 6.3%、annotations 5.2%。三刀合计：core 89,079→39,458（默认档
+同时从 `full` 改 `lean`；只算结构刀是 89,079→63,996，−28.2%）；all 413,796→200,598；nano
+25,998→14,968。
+
+| 刀 | 内容 | 关键事实 |
+|---|---|---|
+| 一 | 结构瘦身（`mdkdebug/surface.py`，只改 wire 副本） | `tool.output_schema` 在 **FastMCP 的活 Tool** 上是只读 property，读 `fn_metadata.output_schema`；而那个字段在**调用路径**上决定「要不要把返回值包成 structuredContent」（`func_metadata.py`: `output_model = self.output_model if self.output_schema is not None else None`）。直接置 None 会**真的改返回形态**——「看似权威的错答案」。`MCPServer.list_tools()` 每次新造 MCPTool（wire 副本），`mcp/shared/peer.py` 序列化用 `exclude_none=True`，所以只对副本置 None 即从线上消失、行为零变化。逃生口 `MDKDEBUG_SURFACE=off` |
+| 二 | 默认描述档 `full`→`lean`（`thin.DEFAULT_MODE` / `toolbox.desc_default_for`） | **对批次56 口径的显式反转**（批次56：默认 full，理由是「默认档悄悄砍边界条件容易用错工具」；批次74：AI 反馈规模本身伤注意力，lean 保住【输出控制】/【参数】/【调用示例】与结尾告警，`MDKDEBUG_DESC=full` 整面逐字节还原）。nano 档仍自动 `min` |
+| 三 | 取回指针瘦身（~82→~69 字符） | 收益小（core 约 374 字符），主要为了别让指针自己成为长文 |
+
+**放弃的刀**：删描述里的【参数】块——core 面合计仅 6,038 字符、真冗余（与 inputSchema 重复）
+仅 1,464 字节，且与批次33「schema 里有的参数、描述里必须有说明」的口径冲突。
+
+**test_batch64 顺带修复**：F1 原断言硬编码 `TCB_SIZE=76 / ENTRY_OFF=64`（某次 F427 Debug 实测值，
+固件一改即过期，且与当前 axf 实测 156/140 不符已现红）。改为「结构不变量 + 测试内独立
+pyelftools 走查交叉核对」，魔数改名 `MOCK_TCB_SIZE/MOCK_ENTRY_OFF`（仅 mock 自造表用）。
+
+回归用例：`tests/test_batch74.py`（24 项，含 `MDKDEBUG_SURFACE=off` 的 A/B 逐字段对照）；
+`tests/test_batch56.py` C1/C3/C6/C8 断言同步改为 lean（87 项）。

@@ -175,8 +175,11 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
   `env_check` 报「符号与固件不同源」时，`next_actions` 第一条就让你直接调 `set_symbol_file` 切到刚烧录的那份；
   只有当你把 `core` 组从面上裁掉（如 `MDKDEBUG_TOOLSETS=mem`）时，它才会把「先 `toolset(action="load", toolsets="symbol")`」这一步补在最前面；
   自己手工切符号时也记得先装这一组，否则只会撞「未知工具」。
-- **上下文不够时的两把刀**：`nano` 极简档（`MDKDEBUG_TOOLSETS=nano`，19 个工具 / 约 4.6 千字符
-  描述，自动用 `min` 描述档；含 `mdk_guide`，正文取回不用另外装）＋ **描述分层** `MDKDEBUG_DESC=full|lean|min`（默认 `full`，只有 `nano` 档自动用 `min`；要省上下文得显式选 `lean`/`min`）。
+- **上下文不够时的三把刀**：`nano` 极简档（`MDKDEBUG_TOOLSETS=nano`，19 个工具 / 约 1.5 万字节
+  线上载荷，自动用 `min` 描述档；含 `mdk_guide`，正文取回不用另外装）＋ **描述分层** `MDKDEBUG_DESC=full|lean|min`（批次74 起**默认 `lean`**，`nano` 档自动 `min`；`MDKDEBUG_DESC=full` 整面逐字节还原）
+  ＋ **结构瘦身**（默认开，`MDKDEBUG_SURFACE=off` 关闭）：只改 tools/list 线上副本，
+  去掉恒定样板的 `outputSchema`、inputSchema 里的注释性 `title`、annotations 里等于规范默认值的字段；
+  活的注册对象与调用路径一个字不动。
   描述分层只把「参考手册」式长正文挪出上下文，正文一字不改地归档，
   用 `mdk_guide(topic="tool", name="read_mem")` 可逐字取回；**结构化尾块
   （【输出控制】/【参数】/【风险】）与正文结尾的关键告警一定保留**——

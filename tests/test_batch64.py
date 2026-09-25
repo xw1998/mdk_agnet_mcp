@@ -20,7 +20,8 @@
   D 解析失败的错误码：无 elf / 无表符号 / 无布局 / 伪值 / 快照不自洽
   D4 跨镜像入口：留空不编名（app 的任务入口不在内核 .axf 里是合法的）
   E 会话内只解析一次；tasks=off 完全不碰
-  F 真实 .axf 的 DWARF 路径（无目标，纯本地解析；文件不在则跳过）
+  F 真实 .axf 的 DWARF 路径（无目标，纯本地解析；文件不在则跳过）。布局**不写死**：
+    查结构不变量，再和测试内自写的极简 DWARF 走查交叉核对（两条独立路径）
   H 多份镜像（内核;app）联合取名：任何一份的入口都能配上名字，但**跨镜像**的名字
     必须过内容核对（板上机器码 == .axf 同地址字节）——地址对上不等于板上跑的是
     这份构建；核不过/核不了就丢名并记 unconfirmed_slots
@@ -58,12 +59,68 @@ def skip(name, why):
     SKIP.append(name)
     print("  [SKIP] %s %s" % (name, why), flush=True)
 
+def dwarf_layout(path, name):
+    """独立于 mdkdebug.rtos 的最小 DWARF 走查，只依赖 pyelftools。
+
+    刻意**不复用** rtos.ElfIndex —— 那样两边同源，等于自己和自己对答案。
+    ARMCC 把成员偏移发成 DW_FORM_block([0x23, 偏移])（DW_OP_plus_uconst）。
+    返回 {"size": int|None, "members": {名字: 偏移}}；缺 pyelftools / 找不到
+    类型一律返回 None（**不猜**）。
+    """
+    try:
+        from elftools.elf.elffile import ELFFile
+    except Exception:                                   # noqa: BLE001
+        return None
+    try:
+        with open(path, "rb") as fp:
+            di = ELFFile(fp).get_dwarf_info()
+            want = name.encode("ascii")
+            for cu in di.iter_CUs():
+                for die in cu.iter_DIEs():
+                    a = die.attributes.get("DW_AT_name")
+                    if (a is None or a.value != want
+                            or die.tag not in ("DW_TAG_typedef",
+                                               "DW_TAG_structure_type",
+                                               "DW_TAG_class_type")):
+                        continue
+                    sd = die
+                    if die.tag == "DW_TAG_typedef":
+                        if die.attributes.get("DW_AT_type") is None:
+                            continue
+                        sd = die.get_DIE_from_attribute("DW_AT_type")
+                    sz = sd.attributes.get("DW_AT_byte_size")
+                    members = {}
+                    for m in sd.iter_children():
+                        if m.tag != "DW_TAG_member":
+                            continue
+                        mn = m.attributes.get("DW_AT_name")
+                        ml = m.attributes.get("DW_AT_data_member_location")
+                        if mn is None or ml is None:
+                            continue
+                        lv = ml.value
+                        if isinstance(lv, int):
+                            off = lv
+                        elif isinstance(lv, (list, tuple)) and lv and lv[0] == 0x23:
+                            off = int(lv[1])            # DW_OP_plus_uconst
+                        else:
+                            continue                    # 认不出的表达式：宁缺勿编
+                        members[mn.value.decode("utf-8", "replace")] = off
+                    return {"size": (sz.value if sz is not None else None),
+                            "members": members}
+    except Exception:                                   # noqa: BLE001
+        return None
+    return None
+
 # ======================================================================
 # 假目标：控制块 + 环 + 一张任务表
 # ======================================================================
 TBL = 0x20001000          # 任务表地址（与环无关，随便挑一个）
-TCB_SIZE = 76             # svcrt_task_t（F427 Debug 实测）
-ENTRY_OFF = 64
+# 下面两个只是本测试**自造 mock 表**用的布局常量（fake .axf 也按它生成），
+# 与真实固件的 svcrt_task_t 无关。真实布局由 F 段对着真 .axf 现场走查，
+# **不写死**——写死的那份是「某天某次 Debug 的实测值」，固件一改就过期，
+# 断言会退化成「今天这个魔数不对」的噪音。
+MOCK_TCB_SIZE = 76
+MOCK_ENTRY_OFF = 64
 
 def build_ctrl(addr, cap=8192, head=0, drained=0, seq=7, flags=None,
                tokens=0, events=0):
@@ -85,7 +142,8 @@ def build_ctrl(addr, cap=8192, head=0, drained=0, seq=7, flags=None,
     b[SWD.OFF_FLAGS:SWD.OFF_FLAGS + 4] = struct.pack("<I", flags)
     return bytes(b)
 
-def task_table_bytes(entries, n_slots=15, size=TCB_SIZE, off=ENTRY_OFF):
+def task_table_bytes(entries, n_slots=15, size=MOCK_TCB_SIZE,
+                     off=MOCK_ENTRY_OFF):
     """按 TCB 布局造一张表：只有 entry 字段有值，其余填 0xA5。"""
     b = bytearray(0xA5 for _ in range(n_slots * size))
     for i in range(n_slots):
@@ -176,8 +234,8 @@ def patch_pick(fake):
 # 假的 ELF 索引 + 假的函数符号表
 # ======================================================================
 class FakeIndex:
-    def __init__(self, base=TBL, count=48, tcb=None, entry_off=ENTRY_OFF,
-                 struct_size=TCB_SIZE, no_table=False, no_layout=False,
+    def __init__(self, base=TBL, count=48, tcb=None, entry_off=MOCK_ENTRY_OFF,
+                 struct_size=MOCK_TCB_SIZE, no_table=False, no_layout=False,
                  code=None):
         self._base = None if no_table else base
         self._count = count
@@ -382,7 +440,7 @@ def main():
     real_read = TRC._read_mem_words
     state = {"n": 0}
     def flaky(addr, n, link="auto", raw=False, **kw):
-        if TBL <= int(addr) < TBL + 15 * TCB_SIZE:
+        if TBL <= int(addr) < TBL + 15 * MOCK_TCB_SIZE:
             state["n"] += 1
             if state["n"] == 1:
                 return b"\x00" * int(n), {"link": "keil", "read_mode": "single",
@@ -440,7 +498,7 @@ def main():
     _one({"no_layout": True}, "tasks-layout-missing")
     # 伪值：整张表读回重复的同一个字
     _one({}, "tasks-read-untrusted",
-         tbl=bytes([0x32, 0xC6, 0xB2, 0x07]) * (15 * TCB_SIZE // 4))
+         tbl=bytes([0x32, 0xC6, 0xB2, 0x07]) * (15 * MOCK_TCB_SIZE // 4))
     # 一个名字都给不出来：所有非空入口都落不到符号表上 → 整批拒绝
     bad = task_table_bytes({0: 0xDEADBEEF, 1: 0x20001234})
     _one({}, "tasks-snapshot-inconsistent", tbl=bad)
@@ -498,11 +556,24 @@ def main():
         skip("F1/F2 真实 axf", "本机没有 SVCrtOS 的 .axf（跳过，不算失败）")
     else:
         ix = RTOS.ElfIndex(AXF)
-        check("F1 匿名 typedef 结构体的布局能取到（svcrt_task_t）",
-              (ix.struct("svcrt_task_t") or {}).get("size") == TCB_SIZE
-              and ix.field("svcrt_task_t", "entry") == ENTRY_OFF,
-              (ix.struct("svcrt_task_t") or {}).get("size"),
-              )
+        lay = ix.struct("svcrt_task_t") or {}
+        size = lay.get("size")
+        entry = ix.field("svcrt_task_t", "entry")
+        # 只查**结构不变量**：拿得到、非空、4 字节对齐、entry 落在结构体内。
+        check("F1 匿名 typedef 结构体的布局自洽（size>0 / 4 对齐 / entry 在界内）",
+              isinstance(size, int) and size > 0 and size % 4 == 0
+              and isinstance(entry, int) and 0 <= entry <= size - 4,
+              (size, entry))
+        ref = dwarf_layout(AXF, "svcrt_task_t")
+        if ref is None:
+            skip("F1b 独立 DWARF 走查交叉核对",
+                 "本机没有可用的 pyelftools / 走查不到该类型（跳过，不算失败）")
+        else:
+            check("F1b 与独立的 DWARF 走查逐项一致（size + entry 偏移）",
+                  ref.get("size") == size
+                  and ref.get("members", {}).get("entry") == entry,
+                  (ref.get("size"), ref.get("members", {}).get("entry"),
+                   size, entry))
         vk = ix.var_kind(TRC._SVCRT_TABLE_SYM) or {}
         check("F2 任务表符号与元素个数都能取到",
               ix.addr_of(TRC._SVCRT_TABLE_SYM) and (vk.get("count") or 0) >= 15, vk)

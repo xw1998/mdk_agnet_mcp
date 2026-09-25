@@ -49,6 +49,7 @@ from . import workspace as _workspace
 from . import rtos as _rtos
 from . import toolbox as _toolbox
 from . import thin as _thin
+from . import surface as _surface
 from . import traceproto as _traceproto
 from . import modbus as _modbus
 from . import resetwatch as _resetwatch
@@ -2679,7 +2680,10 @@ def _apply_annotations(info) -> None:
     """
     try:
         from mcp.types import ToolAnnotations
-        a = _annotate.annotations_for(info.name)
+        # 批次74：只留下**承载信息**的字段——等于 MCP 规范默认值的（客户端会自己补齐，
+        # 写出去只是复述规范）、以及只读工具上「只在 read_only_hint==false 时有意义」
+        # 的 destructive/idempotent。裁剪前后客户端读到的判定结果完全一致。
+        a = _surface.slim_annotations(_annotate.annotations_for(info.name))
         info.annotations = ToolAnnotations(**a)
     except Exception as e:  # noqa: BLE001
         logger.debug("未能写入工具注解：%s（%s）", getattr(info, "name", "?"), e)
@@ -3088,8 +3092,8 @@ def _guide_tool(topic: str, name: str, server) -> dict:
             "before_chars": st["before"], "after_chars": st["after"],
             "modes": st["modes"], "env": st["env"], "tools": idx,
             "note": "给 name= 取回某个工具的完整说明；"
-                    "描述档位用环境变量 MDKDEBUG_DESC=full/lean/min 调（默认 full，"
-                    "只有 nano 档自动用 min）"}
+                    "描述档位用环境变量 MDKDEBUG_DESC=full/lean/min 调"
+                    "（默认 lean，nano 档自动用 min；full = 不改写）"}
 
 
 def _apply_param_hints(server) -> int:
@@ -3279,7 +3283,12 @@ class AliasMCPServer(MCPServer):
                                       "未列出的参数名会被拒绝，不会静默忽略")
             except Exception:  # noqa: BLE001
                 logger.debug("未能写入别名说明：%s", info.name, exc_info=True)
-        return await super().list_tools()
+        # 批次74 结构瘦身：在 super() **刚造出来的 wire 副本**上去掉 outputSchema 与
+        # inputSchema 里递归的 title。活的注册对象与调用路径一个字不动——原因见
+        # surface.py 头部「为什么不去改活的注册对象」。
+        tools = await super().list_tools()
+        _surface.slim_wire(tools)
+        return tools
 
 
 def create_server(host: str = "127.0.0.1", port: int = 4823,
@@ -10155,8 +10164,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     # 工具描述分层（批次56）：把「参考手册」式的长正文挪出上下文，需要时用
     # mdk_guide(topic=tool, name=...) 取回。**必须在 _apply_param_hints 之后**
     # （要连【参数】/【输出控制】块一起保留）、在 toolbox.install 快照之前
-    # （快照的就是瘦身后的）。默认档位看工具面：nano 极简档用 min，其余 full
-    # （不改写）——默认描述不该缺内容，要省得显式选 lean/min；
+    # （快照的就是瘦身后的）。默认档位看工具面：nano 极简档用 min，其余 lean
+    # （正文留段首+段末+结构化尾块，再附一行取回指针）——批次74 起不再默认 full
+    # （那是批次56 的口径），但 MDKDEBUG_DESC=full 仍可退回逐字节一致的历史行为；
     # MDKDEBUG_DESC 显式设了的话以它为准。
     try:
         _thin.install(server,

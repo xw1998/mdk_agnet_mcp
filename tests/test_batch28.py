@@ -23,6 +23,7 @@ import asyncio
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+os.environ.setdefault("MDKDEBUG_DESC", "full")   # 批次74 起默认档为 lean；本模块的内容类断言按归档全文（mdk_guide 可取回）评估
 
 from tests.mock_uvsock_server import MockUVSOCKServer  # noqa: E402
 import os as _os_env  # noqa: E402

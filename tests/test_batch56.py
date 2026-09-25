@@ -75,7 +75,7 @@ def desc_chars(srv):
 def fresh(**kw):
     """建一个 server（清掉上次的环境残留影响，靠显式 toolsets 语义）。
 
-    desc= 显式指定描述档位（默认不设 → 走产品默认档 full）。
+    desc= 显式指定描述档位（默认不设 → 走产品默认档 lean）。
     描述档位在 create_server 期间读环境变量，所以这里临时设、建完立刻还原。
     """
     desc = kw.pop("desc", None)
@@ -159,8 +159,8 @@ def section_b():
 
 def section_c():
     print("C. 描述档位")
-    check("C1 MODES = full/lean/min，默认 full（默认描述不改写）",
-          TH.MODES == ("full", "lean", "min") and TH.DEFAULT_MODE == "full",
+    check("C1 MODES = full/lean/min，默认 lean（批次74 起默认即瘦身档）",
+          TH.MODES == ("full", "lean", "min") and TH.DEFAULT_MODE == "lean",
           (TH.MODES, TH.DEFAULT_MODE))
     check("C2 别名：long/orig→full、short/brief→lean、tiny/none→min",
           (TH._ALIAS.get("long") == "full" and TH._ALIAS.get("orig") == "full"
@@ -169,7 +169,7 @@ def section_c():
           TH._ALIAS)
     saved = os.environ.pop("MDKDEBUG_DESC", None)
     try:
-        check("C3 没设环境变量 → 默认档 full", TH.mode_from_env() == "full",
+        check("C3 没设环境变量 → 默认档 lean", TH.mode_from_env() == "lean",
               TH.mode_from_env())
         os.environ["MDKDEBUG_DESC"] = "min"
         check("C4 MDKDEBUG_DESC=min 生效", TH.mode_from_env() == "min")
@@ -177,23 +177,23 @@ def section_c():
         check("C5 别名 tiny → min", TH.mode_from_env() == "min")
         os.environ["MDKDEBUG_DESC"] = "bogus"
         check("C6 认不出的写法按默认档处理（不静默变别的档）",
-              TH.mode_from_env() == "full", TH.mode_from_env())
+              TH.mode_from_env() == "lean", TH.mode_from_env())
         os.environ["MDKDEBUG_DESC"] = "full"
         check("C7 full 显式生效", TH.mode_from_env() == "full")
     finally:
         os.environ.pop("MDKDEBUG_DESC", None)
         if saved is not None:
             os.environ["MDKDEBUG_DESC"] = saved
-    check("C8 desc_default_for：纯 nano → min，其余 → full",
+    check("C8 desc_default_for：纯 nano → min，其余 → lean",
           TB.desc_default_for("nano") == "min"
-          and TB.desc_default_for("nano,core") == "full"
-          and TB.desc_default_for("all") == "full"
-          and TB.desc_default_for(None) == "full",
+          and TB.desc_default_for("nano,core") == "lean"
+          and TB.desc_default_for("all") == "lean"
+          and TB.desc_default_for(None) == "lean",
           (TB.desc_default_for("nano"), TB.desc_default_for(None)))
 
 def section_d():
     print("D. 瘦身不变量（宁可多留字符，也不给错答案）")
-    srv = fresh(toolsets="all", desc="lean")   # 瘦身路径要显式选档（默认 full 不改写）
+    srv = fresh(toolsets="all", desc="lean")   # 显式选 lean 档（批次74 起也是默认档，显式写以与默认档解耦）
     d_rm = tool_of(srv, "read_mem").description or ""
     f_rm = TH.full_of("read_mem") or ""
     check("D1 瘦身后仍带取回指针（【完整说明】…mdk_guide）",

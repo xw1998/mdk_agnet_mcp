@@ -27,6 +27,7 @@ import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+os.environ.setdefault("MDKDEBUG_DESC", "full")   # 批次74 起默认档为 lean；本模块的内容类断言按归档全文（mdk_guide 可取回）评估
 
 # 测试用独立闸门目录，避免与真实服务/其他测试互相干扰
 GUARD_DIR = os.path.join(tempfile.gettempdir(), "mdkdebug_guard_test_b29")

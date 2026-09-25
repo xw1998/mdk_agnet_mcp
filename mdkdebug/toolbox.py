@@ -202,11 +202,13 @@ def tools_of(g):
 
 
 def desc_default_for(spec=None) -> str:
-    """工具描述分层的默认档位：nano 极简档用 min，其余用 full（不改写）。
+    """工具描述分层的默认档位：nano 极简档用 min，其余用 lean（批次74 起）。
 
-    小上下文场景下 nano 档本来就是为了「装得下」，所以它直接走 min（正文只留
-    一句摘要，全文仍可 mdk_guide 逐字取回）；其余工具面默认 full——默认对外
-    暴露的描述不该缺内容，想省上下文要由调用方显式选 lean/min。
+    nano 档本来就是为了「装得下」，所以它直接走 min（正文只留一句摘要，全文仍可
+    mdk_guide 逐字取回）；其余工具面默认 lean——正文留段首 + 段末 + 结构化尾块，
+    再附一行取回指针。批次56 这里默认是 full（"默认描述不该缺内容"），批次74 按
+    用户反馈「工具规模太大不利于上下文与注意力机制」改为 lean：决定用哪个工具、
+    怎么调的信息都不缺，背景叙述改为按需取回。
     显式设了 MDKDEBUG_DESC 时由 thin.mode_from_env 覆盖本默认值。
     spec=None 表示「调用方没给」——这时看 MDKDEBUG_TOOLSETS（与裁剪策略同一来源）。
     """
@@ -217,7 +219,7 @@ def desc_default_for(spec=None) -> str:
         want, _unknown = parse_groups(s)
         if want == ["nano"]:
             return "min"
-    return "full"
+    return "lean"
 
 # 默认（不设 MDKDEBUG_TOOLSETS 时）暴露的组：调试核心 + 环境引导。
 DEFAULT_GROUPS = ("core",)
