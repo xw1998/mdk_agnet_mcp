@@ -218,4 +218,19 @@
 #  define MDK_TRACE_UART_PUTC(c) ((void)(c))
 #endif
 
+/* ------------------------------------------------- SVCrtOS kernel hooks
+ * 1 = mdk_trace_svcrt.c emits the kernel's own events (context switches, task
+ * lifecycle, object wait/signal/timeout, mutex ownership, ISR enter/exit,
+ * heap). The kernel has to call the adapter at its five hook points - see
+ * mdk_trace_svcrt.h; the adapter itself only forwards to the same primitives
+ * application code uses, so the backend decides what it costs.
+ *
+ * 0 (default) = the adapter still exists and still links, but compiles to
+ * empty bodies. A firmware that calls it and forgot this macro builds fine and
+ * produces a trace with no kernel events; trace_diagnose says exactly that
+ * instead of leaving an empty timeline looking like a quiet system. */
+#ifndef MDK_TRACE_SVCRT_HOOKS
+#  define MDK_TRACE_SVCRT_HOOKS 0
+#endif
+
 #endif /* MDK_TRACE_CONFIG_DEFAULT_H */

@@ -15,16 +15,24 @@ PC/LR/SP/xPSR/HFSR/MMFAR/BFAR 落进缓冲。这是整套东西里最值钱的�
 
 | 文件 | 作用 |
 |------|------|
-| `mdk_trace.h` | 对外 API：初始化、事件、计数器、ISR、scope、sched、fault 捕获 |
-| `mdk_trace.c` | 时间戳源（DWT / `mcycle`）、MTF 组帧、ITM / RTT / UART / buff 分派 |
+| `mdk_trace.h` | 对外 API：初始化、事件、计数器、ISR、scope、sched、sync、heap、fault 捕获 |
+| `mdk_trace.c` | 时间戳源（DWT / `mcycle`）、MTF 组帧、ITM / RTT / UART / buff / swd 分派 |
 | `mdk_trace_rtt.h` / `.c` | SEGGER 兼容的 RTT 控制块与环形缓冲（stream 模式） |
 | `mdk_trace_buff.h` / `.c` | RAM 环形缓冲后端（**buff 模式**：全速录、事后读回） |
+| `mdk_trace_swd.h` / `.c` | 压缩 + 背压的无缝流后端（**swd 模式**：只要 SWD 两线） |
+| `mdk_trace_svcrt.h` / `.c` | **SVCrtOS 内核钩子适配层**（打开后调度 / IPC / 堆自动出事件） |
 | `mdk_trace_config_default.h` | 全部配置项的兜底默认值（每个宏都是 `#ifndef`） |
 | `CMakeLists.txt` | CMake 工程，产出一个静态库 `mdk_trace` |
 
 后端的源文件都是「未选中就编成空目标文件」（内容裹在 `#if` 里），所以
-`mdk_trace.c` + `mdk_trace_rtt.c` + `mdk_trace_buff.c` 可以无脑一起加进工程，
-真正生效的只有 `MDK_TRACE_BACKEND_*` 选中的那一个。
+`mdk_trace.c` + `mdk_trace_rtt.c` + `mdk_trace_buff.c` + `mdk_trace_swd.c` +
+`mdk_trace_svcrt.c` 可以无脑一起加进工程，真正生效的只有 `MDK_TRACE_BACKEND_*`
+选中的那个后端、以及 `MDK_TRACE_SVCRT_HOOKS` 是否打开。
+
+**少一个 .c 的后果不一致，别把它们混为一谈**：漏掉某个后端的 .c，主机定位
+blob 的符号就没了，链接期报 `undefined reference`（当场炸，好事）；漏掉
+`mdk_trace_svcrt.c` 则什么都不会发生——内核钩子调用变成 undefined，链接一样
+会炸，所以这个文件同样必须入列（`trace_instrument` 的构建清单自检会拦）。
 
 代码注释一律用英文：Keil ARMCC（AC5）在部分设置下会把 UTF-8 中文注释渲染成乱码，
 而这个组件是要被丢进别人的工程里编译的。文档用中文。
@@ -124,6 +132,7 @@ trace_buff_dump(elf="build/app.axf", out_file="trace.json",
 | `MDK_TRACE_BUFF_TS_SHIFT` | `0` | buff 模式 dt 的右移位数；0 = 每 CPU 周期（最细） |
 | `MDK_TRACE_BUFF_CLEAR_ON_INIT` | `0` | 0 = 复位后保留上一次运行的记录（异常复位时唯一证据） |
 | `MDK_TRACE_FAULT_FRAME` | `1` | fault handler 里多存一份寄存器现场 |
+| `MDK_TRACE_SVCRT_HOOKS` | `0` | 打开 SVCrtOS 内核钩子适配层（与后端无关；0 时编成空目标文件） |
 
 ## 帧格式（MTF）
 
@@ -152,8 +161,18 @@ trace_buff_dump(elf="build/app.axf", out_file="trace.json",
 | 8 | reset | 原因字符串 |
 | 9 | fault | `class:u16, cfsr:u32` |
 | 10 | sched | `from:u16, to:u32` |
+| 11 | sync | `id:u16` = (obj<<3) 或上 op，`val:u32` |
+| 12 | heap | `op:u16, size:u32` |
 
 `kind`：`0=enter`、`1=exit`、`2=point`、`3=abort`。
+`sync` 的 `op`：`0=wait`、`1=signal`、`2=acquire`、`3=release`、`4=timeout`、
+`5=create`、`6=delete`。`heap` 的 `op`：`0=alloc`、`1=free`。
+
+**`sync` / `heap` 为什么不复用 `kind`**：压缩流（swd 后端）里 `kind` 只有 2 bit，
+再塞操作码就装不下；而且 `kind` 上的 `enter/exit/point/abort` 已经有一套明确
+语义，混进 `wait/signal` 会让下游没法判断一个事件到底是什么。所以语义一律打包
+进 `id`（`obj` 13 bit + `op` 3 bit），`val` / `size` 走 `arg` **全 32 位**——
+把 `val` 裁到 24 位给 op 让位，就是在静默截断一个看起来正常的超时值。
 `fault` 的 `class`：`0=HardFault`、`1=MemManage`、`2=BusFault`、`3=UsageFault`。
 寄存器转储走 `counter` 类型，id 用保留区间 `0xFF01..0xFF07`
 （pc / lr / sp / hfsr / mmfar / bfar / xpsr）。
@@ -227,6 +246,43 @@ fault 复位）之后 `mdk_trace_buff_init()` **保留**上一次运行的记录
 并置 `RESTARTED`、`seq++`。因为对「为什么会复位」这类问题，复位前的记录才是
 唯一证据，而默认清空会正好把它抹掉。代价是时间轴上有接缝——主机把接缝标出来，
 不会假装时间连续。
+
+## SVCrtOS 内核自动钩子：把插桩从「人手放」变成「装上就有」
+
+上面第 3、4 条要求「任务切换点、IPC 等待/唤醒、堆分配都手插」——在一个
+RTOS 上这是几十个插桩点，而且每加一个新阻塞原语就多一个会漏的地方。
+`mdk_trace_svcrt.h` / `.c` 是为此准备的**适配层**：把组件的原语对应到
+SVCrtOS 内核已有的钩点上，内核侧只要在钩点里调一个函数，事件就自动出来。
+
+打开方式：`MDK_TRACE_SVCRT_HOOKS=1`（`trace_instrument(svcrt_hooks=1)`
+会写进生成的 `mdk_trace_config.h`）。关上时该 .c 编成空目标文件——调用
+`mdk_trace_svcrt_*` 仍然能链接、只是什么都不记，主机侧会报「没有内核事件」
+这条可命名的诊断，而不是给你一条空白时间线让你以为没发生任何事。
+
+五个钩点（内核侧调，不在组件里回调内核）：
+
+| 钩点 | 内核侧调 | 产出的事件 |
+|------|---------|-----------|
+| 上下文切换（PendSV / 调度器） | `mdk_trace_svcrt_task_switch(from, to)` | `sched`（from/to） |
+| 任务创建 / 回收 | `mdk_trace_svcrt_task_create(id)` / `_task_exit(id)` | 事件 `0x13` / `0x14`（arg=任务号） |
+| IPC 等待 / 唤醒 / 超时 | `mdk_trace_svcrt_obj_wait/signal/obj_timeout(obj, ...)` | `sync` wait / signal / timeout |
+| 互斥所有权 | `mdk_trace_svcrt_mutex_acquire/release(obj)` | `sync` acquire / release |
+| 堆分配 / 释放 | `mdk_trace_svcrt_heap(op, size)` | `heap` alloc / free |
+
+异常路径：`mdk_trace_svcrt_fault()` 内部就是 `MDK_TRACE_FAULT_CAPTURE()`，
+放在 fault handler 首行即可。ISR 进出用 `mdk_trace_svcrt_isr_enter/exit(irq)`。
+
+**为什么钩点在核心里、而不是在组件里回调内核**：组件不持有任何内核头文件，
+内核换个版本也不会连带追踪组件不能编；而且「哪些点算阻塞」这件事只有内核自己
+知道得最准。适配层只负责翻译，不替内核做决定。
+
+`obj` 用 `MDK_TRACE_SVCRT_OBJ(cls, idx)` 拼（3 bit 类 + 10 bit 下标），
+`cls` 见 `MDK_TRACE_SVCRT_CLASS_*`（SEM / MUTEX / QUEUE / EVENT / FS / DEV）。
+
+初始化时调一次 `mdk_trace_svcrt_init()`：打一个 MARK，让时间线能从
+「内核钩子装好」那一刻切开，而不是从碰巧的第一条事件开始。
+`mdk_trace_svcrt_enabled()` 返回钩子是否真的在发事件（固件自己的 shell 可
+以此自报，而不是靠猜）。
 
 ## 插桩点该往哪儿放
 

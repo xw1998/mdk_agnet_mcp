@@ -71,11 +71,11 @@ SWD = {
         {"type": "isr", "kind": "exit", "id": 15, "t_us": 1350},
         {"type": "fault", "kind": "point", "id": 3, "t_us": 2000,
          "fault_class": "HardFault", "cfsr": 0x400},
-        {"type": "sync", "kind": "point", "seq": 1, "t_us": 2500},
+        {"type": "segment", "kind": "point", "seq": 1, "t_us": 2500},
         {"type": "gap", "kind": "lost", "t_us": 2600, "events_dropped": 40},
         {"type": "sched", "kind": "sw", "from": 2, "to": 0, "t_us": 3000},
     ],
-    "counts_by_type": {"sched": 3, "isr": 2, "fault": 1, "sync": 1},
+    "counts_by_type": {"sched": 3, "isr": 2, "fault": 1, "segment": 1},
     "read_meta": {"unstable": True},
     "warnings": ["TS_OFF：本次没读到时间戳，横轴按事件序号"],
 }
@@ -127,7 +127,7 @@ SWD_NAMED = {
         {"type": "sched", "from": 1, "to": 15, "t_us": 1000},
         {"type": "sched", "from": 15, "to": 0, "t_us": 1200},
         # 有了它 tmax=1300，泳道 0 的最后一段才有宽度（零宽区间会被丢掉）
-        {"type": "sync", "kind": "point", "seq": 1, "t_us": 1300},
+        {"type": "segment", "kind": "point", "seq": 1, "t_us": 1300},
     ],
     "task_names": {"ok": True, "names": {"0": "shell_task", "1": "led_task"},
                    "idle": "idle", "idle_id": 15, "named": 2, "nonempty": 2},
@@ -137,14 +137,14 @@ SWD_NAMED = {
 SWD_EVNAME = {"events": [
     {"type": "sched", "from": 0, "to": 1, "t_us": 0, "from_name": "shell", "to_name": "led"},
     {"type": "sched", "from": 1, "to": 0, "t_us": 500, "from_name": "led", "to_name": "shell"},
-    {"type": "sync", "kind": "point", "seq": 1, "t_us": 600},
+    {"type": "segment", "kind": "point", "seq": 1, "t_us": 600},
 ]}
 
 # 命名失败也要看得到原因
 SWD_NAMEFAIL = {
     "events": [{"type": "sched", "from": 0, "to": 1, "t_us": 0},
                {"type": "sched", "from": 1, "to": 0, "t_us": 100},
-               {"type": "sync", "kind": "point", "seq": 1, "t_us": 200}],
+               {"type": "segment", "kind": "point", "seq": 1, "t_us": 200}],
     "task_names": {"ok": False, "error_code": "tasks-elf-missing",
                    "error": "这份 .axf 没有 DWARF 行表，任务表布局取不到"},
 }
@@ -554,7 +554,7 @@ def section_e():
     srv = SV.create_server()
     tm = getattr(srv, "_tool_manager", None)
     names = sorted((getattr(tm, "_tools", None) or {}).keys())
-    check("E4 注册进服务（总数 197）", "view_render" in names and len(names) == 197, len(names))
+    check("E4 注册进服务（总数 199）", "view_render" in names and len(names) == 199, len(names))
     check("E5 check_surface 全过（无未归类/幽灵工具）", not A.check_surface(names),
           A.check_surface(names))
 
@@ -598,9 +598,9 @@ def section_f():
     check("F1 README 有 view_render（工具面/可读性入口）", "view_render" in readme, "")
     check("F2 SKILL 有 view_render 与 view_guide",
           "view_render" in skill and "view_guide" in skill, "")
-    check("F3 文档工具数同步为 197 / 收起 153",
-          "197 个" in readme and "153 个" in readme and
-          "197 个工具" in skill and "153 个" in skill, "")
+    check("F3 文档工具数同步为 199 / 收起 155",
+          "199 个" in readme and "155 个" in readme and
+          "199 个工具" in skill and "155 个" in skill, "")
 
 
 def main():

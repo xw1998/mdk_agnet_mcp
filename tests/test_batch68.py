@@ -23,7 +23,7 @@ tree-sitter 解析（预编译轮子）+ SQLite 索引，落成 `mdkdebug/codein
   C 解析语义（C fixture）：include guard、条件编译、局部变量、fptr、calls_out、解析错误
   D 解析语义（C++ fixture）：class/namespace/field、调用、include 解析
   E 工具层：5 个工具端到端、错误码、注解、outctl、描述诚实边界、parser-missing
-  F 工具面：注册 197 / 默认面 44 / code 组 7 且默认收起 / 组数 12
+  F 工具面：注册 199 / 默认面 44 / code 组 7 且默认收起 / 组数 12
 
 运行：python -m tests.test_batch68
 """
@@ -669,7 +669,7 @@ def group_f():
     srv_all = SV.create_server(port=PORT_TOOL, toolsets="all")
     na = tool_names(srv_all)
 
-    check("F1 注册总数 197", len(na) == 197, len(na))
+    check("F1 注册总数 199", len(na) == 199, len(na))
     check("F2 默认只暴露 44 个", len(nd) == 44, len(nd))
     check("F3 code 组默认收起（4 个 code_* 都不在默认面）",
           not any(t.startswith("code_") for t in nd), [t for t in nd if t.startswith("code_")])
@@ -697,7 +697,7 @@ def group_f():
     check("F10 capabilities 的 tool_surface 里 code 组 7 个且列为「未装载」",
           (surf.get("groups") or {}).get("code") == 7
           and "code" in (surf.get("not_loaded_groups") or [])
-          and surf.get("registered_total") == 197, surf)
+          and surf.get("registered_total") == 199, surf)
 
 
 def main():

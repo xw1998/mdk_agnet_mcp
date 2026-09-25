@@ -347,7 +347,7 @@ def group_f():
         "events": [
             {"type": "isr", "kind": "enter", "id": 53, "t_us": 0},
             {"type": "isr", "kind": "exit", "id": 53, "t_us": 40},
-            {"type": "sync", "kind": "point", "seq": 1, "t_us": 60},
+            {"type": "segment", "kind": "point", "seq": 1, "t_us": 60},
         ],
         "irq_names": {"53": "USART1_IRQHandler"},
         "irq_names_note": "中断号 → 处理函数名取自镜像的向量表（异常号 >= 16 的外设段）",
@@ -378,8 +378,8 @@ def group_g():
     print("== G 工具面 ==", flush=True)
     names_all = [t.name for t in __import__("asyncio").run(
         SV.create_server(toolsets="all").list_tools())]
-    check("G1 trace_swd_next 已注册、总数 197",
-          "trace_swd_next" in names_all and len(names_all) == 197,
+    check("G1 trace_swd_next 已注册、总数 199",
+          "trace_swd_next" in names_all and len(names_all) == 199,
           (len(names_all), "trace_swd_next" in names_all))
     trace_names = [t.name for t in __import__("asyncio").run(
         SV.create_server(toolsets="trace").list_tools())]

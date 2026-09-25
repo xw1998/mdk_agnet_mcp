@@ -82,6 +82,8 @@ extern "C" {
 #define MDK_TRACE_TYPE_RESET    8u
 #define MDK_TRACE_TYPE_FAULT    9u
 #define MDK_TRACE_TYPE_SCHED   10u
+#define MDK_TRACE_TYPE_SYNC    11u
+#define MDK_TRACE_TYPE_HEAP    12u
 
 /* Event / ISR sub kinds. Must match MTF_KINDS in traceproto.py. */
 #define MDK_TRACE_KIND_ENTER    0u
@@ -149,6 +151,56 @@ void mdk_trace_fault_capture(uint32_t exc_return, uint32_t msp, uint32_t psp);
  * trace shows ownership of the CPU rather than a guess derived from ISRs. */
 void mdk_trace_sched(uint16_t from, uint16_t to);
 
+/* ------------------------------------------------- synchronisation objects
+ * A context switch says a switch happened; it does not say WHY. Without the
+ * second half, a trace can show that task A stopped running but not that it
+ * was blocked on a semaphore held by task B - which is the one question a
+ * priority inversion investigation actually asks.
+ *
+ * mdk_trace_sync() carries both halves in one record: `obj` is the object
+ * handle (your own id for that semaphore / queue / mutex / event group) and
+ * `op` says what happened to it, with `val` free for a waiter count, a
+ * timeout in ticks or the task id that got it.
+ *
+ * On the wire the record is exactly one 12 byte buff record / one swd token:
+ * id = (obj << MDK_TRACE_SYNC_OBJ_SHIFT) | op, arg = val. Nothing is truncated:
+ * obj gets 13 bits (0..8191 objects) and val keeps all 32. `kind` is NOT reused
+ * for the operation, because the compressed stream only has two bits for it.
+ *
+ *   MDK_TRACE_SYNC_WAIT(obj, val)     about to block on obj
+ *   MDK_TRACE_SYNC_SIGNAL(obj, val)   released / posted obj
+ *   MDK_TRACE_SYNC_TIMEOUT(obj, val)  gave up waiting on obj (this is the one
+ *                                     that turns "stuck" into "blocked
+ *                                     forever because nobody signals")
+ *   MDK_TRACE_SYNC_ACQUIRE(obj, val)  took ownership (mutex held by whom)
+ *   MDK_TRACE_SYNC_RELEASE(obj, val)  gave ownership back
+ *   MDK_TRACE_SYNC_CREATE(obj, val)   object created (val = initial state)
+ *   MDK_TRACE_SYNC_DELETE(obj, val)   object deleted
+ */
+void mdk_trace_sync(uint16_t obj, uint8_t op, uint32_t val);
+
+#define MDK_TRACE_SYNC_WAIT     0u
+#define MDK_TRACE_SYNC_SIGNAL   1u
+#define MDK_TRACE_SYNC_ACQUIRE  2u
+#define MDK_TRACE_SYNC_RELEASE  3u
+#define MDK_TRACE_SYNC_TIMEOUT  4u
+#define MDK_TRACE_SYNC_CREATE   5u
+#define MDK_TRACE_SYNC_DELETE   6u
+
+/* How the operation and the object share the record's id field. */
+#define MDK_TRACE_SYNC_OBJ_SHIFT 3u
+#define MDK_TRACE_SYNC_OP_MASK   0x7u
+
+/* ------------------------------------------------------------ heap events
+ * Allocation and free, with the size. Two ids is all it takes to answer
+ * "is this leaking?" from a trace: the host accumulates net bytes and the
+ * largest single block, and reports the peak only as far as it can prove it.
+ */
+void mdk_trace_heap(uint8_t op, uint32_t size);
+
+#define MDK_TRACE_HEAP_ALLOC    0u
+#define MDK_TRACE_HEAP_FREE     1u
+
 #define MDK_TRACE_FAULT_CLASS_HARD      0u
 #define MDK_TRACE_FAULT_CLASS_MEMMANAGE 1u
 #define MDK_TRACE_FAULT_CLASS_BUS       2u
@@ -213,6 +265,17 @@ unsigned mdk_trace_rtt_pending(void);   /* bytes waiting in the up channel   */
  * is replaced by the incoming one - not in the tick handler, or the trace will
  * claim a switch happened on every tick even when the same task continued. */
 #define MDK_TRACE_SCHED(from, to)  do { mdk_trace_sched((from), (to)); } while (0)
+
+/* Synchronisation object hooks. Put WAIT/SIGNAL around the blocking and
+ * releasing operations of your kernel, and ACQUIRE/RELEASE where ownership
+ * moves. "val" is free form (waiter count, timeout in ticks, owning task). */
+#define MDK_TRACE_SYNC(obj, op, val) do { mdk_trace_sync((obj), (op), (val)); } while (0)
+#define MDK_TRACE_OBJ_WAIT(obj, val)     MDK_TRACE_SYNC((obj), MDK_TRACE_SYNC_WAIT, (val))
+#define MDK_TRACE_OBJ_SIGNAL(obj, val)   MDK_TRACE_SYNC((obj), MDK_TRACE_SYNC_SIGNAL, (val))
+#define MDK_TRACE_OBJ_TIMEOUT(obj, val)  MDK_TRACE_SYNC((obj), MDK_TRACE_SYNC_TIMEOUT, (val))
+#define MDK_TRACE_OBJ_ACQUIRE(obj, val)  MDK_TRACE_SYNC((obj), MDK_TRACE_SYNC_ACQUIRE, (val))
+#define MDK_TRACE_OBJ_RELEASE(obj, val)  MDK_TRACE_SYNC((obj), MDK_TRACE_SYNC_RELEASE, (val))
+#define MDK_TRACE_HEAP_CHANGE(op, size)  do { mdk_trace_heap((op), (size)); } while (0)
 
 /* Fault snapshot. GCC / Clang / ARMClang (AC6) read the registers inline.
  * ARMCC 5 cannot: its inline assembler rejects lr/r14 as an operand, and

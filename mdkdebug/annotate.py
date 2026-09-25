@@ -76,6 +76,9 @@ READONLY = {
     # 节拍预算（批次66）：只读两次控制块（间隔 sample_ms）测速率，不搬字节、
     # 不动游标、不停机，所以同样属只读。
     "trace_swd_next",
+    # 分析层（批次72）：在已有事件上算结论 / 跑规则，不改目标状态；
+    # source="buff" 时也只读目标 RAM（trace_buff_dump 本身是只读）。
+    "trace_stats", "trace_diagnose",
     "trace_rtt_find", "trace_swo_read",
     # 可视化说明（批次59）：纯返回文本，不写任何文件。
     "view_guide",

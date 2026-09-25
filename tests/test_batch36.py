@@ -11,7 +11,7 @@
     烧录 / 日志 / 多命令聚合 / 错误路径）
   D trace 族：SWO 采集与 ITM+MTF 解码 / RTT（主机侧读写控制块并推进 RdOff）/
     采样剖析 / DWT / 组件部署
-  E 工具面：注册总数 197、五族齐全、capabilities.non_mdk
+  E 工具面：注册总数 199、五族齐全、capabilities.non_mdk
   F gdb 解析：只挑**真能跑**的 gdb、绝不到别的架构去凑（ESP 工具链复核）
 
 真机（F401 + DAPLink）验证单独做，见 docs/PITFALLS.md。
@@ -403,7 +403,16 @@ def test_ocd(server, mock):
     check("C37 已在运行时 ocd_start 明确拒绝（不重复拉进程）",
           r.get("ok") is False and r.get("error"), r)
 
-    r = asyncio.run(call(server, "ocd_gdb", {"commands": "info registers"}))
+    # 「没有 gdb」这条**不能依赖本机有没有装 gdb**：本机 xpack 工具链里就带着
+    # arm-none-eabi-gdb（实测存在），直接调会真把它跑起来、ok=true，用例就成了
+    # 环境相关红。这里把候选发现打桩成 not-found，判据才与机器无关。
+    _real_find_gdb = _tc.find_gdb
+    _tc.find_gdb = lambda *a, **k: {"ok": False, "error": "未找到可用的 gdb",
+                                    "hint": "装一套 arm-none-eabi-gdb 或设 PATH"}
+    try:
+        r = asyncio.run(call(server, "ocd_gdb", {"commands": "info registers"}))
+    finally:
+        _tc.find_gdb = _real_find_gdb
     check("C38 没有 gdb 时如实报错并给 hint（不假装成功）",
           r.get("ok") is False and (r.get("hint") or r.get("error")), r)
 
@@ -678,13 +687,13 @@ def test_surface(server):
     r = asyncio.run(call(server, "list_tools", {}))
     tools = r.get("tools") or []
     names = [t.get("tool") if isinstance(t, dict) else t for t in tools]
-    check("E1 工具总数 197", len(names) == 197, len(names))
+    check("E1 工具总数 199", len(names) == 199, len(names))
     check("E1b 工程配置发现工具在册", "debug_config" in names)
     # target_ 前缀共 4 个：本批新增 target_list/show/guess 3 个，
     # 另有历史工具 target_info（MDK 侧调试目标信息），故计 4。
-    # trace_ 前缀 31 个（trace 组 35 个，其余以 scope_/dwt_/coverage_ 等命名）
+    # trace_ 前缀 33 个（trace 组 37 个，其余以 scope_/dwt_/coverage_ 等命名）
     for pre, cnt in (("toolchain_", 10), ("target_", 4), ("ocd_", 17),
-                     ("trace_", 31)):
+                     ("trace_", 33)):
         got = [n for n in names if n.startswith(pre)]
         check("E2 %s* 共 %d 个" % (pre, cnt), len(got) == cnt, len(got))
 

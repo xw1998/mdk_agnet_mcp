@@ -62,6 +62,7 @@ from . import rtrecord as _rtr
 from . import rtrace as _rtrace
 from . import viz as _viz
 from . import eventrec as _eventrec
+from . import trstats as _trstats
 from .codeindex import tools as _codetools
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
@@ -10130,7 +10131,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                             ("scatter", _scatter),
                             ("cores", _cores),
                             ("etm", _etm), ("viz", _viz),
-                            ("codeindex", _codetools)):
+                            ("codeindex", _codetools),
+                            ("trstats", _trstats)):
         try:
             _extra_counts[_mod_name] = _mod.register(server, _js)
         except Exception as _e:  # noqa: BLE001

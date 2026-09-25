@@ -57,7 +57,18 @@ endif()
 # symbol in its own .c; if one of these files is missing from the build, the
 # host's single-symbol lookup stops working and the link fails with an
 # undefined reference to that symbol.)
-target_sources(mdk_trace PRIVATE mdk_trace_rtt.c mdk_trace_buff.c mdk_trace_swd.c)
+#
+# mdk_trace_svcrt.c is backend independent: it adapts the component to the
+# SVCrtOS kernel's own hook points. It compiles to nothing unless
+# MDK_TRACE_SVCRT_HOOKS is set, so a project that does not use that kernel is
+# unaffected -- but it still has to be listed, otherwise a project that DOES
+# set the macro silently gets no kernel events.
+target_sources(mdk_trace PRIVATE
+    mdk_trace_rtt.c
+    mdk_trace_buff.c
+    mdk_trace_swd.c
+    mdk_trace_svcrt.c
+)
 
 # If a generated config exists next to this file, expose it on the include path
 # so __has_include() finds it.

@@ -30,7 +30,7 @@ fixture `proj_rel/` 专门为这些边界造：`dup_fn`（两处同名 static �
   D relations：边、summary、depth 下钻、path/line 限定、错误码
   E impact：direct/possible/unresolved/indirect 分段
   F 工具层：2 个工具端到端、错误码、注解、outctl、描述诚实边界
-  G 工具面：注册 197 / 默认面 44 / code 组 7 且默认收起 / 组数 12 / 高输出 48
+  G 工具面：注册 199 / 默认面 44 / code 组 7 且默认收起 / 组数 12 / 高输出 48
 
 运行：python -m tests.test_batch69
 """
@@ -576,7 +576,7 @@ def group_g():
     srv_all = SV.create_server(port=PORT_TOOL, toolsets="all")
     na = tool_names(srv_all)
 
-    check("G1 注册总数 197", len(na) == 197, len(na))
+    check("G1 注册总数 199", len(na) == 199, len(na))
     check("G2 默认只暴露 44 个", len(nd) == 44, len(nd))
     check("G3 code 组默认收起（7 个 code_* 都不在默认面）",
           not any(t.startswith("code_") for t in nd),
@@ -599,10 +599,10 @@ def group_g():
     srv_fresh = SV.create_server(port=PORT_DEF + 2, toolsets=None)
     cap = call_sync(srv_fresh, "capabilities", {})
     surf = cap.get("tool_surface") or {}
-    check("G9 capabilities 的 tool_surface 里 code=7 且列为「未装载」、总数 197",
+    check("G9 capabilities 的 tool_surface 里 code=7 且列为「未装载」、总数 199",
           (surf.get("groups") or {}).get("code") == 7
           and "code" in (surf.get("not_loaded_groups") or [])
-          and surf.get("registered_total") == 197, surf)
+          and surf.get("registered_total") == 199, surf)
 
 def main():
     print("批次69：关系与置信度（basis 三档 + 盲区统计 + code_relations / code_impact）")

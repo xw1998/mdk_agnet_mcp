@@ -234,7 +234,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 197 个工具定义
+│   └── server.py             # MCP Server 与 199 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -283,7 +283,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **197** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **199** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
 - **MDK 族（110 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
 - **非 MDK 族（68 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**、**任务表取名**，34 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
@@ -482,7 +482,7 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 | `ocd_gdb` | 借 GDB 批处理做一件 OpenOCD 原生不好做的事（可指定 `elf` 与 `gdb` 路径） | `commands`、`elf?`、`gdb?` 等 |
 | `ocd_log` | 读 OpenOCD 日志尾巴（可按 `keyword` 过滤），排查启动失败用 | `lines?`、`keyword?` |
 
-### trace（`trace_*`，31 个）
+### trace（`trace_*`，33 个）
 
 三条通路：**SWO/ITM**（经 TPIU 单线输出）、**RTT**（目标内存环形缓冲，主机侧自研读写，不依赖 SEGGER 上位机）、**SWD 采样**（`halt` 采 PC，明确标注侵入式）。三条通路解码出的事件（含 MTF 帧）汇入同一缓冲区，由 `trace_events` 统一取。
 
@@ -525,6 +525,8 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 | `trace_swd_next` | **节拍预算：环还能录多久、该多久搬一次**。环会满、宿主搬得慢就会丢事件，而「还能录多久」以前只能靠试——这里把它算出来：读两次控制块（间隔 `sample_ms`，默认 300 ms），用 `head` 的差值测出**真实写入速率**，再除剩余环空间。返回 `headroom_bytes`（环里还能写多少字节）、`window_ms`（按当前速率还能录多久）、`suggest_pace_ms`（建议节拍＝窗口 ÷ `safety`，默认 8）、`bytes_per_event_now` 与 `bytes_per_event_overall`（当前 vs 全程）、`round_budget` 与 `batch_estimate`。**只读**：不搬字节、不动游标、不停机，随时可以问。三条如实披露：① 速率是**测出来的**，目标这段时间一个字节都没写就**测不出窗口**（`window_ms=null` 并说明），不会拿容量除一个猜的事件率；② 取样期间目标重开过录制（`seq` 变了、计数倒退）这次取样作废（`swd-sample-restarted`），不硬算；③ 目标在跑时控制块可能整片读回 0（`swd-read-degenerate`），那时先 halt 再问。给了 `round_ms=`（你实测的单轮搬运成本，真机约 450~670 ms）就会对比建议节拍，追不上时直说「环太小或事件太密，调粗粒度、少插桩，或把环改大重编重烧」，而不是让你反复调参；`batch_events=N` 还会估算搬 N 条要多少字节、要攒多久。环已满时 `window_ms=0` 并明说目标此刻每条都在丢 | `elf?`、`addr?`、`link?`、`sample_ms?`、`safety?`、`round_ms?`、`batch_events?` |
 | `trace_swd_reset` | 往控制块 `reset_req` 写 1，目标在下一条事件写入时清环、清计数、**字典两边一起清**、`seq` 加一，并往新流里写一个 `SYNC` 标记。**这是无缝流唯一的重新对齐手段**（宿主单方面清字典只会让后续每个 HIT 都解错）。与 buff 同样是**延迟生效**：目标长期没有插桩事件时会一直挂着（返回 `request_latched`），那不是失败，但也不能当成「已清空」，生效与否以 `seq` 是否变化为准（`wait=true` 会重读确认）。**`granularity=` 是切换时间粒度的唯一入口**：先把 `TS_SHIFT`/`DT_UNIT`/`FLAGS` 的 `TS_OFF` 位写进控制块再请求重开录制，于是新录的那段整段都是新粒度；取值 `cycle`（最小，1 个 CPU 周期）/`none`（完全不记时间戳、只留顺序，最省字节）/`500us`（对齐内核 tick）/`1ms`/`2.5us`，或直接给微秒数；留空不动粒度。想多录事件就把粒度调粗：tick 档实测约 1.00 字节/事件 | `elf?`、`addr?`、`wait?`、`link?`、`granularity?` |
 | `trace_swd_tasks` | **任务名从哪来、为什么没名字，看这一个工具**：`tasks=` 的取名靠 DWARF 里 `svcrt_task_table` 的元素类型（`svcrt_task_t` 是**匿名 typedef 结构体**，`ElfIndex` 专门为它做了第三趟挂名）取出 `entry` 偏移，再逐槽读 TCB 的入口指针、**精确匹配** ELF 的函数首地址（不拿「最近的下方符号」顶——那会给跨镜像的地址安上一个像样的错名字）。返回逐槽 `entry`/`entry_addr`/`name`、`slots_read`/`named`/`nonempty`，以及 `read_mode`/`attempts`。**跨镜像的入口是合法的**：SVCrtOS 的 app/驱动是另外下发的镜像，它们的任务入口不在这份内核 `.axf` 里，这种槽位**留空不编**，并给 `unmapped_slots` + `hint`（想取名就把对应镜像的 `.axf` **一并**传给 `elf`——它支持多份，用 `;` 或 `,` 分隔，如 `elf="内核.axf;app.axf"`；或用 `names=` 手给）。多份镜像时布局/任务表取**第一个具备者**，名字从所有镜像按**精确函数首地址**匹配并记 `sym_from`（来自哪份）；**跨镜像的名字必须过内容核对**（板上该地址的机器码 == 那份 `.axf` 同地址的字节）才作数，核不过/核不了就丢名并计入 `unconfirmed_slots`——地址命中只证明「那地址在那份构建里是个函数首地址」，不证明**板上跑的就是那份构建**；任一路径不存在报 `tasks-elf-missing` 并点名。只有**所有**非空槽都落不到符号表里才整批拒绝 （`tasks-snapshot-inconsistent`）。首读是伪值会自动**停机重读一次**（`attempts=2`）。返回里 `elf` 是第一份、`elfs` 列出全部。下标 15 恒定不取名（0xF 被 idle 占），槽位 0 名固定 `idle` | `elf?`、`addr?`、`link?` |
+| `trace_stats` | **在已有事件上算结论**（不是新的采集后端）：把 MTF / SWD 会话 / buff 三类源归一化成统一事件模型，再算调度（逐任务 exec/占比/进出次数、CPU 负载、idle 占比）、同步原语（按 op 计数、按对象聚合、wait→signal/timeout 配对与等待时长 min/max/mean、没配上的 wait）、堆（分配/释放字节、净额、最大单次、未知尺寸）、中断（enter/exit 配对、时长、最慢的哪个 IRQ、超阈值数）、异常（类别 + CFSR 拆位）、断口与段重开、时间轴健康（dt min/max/mean、zero、frozen、长静默）。**两条硬规矩**：① 每个指标要么带 `basis`（依据），要么进 `not_applicable`（说明为什么算不了）；② **时间占比类只认目标侧时间基**——MTF（SWO/RTT）只有主机到达时刻、混着链路与主机调度抖动，一律落 `not_applicable`，绝不拿错时间基算一个看着正常的数。计数类（事件数/类型分布/同步次数/堆净额）任何源都算。`source=auto` **不隐式读设备**（要看目标 RAM 里的 buff 得显式 `source="buff"`）| `source?`、`elf?`、`addr?`、`limit?`、`names?`、`link?`、`cpu_hz?`、`isr_long_us?` |
+| `trace_diagnose` | **规则化诊断**：把 `trace_stats` 的事实过一遍 16 条规则，产出 findings（每条带 `severity` error/warn/info + `evidence` 最小证据 + `hint` 下一步），`verdict` 只有 problems / warnings / clean 三态（不编「健康分」）。规则覆盖 no-data / no-timeline / timebase-missing / dt-frozen / dt-zero-heavy / events-lost / segments-restarted / **kernel-hooks-absent**（有事件但没有任何内核事件——多半是 `MDK_TRACE_SVCRT_HOOKS` 没开，而不是「目标什么都没做」）/ no-sched / sched-no-time / isr-unpaired / isr-long / fault-present / sync-wait-unpaired / sync-pair-ambiguous / quiet-window。**`checked` 与 `not_applicable` 必须一起读**：`checked` 是**真的评估过**的规则、`not_applicable` 是没法评估的（带原因），只读 findings 会把「没查」当成「没问题」 | 同 `trace_stats`，另 `quiet_ratio?`、`with_stats?` |
 
 ### 结果可视化（`view_*`，2 个）
 
@@ -587,7 +589,7 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 
 ### 目标侧插桩组件（`components/trace/`）
 
-trace 不能只靠主机侧「猜」目标行为，需要在被调试代码里插一小段组件把事件送出来。组件随仓库提供（源码注释为英文，避免旧版编译器中文注释乱码），支持 **ITM / RTT / UART / BUFF** 四种后端，只依赖 CMSIS，不绑定 HAL：
+trace 不能只靠主机侧「猜」目标行为，需要在被调试代码里插一小段组件把事件送出来。组件随仓库提供（源码注释为英文，避免旧版编译器中文注释乱码），支持 **ITM / RTT / UART / BUFF / SWD** 后端，只依赖 CMSIS，不绑定 HAL：
 
 | 文件 | 说明 |
 |------|------|
@@ -596,6 +598,8 @@ trace 不能只靠主机侧「猜」目标行为，需要在被调试代码里�
 | `mdk_trace.c` | DWT/`mcycle` 时间戳、MTF 组帧（CRC8）、三种后端的发送实现 |
 | `mdk_trace_rtt.c` / `.h` | SEGGER 兼容的 RTT 控制块与环形缓冲（**目标侧绝不写 RdOff**，由主机侧推进） |
 | `mdk_trace_buff.c` / `.h` | **目标侧静态环形缓冲后端**：控制块 80 B + 记录区（定长 12 B/条）放在**一个连续 blob** 里，主机只认一个符号 `mdk_trace_buff_blob`；暖启动保留复位前记录（看门狗咬/HardFault 复位后的唯一证据）。**符号由 `mdk_trace_buff.c` 自己定义**——这个 `.c` 必须进编译，漏了会 `L6218E` |
+| `mdk_trace_swd.c` / `.h` | **SWD 两线无缝流后端**（批次56）：目标压缩入环 + 主机增量搬走，未读区永不覆盖；只接 SWD 两线即可连续零丢失录制 |
+| `mdk_trace_svcrt.c` / `.h` | **SVCrtOS 内核自动钩子**（批次72）：在内核的切换 / 任务创建回收 / IPC 等待唤醒超时 / 互斥所有权 / fault handler 首行调一次 `mdk_trace_svcrt_*`，插桩就从「人手放」变成「装上就有」。与后端无关，**一律入列**；`MDK_TRACE_SVCRT_HOOKS=0`（默认）时编成**空目标文件**——忘了开的固件仍能过链接，主机把「没有任何内核事件」当成一条**可命名**的诊断（`kernel-hooks-absent`）报出来，而不是静默给一条空时间线。`trace_instrument(svcrt_hooks=1)` 打开 |
 | `CMakeLists.txt` / `README.md` | 静态库 `mdk_trace` 的构建与使用说明 |
 
 典型用法（更多见组件内 README）：
@@ -616,13 +620,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-197 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 153 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+199 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 155 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 197 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 199 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -648,18 +652,18 @@ toolset(action="load",   toolsets="all")        # 一次全装 197 个（=full/*
 
 #### 小上下文模型：`nano` 档 + 描述分层
 
-工具数只是上下文成本的一半，另一半是**每个工具的描述**：197 个工具的描述合计约 9.5 万字符，其中约八成是背景叙述、失败模式、真机踩坑这类「参考手册」内容。两条路一起用，冷启动成本能压到很小：
+工具数只是上下文成本的一半，另一半是**每个工具的描述**：199 个工具的描述合计约 9.5 万字符，其中约八成是背景叙述、失败模式、真机踩坑这类「参考手册」内容。两条路一起用，冷启动成本能压到很小：
 
 | 档位 | 工具数 | 描述总字符 | 怎么用 |
 |---|---|---|---|
 | 默认（`core` 组 + 元工具） | 44 | 约 2.3 万 | 不设环境变量 |
 | **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 4.6 千** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
-| `all`（全装，描述默认 `full`） | 197 | 约 9.5 万 | `toolset(toolsets="all")` |
-| `all` + `MDKDEBUG_DESC=lean` | 197 | 约 8.0 万 | 正文只留 ~360 字符（结构化尾块与结尾告警照留） |
-| `all` + `MDKDEBUG_DESC=min` | 197 | 约 5.1 万 | 工具全要，但描述只留一句摘要 |
+| `all`（全装，描述默认 `full`） | 199 | 约 9.5 万 | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=lean` | 199 | 约 8.0 万 | 正文只留 ~360 字符（结构化尾块与结尾告警照留） |
+| `all` + `MDKDEBUG_DESC=min` | 199 | 约 5.1 万 | 工具全要，但描述只留一句摘要 |
 
 - **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。
-- **描述分层**（`MDKDEBUG_DESC=full|lean|min`，**默认 `full`**——默认对外暴露的描述一个字不改）：选 `lean` / `min` 时，常驻层只留一句话用途 ＋ 【输出控制】/【参数】/【调用示例】块；被挪走的正文**一个字不改**地归档，随时用 `mdk_guide(topic="tool", name="read_mem")` 逐字取回（取回结果与瘦身前完全一致）。正文截断保留「段首 + 段末」，**绝不把结尾的关键告警截掉**（如 `read_mem` 结尾的「置信度低时不要据此下结论」）——**schema 里有的参数，描述里必须有说明**，不允许出现「参数在、说明没了」这种看似权威的错答案。**默认档为什么是 `full`**：197 个工具里有七十多个长到会被截，而截掉的往往是边界条件与失败模式——默认档悄悄砍掉它们，模型反而更容易用错工具（这是「看似权威的错答案」的同族问题）；要省上下文请走 `nano` 档（自动 `min`）或显式选 `lean` / `min`，别指望默认档替你省。
+- **描述分层**（`MDKDEBUG_DESC=full|lean|min`，**默认 `full`**——默认对外暴露的描述一个字不改）：选 `lean` / `min` 时，常驻层只留一句话用途 ＋ 【输出控制】/【参数】/【调用示例】块；被挪走的正文**一个字不改**地归档，随时用 `mdk_guide(topic="tool", name="read_mem")` 逐字取回（取回结果与瘦身前完全一致）。正文截断保留「段首 + 段末」，**绝不把结尾的关键告警截掉**（如 `read_mem` 结尾的「置信度低时不要据此下结论」）——**schema 里有的参数，描述里必须有说明**，不允许出现「参数在、说明没了」这种看似权威的错答案。**默认档为什么是 `full`**：199 个工具里有七十多个长到会被截，而截掉的往往是边界条件与失败模式——默认档悄悄砍掉它们，模型反而更容易用错工具（这是「看似权威的错答案」的同族问题）；要省上下文请走 `nano` 档（自动 `min`）或显式选 `lean` / `min`，别指望默认档替你省。
 - 两个装卸入口：`tools_groups()` 列全部组 / 档与当前是否已装（可直接 `tools_groups(group="mem")` 看某组里有什么）；`tools_load(group="mem,trace")` 按需装上（`group=nano` / `all` 也认，`unload=true` 收起）。`toolset` 与它们等价，老用法不受影响。
 
 ### 参数约定（别名 / 类型宽容 / 单位换算）

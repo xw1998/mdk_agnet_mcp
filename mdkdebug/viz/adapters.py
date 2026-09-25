@@ -29,7 +29,8 @@ _CM_EXC = {
 _SVC_ARG_EV = {0x11: "wait", 0x12: "ready", 0x13: "create", 0x14: "exit"}
 
 # 事件类型的中文写法（只影响标题，不改判定）
-_TYP_CN = {"event": "事件", "sched": "调度", "isr": "中断", "fault": "异常"}
+_TYP_CN = {"event": "事件", "sched": "调度", "isr": "中断", "fault": "异常",
+           "sync": "同步原语", "heap": "堆"}
 
 _MAX_TRACKS = 24          # 轨道数上限（超出合并）
 _MAX_SPLIT = 10           # 同一类事件按 id 最多拆几条轨道
@@ -462,7 +463,9 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
             w = max(((nxt - t) if nxt and nxt > t else tmax * 0.002), tmax * 0.0005)
             gaps.append({"t0": t, "t1": t + w,
                          "label": "丢 %s 条事件" % (e.get("events_dropped") or "?")})
-        elif typ == "sync":
+        elif typ == "segment":
+            # 段重开标记（批次56 的 CTL_SYNC）；与新事件类型 "sync"（同步原语
+            # wait/signal）是两回事，名字必须分开，否则两者会汇进同一个桶。
             markers.append({"t": t, "label": "重开录制段 seq=%s" % (e.get("seq") or "?"),
                             "level": "warn"})
 
@@ -472,35 +475,60 @@ def timeline_from_events(payload: dict, names: dict = None, title: str = "",
         if not isinstance(e, dict):
             continue
         typ = str(e.get("type") or "event")
-        if typ in ("sched", "isr", "fault", "gap", "sync"):
+        if typ in ("sched", "isr", "fault", "gap", "segment"):
             continue
         if times[i] is None:
             continue
-        ident = e.get("id") if "id" in e else None
+        if typ == "sync":
+            # sync 的 id 是 (obj<<3)|op：按对象与操作分轨，否则一整个信号量的
+            # wait/signal 挤在一条线上，看不出「谁在等、谁在放」。
+            ident = e.get("obj")
+            sub = e.get("op_name") or "op"
+        elif typ == "heap":
+            ident = None
+            sub = e.get("op_name") or "heap"
+        else:
+            ident = e.get("id") if "id" in e else None
+            sub = ""
         # 同一类系统事件可能来自不同任务（WAIT/READY 的 arg 就是任务号）：
         # 按任务名再分一层轨道，否则一整个「wait」看不出是谁在等。
         tname = e.get("task_name") or None
-        buckets.setdefault((typ, ident, tname), []).append((times[i], e))
+        buckets.setdefault((typ, ident, tname, sub), []).append((times[i], e))
     ranked = sorted(buckets.items(), key=lambda kv: -len(kv[1]))
     shown = ranked[:_MAX_SPLIT]
     rest = ranked[_MAX_SPLIT:]
-    for (typ, ident, tname), items in shown:
+    for (typ, ident, tname, sub), items in shown:
         nm = None
         for _t, e in items:
             nm = e.get("id_name") or nm
             break
-        nm = nm or _name_of(names, ident, None)
+        nm = nm or (_name_of(names, ident, None) if typ not in ("sync", "heap")
+                    else None)
         if nm:
             label = str(nm)
+        elif typ == "sync":
+            label = "obj %s · %s" % (ident, sub)
+        elif typ == "heap":
+            label = "heap · %s" % sub
         elif tname:
             label = "%s · %s" % (_SVC_ARG_EV.get(ident) or typ, tname)
         else:
             label = "%s%s" % (typ, "" if ident is None else " id=%s" % ident)
-        idnote = "" if ident is None else "（id=%s）" % (
-            "0x%X" % ident if isinstance(ident, int) else ident)
+        if typ == "sync":
+            idnote = "（obj=%s, op=%s）" % (ident, sub)
+        elif typ == "heap":
+            idnote = "（%s）" % sub
+        else:
+            idnote = "" if ident is None else "（id=%s）" % (
+                "0x%X" % ident if isinstance(ident, int) else ident)
         marks = [[t, None] for t, _e in items]
         dense = len(marks) > 3000
-        add({"id": "%s-%s-%s" % (typ, ident, tname), "name": label,
+        # 轨道 id：只在有 sub（sync/heap）时才追加，否则与历史格式一致——
+        # 别的类型凭空多一截空字段会让下游按 id 认轨道的用例全部失配。
+        _tid = "%s-%s-%s" % (typ, ident, tname)
+        if sub:
+            _tid += "-%s" % sub
+        add({"id": _tid, "name": label,
              "sub": "%d 个%s%s" % (len(items), _TYP_CN.get(typ, typ), idnote),
              "type": "density" if dense else "marks",
              "marks": marks, "count": len(marks), "toggle": True})

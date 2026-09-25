@@ -221,6 +221,15 @@ MTF_TYPES = {
     6: "ts",
     7: "kv",
     8: "reset",
+    # 9..12 与 C 侧 MDK_TRACE_TYPE_* / swd.TYPES / _BUFF_TYPES 同一套编号。
+    # 它们原来在 MTF 侧缺席：SWO/RTT 通路收到 SCHED/FAULT/SYNC/HEAP 帧时，
+    # type 落在 _PAYLOAD_FMT 之外，载荷被解成 raw_hex —— 调度事件的 from/to、
+    # sync 的 obj/op、fault 的类别与 CFSR 全部丢失，而宿主看上去「解出了事件」，
+    # 是典型的静默错答案。
+    9: "fault",
+    10: "sched",
+    11: "sync",
+    12: "heap",
 }
 
 # event/isr 的 kind
@@ -233,6 +242,16 @@ _PAYLOAD_FMT = {
     5: ("<I", ("tag",)),                            # mark
     6: ("<I", ("ts",)),                             # ts
     7: ("<Hi", ("key", "value")),                   # kv
+    # 9..12：载荷统一是 little-endian 的 u16 + u32（与 mdk_trace.c 里
+    # _put_u16/_put_u32 的写法一致）。语义在 id/arg 里，不在这里拆：
+    #   fault -> id=类别, arg=CFSR
+    #   sched -> id=from, arg=to
+    #   sync  -> id=(obj<<3)|op, arg=val
+    #   heap  -> id=op, arg=size
+    9: ("<HI", ("id", "arg")),                         # fault
+    10: ("<HI", ("id", "arg")),                        # sched
+    11: ("<HI", ("id", "arg")),                        # sync
+    12: ("<HI", ("id", "arg")),                        # heap
 }
 
 

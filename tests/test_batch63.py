@@ -185,7 +185,7 @@ FAKE = bytes([0x32, 0xC6, 0xB2, 0x07]) * 16        # 真机抓到的那种「重
 def ev_count(out):
     """折出来的事件数：去掉 sync/lost 这类 CTL 标记（它们也是 item，但不是事件）。"""
     return len([e for e in (out.get("events") or [])
-                if e.get("type") not in ("sync", "lost", "gap")])
+                if e.get("type") not in ("segment", "lost", "gap")])
 
 
 def main():

@@ -141,6 +141,8 @@ TOOLSETS = {
         "trace_swd_next",
         # 任务名解析（批次64）：读内核 svcrt_task_table + ELF 符号，调度事件才有名字。
         "trace_swd_tasks",
+        # 分析层（批次72）：在已有事件上算结论、跑规则诊断，不是新的采集后端。
+        "trace_stats", "trace_diagnose",
     },
     # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组。
     "rtos": {

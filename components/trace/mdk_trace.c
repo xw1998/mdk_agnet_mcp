@@ -320,6 +320,8 @@ static void _buff_receive(uint8_t type, const uint8_t *payload, uint8_t len)
     case MDK_TRACE_TYPE_KV:
     case MDK_TRACE_TYPE_FAULT:
     case MDK_TRACE_TYPE_SCHED:
+    case MDK_TRACE_TYPE_SYNC:
+    case MDK_TRACE_TYPE_HEAP:
         if (len < 6u) { mdk_trace_buff_note_unsupported(); return; }
         mdk_trace_buff_put(type, 0u, _rd_u16(payload), _rd_u32(payload + 2));
         break;
@@ -365,6 +367,8 @@ static void _swd_receive(uint8_t type, const uint8_t *payload, uint8_t len)
     case MDK_TRACE_TYPE_KV:
     case MDK_TRACE_TYPE_FAULT:
     case MDK_TRACE_TYPE_SCHED:
+    case MDK_TRACE_TYPE_SYNC:
+    case MDK_TRACE_TYPE_HEAP:
         if (len < 6u) { _swd_unsupported++; return; }
         mdk_trace_swd_event(type, MDK_TRACE_SWD_K_POINT,
                             _rd_u16(payload), _rd_u32(payload + 2));
@@ -675,6 +679,29 @@ void mdk_trace_sched(uint16_t from, uint16_t to)
     _put_u16(p, from);
     _put_u32(p + 2, (uint32_t)to);
     mdk_trace_send((uint8_t)MDK_TRACE_TYPE_SCHED, p, 6u);
+}
+
+void mdk_trace_sync(uint16_t obj, uint8_t op, uint32_t val)
+{
+    uint8_t p[6];
+
+    /* obj and op share the 16 bit id, val keeps all 32 bits. Masking `val`
+     * down to 24 bits to make room for the op would truncate a timeout or a
+     * waiter count **silently** - the host would show a number that looks
+     * right and is wrong. 13 bits of object is far more than any kernel has. */
+    _put_u16(p, (uint16_t)(((obj & 0x1FFFu) << MDK_TRACE_SYNC_OBJ_SHIFT) |
+                           (uint16_t)(op & MDK_TRACE_SYNC_OP_MASK)));
+    _put_u32(p + 2, val);
+    mdk_trace_send((uint8_t)MDK_TRACE_TYPE_SYNC, p, 6u);
+}
+
+void mdk_trace_heap(uint8_t op, uint32_t size)
+{
+    uint8_t p[6];
+
+    _put_u16(p, (uint16_t)op);
+    _put_u32(p + 2, size);
+    mdk_trace_send((uint8_t)MDK_TRACE_TYPE_HEAP, p, 6u);
 }
 
 void mdk_trace_fault_capture(uint32_t exc_return, uint32_t msp, uint32_t psp)

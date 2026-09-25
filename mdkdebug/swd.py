@@ -72,7 +72,13 @@ FLAG_TS_OFF = 1 << 2    # 宿主写：完全不记时间戳，只记事件顺序
 
 # 事件类型 / kind，与 mdk_trace.h 保持同一套编号
 TYPES = {0: "raw", 1: "text", 2: "event", 3: "counter", 4: "isr", 5: "mark",
-         6: "ts", 7: "kv", 8: "reset", 9: "fault", 10: "sched"}
+         6: "ts", 7: "kv", 8: "reset", 9: "fault", 10: "sched",
+         # 11/12 是批次72 加的语义事件：sync 把原语等待/唤醒/所有权做成一等事件、
+         # heap 让分配/释放可统计。压缩流只有 2 bit 的 kind，所以这两个类型
+         # **不复用 kind**，语义打包在 id 里（sync: id=(obj<<3)|op、heap: id=op），
+         # val/size 走 arg 全 32 位。类型号必须 < 16 —— make_key 里是 type & 0xF，
+         # 超过 15 会被静默取模成另一个类型（那就是看似权威的错答案）。
+         11: "sync", 12: "heap"}
 KINDS = {0: "enter", 1: "exit", 2: "point", 3: "abort"}
 FAULT_CLASS = {0: "hardfault", 1: "memmanage", 2: "busfault", 3: "usagefault"}
 FAULT_BASE = 0xFE00

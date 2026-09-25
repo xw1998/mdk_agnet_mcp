@@ -1945,7 +1945,12 @@ int main(void) { return 0; }
 """
 
 def component_sources(backend: str) -> list:
-    """该后端真正需要加入编译的组件源文件（next 清单与自检共用同一份）。"""
+    """该后端真正需要加入编译的组件源文件（next 清单与自检共用同一份）。
+
+    mdk_trace_svcrt.c 与后端无关，**一律入列**：它的内容裹在
+    `#if MDK_TRACE_SVCRT_HOOKS && MDK_TRACE_ENABLE` 里，开关关上时编成空目标文件，
+    不会给未用 SVCrtOS 的工程增加任何东西；漏了它则“装上就有内核事件”就无从谈起。
+    """
     b = (backend or "itm").strip().lower()
     srcs = ["mdk_trace.c"]
     if b in ("rtt", "uart"):
@@ -1954,6 +1959,7 @@ def component_sources(backend: str) -> list:
         srcs.append("mdk_trace_buff.c")
     if b == "swd":
         srcs.append("mdk_trace_swd.c")
+    srcs.append("mdk_trace_svcrt.c")
     return srcs
 
 def component_link_check(backend: str = "itm", src_dir: str = "",
@@ -2084,7 +2090,8 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
                      buff_clear_on_init: bool = False,
                      swd_bytes: int = 8192, swd_ts_shift: int = 0,
                      swd_clear_on_init: bool = True,
-                     fault_frame: bool = True, link_check: bool = True) -> dict:
+                     fault_frame: bool = True, link_check: bool = True,
+                     svcrt_hooks: int = 0) -> dict:
     """把插桩组件拷进工程，并生成 mdk_trace_config.h + 构建片段。
 
     复制完会就地做一次**编译 + 链接**自检（link_check，默认开）：组件缺符号
@@ -2119,7 +2126,8 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
                         buff_clear_on_init=buff_clear_on_init,
                         swd_bytes=swd_bytes, swd_ts_shift=swd_ts_shift,
                         swd_clear_on_init=swd_clear_on_init,
-                        fault_frame=fault_frame)
+                        fault_frame=fault_frame,
+                        svcrt_hooks=int(svcrt_hooks or 0))
     cfg_path = os.path.join(dst, "mdk_trace_config.h")
     if os.path.exists(cfg_path) and not overwrite:
         skipped.append("mdk_trace_config.h")
@@ -2142,6 +2150,17 @@ def deploy_component(target_dir: str, backend: str = "itm", itm_port: int = 1,
            "MDK_TRACE_FAULT_CAPTURE()（越早越好，栈还可能没被破坏），再进你的死循环；"
            "看门狗喂狗点、关键状态迁移用 MDK_TRACE_MARK()",
            "任务 / 线程切换处调 MDK_TRACE_SCHED(from, to)"]
+    if int(svcrt_hooks or 0):
+        nxt += ["**SVCrtOS 内核自动钩子已打开**：在 svcrtos_new 侧调 mdk_trace_svcrt_* "
+                "（切换点 / 任务创建与回收 / IPC 等待与唤醒 / 互斥所有权 / fault 首行），"
+                "插桩就从「人手放」变成「装上就有」——调度、IPC、堆都不用逐处手写 "
+                "MDK_TRACE_*；钩点与函数签名见部署目录的 mdk_trace_svcrt.h。",
+                "钩子在**内核**里调，不在追踪组件里回调内核——组件不持有内核头文件，"
+                "这样内核换版本也不会连带追踪组件不能编。"]
+    else:
+        nxt += ["若目标是 SVCrtOS：把 svcrt_hooks 设 1（mdk_trace_config.h 里的 "
+                "MDK_TRACE_SVCRT_HOOKS），内核会自动吐出调度 / IPC / 堆事件；留着 0 "
+                "则只有一个空适配层，主机侧会报「没有内核事件」而不是链接错误。"]
     if b == "buff":
         nxt += ["buff 模式：目标跑完或出事后 trace_buff_dump(elf=你的.axf) 一次性读回",
                 "buff 模式不需要 SWO 引脚、不需要主机实时跟读，但缓冲写满会覆盖最旧的",
@@ -2196,7 +2215,8 @@ def _gen_config_h(backend: str, itm_port: int, rtt_up: int, rtt_down: int,
                   buff_ts_shift: int = 0, buff_clear_on_init: bool = False,
                   swd_bytes: int = 8192, swd_ts_shift: int = 0,
                   swd_clear_on_init: bool = True,
-                  fault_frame: bool = True) -> str:
+                  fault_frame: bool = True,
+                  svcrt_hooks: int = 0) -> str:
     b = (backend or "itm").strip().lower()
     if b not in ("itm", "rtt", "uart", "none", "buff", "swd"):
         b = "itm"
@@ -2234,6 +2254,10 @@ def _gen_config_h(backend: str, itm_port: int, rtt_up: int, rtt_down: int,
         "/* 把控制块的 cycles 换算成秒用；必填，否则时间轴只有周期数 */",
         "#define MDK_TRACE_SWD_CPU_HZ        %d" % int(coreclk or 0),
         "",
+        "/* SVCrtOS 内核自动钩子（mdk_trace_svcrt.c）：1 = 打开。 */",
+        "/* 打开后 kernel 侧只要调 mdk_trace_svcrt_*，插桩就从「人手放」变成「装上就有」 */",
+        "/* 与后端无关；关上时该 .c 编成空目标文件，不开也不给未用 SVCrtOS 的工程添乱 */",
+        "#define MDK_TRACE_SVCRT_HOOKS       %d" % (1 if svcrt_hooks else 0),
         "/* 事件 ID 区间（主机侧按区间分派语义） */",
         "#define MDK_TRACE_ID_APP_BASE      0x1000",
         "#define MDK_TRACE_ID_ISR_BASE      0x2000",
@@ -2249,7 +2273,7 @@ def _gen_make_fragment() -> str:
         "# 由 mdkdebug 的 trace_instrument 生成：把插桩组件接进 Makefile",
         "# 用法：在你的 Makefile 里 `include path/to/mdk_trace.mk`",
         "MDK_TRACE_DIR ?= $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))",
-        "# 四个源文件都可无脑编：未选中的后端会编成空目标文件（内容裹在 #if 里）",
+        "# 五个源文件都可无脑编：未选中的后端 / 没开内核钩子都会编成空目标文件（内容裹在 #if 里）",
         "# 每个后端自己的 blob（主机定位用的那个符号）就定义在它自己的 .c 里：",
         "#   buff -> mdk_trace_buff_blob（mdk_trace_buff.c）",
         "#   swd  -> mdk_trace_swd_blob（mdk_trace_swd.c）",
@@ -2257,7 +2281,8 @@ def _gen_make_fragment() -> str:
         "MDK_TRACE_SRCS := $(MDK_TRACE_DIR)/mdk_trace.c \\",
         "                  $(MDK_TRACE_DIR)/mdk_trace_buff.c \\",
         "                  $(MDK_TRACE_DIR)/mdk_trace_swd.c \\",
-        "                  $(MDK_TRACE_DIR)/mdk_trace_rtt.c",
+        "                  $(MDK_TRACE_DIR)/mdk_trace_rtt.c \\",
+        "                  $(MDK_TRACE_DIR)/mdk_trace_svcrt.c",
         "C_SOURCES  += $(MDK_TRACE_SRCS)",
         "C_INCLUDES += -I$(MDK_TRACE_DIR)",
         "",
@@ -2286,7 +2311,37 @@ _BUFF_RESET_REQ_OFF = 56
 
 _BUFF_TYPES = {0: "raw", 1: "text", 2: "event", 3: "counter", 4: "isr",
                5: "mark", 6: "ts", 7: "kv", 8: "reset", 9: "fault",
-               10: "sched"}
+               10: "sched", 11: "sync", 12: "heap"}
+
+# sync / heap 的语义（批次72）。事件里的 id 是打包过的：sync 是 (obj<<3)|op，
+# heap 是 op；把 op 拆出来才能统计「等了多少次 / 谁等得最久 / 堆净增多少」。
+# 不在这里拆，下游拿到的就只是一个看着像 id 的数字。
+_SYNC_OBJ_SHIFT = 3
+_SYNC_OP_MASK = 0x7
+_SYNC_OPS = {0: "wait", 1: "signal", 2: "acquire", 3: "release",
+             4: "timeout", 5: "create", 6: "delete"}
+_HEAP_OPS = {0: "alloc", 1: "free"}
+
+
+def _derive_semantics(ev: dict) -> None:
+    """给 sync / heap 事件补上拆包后的可读字段（就地修改）。
+
+    sync： id=(obj<<3)|op、arg=val → 补 obj / op / op_name。
+    heap： id=op、arg=size       → 补 op / op_name / size。
+    拆不开（id 不是整数）就什么都不补，绝不编一个 obj=0。
+    """
+    typ = ev.get("type")
+    i = ev.get("id")
+    if not isinstance(i, int):
+        return
+    if typ == "sync":
+        ev["obj"] = i >> _SYNC_OBJ_SHIFT
+        ev["op"] = i & _SYNC_OP_MASK
+        ev["op_name"] = _SYNC_OPS.get(ev["op"], "op%d" % ev["op"])
+    elif typ == "heap":
+        ev["op"] = i & 0xFF
+        ev["op_name"] = _HEAP_OPS.get(ev["op"], "op%d" % ev["op"])
+        ev["size"] = ev.get("arg")
 _BUFF_KINDS = {0: "enter", 1: "exit", 2: "point", 3: "abort"}
 _BUFF_FAULT_CLASS = {0: "hardfault", 1: "memmanage", 2: "busfault",
                      3: "usagefault"}
@@ -2566,6 +2621,8 @@ def _buff_decode(info: dict, recs: bytes, names: dict = None) -> dict:
             ev["value_hex"] = "0x%08X" % r["arg"]
             if cur_fault is not None and reg not in cur_fault["registers"]:
                 cur_fault["registers"][reg] = "0x%08X" % r["arg"]
+        elif typ in ("sync", "heap"):
+            _derive_semantics(ev)
         by_type[typ] = by_type.get(typ, 0) + 1
         by_id[r["id"]] = by_id.get(r["id"], 0) + 1
         if "kind" in ev:
@@ -2915,7 +2972,12 @@ def _swd_fold(s: dict, items: list, ts_shift: int, cpu_hz: int,
                 out.append(ev)
             elif sub == _swd.CTL_SYNC:
                 s["syncs"] += 1
-                ev = {"type": "sync", "kind": "point", "seq": val,
+                # 类型叫 "segment" 而不是 "sync"：批次72 把 11 号事件类型
+                # （同步原语：wait/signal/acquire/release）命名为 "sync"，而这里
+                # 是「目标重开了一段录制」的 CTL 标记——两者用一个名字会在每个
+                # 聚合（counts_by_type、轨道分组）里静默合并成同一个东西。
+                # 一个键名一义：gap=丢事件、segment=重开段。
+                ev = {"type": "segment", "kind": "point", "seq": val,
                       "note": "目标在这里重开了录制段（seq=%d），字典已清" % val}
                 ev.update(tm)
                 out.append(ev)
@@ -2967,6 +3029,9 @@ def _swd_fold(s: dict, items: list, ts_shift: int, cpu_hz: int,
             ev["value_hex"] = "0x%08X" % a
             if cur_fault is not None and ev["reg"] not in cur_fault["registers"]:
                 cur_fault["registers"][ev["reg"]] = ev["value_hex"]
+        elif typ in ("sync", "heap"):
+            # 拆出 obj/op（sync）与 op/size（heap），否则下游只看到一个 id 数字。
+            _derive_semantics(ev)
         out.append(ev)
     if task_names is not None:
         # 名字在这里一次性补上：事件里存的是**原始** id/arg/from/to，所以即使
@@ -4708,6 +4773,12 @@ def register(server, js=None) -> int:
             "swd 的旋钮：swd_bytes（环字节数 = 静态 RAM，默认 8192）、swd_ts_shift（0 = 每周期）、"
             "swd_clear_on_init（**默认 true**，与 buff 相反——无缝流主机是从游标往 head 读，"
             "环里留着上一次运行的字节会把两段无关运行无缝拼在一起，没有可见接缝，最危险）。\n"
+            "**SVCrtOS 内核自动钩子（svcrt_hooks，默认 0）**：设 1 时生成 "
+            "MDK_TRACE_SVCRT_HOOKS=1，配合部署目录的 mdk_trace_svcrt.h/.c，内核侧调 "
+            "mdk_trace_svcrt_* 就能自动吐出调度 / IPC 等待与唤醒 / 堆分配事件——插桩从 "
+            "「人手放」变成「装上就有」。与后端无关：关上时 mdk_trace_svcrt.c 编成空目标文件，"
+            "未用 SVCrtOS 的工程不受影响；忘了开也不会链接失败，主机侧会报「没有内核事件」"
+            "（一条可命名的诊断，而不是一条空白时间线）。\n"
             "**构建清单自检**：返回里还带 build_list_check —— 核对 mdk_trace.mk 与 "
             "CMakeLists.txt 列出的 .c 是否与目录里实际的后端源文件一致（漏列 = 那条通路"
             "根本没编进去，多列 = 构建必然失败）；不一致时 ok=false、"
@@ -4734,7 +4805,8 @@ def register(server, js=None) -> int:
                                swd_bytes: int = 8192,
                                swd_ts_shift: int = 0,
                                swd_clear_on_init: bool = True,
-                               link_check: bool = True) -> str:
+                               link_check: bool = True,
+                               svcrt_hooks: int = 0) -> str:
         try:
             return _js(deploy_component(target_dir, backend=backend,
                                         itm_port=int(itm_port), rtt_up=int(rtt_up),
@@ -4749,7 +4821,8 @@ def register(server, js=None) -> int:
                                         swd_bytes=int(swd_bytes),
                                         swd_ts_shift=int(swd_ts_shift),
                                         swd_clear_on_init=bool(swd_clear_on_init),
-                                        link_check=bool(link_check)))
+                                        link_check=bool(link_check),
+                                        svcrt_hooks=int(svcrt_hooks or 0)))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "target_dir": target_dir, "error": str(e)})
     n += 1
@@ -4995,7 +5068,8 @@ def register(server, js=None) -> int:
         title="swd 无缝流：让目标开一段新录制（清环 + 两边一起清字典）",
         description=(
             "往控制块的 reset_req 写 1，目标在下一条事件写入时清环、清计数、字典两边一起清、seq 加一，"
-            "并往新流里写一个 SYNC 标记。\n"
+            "并往新流里写一个段重开标记（主机侧解出来的事件类型是 segment，kind=point，"
+            "带 seq）——它**不是**同步原语事件（那类事件的类型也叫 sync，见 sync/heap 说明）。\n"
             "**这是无缝流唯一的重新对齐手段**：宿主字典与目标字典不同步时，宿主单方面清字典只会让"
             "后续每个 HIT 都解错——只能由目标重开一段把两边一起归零。\n"
             "与 buff 一样是**延迟生效**的：目标长期没有插桩事件时会一直挂着（返回 request_latched），"

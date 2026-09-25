@@ -67,11 +67,11 @@ def main():
     # ============ A. 源文件清单三处一致 ============
     print("A. component_sources 与 mk / CMakeLists 清单一致")
     expect = {
-        "itm": ["mdk_trace.c"],
-        "rtt": ["mdk_trace.c", "mdk_trace_rtt.c"],
-        "uart": ["mdk_trace.c", "mdk_trace_rtt.c"],
-        "buff": ["mdk_trace.c", "mdk_trace_buff.c"],
-        "swd": ["mdk_trace.c", "mdk_trace_swd.c"],
+        "itm": ["mdk_trace.c", "mdk_trace_svcrt.c"],
+        "rtt": ["mdk_trace.c", "mdk_trace_rtt.c", "mdk_trace_svcrt.c"],
+        "uart": ["mdk_trace.c", "mdk_trace_rtt.c", "mdk_trace_svcrt.c"],
+        "buff": ["mdk_trace.c", "mdk_trace_buff.c", "mdk_trace_svcrt.c"],
+        "swd": ["mdk_trace.c", "mdk_trace_swd.c", "mdk_trace_svcrt.c"],
     }
     bad = {b: trace.component_sources(b) for b in BACKENDS
            if trace.component_sources(b) != expect[b]}
@@ -79,13 +79,13 @@ def main():
 
     mk = trace._gen_make_fragment()
     missing_mk = [f for f in ("mdk_trace.c", "mdk_trace_rtt.c", "mdk_trace_buff.c",
-                              "mdk_trace_swd.c") if f not in mk]
-    check("A2 mdk_trace.mk 片段列出全部四个源文件（swd 曾漏）", not missing_mk, missing_mk)
+                              "mdk_trace_swd.c", "mdk_trace_svcrt.c") if f not in mk]
+    check("A2 mdk_trace.mk 片段列出全部源文件（swd/svcrt 曾漏）", not missing_mk, missing_mk)
 
     cml = open(os.path.join(COMPONENT_DIR, "CMakeLists.txt"), encoding="utf-8").read()
-    missing_cml = [f for f in ("mdk_trace_rtt.c", "mdk_trace_buff.c", "mdk_trace_swd.c")
-                   if f not in cml]
-    check("A3 CMakeLists 把三个后端 .c 都加进 target_sources", not missing_cml, missing_cml)
+    missing_cml = [f for f in ("mdk_trace_rtt.c", "mdk_trace_buff.c", "mdk_trace_swd.c",
+                               "mdk_trace_svcrt.c") if f not in cml]
+    check("A3 CMakeLists 把后端 .c 与 svcrt 都加进 target_sources", not missing_cml, missing_cml)
     check("A4 CMakeLists 有 swd 的 MDK_TRACE_BACKEND_SWD 分支",
           "MDK_TRACE_BACKEND_SWD" in cml and 'STREQUAL "swd"' in cml,
           [ln for ln in cml.splitlines() if "swd" in ln.lower()][:3])
@@ -189,7 +189,8 @@ def main():
     check("E1 生成模板 + CMakeLists 都覆盖全部后端 .c", r.get("ok") is True, r)
     check("E2 报告里能看到实际源文件与各清单的比对结果",
           r.get("actual") == ["mdk_trace.c", "mdk_trace_buff.c", "mdk_trace_rtt.c",
-                              "mdk_trace_swd.c"] and len(r.get("checks") or {}) >= 2, r)
+                              "mdk_trace_svcrt.c", "mdk_trace_swd.c"]
+          and len(r.get("checks") or {}) >= 2, r)
 
     tmp2 = tempfile.mkdtemp(prefix="mdkdebug_bsc_")
     try:
