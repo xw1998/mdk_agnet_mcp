@@ -143,6 +143,8 @@ TOOLSETS = {
         "trace_swd_tasks",
         # 分析层（批次72）：在已有事件上算结论、跑规则诊断，不是新的采集后端。
         "trace_stats", "trace_diagnose",
+        # 条件触发层（批次75）：主机侧等一件事发生，命中即返回事件+上下文+诊断。
+        "trace_watch",
     },
     # RTOS 任务感知：跨两条链路（Keil / OpenOCD），所以单独成组。
     "rtos": {

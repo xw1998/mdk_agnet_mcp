@@ -11,7 +11,7 @@
     烧录 / 日志 / 多命令聚合 / 错误路径）
   D trace 族：SWO 采集与 ITM+MTF 解码 / RTT（主机侧读写控制块并推进 RdOff）/
     采样剖析 / DWT / 组件部署
-  E 工具面：注册总数 199、五族齐全、capabilities.non_mdk
+  E 工具面：注册总数 200、五族齐全、capabilities.non_mdk
   F gdb 解析：只挑**真能跑**的 gdb、绝不到别的架构去凑（ESP 工具链复核）
 
 真机（F401 + DAPLink）验证单独做，见 docs/PITFALLS.md。
@@ -152,7 +152,11 @@ def test_toolchain(server):
     r = asyncio.run(call(server, "toolchain_detect_project", {"path": make_dir}))
     check("A7 识别 Make 工程", r.get("kind") == "make", r)
 
-    empty = os.path.join(TMPROOT, "proj_none")
+    # A8 的「认不出」必须在**不受共享临时根影响**的目录里测：tmp 根（本机 C:\tmp）里
+    # 可能有别的进程留下的 *.mk，而 detect_project 会向上找 max_up 层——那会把「环境里
+    # 有别人的文件」误判成「工具认错了」。所以把探针目录嵌到 TMPROOT 里第 4 层，向上
+    # 3 层走不出 TMPROOT，测的仍是「一条链上没有任何工程文件」。
+    empty = os.path.join(TMPROOT, "iso", "lv2", "proj_none")
     os.makedirs(empty, exist_ok=True)
     r = asyncio.run(call(server, "toolchain_detect_project", {"path": empty}))
     check("A8 认不出就说 none（不硬猜）", r.get("kind") == "none", r)
@@ -687,13 +691,13 @@ def test_surface(server):
     r = asyncio.run(call(server, "list_tools", {}))
     tools = r.get("tools") or []
     names = [t.get("tool") if isinstance(t, dict) else t for t in tools]
-    check("E1 工具总数 199", len(names) == 199, len(names))
+    check("E1 工具总数 200", len(names) == 200, len(names))
     check("E1b 工程配置发现工具在册", "debug_config" in names)
     # target_ 前缀共 4 个：本批新增 target_list/show/guess 3 个，
     # 另有历史工具 target_info（MDK 侧调试目标信息），故计 4。
-    # trace_ 前缀 33 个（trace 组 37 个，其余以 scope_/dwt_/coverage_ 等命名）
+    # trace_ 前缀 34 个（trace 组 38 个，其余以 scope_/dwt_/coverage_ 等命名）
     for pre, cnt in (("toolchain_", 10), ("target_", 4), ("ocd_", 17),
-                     ("trace_", 33)):
+                     ("trace_", 34)):
         got = [n for n in names if n.startswith(pre)]
         check("E2 %s* 共 %d 个" % (pre, cnt), len(got) == cnt, len(got))
 

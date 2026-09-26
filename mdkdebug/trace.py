@@ -35,6 +35,7 @@ import time
 from . import traceproto as _tp
 from . import linkio as _link
 from . import swd as _swd
+from . import trwatch as _tw
 
 __all__ = ["state", "reset_state", "register"]
 
@@ -3783,6 +3784,12 @@ def swd_read(elf: str = "", addr="", limit: int = 200, out_file: str = "",
         del s["events"][:drop]
         s["session_events_dropped"] = s.get("session_events_dropped", 0) + drop
     s["bytes_read"] += len(data)
+    # 留一份最近一次控制块读数：条件触发层要判「这段时间是不是完整的」
+    # （lost_events 是目标侧的权威计数）。不留的话它会永远算成「完整」——
+    # 那是把「没测到」说成「没发生」，属红线。
+    s["last_ctrl"] = {k: info.get(k) for k in
+                      ("lost_events", "lost_bytes", "head", "drained",
+                       "pending", "seq", "cap", "enabled")}
 
     view = _swd_session_view(s, limit=limit)
     if only_new:
@@ -4298,6 +4305,268 @@ GUIDE = {
     ),
 }
 
+
+# ================================================================ 条件触发（watch）
+#
+# 为什么在主机侧：目标侧 SWD 控制块只有 80 字节、没有 mask/filter/trigger 字段
+# （实测），固件不做条件判定；而无缝流本身是**无损累积**的（未读区不被覆盖），
+# 所以「两次调用之间错过的那段」照样能判——覆盖范围是整个会话已录部分。
+#
+# 这里的状态是进程内的（与 _T["swd"] 同级）：arm 一次，之后 wait / status 都看它。
+
+_WATCH = {"spec": None, "min_count": 1, "cursor": 0, "matches": 0, "hit": None,
+          "rounds": 0, "scanned": 0, "source": "swd", "spec_desc": "",
+          "lost_at_arm": None, "elapsed_ms": 0}
+
+
+def _watch_reset_state(spec=None, min_count=1, source="swd", cursor=0,
+                       spec_desc=""):
+    _WATCH.update({"spec": spec, "min_count": max(1, int(min_count or 1)),
+                   "cursor": int(cursor), "matches": 0, "hit": None,
+                   "rounds": 0, "scanned": 0, "source": source,
+                   "spec_desc": spec_desc, "lost_at_arm": None,
+                   "elapsed_ms": 0})
+
+
+def _watch_lost_now(s: dict = None) -> int:
+    """当前会话的目标侧丢事件计数（权威计数）。取不到就给 0。"""
+    try:
+        s = s if s is not None else _T.get("swd")
+        if not s:
+            return 0
+        info = s.get("last_ctrl") or {}
+        return int(info.get("lost_events") or 0)
+    except Exception:                                        # noqa: BLE001
+        return 0
+
+
+def _watch_cov(lost_now: int = 0, note: str = "") -> dict:
+    from . import trwatch as _tw2
+    s = _T.get("swd") or {}
+    gaps = 0
+    dropped = 0
+    for e in s.get("events") or []:
+        if e.get("type") == "gap":
+            gaps += 1
+            dropped += int(e.get("events_dropped") or 0)
+    return _tw2.coverage(lost_events=lost_now, gaps=gaps, dropped=dropped,
+                         note=note)
+
+
+def watch_test(spec: str = "", source: str = "swd", elf: str = "",
+               addr: str = "", link: str = "auto", limit: int = 0,
+               before: int = 3, after: int = 3, max_hits: int = 20,
+               min_count: int = 1, names: str = "", cpu_hz: int = 0) -> dict:
+    """在**已经录下来的**事件上跑一次条件（只看历史，不 arm、不等待）。
+
+    用来回答「这条条件在这段数据里命中几次 / 长什么样」，也是把条件写对了
+    再 arm 的预检。条件写错→报错（不静默不命中）。
+    """
+    from . import trwatch as _tw2
+    from . import trstats as _st
+    try:
+        sp = _tw2.parse(spec)
+    except _tw2.SpecError as e:
+        return {"ok": False, "error_code": "watch-spec-invalid", "error": str(e),
+                "fields": list(_tw2.FIELDS), "types": list(_tw2.EVENT_TYPES)}
+    got = _st.collect(source=source, elf=elf, addr=addr, limit=limit,
+                      names=names, link=link, cpu_hz=cpu_hz)
+    if not got.get("ok"):
+        return got
+    evs = got.get("events") or []
+    # collect 已按 source 归一化过（obj/op/op_name 都在），条件语言直接吃得下
+    res = _tw2.evaluate(evs, sp, start=0, min_count=min_count,
+                        max_hits=max_hits, before=before, after=after)
+    res["ok"] = True
+    res["source"] = got.get("source")
+    res["available"] = len(evs)
+    res["coverage"] = _watch_cov(_watch_lost_now())
+    if not evs:
+        res["empty"] = True
+        res["hint"] = ("这个来源里一条事件都没有——「没命中」在这里没有意义。"
+                       "先确认固件调过 mdk_trace_init()、插桩点被执行到、"
+                       "后端与主机读法匹配（trace_status / trace_guide）。")
+    return res
+
+
+def watch_arm(spec: str = "", min_count: int = 1, source: str = "swd",
+              cursor: str = "") -> dict:
+    """装上一个条件，并把游标放到当前位置（之前的历史不算命中）。
+
+    cursor="history" 的话从会话起点开始判（把「刚才那段里出现过没有」也纳入）。
+    """
+    from . import trwatch as _tw2
+    try:
+        sp = _tw2.parse(spec)
+    except _tw2.SpecError as e:
+        return {"ok": False, "error_code": "watch-spec-invalid", "error": str(e),
+                "fields": list(_tw2.FIELDS), "types": list(_tw2.EVENT_TYPES)}
+    s = _T.get("swd") or {}
+    n = len(s.get("events") or []) if source == "swd" else 0
+    c = 0 if str(cursor).strip().lower() in ("history", "all", "0") else n
+    _watch_reset_state(spec=sp, min_count=min_count, source=source, cursor=c,
+                       spec_desc=sp.describe())
+    _WATCH["lost_at_arm"] = _watch_lost_now(s)
+    return {"ok": True, "armed": True, "spec": sp.raw,
+            "spec_desc": sp.describe(), "min_count": _WATCH["min_count"],
+            "cursor": c, "session_events": n,
+            "lost_events_at_arm": _WATCH["lost_at_arm"],
+            "note": ("已装上。用 trace_watch(action=\"wait\") 等它命中（命中即返回"
+                     "命中事件 + 前后上下文 + 诊断结论），或 action=\"status\" 看进展。"
+                     + ("；本次从会话起点判（history）" if c == 0 and n else
+                        "；只判从现在起新出现的事件"))}
+
+
+def watch_status() -> dict:
+    if not _WATCH.get("spec"):
+        return {"ok": True, "armed": False,
+                "note": "当前没有装条件。trace_watch(action=\"arm\", spec=\"...\") 装上。"}
+    s = _T.get("swd") or {}
+    n = len(s.get("events") or [])
+    lost_now = _watch_lost_now(s)
+    out = {"ok": True, "armed": True, "spec": _WATCH["spec"], "spec_desc": _WATCH["spec_desc"],
+           "min_count": _WATCH["min_count"], "matches": _WATCH["matches"],
+           "triggered": bool(_WATCH.get("hit")),
+           "scanned": _WATCH["scanned"], "cursor": _WATCH["cursor"],
+           "session_events": n, "waited_rounds": _WATCH["rounds"],
+           "elapsed_ms": _WATCH["elapsed_ms"],
+           "lost_events_now": lost_now,
+           "lost_events_at_arm": _WATCH["lost_at_arm"]}
+    if lost_now > int(_WATCH.get("lost_at_arm") or 0):
+        out["coverage"] = _watch_cov(lost_now)
+    if _WATCH.get("hit"):
+        out["hit"] = _WATCH["hit"]
+    return out
+
+
+def watch_clear() -> dict:
+    had = bool(_WATCH.get("spec"))
+    _watch_reset_state()
+    return {"ok": True, "cleared": True, "was_armed": had}
+
+
+def watch_wait(spec: str = "", min_count: int = 1, timeout_ms: int = 5000,
+               pace_ms: int = 250, elf: str = "", addr: str = "", link: str = "auto",
+               before: int = 3, after: int = 3, max_hits: int = 5,
+               diagnose: bool = True, out_file: str = "") -> dict:
+    """等条件命中：反复搬一块、判一次，命中就返回（**这就是「通知 AI」的形态**）。
+
+    MCP 服务端不能主动唤醒模型，所以「通知」做成**有界长轮询**：一次调用等到命中
+    或超时为止，命中时把「命中事件 + 前后上下文 + 诊断结论」一次交回，AI 不必自己
+    翻事件列表。超时**不等于没发生**——覆盖度里写明这段是不是完整的。
+    """
+    import time as _time
+    from . import trwatch as _tw2
+    from . import trstats as _st
+    # 先判「等什么」再解析条件：既没 arm 也没给 spec 时，压根没有条件可解析，
+    # 报 watch-spec-invalid 会把「没装条件」伪装成「条件写错了」，方向完全错。
+    if not spec and not _WATCH.get("spec"):
+        return {"ok": False, "error_code": "watch-not-armed",
+                "error": "既没给 spec 也没 arm 过，不知道等什么",
+                "hint": "trace_watch(action=\"arm\", spec=\"sync,obj=cond,op=wait\") "
+                        "或 trace_watch(action=\"wait\", spec=\"...\")"}
+    try:
+        sp = _tw2.parse(spec or _WATCH.get("spec") or "")
+    except _tw2.SpecError as e:
+        return {"ok": False, "error_code": "watch-spec-invalid", "error": str(e),
+                "fields": list(_tw2.FIELDS), "types": list(_tw2.EVENT_TYPES)}
+    if spec:
+        s0 = _T.get("swd") or {}
+        _watch_reset_state(spec=sp, min_count=min_count, source="swd",
+                           cursor=len(s0.get("events") or []),
+                           spec_desc=sp.describe())
+        _WATCH["lost_at_arm"] = _watch_lost_now(s0)
+    else:
+        _WATCH["min_count"] = max(1, int(min_count or _WATCH["min_count"] or 1))
+    _WATCH["spec"] = sp.raw
+    _WATCH["spec_desc"] = sp.describe()
+
+    t0 = _time.time()
+    budget = max(0, int(timeout_ms)) / 1000.0
+    pace = max(0.05, min(2.0, int(pace_ms) / 1000.0))
+    last_err = None
+    while True:
+        _WATCH["rounds"] += 1
+        out = swd_read(elf=elf, addr=addr, link=link, limit=1,
+                       only_new=True, out_file=out_file)
+        if not out.get("ok"):
+            last_err = {k: out.get(k) for k in
+                        ("error", "error_code", "hint", "link", "addr")}
+            break
+        s = _T.get("swd") or {}
+        evs = s.get("events") or []
+        if len(evs) < _WATCH["cursor"]:
+            # 会话被裁剪（max_session_events）——游标越界，如实说，别静默从头重扫
+            _WATCH["cursor"] = 0
+            out.setdefault("notes", []).append(
+                "会话被裁剪过（超过 max_session_events），游标已回到 0 重新扫")
+        res = _tw2.evaluate(evs, sp, start=_WATCH["cursor"],
+                            min_count=_WATCH["min_count"], max_hits=max_hits,
+                            before=before, after=after)
+        _WATCH["matches"] += int(res["matches"])
+        _WATCH["scanned"] += int(res["scanned"]["count"])
+        _WATCH["cursor"] = len(evs)
+        if res["triggered"] and res["hits"]:
+            _WATCH["hit"] = res["hits"][0]
+            _WATCH["elapsed_ms"] = int((_time.time() - t0) * 1000)
+            payload = {"ok": True, "triggered": True, "spec": sp.raw,
+                       "spec_desc": sp.describe(),
+                       "elapsed_ms": _WATCH["elapsed_ms"],
+                       "rounds": _WATCH["rounds"],
+                       "matches": _WATCH["matches"],
+                       "hits": res["hits"],
+                       "hits_truncated": res["hits_truncated"],
+                       "hit": res["hits"][0],
+                       "unmatched_names": res.get("unmatched_names") or [],
+                       "coverage": _watch_cov(_watch_lost_now(s)),
+                       "events_scanned": _WATCH["scanned"],
+                       "session_events": len(evs)}
+            if diagnose:
+                try:
+                    d = _st.diagnose(source="swd", elf=elf, addr=addr, link=link,
+                                     with_stats=False)
+                    payload["diagnosis"] = {
+                        "verdict": d.get("verdict"),
+                        "summary": (d.get("summary") or {}).get("lines"),
+                        "findings": (d.get("findings") or [])[:8],
+                        "checked": len(d.get("checked") or []),
+                        "not_applicable": list((d.get("not_applicable") or {}).keys()),
+                        "note": "命中那一刻的整段会话诊断（with_stats=False）；"
+                                "findings 只给前 8 条，全量用 trace_diagnose"}
+                except Exception as e:                        # noqa: BLE001
+                    payload["diagnosis"] = {"ok": False, "error": str(e)}
+            return payload
+        if (time.time() - t0) >= budget:
+            _WATCH["elapsed_ms"] = int((time.time() - t0) * 1000)
+            cov = _watch_cov(_watch_lost_now(s))
+            note = ("在 %d ms 内（%d 轮、扫了 %d 条新事件）没有命中：%r。"
+                    "这是**「没测到」**。" % (_WATCH["elapsed_ms"],
+                                            _WATCH["rounds"],
+                                            _WATCH["scanned"], sp.raw))
+            if not _WATCH["scanned"]:
+                note += ("这段期间**一条新事件都没有**——条件不会命中；先确认目标在跑、"
+                         "插桩点被执行到（trace_swd_status / trace_status）。")
+            cov = dict(cov)
+            cov["note"] = note
+            payload = {"ok": True, "triggered": False, "spec": sp.raw,
+                       "spec_desc": sp.describe(),
+                       "elapsed_ms": _WATCH["elapsed_ms"],
+                       "rounds": _WATCH["rounds"],
+                       "matches": _WATCH["matches"],
+                       "events_scanned": _WATCH["scanned"],
+                       "session_events": len(evs),
+                       "coverage": cov,
+                       "hint": ("覆盖完整时可以说「这段时间内没发生」；"
+                                "coverage.complete=false 时只能说「已录下的部分里没有」。" +
+                                ("要等更久就把 timeout_ms 调大（单次上限 60000）。"
+                                 if int(timeout_ms) < 60000 else
+                                 "已经到单次等待上限：改成多次 wait，或先 trace_swd_reset "
+                                 "重开一段再等。"))}
+            return payload
+        _time.sleep(min(pace, max(0.0, budget - (time.time() - t0))))
+    return {"ok": False, "error_code": "watch-wait-failed",
+            "error": "等待期间搬运失败：%s" % (last_err or {}).get("error"),
+            "detail": last_err or {}, "rounds": _WATCH["rounds"]}
 
 def register(server, js=None) -> int:
     _js = js or _default_js
@@ -5096,6 +5365,81 @@ def register(server, js=None) -> int:
                                  granularity=granularity))
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
+    n += 1
+
+    @server.tool(
+        name="trace_watch",
+        title="条件触发：等一件事发生（命中即返回事件+上下文+诊断）",
+        description=(
+            "把「等某件事出现」做成一次调用，而不是反复搬一小段、人来扫几千条事件。\n"
+            "**判定在主机侧**：目标侧的 SWD 控制块只有 80 字节、没有 mask/filter/trigger "
+            "字段（实测），固件不做条件判定；而无缝流是**无损累积**的（未读区不被覆盖），"
+            "所以「两次调用之间错过的那段」照样能判——覆盖范围是整个会话已录部分。\n"
+            "**两个事件源同一套条件**：手动 `MDK_TRACE_*` 插桩事件（用你自己给的 id）与"
+            "内核自动钩子事件（sched/sync/heap/isr/fault 语义）走同一条流，不需要两套写法。\n"
+            "**action**：\n"
+            "  · `arm` 装上条件（spec=），游标放在当前位置（cursor=\"history\" 才连历史一起判）；\n"
+            "  · `wait` 等它命中——有界长轮询（timeout_ms 默认 5000、上限 60000，"
+            "pace_ms 默认 250）：命中就返回**命中事件 + 前后上下文 + 整段会话的诊断结论**，"
+            "不用你自己翻事件列表。MCP 服务端不能主动唤醒模型，「通知」就做成长轮询；\n"
+            "  · `test` 只对**已经录下来**的事件跑一次（预检条件写对了没、命中几次），不 arm；\n"
+            "  · `status` 看进展（扫了多少条、命中几次、期间丢没丢事件）；`clear` 卸掉。\n"
+            "**spec 语法**：`子句(,子句)*` 是「且」，`子句|子句` 是「或」。字段：\n"
+            "  `type`=fault/sched/sync/heap/isr/event/text/counter/mark/ts/kv/reset/raw/segment/gap、"
+            "`kind`=enter/exit/point/abort、`id`=原始事件 id（手插桩就是你插的 id）、"
+            "`arg`=数值负载、`obj`=sem/mutex/queue/event/fs/dev/cond、"
+            "`op`=wait/signal/acquire/release/timeout/create/delete/alloc/free、"
+            "`from`/`to`/`task`=任务号、`from_name`/`to_name`/`task_name`=任务名（会话解析出名字时）、"
+            "`class`=hardfault/memmanage/busfault/usagefault、`reg`=pc/lr/sp/hfsr/mmfar/bfar/xpsr/cfsr、"
+            "时间 `dt_cycles`/`cycles`/`t_us`。比较符 = != > >= < <=（缺省 =）。\n"
+            "  例：`fault`、`sync,obj=cond,op=wait`、`id=42`、`isr,id=10`、`t_us>=1500`、"
+            "`sched,to=3|sched,from=3`、`heap,op=alloc,size>=256`。\n"
+            "**写错字段名或枚举值一律报错**（附可用取值），不会静默变成「永不命中」——"
+            "那会把「条件写错了」伪装成「事情没发生」。\n"
+            "**没命中 ≠ 没发生**：目标因宿主跟不上丢过事件时（lost_events / gap），返回里的 "
+            "coverage.complete=false 并说明丢了多少——这时只能说「已录下的部分里没有」。"
+            "要下「没发生」的结论，先 trace_swd_reset 重开一段再等。\n"
+            "`min_count=N` 表示第 N 次命中才算触发；命中时附一份 `diagnosis`（整段会话的"
+            "规则诊断，findings 只给前 8 条，全量用 trace_diagnose）。"
+        ),
+    )
+    async def trace_watch(action: str = "status", spec: str = "",
+                          min_count: int = 1, timeout_ms: int = 5000,
+                          pace_ms: int = 250, elf: str = "", addr: str = "",
+                          link: str = "auto", before: int = 3, after: int = 3,
+                          max_hits: int = 5, source: str = "swd", limit: int = 0,
+                          names: str = "", cpu_hz: int = 0, diagnose: bool = True,
+                          cursor: str = "", out_file: str = "") -> str:
+        try:
+            act = str(action or "status").strip().lower()
+            if act in ("arm", "add", "set"):
+                return _js(watch_arm(spec=spec, min_count=min_count,
+                                     source=source, cursor=cursor))
+            if act in ("wait", "await", "block"):
+                return _js(watch_wait(spec=spec, min_count=min_count,
+                                      timeout_ms=min(60000, max(0, int(timeout_ms))),
+                                      pace_ms=pace_ms, elf=elf, addr=addr,
+                                      link=link, before=before, after=after,
+                                      max_hits=max_hits, diagnose=bool(diagnose),
+                                      out_file=out_file))
+            if act in ("test", "try", "dry-run", "dryrun", "check"):
+                return _js(watch_test(spec=spec, source=source, elf=elf, addr=addr,
+                                      link=link, limit=limit, before=before,
+                                      after=after, max_hits=max_hits,
+                                      min_count=min_count, names=names,
+                                      cpu_hz=cpu_hz))
+            if act in ("status", "state"):
+                return _js(watch_status())
+            if act in ("clear", "reset", "off"):
+                return _js(watch_clear())
+            return _js({"ok": False, "error_code": "watch-action-invalid",
+                        "error": "action 只能是 arm / wait / test / status / clear，"
+                                 "收到 %r" % (action,),
+                        "hint": "test=对已录事件预检；arm=装上；wait=等命中；"
+                                "status=看进展；clear=卸掉。"})
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error_code": "watch-failed",
+                        "error": "%s: %s" % (type(e).__name__, e)})
     n += 1
 
     return n

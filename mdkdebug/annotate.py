@@ -79,6 +79,9 @@ READONLY = {
     # 分析层（批次72）：在已有事件上算结论 / 跑规则，不改目标状态；
     # source="buff" 时也只读目标 RAM（trace_buff_dump 本身是只读）。
     "trace_stats", "trace_diagnose",
+    # 条件触发层（批次75）：test/status 只读已录事件与主机侧状态；arm/clear 只动主机侧
+    # 条件；wait 内部调 trace_swd_read（同样只搬字节 + 回报 drained 游标），不动用户数据。
+    "trace_watch",
     "trace_rtt_find", "trace_swo_read",
     # 可视化说明（批次59）：纯返回文本，不写任何文件。
     "view_guide",

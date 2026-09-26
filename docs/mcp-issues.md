@@ -432,3 +432,37 @@ pyelftools 走查交叉核对」，魔数改名 `MOCK_TCB_SIZE/MOCK_ENTRY_OFF`�
 
 回归用例：`tests/test_batch74.py`（24 项，含 `MDKDEBUG_SURFACE=off` 的 A/B 逐字段对照）；
 `tests/test_batch56.py` C1/C3/C6/C8 断言同步改为 lean（87 项）。
+
+---
+
+## 批次75 · 条件触发层 `trace_watch`（2026-09-26）
+
+**需求（用户原话）**：「mcp 上位机层应该可以做 trace 条件触发功能吧，这样触发了可以通知 AI，
+不用 AI 一点一点看，要插桩和自动钩子都支持」。
+
+**落点：主机侧**。目标侧 SWD 控制块只有 80 字节、**没有 mask/filter/trigger 字段**（实测），
+固件不做条件判定；SWD 无缝流本身无损累积，所以条件是在**主机侧对已录事件**求值，
+覆盖范围 = **整个会话已录部分**，不受「在第几次调用时开始监听」限制。
+
+| 件 | 内容 | 关键事实 |
+|---|---|---|
+| `mdkdebug/trwatch.py`（新） | 条件语言 + 求值 + 覆盖度 | 竖线=或、逗号=且、裸词=`type` 简写；字段表把 `id/arg/from/to/task/obj/size/dt_cycles/cycles/t_us/events_dropped` 当数值、`type/kind/class/reg` 当枚举、`*_name` 当字符串；`obj=cond` 与 `obj=6` 等价；事件里只有数字 `op` 时按 `SYNC_OPS`/`HEAP_OPS` 回退成名字 |
+| `trace.py`：`watch_test` | 在**已录事件**上预检 | 不改状态；零事件时给 `empty`+`hint`，**不把「没命中」当结论** |
+| `trace.py`：`watch_arm` / `status` / `clear` | 只装条件 | `cursor=len(events)`（历史不计）；`cursor="history"` 从会话起点算 |
+| `trace.py`：`watch_wait` | **「通知 AI」的形态** | 有界长轮询（`timeout_ms` ≤ 60000）：反复搬一块 + 判一次，命中即返回命中事件 + `before/after` 上下文 + `diagnosis`；超时返回 `coverage` |
+| `trace.py`：`swd_read` 补 `s["last_ctrl"]` | 让覆盖度诚实 | 不落这份读数，`lost_events` 恒为 0 ＝ 静默报「完整」 |
+| 工具注册 | `trace_watch`（action=arm/wait/test/status/clear） | 进 `trace` 组；默认面仍是 44 个，工具总数 199→**200** |
+
+**红线（沿用「宁可报错，也不给看似权威的错答案」）**：
+
+- **条件写错必须报错**（`watch-spec-invalid`，附可用字段/取值）——绝不静默变成一个永不命中的条件，
+  那会把「条件写错了」伪装成「事情没发生」。
+- **没命中 ≠ 没发生**：`coverage.complete=false` 时（目标丢过事件 / 会话被裁剪 / 期间一条新事件都没有）
+  只说「已录下的部分里没有」，要下「没发生」的结论先 `trace_swd_reset` 重开一段再等。
+- **既没 arm 也没给 spec** → `watch-not-armed`（不是 `watch-spec-invalid`）：压根没有条件可解析时，
+  报「条件写错了」会把排查方向带偏（这是首跑就抓到的一处，测试 D8 专门钉住）。
+
+**未做**（当时提出、未拍板）：控制块 id 白名单/掩码的**硬件侧**过滤。
+
+回归用例：`tests/test_batch75.py`（35 项：A 条件引擎 13 / B watch_test 4 / C arm-status-clear 5 /
+D watch_wait 8 / E 工具面 3 / F 动作校验 2）。

@@ -27,7 +27,7 @@ IMPORT、条件汇编、宏、`LDR =sym`+`BLX Rn`、无名 `BLX R3`、`B <import
   D 跨语言可见性（C 调汇编 exact vs name-only、汇编 IMPORT 调 C exact、GET 传递）
   E 诚实口径（parse_error 恒 0、unparsed 计数与样本、无名间接计数、盲区拆分）
   F 工具层（code_* 端到端 + 描述边界）
-  G 工具面：注册 199 / 默认面 44 / code 组 7 / 组数 12 / 高输出 48
+  G 工具面：注册 200 / 默认面 44 / code 组 7 / 组数 12 / 高输出 48
 
 运行：python -m tests.test_batch70
 """
@@ -534,7 +534,7 @@ def group_g():
     srv_all = SV.create_server(port=PORT_TOOL, toolsets="all")
     na = tool_names(srv_all)
 
-    check("G1 注册总数 199", len(na) == 199, len(na))
+    check("G1 注册总数 200", len(na) == 200, len(na))
     check("G2 默认只暴露 44 个", len(nd) == 44, len(nd))
     check("G3 code 组默认收起（7 个 code_* 都不在默认面）",
           not any(t.startswith("code_") for t in nd),
@@ -555,10 +555,10 @@ def group_g():
     srv_fresh = SV.create_server(port=PORT_DEF + 2, toolsets=None)
     cap = call_sync(srv_fresh, "capabilities", {})
     surf = cap.get("tool_surface") or {}
-    check("G9 capabilities 的 tool_surface 里 code=7 且列为「未装载」、总数 199",
+    check("G9 capabilities 的 tool_surface 里 code=7 且列为「未装载」、总数 200",
           (surf.get("groups") or {}).get("code") == 7
           and "code" in (surf.get("not_loaded_groups") or [])
-          and surf.get("registered_total") == 199, surf)
+          and surf.get("registered_total") == 200, surf)
 
 def main():
     print("批次70：汇编（.s/.S/.asm）进代码索引")

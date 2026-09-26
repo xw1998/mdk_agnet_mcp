@@ -234,7 +234,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 199 个工具定义
+│   └── server.py             # MCP Server 与 200 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -283,7 +283,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **199** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **200** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
 - **MDK 族（110 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
 - **非 MDK 族（68 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**、**任务表取名**，34 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
@@ -482,7 +482,7 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 | `ocd_gdb` | 借 GDB 批处理做一件 OpenOCD 原生不好做的事（可指定 `elf` 与 `gdb` 路径） | `commands`、`elf?`、`gdb?` 等 |
 | `ocd_log` | 读 OpenOCD 日志尾巴（可按 `keyword` 过滤），排查启动失败用 | `lines?`、`keyword?` |
 
-### trace（`trace_*`，33 个）
+### trace（`trace_*`，34 个）
 
 三条通路：**SWO/ITM**（经 TPIU 单线输出）、**RTT**（目标内存环形缓冲，主机侧自研读写，不依赖 SEGGER 上位机）、**SWD 采样**（`halt` 采 PC，明确标注侵入式）。三条通路解码出的事件（含 MTF 帧）汇入同一缓冲区，由 `trace_events` 统一取。
 
@@ -527,6 +527,7 @@ H7 双核（CM7 + CM4）、RP2040 双核（M0+ × 2）这类目标上，最容�
 | `trace_swd_tasks` | **任务名从哪来、为什么没名字，看这一个工具**：`tasks=` 的取名靠 DWARF 里 `svcrt_task_table` 的元素类型（`svcrt_task_t` 是**匿名 typedef 结构体**，`ElfIndex` 专门为它做了第三趟挂名）取出 `entry` 偏移，再逐槽读 TCB 的入口指针、**精确匹配** ELF 的函数首地址（不拿「最近的下方符号」顶——那会给跨镜像的地址安上一个像样的错名字）。返回逐槽 `entry`/`entry_addr`/`name`、`slots_read`/`named`/`nonempty`，以及 `read_mode`/`attempts`。**跨镜像的入口是合法的**：SVCrtOS 的 app/驱动是另外下发的镜像，它们的任务入口不在这份内核 `.axf` 里，这种槽位**留空不编**，并给 `unmapped_slots` + `hint`（想取名就把对应镜像的 `.axf` **一并**传给 `elf`——它支持多份，用 `;` 或 `,` 分隔，如 `elf="内核.axf;app.axf"`；或用 `names=` 手给）。多份镜像时布局/任务表取**第一个具备者**，名字从所有镜像按**精确函数首地址**匹配并记 `sym_from`（来自哪份）；**跨镜像的名字必须过内容核对**（板上该地址的机器码 == 那份 `.axf` 同地址的字节）才作数，核不过/核不了就丢名并计入 `unconfirmed_slots`——地址命中只证明「那地址在那份构建里是个函数首地址」，不证明**板上跑的就是那份构建**；任一路径不存在报 `tasks-elf-missing` 并点名。只有**所有**非空槽都落不到符号表里才整批拒绝 （`tasks-snapshot-inconsistent`）。首读是伪值会自动**停机重读一次**（`attempts=2`）。返回里 `elf` 是第一份、`elfs` 列出全部。下标 15 恒定不取名（0xF 被 idle 占），槽位 0 名固定 `idle` | `elf?`、`addr?`、`link?` |
 | `trace_stats` | **在已有事件上算结论**（不是新的采集后端）：把 MTF / SWD 会话 / buff 三类源归一化成统一事件模型，再算调度（逐任务 exec/占比/进出次数、CPU 负载、idle 占比）、同步原语（按 op 计数、按对象聚合、wait→signal/timeout 配对与等待时长 min/max/mean、没配上的 wait）、堆（分配/释放字节、净额、最大单次、未知尺寸）、中断（enter/exit 配对、时长、最慢的哪个 IRQ、超阈值数）、异常（类别 + CFSR 拆位）、断口与段重开、时间轴健康（dt min/max/mean、zero、frozen、长静默）。**两条硬规矩**：① 每个指标要么带 `basis`（依据），要么进 `not_applicable`（说明为什么算不了）；② **时间占比类只认目标侧时间基**——MTF（SWO/RTT）只有主机到达时刻、混着链路与主机调度抖动，一律落 `not_applicable`，绝不拿错时间基算一个看着正常的数。计数类（事件数/类型分布/同步次数/堆净额）任何源都算。`source=auto` **不隐式读设备**（要看目标 RAM 里的 buff 得显式 `source="buff"`）| `source?`、`elf?`、`addr?`、`limit?`、`names?`、`link?`、`cpu_hz?`、`isr_long_us?` |
 | `trace_diagnose` | **规则化诊断**：把 `trace_stats` 的事实过一遍 16 条规则，产出 findings（每条带 `severity` error/warn/info + `evidence` 最小证据 + `hint` 下一步），`verdict` 只有 problems / warnings / clean 三态（不编「健康分」）。规则覆盖 no-data / no-timeline / timebase-missing / dt-frozen / dt-zero-heavy / events-lost / segments-restarted / **kernel-hooks-absent**（有事件但没有任何内核事件——多半是 `MDK_TRACE_SVCRT_HOOKS` 没开，而不是「目标什么都没做」）/ no-sched / sched-no-time / isr-unpaired / isr-long / fault-present / sync-wait-unpaired / sync-pair-ambiguous / quiet-window。**`checked` 与 `not_applicable` 必须一起读**：`checked` 是**真的评估过**的规则、`not_applicable` 是没法评估的（带原因），只读 findings 会把「没查」当成「没问题」 | 同 `trace_stats`，另 `quiet_ratio?`、`with_stats?` |
+| `trace_watch` | **条件等待（批次75，「通知 AI」的形态）**：把「等某件事发生」告诉工具，别一点一点翻事件。MCP 服务端不能主动唤醒模型，所以做成**一次有界长轮询**（`action="wait"`，`timeout_ms` 上限 60000）：反复搬一块 + 判一次，命中即返回**命中事件 + 前后上下文（`before`/`after`）+ 整段会话的诊断结论**。条件语言一套管两种事件——**手动插桩事件**（自定 `id`，如 `id=42`）与**内核自动钩子事件**（`sched`/`sync`/`heap`/`isr`/`fault`）在同一条流上；**竖线表「或」、逗号表「且」**、裸词是 `type` 简写，例：`sync,obj=cond,op=wait`、`isr,id=10`、`t_us>=1500`、`heap,op=alloc,size>=256`。**字段/枚举写错一律报错**（附可用取值），不静默变成「永不命中」；先 `action="test"` 对已录事件预检、`arm` 只装条件（默认从当前位置起判）、`status` 看进展、`clear` 卸掉。**没命中 ≠ 没发生**：`coverage` 明说这段是不是完整的（目标丢过事件 / 会话被裁剪 / 期间一条新事件都没有 ⇒ `complete=false`） | `action?`、`spec?`、`min_count?`、`timeout_ms?`、`pace_ms?`、`before?`、`after?`、`max_hits?`、`elf?`、`addr?`、`link?`、`source?`、`limit?`、`names?`、`cpu_hz?`、`diagnose?`、`cursor?`、`out_file?` |
 
 ### 结果可视化（`view_*`，2 个）
 
@@ -620,13 +621,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-199 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 155 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+200 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 156 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 199 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 200 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -644,7 +645,7 @@ toolset(action="load",   toolsets="all")        # 一次全装 199 个（=full/*
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
 | `target` | 非 MDK：目标档案查询与自动识别、工程现场调试配置发现、多核目标列举与切换（7 个） |
 | `ocd` | 非 MDK：OpenOCD 会话 / 内存 / 寄存器 / 断点 / 烧录（17 个） |
-| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 函数运行时线录制 / 插桩组件部署（含目标侧缓冲后端、SWD 无缝流后端）/ 代码覆盖率 / ETM 能力探测（35 个） |
+| `trace` | 非 MDK：SWO / RTT / 采样 / DWT / 非侵入式 scope / 函数运行时线录制 / 插桩组件部署（含目标侧缓冲后端、SWD 无缝流后端）/ 代码覆盖率 / ETM 能力探测 / **条件等待 `trace_watch`**（38 个） |
 | `rtos` | RTOS 任务感知：任务列表 / 栈水位 / 队列信号量（3 个；跨 Keil 与 OpenOCD 两条链路） |
 | `code` | 代码结构索引（C/C++）：建/同步索引、符号检索、单符号源码体、文件清单、调用关系与影响面（7 个） |
 
@@ -658,8 +659,8 @@ toolset(action="load",   toolsets="all")        # 一次全装 199 个（=full/*
 |---|---|---|---|---|
 | 默认（`core` 组 + 元工具，描述 `lean`） | 44 | 约 2.2 万 | **约 3.9 万**（−56%） | 不设环境变量 |
 | **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 6 千** | **约 1.5 万** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
-| `all`（全装，描述默认 `lean`） | 199 | 约 10 万 | 约 20.1 万（−51%） | `toolset(toolsets="all")` |
-| `all` + `MDKDEBUG_DESC=min` | 199 | 约 6.5 万 | 约 16.6 万 | 工具全要，但描述只留一句摘要 |
+| `all`（全装，描述默认 `lean`） | 200 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=min` | 200 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
 | 上述任一档 + `MDKDEBUG_DESC=full` | — | 逐字节还原全文 | — | 要逐字完整说明时 |
 
 - **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。

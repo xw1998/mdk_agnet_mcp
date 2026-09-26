@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 199 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 200 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -167,7 +167,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 155 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 156 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。
@@ -277,6 +277,29 @@ trace_instrument(backend="buff", buff_records=2048, buff_ts_shift=0,
 （`MDK_TRACE_FAULT_CAPTURE()`，一次拿到 PC/LR/SP/xPSR + CFSR，性价比最高）→ 喂狗点与复位原因
 → 任务/上下文切换点 → 状态迁移点。高频中断最内层、被内联的小函数、时间敏感临界区不要插。
 
+### 等一件事发生：`trace_watch`（别一点一点翻事件）
+
+想确认「某个事件发生没发生」时，**不要反复 `trace_swd_read` 逐条扫**——把条件告诉工具，让它等：
+
+```
+trace_watch(action="wait", spec="sync,obj=cond,op=wait", timeout_ms=10000)
+```
+
+命中就把**命中事件 + 前后上下文 + 诊断结论**一次交回（`hit.event` / `hit.before` / `hit.after` /
+`hit.clause` / `diagnosis`）；没命中则给 `coverage`。**「通知 AI」= 一次有界长轮询**
+（MCP 服务端不能主动唤醒模型），`timeout_ms` ≤ 60000。
+
+- **条件语言一套管两种事件**：手动插桩事件（自定 `id`，如 `id=42`）与内核自动钩子事件
+  （`sched`/`sync`/`heap`/`isr`/`fault`）在同一条流上，`spec` 同时认 `id` 与语义字段。
+- **写法**：`|` 是或、`,` 是且、裸词是 `type` 简写。例：`fault`、`sync,obj=cond,op=wait`、
+  `isr,id=10`、`t_us>=1500`、`sched,to=3|sched,from=3`、`heap,op=alloc,size>=256`。
+  字段/枚举写错**一律报错**（附可用取值）——不静默变成「永不命中」。
+- **先预检再等**：`trace_watch(action="test", spec=…)` 在**已录事件**上试判，不改状态；
+  `arm` 只装条件（`cursor=len(events)`，历史不计；`cursor="history"` 从会话起点算）；
+  `status` 看进展；`clear` 卸掉。
+- **没命中 ≠ 没发生**：`coverage.complete=false`（目标丢过事件 / 会话被裁剪 / 一段新事件都没有）
+  时就只能说「已录下的部分里没有」。要下「没发生」的结论，先 `trace_swd_reset` 重开一段再等。
+
 ## 六、给人看图：`view_render` / `view_guide`
 
 上面采集回来的都是 JSON。要给人看（汇报、贴图、解释「为什么死在这」），**不要从头手写网页**——
@@ -331,6 +354,7 @@ view_guide(topic="howto")                # 不知道该配哪张图？先问它�
 | 要改 .sct / 校验分散加载文件 | `scatter_read` → `scatter_check` → `scatter_edit`（改前备份、改后重解析校验，校验不过不落盘） |
 | 想看任务切换 / 上下文切换的完整过程 | `trace_instrument(backend="buff")` 插桩 → 跑 → `trace_buff_dump`（全速录不停目标、10ns 粒度）。读回全 0 是「没读到」不是「没有」，先 `stop` |
 | 想看异常为什么死 | 在 handler 第一条指令放 `MDK_TRACE_FAULT_CAPTURE()`，事后 `trace_buff_dump` 拿 PC/LR/SP/xPSR + CFSR 分位 |
+| 想等「某件事发生」而不是一页一页翻事件 | `trace_watch(action="wait", spec="sync,obj=cond,op=wait")`（手动插桩与自动钩子共用一套条件）；不确定条件写没写对先 `action="test"` 预检 |
 | 要给人看波形/时间线/排名（不想手写网页） | `view_render(data_file=..., view="auto")`；不知配哪张图先 `view_guide(topic="views")` |
 
 ## 八、一条总原则

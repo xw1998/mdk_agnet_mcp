@@ -327,7 +327,7 @@ def group_f():
     print("F. 工具面与注册")
     srv_all = SV.create_server(port=PORT_TOOL, toolsets="all")
     na = tool_names(srv_all)
-    check("F1 注册总数 199", len(na) == 199, len(na))
+    check("F1 注册总数 200", len(na) == 200, len(na))
     check("F2 trace_stats / trace_diagnose 已注册",
           "trace_stats" in na and "trace_diagnose" in na, None)
     check("F3 两个新工具都在 trace 组里",
