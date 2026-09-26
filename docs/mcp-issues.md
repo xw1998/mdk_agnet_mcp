@@ -466,3 +466,23 @@ pyelftools 走查交叉核对」，魔数改名 `MOCK_TCB_SIZE/MOCK_ENTRY_OFF`�
 
 回归用例：`tests/test_batch75.py`（35 项：A 条件引擎 13 / B watch_test 4 / C arm-status-clear 5 /
 D watch_wait 8 / E 工具面 3 / F 动作校验 2）。
+
+## 批次76 · `toolset` 说明里的「11 个组」（2026-09-26）
+
+**形状**：`toolset` 是 AI 找工具面的入口，它 description 里手写着「本服务的工具按 **11 个组**
+划分」，后面还逐条枚举了 11 个组。`code` 组（批次68-70 的代码索引）加入后这句**没有同步**：
+实际 12 个组，枚举里也没有 `code`。README 与测试（`test_batch42` A5 / `test_batch47` A7）
+都已经是 12 —— 只有 AI 唯一会读到的那一份还停在 11。
+
+**为什么算缺陷**：这是「**看似权威的错答案**」。AI 读到会有两个后果：①拿到一个错的组数；
+②枚举里看不到 `code`，于是压根不知道「省 token 应对大型工程」的那一组存在——**功能不是没实现，
+是没被说出去**。
+
+**处置**：不是把 11 改成 12，而是把「组数 + 组名清单」改成**从 `toolbox.TOOLSETS` 现取**
+（`toolbox.group_catalog()` + `len(TOOLSETS)`），加组/删组描述自动跟着变，这一类腐烂不会再回来。
+
+**附带确认**（lean 档的边界）：lean 只保留描述的「段首 + 段末」，所以组**数**在默认档可见（段首），
+组**名清单**落在中段、要 full 档才看得到。测试据此分档断言（A 段默认档 / B 段 full 档），
+不要把「lean 里看不见」误判成「没写进去」。
+
+回归用例：`tests/test_batch76.py`（13 项：A 默认档组数 3 / B full 档枚举 3 / C catalog 3 / D 不变量 4）。

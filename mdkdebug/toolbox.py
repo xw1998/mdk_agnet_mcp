@@ -245,6 +245,29 @@ GROUP_NOTES = {
     "code": "代码结构索引：建/同步索引、符号检索、单符号源码体、文件清单、调用关系与影响面（C/C++）",
 }
 
+# `toolset` 工具描述里「组名 短标签」用的短名：默认取 GROUP_NOTES 冒号前那一段，
+# 只有那一段不够明确时才在这里覆盖。
+# 批次76：这份清单**不再手写**——组数与组名都从 TOOLSETS 现取，所以加组/删组后
+# 描述自动跟着变。此前是手写文本，「按 11 个组划分」在 code 组（批次68-70）加入后
+# 没同步（实际 12 个），枚举里也没有 code——AI 读到的是一份看似权威的错清单，
+# 还因此压根不知道代码索引那一组存在。
+SHORT_NOTES = {
+    "advanced": "异常/watch/SVD",
+    "trace": "SWO/RTT/变量时间线/插桩",
+}
+
+def group_catalog() -> str:
+    """`toolset` 描述用的「组名 短标签」全清单，按组名排序。
+
+    从 TOOLSETS 现取，保证「不漏组、不多组」——加组后描述自动跟着变。
+    """
+    parts = []
+    for g in sorted(TOOLSETS):
+        label = SHORT_NOTES.get(g) or (GROUP_NOTES.get(g) or "").split("：")[0] or "—"
+        parts.append("%s %s" % (g, label))
+    return "、".join(parts)
+
+
 
 def assigned_names() -> set:
     out = set()

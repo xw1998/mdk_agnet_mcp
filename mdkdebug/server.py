@@ -9962,27 +9962,34 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "action": action, "error": str(e)})
 
-    @server.tool(
-        name="toolset",
-        title="工具面装卸（按组按需加载工具）",
-        description=(
-            "本服务的工具按 11 个组划分，另有一个 **nano 极简档**（只暴露十几个最短入口），"
+    def _toolset_description() -> str:
+        """`toolset` 工具的说明：组数与「组名 短标签」清单都从 toolbox 现取（批次76）。
+
+        以前这里是手写文本 —— code 组（批次68-70 的代码索引）加入后，「按 11 个组划分」
+        这句没跟着改（实际 12 个），下面的枚举里也没有 code：AI 读到的是一份**看似权威的
+        错清单**，还会因此压根不知道那一组存在。改成现取后，加组/删组描述自动跟着变。
+        """
+        return (
+            "本服务的工具按 " + str(len(_toolbox.TOOLSETS)) + " 个组划分，"
+            "另有一个 **nano 极简档**（只暴露十几个最短入口），"
             "**默认只暴露 core 组**（调试核心 + 环境引导），其余组用到时现装——"
             "这样上下文里只放当前真正用得上的工具描述，工具多的时候这是省上下文的主要手段。"
             "action=status 看当前暴露了哪些组、各组多少个、还差什么；"
             "action=load 把 toolsets 指定的组装回来（例：toolsets=mem,trace，"
             "toolsets=all 一次全装，toolsets=nano 极简）；"
             "action=unload 把某组收起来（例：toolsets=trace）。"
-            "可用组与含义：core 调试核心/引导、mem 内存进阶、symbol 符号反汇编、"
-            "build 编译烧录、serial 串口、advanced 异常/watch/SVD、"
-            "toolchain 非MDK构建、target 目标档案、ocd OpenOCD、"
-            "trace SWO/RTT/变量时间线、rtos 任务感知。"
+            "可用组与含义：" + _toolbox.group_catalog() + "。"
             "**装卸后工具面立即变化，但很多 MCP 客户端缓存了工具列表**："
             "若装完仍报未知工具，先重新拉一次 tools/list 再调。"
             "list_tools / get_version / capabilities / toolset 这四个永远保留。"
             "**小上下文模型**：先 tools_groups() 看有哪些组，再 tools_load(group=...) "
             "现装；或直接以 MDKDEBUG_TOOLSETS=nano 启动，只暴露十几个最短入口。"
-        ),
+        )
+
+    @server.tool(
+        name="toolset",
+        title="工具面装卸（按组按需加载工具）",
+        description=_toolset_description(),
     )
     async def toolset_tool(action: str = "status", toolsets: str = "") -> str:
         try:
