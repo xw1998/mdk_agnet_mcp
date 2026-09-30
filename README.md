@@ -950,6 +950,12 @@ Copyright (c) 2026 <春雫>
   的能力边界对照
 - [agentic-hil/agentic-hil](https://github.com/agentic-hil/agentic-hil)：把真机当闸门的流程思路
   （与「实现 → mock → 真机 → 提交」同源）
+- [TaoCosmo-Dev/STM32_AutoDebug_Universal_Kit](https://github.com/TaoCosmo-Dev/STM32_AutoDebug_Universal_Kit)：
+  「编译 → 烧录 → 串口收结论」串成一条闭环入口的思路，以及上板前的工程体检（源文件编码、
+  中文字面量、Include/Define 一致性）。**只吸收了这 4 处真空白**（`build_flash_verify`、
+  `firmware_precheck`、uvprojx 的 `add_defines` / `set_debug_information`）；它的固件侧
+  回溯库（用 SWD 主动读 CFSR/BFAR/MMFAR/PC 更强，不必往目标塞代码）、退出码契约、
+  以 pyocd 为核心、工程生成/模板这四项**没有采纳**
 
 > 另有 [SAP/mdk-mcp-server](https://github.com/SAP/mdk-mcp-server) 是按关键词搜到的，核对后
 > 与 Keil 无关，**没有参考**，列在这里只是为了不让后来者重复调查。
