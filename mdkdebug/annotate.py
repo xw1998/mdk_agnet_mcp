@@ -96,6 +96,9 @@ READONLY = {
     # 复位观测：只读 DHCSR（+ 可选读一个复位标志寄存器），不停目标、不改状态。
     # sample_pc=true 时会短暂停一下再恢复，属瞬时副作用（与 wait_breakpoint 同口径）。
     "watch_reset",
+    # 固件契约预检（批次77）：只读工程文件与源码文本，查编码/字面量/令牌/
+    # 调试信息是否具备；不写文件、不碰目标。
+    "firmware_precheck",
 }
 
 # ----------------------------------------------------------------------
@@ -105,6 +108,8 @@ READONLY = {
 DESTRUCTIVE = {
     # Keil 侧
     "flash_download", "flash_debug", "build_and_flash", "clean_project",
+    # 闭环入口（批次77）：内部会编译并烧录，属不可逆那一档。
+    "build_flash_verify",
     "fill_mem", "write_peripheral", "close_uvision", "restart_keil",
     "reset", "set_breakpoint", "clear_all_breakpoints", "write_mem",
     "batch_debug_script",
@@ -124,6 +129,8 @@ NON_IDEMPOTENT = {
     "close_uvision", "ocd_start", "ocd_stop", "run", "run_timeout", "step",
     "wait_fault", "trace_instrument", "toolchain_env", "session_state",
     "uvprojx_edit", "batch", "batch_debug_script", "flash_debug",
+    # 闭环入口：编译 + 烧录 + 等令牌，重复调用不是「只做一次的效果」。
+    "build_flash_verify",
     # 渲染默认每次生成一个带时间戳的新文件（重复调用会攒出多个页面），
     # 因此不是幂等——与 session_state 同口径。
     "view_render",
@@ -149,6 +156,7 @@ MUTATING = {
     "clear_breakpoint", "clear_faults", "clear_uvoptx_breakpoints",
     "clear_watchpoint", "close_uvision", "dismiss_dialog", "dwt",
     "enter_debug", "exit_debug", "fill_mem", "flash_debug", "flash_download",
+    "build_flash_verify",
     "itm_trace", "keil_command", "launch_uvision", "ocd_bp", "ocd_cmd",
     "ocd_control", "ocd_flash", "ocd_gdb", "ocd_load", "ocd_reg", "ocd_start",
     "ocd_stop", "ocd_wp", "ocd_write_mem", "profile_function",

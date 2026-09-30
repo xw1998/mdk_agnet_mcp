@@ -84,7 +84,7 @@ def section_d():
     print("D. 工具面不变量")
     all_n = len(asyncio.run(SV.create_server(port=PORT, toolsets="all").list_tools()))
     core_n = len(asyncio.run(SV.create_server(port=PORT, toolsets="core").list_tools()))
-    check("D1 注册总数 200", all_n == 200, all_n)
+    check("D1 注册总数 202", all_n == 202, all_n)
     check("D2 默认面 44（core 38 + 6 个永远保留的入口）", core_n == 44, core_n)
     check("D3 core 组 38", len(TB.TOOLSETS["core"]) == 38, len(TB.TOOLSETS["core"]))
     check("D4 trace 组 38", len(TB.TOOLSETS["trace"]) == 38, len(TB.TOOLSETS["trace"]))

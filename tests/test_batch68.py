@@ -670,7 +670,7 @@ def group_f():
     srv_all = SV.create_server(port=PORT_TOOL, toolsets="all")
     na = tool_names(srv_all)
 
-    check("F1 注册总数 200", len(na) == 200, len(na))
+    check("F1 注册总数 202", len(na) == 202, len(na))
     check("F2 默认只暴露 44 个", len(nd) == 44, len(nd))
     check("F3 code 组默认收起（4 个 code_* 都不在默认面）",
           not any(t.startswith("code_") for t in nd), [t for t in nd if t.startswith("code_")])
@@ -698,7 +698,7 @@ def group_f():
     check("F10 capabilities 的 tool_surface 里 code 组 7 个且列为「未装载」",
           (surf.get("groups") or {}).get("code") == 7
           and "code" in (surf.get("not_loaded_groups") or [])
-          and surf.get("registered_total") == 200, surf)
+          and surf.get("registered_total") == 202, surf)
 
 
 def main():

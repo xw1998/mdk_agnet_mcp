@@ -81,6 +81,9 @@ TOOLSETS = {
         "uvprojx_read", "uvprojx_edit",
         "scatter_read", "scatter_edit", "scatter_check", "project_targets", "set_debug_target",
         "read_project_config",
+        # 批次77：固件契约预检（只读）与「编译→烧录→串口等令牌」闭环入口。
+        # 两者都围绕「这次烧进去的固件能不能自证跑起来了」，与编译烧录同场景。
+        "firmware_precheck", "build_flash_verify",
     },
     "serial": {
         "serial_list_ports", "serial_monitor_start", "serial_monitor_status",

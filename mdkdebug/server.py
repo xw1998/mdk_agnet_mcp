@@ -39,6 +39,8 @@ from . import keilkb as _keilkb
 from . import cmdscript as _cmdscript
 from . import svd as _svd
 from . import uvprojx as _uvprojx
+from . import precheck as _precheck
+from . import verify as _verify
 from . import session as _session
 from . import outctl as _outctl
 from . import toolchain as _toolchain
@@ -7210,6 +7212,147 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="firmware_precheck",
+        title="固件契约预检（上板之前）",
+        description=(
+            "上板**之前**的固件契约预检：只读、不碰硬件、不改任何文件，把「注定编不过 / 注定判不出来」"
+            "的事情先摆出来。四项检查：\n"
+            "① **AC5 + UTF-8 源文件里的非 ASCII 字符串字面量**——AC5（armcc）按本机代码页（中文 Windows 上是 GBK）"
+            "解析源文件，UTF-8 中文会被拆坏，报 **#8: missing closing quote**：**报错指向引号，还会连累下一行**"
+            "（实测：第 3 行的中文字面量让第 4 行也报 expected a \";\"），照报错改会把一行本来正确的代码改坏。"
+            "中文注释不受影响。AC6（armclang）工程该项为 not_applicable。\n"
+            "② **通过令牌**：源码里有没有那个「测试通过」令牌——没有它，闭环永远不可能判定成功，"
+            "超时看起来像「测试失败」其实只是「没等到那句话」。\n"
+            "③ **调试信息**：`<DebugInformation>` 关着的话编译不产出 DWARF，崩溃现场只剩一串地址。\n"
+            "④ **串口**：本机有没有串口——没有时能编译、能烧录、能读故障寄存器，但**「测试是否通过」无法判定**，"
+            "且多数缺陷（帧偏移、时钟配置错、从机地址错、状态机分支遗漏）程序照跑只是结果不对、"
+            "没有串口时完全不可见。\n"
+            "返回 verdict=ready/warn/blocked 与逐项 status/why/how_to_fix/findings。"
+            "build_flash_verify 判定失败时会自动附带这份清单。只读工具，可随时调。"
+        ),
+    )
+    async def firmware_precheck(project: str = "", target: str = "",
+                                token: str = "", port: str = "",
+                                max_files: int = 400) -> str:
+        try:
+            p = _resolve_project(project)
+            if not os.path.isfile(p):
+                return _js({"ok": False, "error": "工程文件不存在：%s" % p})
+            out = _precheck.precheck(p, target=str(target or "").strip(),
+                                     token=str(token or "").strip(),
+                                     port=str(port or "").strip(),
+                                     max_files=int(max_files or 400))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="build_flash_verify",
+        title="闭环上板验证（编译→开串口→烧录→等令牌→判定）",
+        description=(
+            "一次调用跑完闭环，并把**顺序**固化成代码：编译 → **先打开串口** → 记游标 → 烧录（复位并运行）→ "
+            "等通过令牌 → 判定。\n"
+            "顺序为什么是关键：固件复位后几十毫秒就输出启动信息，而主机打开串口要设备枚举，更慢——"
+            "「先烧录、再开串口」**必然丢掉启动段输出**，现象是固件明明正确却一直超时：一个纯时序问题，"
+            "会被读成固件缺陷，于是去改本来正确的代码。本工具先开串口再烧录，**一个字节都不丢**；"
+            "并用 `since` 游标保证缓冲区里的老日志不会算作本次命中。\n"
+            "判定（verdict）没有含糊档：**passed 只有一种走法——烧录之后真的收到令牌**，并带时间戳新鲜度证据"
+            "（旧固件还在刷的令牌会被判 token_stale）；no_output（一个字节都没新增：串口重定向/接线/波特率问题）"
+            "与 token_timeout（有输出但等不到令牌：可能测试没跑到输出点）**刻意分开**，因为两者下一步动作完全不同；"
+            "flash_failed 明确是探针/接线/供电/读保护问题，**别改源码**。\n"
+            "token 留空时只捕获启动输出、**不作通过/失败判定**（verdict=captured）——不把「没判据」伪装成「通过」。"
+            "token 默认 [ALL TESTS PASSED]，请传本工程实际用的那句（firmware_precheck 的 pass_token 项替你确认它存在）。\n"
+            "串口不可用时**不会烧录**（烧了也无法判定，只多一次不可复核的副作用）。"
+            "project/target 同 build_project；port 省略时取第一个串口（多候选会明示）；baud 默认 115200；"
+            "timeout_s 是等令牌的预算（默认 20 秒，初始化慢就调大）；build/flash 可置 false 以复用已有产物或只做采集；"
+            "release_serial 默认 false（留着串口，判定失败时方便 serial_read 续读）。"
+        ),
+    )
+    async def build_flash_verify(project: str = "", target: str = "",
+                                 port: str = "", baud: int = 115200,
+                                 token: str = "", timeout_s: float = 20.0,
+                                 build: bool = True, flash: bool = True,
+                                 release_serial: bool = False,
+                                 ensure_debug_channel: bool = True) -> str:
+        try:
+            p = _resolve_project(project)
+            uv4 = _builder_cfg["uv4"]
+            tgt = str(target or "").strip() or None
+            want = str(port or "").strip()
+            notes_pre = []
+            if not want:
+                _ports = serialmon.list_ports()
+                if not _ports:
+                    return _js({"ok": False, "verdict": "serial_unavailable",
+                                "verdict_meaning": _verify.VERDICTS["serial_unavailable"],
+                                "error": "本机未发现任何串口",
+                                "next_actions": ["接 USB-UART（TX/RX/GND 三根即可）；"
+                                                 "firmware_precheck 会说明缺串口时哪些判据不可得。"]})
+                want = _ports[0]
+                if len(_ports) > 1:
+                    notes_pre.append("本机有 %d 个串口，未指定 port 时取了 %s；不对就带 port 重调"
+                                     % (len(_ports), want))
+
+            def _build():
+                if uv4 is None:
+                    return {"ok": False, "error": "未定位到 UV4.exe，请用 --uv4-path 指定"}
+                return builder.build_project(uv4, p, tgt, builder.DEFAULT_BUILD_TIMEOUT)
+
+            def _flash():
+                if uv4 is None:
+                    return {"ok": False, "error": "未定位到 UV4.exe，请用 --uv4-path 指定"}
+                # 注意：这里刻意**不走** flash_download 工具层的收尾逻辑——
+                # 那一步会在烧录后立刻 stop 目标（退出旧调试会话），可能把刚开机的启动输出截断。
+                # 收尾挪到 expect 之后再做。
+                return builder.flash_download(uv4, p, tgt, builder.DEFAULT_FLASH_TIMEOUT,
+                                              ensure_debug_channel=ensure_debug_channel)
+
+            def _monitor():
+                st = dict(serialmon.start_monitor(want, baud=int(baud or 115200)))
+                st["port"] = st.get("port") or want
+                if st.get("state") == "error" or st.get("port_ready") is False:
+                    st["ok"] = False
+                return st
+
+            def _cursor():
+                return int(serialmon.status().get("next_seq") or 0)
+
+            def _expect(pattern, tmo, since):
+                return serialmon.expect(pattern, timeout_s=float(tmo or 0), since=since)
+
+            def _tail(n):
+                return serialmon.read(max_items=int(n or 20)).get("lines") or []
+
+            def _precheck_tail():
+                return _precheck.precheck(p, target=(tgt or ""), token=str(token or "").strip())
+
+            out = _verify.run_closed_loop(
+                build_fn=_build, flash_fn=_flash, monitor_start_fn=_monitor,
+                cursor_fn=_cursor, expect_fn=_expect, tail_fn=_tail,
+                precheck_fn=_precheck_tail,
+                token=str(token or ""), timeout_s=float(timeout_s or 0),
+                do_build=bool(build), do_flash=bool(flash),
+                release_serial=bool(release_serial))
+            if notes_pre:
+                out.setdefault("notes", []).extend(notes_pre)
+            if out.get("verdict") == "passed":
+                _note_firmware_event("build_flash_verify")
+                fw = _record_flashed_firmware(p, tgt or "", "build_flash_verify")
+                if fw.get("symbol_rebind"):
+                    out["symbol_rebind"] = fw["symbol_rebind"]
+            # 判定做完再收尾旧调试会话（符号已过期），避免提前 stop 截断启动输出
+            if do_flash and out.get("verdict") not in ("flash_failed", "serial_unavailable"):
+                try:
+                    out["debug_session"] = _post_flash_debug_state(_get_client(), do_exit=True)
+                except Exception as e:  # noqa: BLE001
+                    out["debug_session"] = {"error": str(e)}
+            if release_serial:
+                _release_serial("build_flash_verify 收尾", out)
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="flash_debug",
         description=(
             "「关旧 Keil→编烧→开新→进调试」一体闭环：先关闭所有 Keil 实例（避免残留旧工程窗口导致调试到旧代码），"
@@ -9487,13 +9630,19 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
 
     @server.tool(
         name="uvprojx_edit",
-        title="受控编辑 uVision 工程（加包含路径/加文件/按正则删除）",
+        title="受控编辑 uVision 工程（包含路径/文件/宏定义/调试信息）",
         description=(
             "改 .uvprojx 的**受控编辑**通道，专治「手工往工程里加一个 .c 文件」这种体力活。"
             "action 取值：`add_include_path`（paths=目录列表）、`del_include_path`（pattern=正则）、"
             "`add_files`（group + files，分组不存在会自动新建）、`remove_files`（pattern=正则，"
-            "匹配 FilePath）。project 为空用默认工程；target 为空用第一个 target。"
+            "匹配 FilePath）、`add_defines`（defines=逗号分隔的宏）、`del_defines`（pattern=正则）、"
+            "`set_debug_information`（enabled=true/false）。project 为空用默认工程；target 为空用第一个 target。"
             "paths/files 接受数组或逗号/分号分隔字符串。\n"
+            "• **`add_defines` 写进 C 编译器那一份 `<Cads>` 的 `<Define>`**——每个 target 的 `<Define>` 有"
+            "两处（Cads 与 Aads 汇编器），取错会把宏写进汇编器那份：编译看着过、行为却不对；"
+            "已存在的宏自动跳过（大小写不敏感）。\n"
+            "• **`set_debug_information`** 开关 Options→Output→Debug Information。关掉它不产出 DWARF，"
+            "一次崩溃就只剩一串地址；宁可显式打开。\n"
             "**三条真机约定，请照做**：\n"
             "1. **先读后写**：动手前先 uvprojx_read 看清现有分组名与包含路径，避免加出重复项；"
             "2. **一定留着备份**：默认 backup=true，写前把原文件复制成 `<工程名>.uvprojx.mdkdebug.bak`，"
@@ -9509,7 +9658,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def uvprojx_edit(action: str, project: str = "", target: str = "",
                            paths="", pattern: str = "", group: str = "",
-                           files="", backup: bool = True,
+                           files="", defines="", enabled: bool = True,
+                           backup: bool = True,
                            force: bool = False) -> str:
         try:
             p = _resolve_project(project)
@@ -9570,10 +9720,25 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                         "确认无误前不要删备份。建议把正则收紧，例如 /Src/mdk_.* 这类带目录前缀的写法。"
                         % len(_rm))
                 return _js(res)
+            if a == "add_defines":
+                items = _csv_tokens(defines)
+                if not items:
+                    return _js({"ok": False, "action": a,
+                                "error": "add_defines 需要 defines（逗号分隔的宏，如 USE_HAL_DRIVER,BOARD_V2）"})
+                return _js(_uvprojx.add_defines(p, items, target.strip(), backup=bk))
+            if a == "del_defines":
+                if not (pattern or "").strip():
+                    return _js({"ok": False, "action": a, "error": "pattern（正则）不能为空"})
+                return _js(_uvprojx.del_defines(p, pattern, target.strip(), backup=bk))
+            if a == "set_debug_information":
+                return _js(_uvprojx.set_debug_information(p, bool(enabled),
+                                                          target.strip(), backup=bk))
             return _js({"ok": False, "action": action,
                         "error": "未知 action %s" % action,
                         "available": ["add_include_path", "del_include_path",
-                                      "add_files", "remove_files"]})
+                                      "add_files", "remove_files",
+                                      "add_defines", "del_defines",
+                                      "set_debug_information"]})
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 

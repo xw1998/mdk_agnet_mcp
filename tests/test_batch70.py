@@ -534,7 +534,7 @@ def group_g():
     srv_all = SV.create_server(port=PORT_TOOL, toolsets="all")
     na = tool_names(srv_all)
 
-    check("G1 注册总数 200", len(na) == 200, len(na))
+    check("G1 注册总数 202", len(na) == 202, len(na))
     check("G2 默认只暴露 44 个", len(nd) == 44, len(nd))
     check("G3 code 组默认收起（7 个 code_* 都不在默认面）",
           not any(t.startswith("code_") for t in nd),
@@ -555,10 +555,10 @@ def group_g():
     srv_fresh = SV.create_server(port=PORT_DEF + 2, toolsets=None)
     cap = call_sync(srv_fresh, "capabilities", {})
     surf = cap.get("tool_surface") or {}
-    check("G9 capabilities 的 tool_surface 里 code=7 且列为「未装载」、总数 200",
+    check("G9 capabilities 的 tool_surface 里 code=7 且列为「未装载」、总数 202",
           (surf.get("groups") or {}).get("code") == 7
           and "code" in (surf.get("not_loaded_groups") or [])
-          and surf.get("registered_total") == 200, surf)
+          and surf.get("registered_total") == 202, surf)
 
 def main():
     print("批次70：汇编（.s/.S/.asm）进代码索引")

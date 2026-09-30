@@ -266,8 +266,8 @@ def section_e():
     names = [t.name for t in asyncio.run(srv.list_tools())]
     check("E2 不在默认面（默认面仍是 44 个，注意力预算不涨）",
           len(names) == 44 and "trace_watch" not in names, len(names))
-    check("E3 工具总数 == 200（新工具已注册且计入）",
-          len(SV.create_server(toolsets="all", port=PORT)._tool_manager._tools) == 200)
+    check("E3 工具总数 == 202（新工具已注册且计入）",
+          len(SV.create_server(toolsets="all", port=PORT)._tool_manager._tools) == 202)
 
 # ------------------------------------------------------------------ F
 def section_f():

@@ -691,7 +691,7 @@ def test_surface(server):
     r = asyncio.run(call(server, "list_tools", {}))
     tools = r.get("tools") or []
     names = [t.get("tool") if isinstance(t, dict) else t for t in tools]
-    check("E1 工具总数 200", len(names) == 200, len(names))
+    check("E1 工具总数 202", len(names) == 202, len(names))
     check("E1b 工程配置发现工具在册", "debug_config" in names)
     # target_ 前缀共 4 个：本批新增 target_list/show/guess 3 个，
     # 另有历史工具 target_info（MDK 侧调试目标信息），故计 4。

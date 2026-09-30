@@ -262,7 +262,7 @@ def group_f():
     print("F. 接线自检：三处烧录出口都要把 symbol_rebind 交给调用方")
     src = open(os.path.join(ROOT, "mdkdebug", "server.py"), encoding="utf-8").read()
     check("F1 flash_download / build_and_flash 都取返回值并透出",
-          src.count('out["symbol_rebind"] = fw["symbol_rebind"]') == 2,
+          src.count('out["symbol_rebind"] = fw["symbol_rebind"]') == 3,
           src.count('out["symbol_rebind"] = fw["symbol_rebind"]'))
     check("F2 flash_debug 的 payload 带 symbol_rebind（变量在 payload 前已初始化）",
           '"symbol_rebind": symbol_rebind,' in src
