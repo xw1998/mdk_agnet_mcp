@@ -7618,6 +7618,72 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="recover_project_exact",
+        title="固件逆向：出**字节精确**的可重链接工程（armasm + sct + 可选 .uvprojx），能自证",
+        description=(
+            "与 recover_project 的分工：那个出「能读能改的骨架」，这个出「**原样复刻**」——"
+            "判据不是看起来像，而是重新链接出来的 bin 与原镜像**逐字节相同**（用 recover_verify 自证）。\n"
+            "产物（目录必须不存在，逐文件回读 SHA-256）：\n"
+            "src/image_exact.s——把可加载字节按 AREA 逐个 DCB 复刻（原函数起点插地址标签，"
+            "**这不是可读源码**，指令在 asm/disassembly.asm）；\n"
+            "linker/recovered.sct——每个可加载块一个执行区，基址/大小取自原镜像，用段名选择器钉死；\n"
+            "<name>.uvprojx——由仓库内已知能编译的工程模板改造（器件是**占位**，烧录前必须改成你的芯片），"
+            "模板不在时**不出**而不是给一个没验证过的 XML；\n"
+            "Makefile.keil（armasm/armlink/fromelf）+ asm/disassembly.asm + include/recovered_symbols.h"
+            " + manifest.json（块表与 concatenated sha256）+ README.md。\n"
+            "口径：ELF 取 PT_LOAD 的 filesz（段才是「下载进 flash 的字节」的权威定义；按节表会把 .data 的"
+            "初始值摆到 RAM 地址上）；.lib/.a 与 .o 直接拒绝——重定位目标没有最终地址；"
+            "Cortex-M 的入口是向量表，不设 ELF entry（armlink 会警告 L6305W，属预期）。\n"
+            "**先跑 recover_verify 拿到 byte_identical=true 再谈「恢复成功」。**"
+        ),
+    )
+    async def recover_project_exact(path: str, out_dir: str, name: str = "recovered",
+                                    base: int = 0, device: str = "", vendor: str = "",
+                                    pack_id: str = "", emit_uvprojx: bool = True,
+                                    include_asm: bool = True,
+                                    max_asm_functions: int = 400,
+                                    max_functions: int = 4000) -> str:
+        try:
+            out = _recover.project_exact(
+                str(path or "").strip(), str(out_dir or "").strip(),
+                name=str(name or "recovered") or "recovered",
+                base=int(base or 0), device=str(device or ""),
+                vendor=str(vendor or ""), pack_id=str(pack_id or ""),
+                emit_uvprojx=bool(emit_uvprojx), include_asm=bool(include_asm),
+                max_asm_functions=int(max_asm_functions or 400),
+                max_functions=int(max_functions or 4000))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_verify",
+        title="固件逆向：用真工具链重链接一遍，逐字节比对（byte_identical 才是结论）",
+        description=(
+            "把 recover_project_exact 出的工程**真的编译/链接一次**，再与原镜像的 bin 逐字节比对：\n"
+            "默认 armasm → armlink（按 linker/recovered.sct）→ fromelf --bin；\n"
+            "via_uvprojx=true 时改用 UV4 -b 编译生成的那份 .uvprojx（证据最强：同时证明工程文件可用）；\n"
+            "期望字节优先由 fromelf 抽原镜像（独立证据），没有原镜像时如实说明「本次没有独立证据」。\n"
+            "返回 byte_identical / expected 与 actual 的 size+sha256 / diff.diff_offsets（bin 内偏移，"
+            "加 base 才是地址）/ 每一步的 cmd 与 stderr。\n"
+            "任何一步失败都报 failed_step 与该步输出，不给「大概成功」。\n"
+            "会往 <project_dir>/build/ 写中间产物（所以不是只读工具）。"
+        ),
+    )
+    async def recover_verify(project_dir: str, image: str = "", base: int = 0,
+                             arm_bin: str = "", via_uvprojx: bool = False,
+                             timeout_s: float = 240.0) -> str:
+        try:
+            out = _recover.verify_project(
+                str(project_dir or "").strip(), str(image or "").strip(),
+                base=int(base or 0), arm_bin=str(arm_bin or ""),
+                via_uvprojx=bool(via_uvprojx),
+                timeout_s=float(timeout_s or 240.0))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="flash_debug",
         description=(
             "「关旧 Keil→编烧→开新→进调试」一体闭环：先关闭所有 Keil 实例（避免残留旧工程窗口导致调试到旧代码），"

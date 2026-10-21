@@ -90,6 +90,9 @@ TOOLSETS = {
         # 批次79：工程级逆向。与 build 同场景——「这份产物到底是个什么工程、
         # 能不能从中重建出可编译的骨架」。全部不进默认面（recover_project 会写文件）。
         "recover_probe", "recover_symbols", "recover_disasm", "recover_project",
+        # 批次80：字节精确的重链接工程 + 自证。recover_project_exact 会写文件、
+        # recover_verify 会写 build/ 并调 armasm/armlink/UV4，两者都不进默认面。
+        "recover_project_exact", "recover_verify",
     },
     "serial": {
         "serial_list_ports", "serial_monitor_start", "serial_monitor_status",

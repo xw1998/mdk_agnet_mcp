@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.4）
+│   ├── __init__.py           # 包初始化（版本号 0.2.5）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -234,7 +234,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 208 个工具定义
+│   └── server.py             # MCP Server 与 210 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -283,7 +283,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **208** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **210** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
 - **MDK 族（110 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
 - **非 MDK 族（68 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**、**任务表取名**，34 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
@@ -621,13 +621,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-208 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 164 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+210 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 166 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 208 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 210 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -639,7 +639,7 @@ toolset(action="load",   toolsets="all")        # 一次全装 208 个（=full/*
 | `core` | 进出调试 / 运行控制 / 状态 / 跨会话状态 / 环境一致性体检、符号工程绑定、断点硬件残留校验、复位循环识别、可视化出图（38 个） |
 | `mem` | 内存与外设读写 / D-Cache 一致性维护（11 个） |
 | `symbol` | 符号与源码定位（7 个；`set_symbol_file`/`list_symbol_projects` 已上移 `core`） |
-| `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑 / 固件契约预检、闭环验证 / 镜像取证 / 固件逆向出工程骨架（24 个） |
+| `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑 / 固件契约预检、闭环验证 / 镜像取证 / 固件逆向（骨架与字节精确复刻）（26 个） |
 | `serial` | 宿主机串口监听与命令应答 + Modbus 主站（14 个） |
 | `advanced` | 诊断 / 剖析 / SVD / 工程编辑 / 复位循环识别等进阶能力（26 个） |
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
@@ -659,8 +659,8 @@ toolset(action="load",   toolsets="all")        # 一次全装 208 个（=full/*
 |---|---|---|---|---|
 | 默认（`core` 组 + 元工具，描述 `lean`） | 44 | 约 2.2 万 | **约 3.9 万**（−56%） | 不设环境变量 |
 | **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 6 千** | **约 1.5 万** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
-| `all`（全装，描述默认 `lean`） | 208 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
-| `all` + `MDKDEBUG_DESC=min` | 208 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
+| `all`（全装，描述默认 `lean`） | 210 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=min` | 210 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
 | 上述任一档 + `MDKDEBUG_DESC=full` | — | 逐字节还原全文 | — | 要逐字完整说明时 |
 
 - **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。
@@ -1017,6 +1017,36 @@ Copyright (c) 2026 <春雫>
   每个文件回读 SHA-256 并写进报告（`sha256_verified`）。
 - **不恢复**：C 源码、结构体布局、参数个数与类型、局部变量名、宏、内联函数边界、中断优先级配置。
   这些不是「还没做」，是这份输入里**不存在**的信息。
+
+### 字节精确复刻层（批次80）
+
+批次79 的工程**从来没有被真工具链编过**，产物里也没有原代码——那只能叫「骨架」。批次80 换判据：
+不再说「能编译」，而是**重新链接出来的 bin 与原镜像逐字节相同**。这一步的口径是这样的：
+
+| 问题 | 口径 |
+|---|---|
+| 复刻什么 | ELF 的 `PT_LOAD` 段的 `filesz`。**段**才是「下载进 flash 的字节」的权威定义；按节表会把 `.data` 的 64 字节初值摆到 RAM 地址 `0x20000000` 上，链接结果就与原镜像不同了 |
+| 怎么复刻 | `src/image_exact.s`：每块一个 `AREA \|.recNN\|, CODE, READONLY` + 逐行 16 字节 `DCB`。**不反汇编回源码**——反汇编文本无法保证原字节（字面量池、对齐、`adr` 都会被改写成等价但不同的编码）；可读指令另给 `asm/disassembly.asm` |
+| 地址怎么钉死 | `linker/recovered.sct`：每块一个 `LR_ROMn`/`ER_ROMn`，基址/大小取原值，用 `*.o (.recNN)` 选择器钉死。**不用 `*(+RO)`**（放置顺序由链接器定，块一多就会挪位） |
+| 判据 | `recover_verify` 的 `byte_identical`。期望字节优先由 `fromelf --bin` 抽**原镜像**（独立证据），不给「自己比自己」的循环论证；没传原镜像时如实说「本次没有独立证据」 |
+| 长度差一点怎么办 | armasm 的 AREA 至少 4 字节对齐，原镜像长度不是 4 的倍数时会多出 1~3 个**全零**尾字节。这不算内容差异，但也绝不悄悄吞掉：只在「前缀逐字节相同 + 多出的部分全是 0 + 不超过 3 字节」时记为 `diff.alignment_padding=N`，否则照样判不同 |
+| 入口点 | **不发 `ENTRY`**：Cortex-M 的入口是向量表里的复位地址，ELF entry 不参与启动。armasm 的 `ENTRY` 在整段 DCB 的 AREA 上会被 armlink 判 `L6204E: Entry point does not point to an instruction`；反过来 armlink 会警告 `L6305W`（没有入口点），那是**预期**，`notes` 里会写明 |
+| `.lib` / `.o` | **直接拒绝**：重定位目标的地址是节内偏移，出工程只会误导。先链接成 axf 再来 |
+| 工程文件 | `recover_project_exact` 默认出 `.uvprojx`，做法是**改造仓库内那份已知能编译的模板**（改器件/输出名/ScatterFile/文件组/RTE 目标名），不凭空写 XML；模板不在时**不出**而不是给一份没验证过的东西。`<umfTarg>` 必须强制为 `0`——`1` 是「用 Target 对话框的内存布局」，它会忽略 ScatterFile 自己生成一份 scatter，一编译就 `L6236E: No section matches selector` |
+| 工具链从哪来 | `armasm`/`armlink`/`fromelf` 三路定位：显式目录 → `MDK_ARMCC_BIN` → 从 `UV4.exe` 反推 `<root>\ARM\ARMCC\bin`。找不到就报错并列出试过哪些目录，不猜 |
+
+产物：`src/image_exact.s`、`linker/recovered.sct`、`Makefile.keil`、`<name>.uvprojx`、
+`include/recovered_symbols.h`、`asm/disassembly.asm`、`manifest.json`（块表 + 拼接 SHA-256）、
+`README.md`。两个工具分工：
+
+```
+recover_project_exact(path, out_dir, name="recovered", base=0, device="", emit_uvprojx=true)
+recover_verify(project_dir, image="", arm_bin="", via_uvprojx=false)
+```
+
+`recover_project`（骨架，能读能改）与 `recover_project_exact`（复刻，能自证）**并存而不合并**：
+一份用来读和改，一份用来证。`via_uvprojx=true` 时 `recover_verify` 改用 `UV4 -b` 编译**生成的
+那份工程文件**，证据最强——同时证明「工程文件可用」与「字节一致」。
 
 ### 底层库
 

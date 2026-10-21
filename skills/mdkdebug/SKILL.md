@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 208 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 210 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -126,7 +126,21 @@ recover_probe(file)                          # 先看容器、架构、向量表
 recover_symbols(file, deep=true)             # 函数清单（observed/inferred/weak 三档置信）
 recover_disasm(file, symbol="main")          # 按符号或地址区间反汇编（需要 capstone）
 recover_project(file, out_dir="...")         # 出 sct/ld/头文件/startup/stub/反汇编/map/report
+recover_project_exact(file, out_dir="...")   # 出**字节精确可重链接**工程（armasm + sct + uvprojx）
+recover_verify(project_dir, image=file)      # 真工具链重链接，逐字节比对（byte_identical）
 ```
+
+**先自证再用**：`recover_project_exact` 自己不说成功，判据是 `recover_verify` 的
+`byte_identical=true`。两条路分工：`recover_project` 出「能读能改的骨架」，
+`recover_project_exact` 出「原样复刻、能证明」。要点：
+- 复刻的是 `PT_LOAD` 的 `filesz`（段才是进 flash 的字节），不是节表；
+- 期望字节优先由 `fromelf --bin` 抽原镜像（独立证据），没传 `image` 时工具会明说
+  「本次没有独立证据」；
+- `diff.alignment_padding` 是 armasm 的 4 字节对齐填充（原镜像长度不是 4 的倍数时），
+  不算差异；其余任何长度/字节不同都判 `false`；
+- `armlink` 的 `L6305W`（没有入口点）是**预期**：Cortex-M 入口在向量表里；
+- 产物的 `.uvprojx` 是模板改造来的，**器件是占位**，烧录前必须改成你的芯片；
+- `.lib` / `.o` 仍被拒（重定位目标没有最终地址）。
 
 要点：
 - **三档置信要当真**：`observed` 来自 `symtab`/DWARF；`inferred` 来自向量表或 `bl` 目标；
@@ -188,7 +202,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 164 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 166 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。

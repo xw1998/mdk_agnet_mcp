@@ -501,8 +501,8 @@ def group_c():
     restore_root()
 
     # 工具面没被本批改坏
-    check("C22 注册总数 208、code 组仍是 7（批次72/75 只在 trace 组加分析层与条件等待）",
-          len(ds) == 208 and TB.TOOLSETS.get("code") == {
+    check("C22 注册总数 210、code 组仍是 7（批次72/75 只在 trace 组加分析层与条件等待）",
+          len(ds) == 210 and TB.TOOLSETS.get("code") == {
               "code_index", "code_status", "code_files", "code_query", "code_node",
               "code_relations", "code_impact"}, (len(ds), TB.TOOLSETS.get("code")))
 

@@ -35,7 +35,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import struct
+import subprocess
 
 # ---- 上限：都是「防呆」，不是「性能调优」 ----
 MAX_INPUT_BYTES = 128 * 1024 * 1024   # 与批次78 的镜像取证同口径
@@ -1965,3 +1967,787 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
     r["limits"] = ["反汇编只说明「这些字节被解码成这些指令」；"
                    "数据被误当代码（字面量池、跳转表）时会产出看着正常的垃圾指令"]
     return r
+
+
+# ======================================================================
+# 批次80：字节精确的可重链接工程（+ 用真工具链自证的 recover_verify）
+#
+# 批次79 出的是「骨架」：能编译，但里面没有原来的代码。这一节出的是
+# 「重链接复现」：把原镜像的可加载字节按 AREA 复刻，用 armasm/armlink 重新
+# 链接，再用 fromelf --bin 与原镜像的 bin 逐字节比对。**比对通过 = 地址、
+# 布局、符号位置都对**；比对不过就如实报第一处差异，不粉饰。
+# ======================================================================
+
+ARM_TOOLS = ("armasm", "armlink", "fromelf")
+
+# Keil 安装根下的工具链子目录（AC5 优先：批 79/80 的载体是 ARMCC 5 生成的 axf）
+_ARM_BIN_SUBDIRS = (
+    os.path.join("ARM", "ARMCC", "bin"),
+    os.path.join("ARM", "ARMCLANG", "bin"),
+    os.path.join("ARM", "ARMCC", "bin64"),
+)
+
+
+def find_arm_tools(explicit: str = "") -> dict:
+    """定位 armasm / armlink / fromelf。
+
+    三路来源，**按顺序**：调用方显式目录 → 环境变量 ``MDK_ARMCC_BIN`` →
+    从 ``UV4.exe`` 反推安装根 + ``<root>\\ARM\\ARMCC\\bin``。
+
+    找不到时**不猜**：返回 ``ok=False`` 与试过哪些地方，让上层明确报错。
+    """
+    cands: list[str] = []
+    if explicit:
+        cands.append(explicit)
+    env = os.environ.get("MDK_ARMCC_BIN") or os.environ.get("ARMCC_BIN") or ""
+    if env:
+        cands.append(env)
+    tried: list[str] = []
+    try:
+        from . import builder as _builder  # noqa: PLC0415
+        found = _builder.find_uv4_detailed(None)
+        uv4 = found.get("uv4") or ""
+        if uv4:
+            # <root>\UV4\UV4.exe → <root>\ARM\ARMCC\bin
+            root = os.path.dirname(os.path.dirname(uv4))
+            for sub in _ARM_BIN_SUBDIRS:
+                cands.append(os.path.join(root, sub))
+    except Exception as exc:  # noqa: BLE001
+        tried.append("从 UV4 反推失败：%s" % exc)
+
+    for d in cands:
+        if not d:
+            continue
+        tried.append(d)
+        tools = {t: os.path.join(d, t + (".exe" if os.name == "nt" else ""))
+                 for t in ARM_TOOLS}
+        if all(os.path.isfile(p) for p in tools.values()):
+            return {"ok": True, "bin_dir": d, "tools": tools,
+                    "version": _arm_tool_version(tools["armasm"]), "tried": tried}
+    return {"ok": False, "bin_dir": "", "tools": {}, "tried": tried,
+            "error": "找不到 armasm/armlink/fromelf（试过 %d 个目录）" % len(tried),
+            "hint": "装 Keil MDK（含 ARMCC 5）或设 MDK_ARMCC_BIN=<...\\ARM\\ARMCC\\bin>；"
+                    "只有 GNU 工具链时请用 linker/recovered.ld + Makefile"}
+
+
+def _arm_tool_version(armasm: str) -> str:
+    """取 armasm 版本行（只用于报告；取不到就空串，不算失败）。"""
+    try:
+        out = subprocess.run([armasm, "--vsn"], capture_output=True, text=True,
+                             errors="replace", timeout=30)
+        text = (out.stdout or "") + (out.stderr or "")
+        for line in text.splitlines():
+            if "version" in line.lower():
+                return line.strip()[:80]
+        return text.strip().splitlines()[0][:80] if text.strip() else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def load_chunks(unit: "Unit") -> list[dict]:
+    """**可加载字节**的分块（按地址升序）。
+
+    口径：ELF 用 ``PT_LOAD`` 段的 ``filesz``（段是"下载进 flash 的字节"的权威定义，
+    节的 vaddr 会把 RAM 里的 .data 也报成 0x20000000 而字节其实在 ROM）；HEX/BIN 整块一块。
+
+    为什么不用节表：MDK 的 axf 里 ``RW_IRAM1``(PROGBITS) 的 vaddr 是 0x20000000，
+    但它的 64 字节初始值实际存放在 0x080036EC 的 ROM 里。按节表复刻会把同一批字节
+    放到 RAM 地址上，链接结果就与原镜像不同了。
+    """
+    out: list[dict] = []
+    if unit.elf:
+        segs = [s for s in unit.elf.get("segments") or []
+                if s.get("filesz") and s.get("offset") is not None]
+        segs.sort(key=lambda s: (s.get("paddr") or s["vaddr"]))
+        for i, s in enumerate(segs):
+            raw = unit.data[s["offset"]:s["offset"] + s["filesz"]]
+            if not raw:
+                continue
+            addr = int(s.get("paddr") or s["vaddr"])
+            out.append({"addr": addr, "size": len(raw), "data": raw,
+                        "name": "seg%d" % i, "load_addr": addr,
+                        "vaddr": int(s["vaddr"]), "exec": bool(s["flags"] & 0x1)})
+        if out:
+            return out
+        for i, s in enumerate(unit.elf.get("sections") or []):
+            if not s.get("alloc") or s["type_name"] == "NOBITS" or not s["size"]:
+                continue
+            raw = unit.data[s["offset"]:s["offset"] + s["size"]]
+            if raw:
+                out.append({"addr": s["addr"], "size": len(raw), "data": raw,
+                            "name": "sec%d" % i, "load_addr": s["addr"],
+                            "vaddr": s["addr"], "exec": bool(s.get("exec"))})
+        return out
+    return [{"addr": unit.base, "size": len(unit.data), "data": unit.data,
+             "name": "image", "load_addr": unit.base, "vaddr": unit.base,
+             "exec": True}]
+
+
+def data_copies(unit: "Unit", chunks: list[dict]) -> list[dict]:
+    """.data 的「从 flash 拷到 RAM」目标表（只报告，不参与复刻）。
+
+    原固件的启动代码本来就会做这件事；这份表是给**人**核对用的：
+    字节在 ROM 的哪里、要搬到 RAM 的哪里、搬多少。
+    """
+    if not unit.elf:
+        return []
+    flash_lo = min((c["addr"] for c in chunks), default=0)
+    flash_hi = max((c["addr"] + c["size"] for c in chunks), default=0)
+    out = []
+    for s in unit.elf.get("sections") or []:
+        if not s.get("alloc") or not s.get("writable") or s["type_name"] == "NOBITS":
+            continue
+        if not s["size"]:
+            continue
+        if flash_lo <= s["addr"] < flash_hi:
+            continue                      # 本来就在 ROM 里，不用搬
+        out.append({"section": s["name"], "dst": "0x%08X" % s["addr"],
+                    "size": s["size"],
+                    "note": "初始值在镜像的可加载字节里；运行期由原启动代码拷到该地址"})
+    return out
+
+
+def _exact_symbol_labels(unit: "Unit", lo: int, hi: int) -> list[dict]:
+    """给精确复刻的 DCB 插入标签/注释用的函数清单（按地址升序）。"""
+    try:
+        funcs = symbol_table(unit)["functions"] if unit.elf else []
+    except Exception:  # noqa: BLE001
+        funcs = []
+    out = []
+    for f in funcs:
+        a = f["addr"]
+        if lo <= a < hi:
+            out.append({"addr": a, "name": f["name"], "size": f.get("size") or 0})
+    out.sort(key=lambda f: f["addr"])
+    return out
+
+
+def _exact_asm(unit: "Unit", chunks: list[dict]) -> str:
+    """生成 armasm 源码：每个可加载块一个 AREA，字节逐个 DCB，原函数起点插标签。
+
+    为什么用 DCB 而不是反汇编文本：反汇编文本**无法保证原字节复现**
+    （字面量池、对齐、adr 都被反汇编器改写成了等价但不同的编码）。
+    这一份的用途是"把原固件重新链接出来"，所以只求字节一致；可读的指令在
+    ``asm/disassembly.asm`` 里另给。
+    """
+    L = []
+    L.append("; 由 mdkdebug recover_project_exact 生成（批次80）")
+    L.append("; 这不是可读源码：字节逐个 DCB，目的是**重新链接出与原镜像逐字节相同的 bin**。")
+    L.append("; 函数标签只是地址锚点，函数体语义没有恢复；要读指令请看 asm/disassembly.asm。")
+    L.append("")
+    L.append("        PRESERVE8")
+    L.append("        THUMB")
+    L.append("")
+    used: set = set()
+    for idx, c in enumerate(chunks):
+        lo = c["addr"]
+        hi = lo + c["size"]
+        area = ".rec%02d" % idx
+        L.append("; ---- 可加载块 %d：0x%08X .. 0x%08X（%d 字节）----"
+                 % (idx, lo, hi, c["size"]))
+        L.append("        AREA    |%s|, CODE, READONLY, ALIGN=2" % area)
+        labels = {f["addr"]: f["name"] for f in _exact_symbol_labels(unit, lo, hi)}
+        data = c["data"]
+        for off in range(0, len(data), 16):
+            addr = lo + off
+            if addr in labels:
+                name = _c_name(labels[addr], used)
+                L.append("f_%s" % name)
+            row = data[off:off + 16]
+            L.append("        DCB     " + ",".join("0x%02X" % b for b in row))
+        L.append("")
+    # 不给 ENTRY：Cortex-M 的入口是**向量表里的复位地址**，不是 ELF entry；
+    # armasm 的 ENTRY 在这种「整段 DCB」的 AREA 上会被 armlink 判成
+    # 「does not point to an instruction」（L6204E），而那是我们自己造的麻烦。
+    L.append("        END")
+    return "\n".join(L) + "\n"
+
+
+def _exact_sct(chunks: list[dict], ram: dict | None, note: str) -> str:
+    """精确 sct：每个可加载块一个执行区，用输入段名选择器**钉死**放置位置。
+
+    不用 ``*(+RO)``：那个选择器的放置顺序由链接器决定，块一多就可能挪位；
+    这里每块单独一个 ``ER_xxxx`` + ``*(.recNN)`` 选择器，地址与大小都是原值。
+    """
+    L = []
+    L.append("; 由 mdkdebug recover_project_exact 生成（批次80）——%s" % note)
+    L.append("; 每个执行区的基址/大小取自原镜像的可加载块；**不要手工改这些数字**，")
+    L.append("; 改了 recover_verify 会立刻报出第一处差异。")
+    L.append("")
+    for idx, c in enumerate(chunks):
+        size = _round_up(c["size"], 4)
+        L.append("LR_ROM%d 0x%08X 0x%08X  {" % (idx, c["addr"], size))
+        L.append("  ER_ROM%d 0x%08X 0x%08X  {" % (idx, c["addr"], size))
+        L.append("   *.o (.rec%02d)" % idx)
+        L.append("  }")
+        L.append("}")
+        L.append("")
+    if ram and ram.get("start") is not None:
+        L.append("; 原镜像的 RAM 初值（.data）由原启动代码搬运；这里留一个空 RAM 区，")
+        L.append("; 只为让链接器知道 RAM 窗口（复刻的是 flash 内容，RAM 内容运行期才有）。")
+        L.append("LR_RAM 0x%08X 0x%08X  {" % (ram["start"], ram.get("size") or 0x1000))
+        L.append("  RW_IRAM1 0x%08X 0x%08X  {" % (ram["start"], ram.get("size") or 0x1000))
+        L.append("   .ANY (+RW +ZI)")
+        L.append("  }")
+        L.append("}")
+        L.append("")
+    return "\n".join(L)
+
+
+def _keil_makefile(name: str) -> str:
+    """给 Keil 工具链的构建脚本（与 GNU 的 Makefile 并存，互不覆盖）。"""
+    return """\
+# 由 mdkdebug recover_project_exact 生成（批次80）——字节精确重链接
+# 用法：make -f Makefile.keil   （需 armasm/armlink/fromelf 在 PATH，或设 ARM_BIN）
+# 产物：build/%(name)s.axf + build/%(name)s.bin；后者应与原镜像的 bin 逐字节相同。
+
+ARM_BIN ?= $(dir $(shell where armasm 2>NUL))
+ASM     := $(ARM_BIN)armasm
+LINK    := $(ARM_BIN)armlink
+ELF2BIN := $(ARM_BIN)fromelf
+NAME    := %(name)s
+BUILD   := build
+
+all: $(BUILD)/$(NAME)s.bin
+
+$(BUILD):
+	mkdir $(BUILD)
+
+$(BUILD)/image_exact.o: src/image_exact.s | $(BUILD)
+	$(ASM) --32 --thumb -o $@ $<
+
+$(BUILD)/$(NAME)s.axf: $(BUILD)/image_exact.o linker/recovered.sct
+	$(LINK) --scatter linker/recovered.sct --info sizes -o $@ $<
+
+$(BUILD)/$(NAME)s.bin: $(BUILD)/$(NAME)s.axf
+	$(ELF2BIN) --bin -o $@ $^
+
+clean:
+	rm -rf $(BUILD)
+
+.PHONY: all clean
+""" % {"name": name}
+
+
+def _uvprojx_text(template: str, name: str, asm_rel: str, sct_rel: str,
+                  device: str = "", vendor: str = "", pack_id: str = "") -> str:
+    """把仓库里那份**已知能编译**的工程模板改造成单文件 asm 工程。
+
+    只改五处：器件（可留空=模板原值）、输出名、分散加载文件、文件组、RTE 目标名。
+    改模板而不是凭空写 XML：Keil 的工程文件里有一堆会被校验的默认项，
+    少一个就弹「工程文件非法」，而我看不到 UI。
+    """
+    text = template
+    if device:
+        text = re.sub(r"<Device>[^<]*</Device>", "<Device>%s</Device>" % device, text, count=1)
+    if vendor:
+        text = re.sub(r"<Vendor>[^<]*</Vendor>", "<Vendor>%s</Vendor>" % vendor, text, count=1)
+    if pack_id:
+        text = re.sub(r"<PackID>[^<]*</PackID>", "<PackID>%s</PackID>" % pack_id,
+                      text, count=1)
+    text = re.sub(r"<OutputName>[^<]*</OutputName>",
+                  "<OutputName>%s</OutputName>" % name, text, count=1)
+    # 注意：re.sub 的**替换串**会解释反斜杠转义（\r 变回车）——本文件里凡是
+    # 带 Windows 路径的替换一律走 lambda，否则 Keil 拿到的是一条断掉的路径。
+    text = re.sub(r"<OutputDirectory>[^<]*</OutputDirectory>",
+                  lambda _m: "<OutputDirectory>build\\</OutputDirectory>", text, count=1)
+    text = re.sub(r"<ScatterFile>[^<]*</ScatterFile>",
+                  lambda _m: "<ScatterFile>%s</ScatterFile>" % sct_rel, text, count=1)
+    # umfTarg=1 是「用 Target 对话框里的内存布局」，它会**忽略 ScatterFile** 自己生成
+    # 一份 scatter（并要求 RESET 段）——真机踩过：工程能打开、一编译就 L6236E。
+    text = re.sub(r"<umfTarg>[^<]*</umfTarg>", "<umfTarg>0</umfTarg>", text, count=1)
+    group = ("""\
+      <Groups>
+        <Group>
+          <GroupName>Recovered</GroupName>
+          <Files>
+            <File>
+              <FileName>image_exact.s</FileName>
+              <FileType>2</FileType>
+              <FilePath>%s</FilePath>
+            </File>
+          </Files>
+        </Group>
+      </Groups>""" % asm_rel).replace("\n      <Files>", "\n      <Files>")
+    # 整段替换 <Groups>…</Groups>（非贪婪，只第一处）
+    # 用 lambda 做替换：替换串里有 Windows 反斜杠路径，直接传会被当转义序列
+    text = re.sub(r"<Groups>.*?</Groups>", lambda _m: group, text, count=1, flags=re.S)
+    text = re.sub(r"<targetInfo name=\"[^\"]*\"", "<targetInfo name=\"%s\"" % name, text)
+    text = re.sub(r"<LayName>[^<]*</LayName>", "<LayName>%s</LayName>" % name, text, count=1)
+    return text
+
+
+def _exact_readme(an: dict, chunks: list[dict], copies: list[dict],
+                  verify_hint: str) -> str:
+    L = []
+    L.append("# 字节精确的重链接工程：%s" % os.path.basename(an["path"]))
+    L.append("")
+    L.append("> 由 mdkdebug `recover_project_exact` 生成（批次80）。")
+    L.append("> **这份工程的判据只有一条：重新链接出来的 bin 与原镜像的 bin 逐字节相同。**")
+    L.append("> 通过与否不靠我说，跑 `recover_verify` 看 `byte_identical`。")
+    L.append("")
+    L.append("## 1. 输入身份")
+    L.append("")
+    L.append("| 项 | 值 |")
+    L.append("| --- | --- |")
+    L.append("| 路径 | `%s` |" % an["path"])
+    L.append("| 大小 | %d 字节 |" % an["size"])
+    L.append("| SHA-256 | `%s` |" % an["sha256"])
+    L.append("")
+    L.append("## 2. 复刻的可加载块")
+    L.append("")
+    L.append("| # | 起始地址 | 长度 | 说明 |")
+    L.append("| --- | --- | --- | --- |")
+    for i, c in enumerate(chunks):
+        L.append("| %d | `0x%08X` | %d | %s |"
+                 % (i, c["addr"], c["size"],
+                    "可执行" if c.get("exec") else "只读数据"))
+    L.append("")
+    if copies:
+        L.append("## 3. .data 的搬运目标（只报告，不参与复刻）")
+        L.append("")
+        L.append("| 节 | RAM 目标 | 长度 |")
+        L.append("| --- | --- | --- |")
+        for c in copies:
+            L.append("| `%s` | `%s` | %d |" % (c["section"], c["dst"], c["size"]))
+        L.append("")
+        L.append("这些字节已经在 ROM 的可加载块里；运行期由**原固件的启动代码**搬过去。"
+                 "本工程没有重建启动代码，所以烧进去能跑到原来那一步，"
+                 "但 RAM 初值要靠原代码自己搬。")
+        L.append("")
+    L.append("## 4. 怎么用")
+    L.append("")
+    L.append("```")
+    L.append("recover_verify(project_dir=..., image=...)   # 先自证：byte_identical 应为 true")
+    L.append("make -f Makefile.keil                        # armasm + armlink + fromelf")
+    L.append("```")
+    L.append("")
+    L.append(verify_hint)
+    L.append("")
+    L.append("## 5. 这份工程**没有**恢复什么")
+    L.append("")
+    L.append("- 可读的 C/汇编源码：`src/image_exact.s` 是 DCB 字节表，指令在 `asm/disassembly.asm`；")
+    L.append("- 函数边界之外的东西：寄存器约定、参数个数与类型、结构体布局、宏、中断优先级；")
+    L.append("- 启动代码与 .data 搬运：原代码自带，这里不重建也不改动；")
+    L.append("- 可编译的 C 骨架：那是 `recover_project` 的产物，两者用途不同（一份能改，一份能证）。")
+    L.append("")
+    return "\n".join(L)
+
+
+def _ram_window(unit: "Unit", chunks: list[dict]) -> dict | None:
+    if not unit.elf:
+        return None
+    rw = [s for s in unit.elf.get("sections") or []
+          if s.get("alloc") and (s.get("writable") or s["type_name"] == "NOBITS")
+          and s["size"] and s["addr"] >= 0x20000000]
+    if not rw:
+        return None
+    lo = min(s["addr"] for s in rw)
+    hi = max(s["addr"] + s["size"] for s in rw)
+    return {"start": lo, "size": _round_up(hi - lo)}
+
+
+def project_exact(path: str, out_dir: str, *, name: str = "recovered",
+                  base: int = 0, device: str = "", vendor: str = "",
+                  pack_id: str = "", emit_uvprojx: bool = True,
+                  include_asm: bool = True, max_asm_functions: int = 400,
+                  **kw) -> dict:
+    """出「字节精确 + 可重链接」的工程（批次80）。
+
+    与 :func:`build_project` 的分工：
+    - ``build_project``：可读、可改的**骨架**（stub + 头文件 + 启动表），编译得过、
+      但里面没有原代码；
+    - ``project_exact``：**原样复刻**，重新链接出的 bin 与原镜像逐字节相同（用
+      :func:`verify_project` 自证），代价是源码不可读。
+    """
+    data, err = _read_file(path)
+    if err:
+        return err
+    _kind = detect_container(data[:4096])
+    if _kind == "ar":
+        return {"ok": False,
+                "error": "这是 ar 归档（.lib/.a）：成员是可重定位目标文件，地址是**节内偏移**，"
+                         "不是最终地址——直接复刻会得到一个地址全错的工程",
+                "hint": "先用 recover_probe 看成员清单，再对单个成员用 recover_disasm；"
+                        "把归档链接成 axf（Keil 里编译工程）之后再对 axf 用本工具"}
+    unit = _unit_from_data(data, os.path.basename(path), base)
+    if unit.relocatable:
+        return {"ok": False,
+                "error": "这是可重定位目标文件（ET_REL，如 .o / 库成员）：没有最终地址，无法复刻",
+                "hint": "对单个目标文件用 recover_disasm 看指令；要出可链接工程请给已链接的 axf/elf"}
+    chunks = load_chunks(unit)
+    if not chunks:
+        return {"ok": False, "error": "没有可加载字节：这份输入里找不到能复刻的区间"}
+    dest = os.path.abspath(out_dir)
+    if os.path.exists(dest):
+        return {"ok": False,
+                "error": "输出目录已存在：%s" % dest,
+                "hint": "出件绝不复用目录（不覆盖既有证据）；换一个不存在的路径"}
+    os.makedirs(dest)
+
+    # 要出可读反汇编就得做交叉引用扫描（deep）；只要字节复刻时可以关掉（快）
+    an = analyze(path, base=base, deep=bool(include_asm),
+                 max_functions=int(kw.get("max_functions") or MAX_FUNCTIONS),
+                 max_insns=int(kw.get("max_insns") or MAX_INSNS))
+    files: list = []
+    copies = data_copies(unit, chunks)
+    ram = _ram_window(unit, chunks)
+
+    _emit(dest, "src/image_exact.s", _exact_asm(unit, chunks), files)
+    _emit(dest, "linker/recovered.sct",
+          _exact_sct(chunks, ram, "布局来自原镜像的可加载块"), files)
+    _emit(dest, "Makefile.keil", _keil_makefile(name), files)
+
+    funcs = (an.get("_recover") or {}).get("functions") or []
+    used: set = set()
+    hdr = ["/* 自动生成（mdkdebug recover_project_exact，批次80）。",
+           " *",
+           " * 地址来自原镜像；**函数原型与参数没有恢复**，一律按无参 void 登记。",
+           " * 这些是 flash 里的地址常量，可直接用于调试器/上位机对位。 */",
+           "#ifndef RECOVERED_SYMBOLS_H", "#define RECOVERED_SYMBOLS_H", ""]
+    for f in funcs[:600]:
+        hdr.append("#define ADDR_%s 0x%08Xu  /* %s, %s */"
+                   % (_c_name(f["name"], used).upper(), f["addr"] & ~1,
+                      f.get("confidence", "?"), f.get("source", "?")))
+    hdr += ["", "#endif", ""]
+    _emit(dest, "include/recovered_symbols.h", "\n".join(hdr), files)
+
+    # 可读反汇编（与精确复刻并存：一份能证、一份能读）
+    asm_note = "未生成（include_asm=false）"
+    if include_asm:
+        try:
+            r = disasm_text(unit, funcs[:max(0, int(max_asm_functions))],
+                            max_insns=int(kw.get("max_insns") or MAX_INSNS))
+            if r.get("ok") and r.get("text"):
+                _emit(dest, "asm/disassembly.asm", r["text"], files)
+                asm_note = "asm/disassembly.asm（%d 个函数 / %d 条指令）" % (
+                    min(len(funcs), int(max_asm_functions)), r.get("insn_count") or 0)
+            else:
+                asm_note = "未生成：%s" % (r.get("error") or "反汇编为空")
+        except Exception as exc:  # noqa: BLE001
+            asm_note = "生成失败：%s" % exc
+
+    uv_note = "未生成"
+    if emit_uvprojx:
+        tmpl = _uvprojx_template()
+        if not tmpl.get("ok"):
+            uv_note = "未生成：%s" % tmpl.get("error")
+        else:
+            text = _uvprojx_text(tmpl["text"], name, r"src\image_exact.s",
+                                 r"linker\recovered.sct", device, vendor, pack_id)
+            _emit(dest, "%s.uvprojx" % name, text, files)
+            uv_note = "%s.uvprojx（器件 %s——%s）" % (
+                name, device or tmpl.get("device") or "模板原值",
+                "按参数设置" if device else "占位：编译不受影响，**烧录前必须改成本机芯片**")
+    else:
+        uv_note = "未生成（emit_uvprojx=false）"
+
+    an2 = {"path": os.path.abspath(path), "size": len(data),
+           "sha256": sha256_bytes(data), "arch": unit.arch}
+    hint = ("**先跑 `recover_verify(project_dir=\"%s\", image=\"%s\")`**："
+            "`byte_identical=true` 才说明这份工程真的复刻了原镜像。" % (dest, os.path.abspath(path)))
+    _emit(dest, "README.md", _exact_readme(an2, chunks, copies, hint), files)
+
+    manifest = {
+        "format": "mdkdebug.recover_exact/1",
+        "input": {"path": os.path.abspath(path), "size": len(data),
+                  "sha256": sha256_bytes(data)},
+        "name": name,
+        "base": chunks[0]["addr"],
+        "chunks": [{"index": i, "addr": "0x%08X" % c["addr"], "size": c["size"],
+                    "sha256": sha256_bytes(c["data"]),
+                    "area": ".rec%02d" % i} for i, c in enumerate(chunks)],
+        "expected_bin": {"concat_sha256": sha256_bytes(b"".join(c["data"] for c in chunks)),
+                         "total": sum(c["size"] for c in chunks)},
+        "sct": "linker/recovered.sct",
+        "asm": "src/image_exact.s",
+        "data_copies": copies,
+        "arch": unit.arch,
+        "uvprojx": uv_note,
+        "notes": [
+            "复刻的是 flash 里的可加载字节，不是语义",
+            "判据是 recover_verify 的 byte_identical，不是「看起来像」",
+        ],
+    }
+    _emit(dest, "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+          files)
+
+    return {"ok": True,
+            "out_dir": dest,
+            "name": name,
+            "input": manifest["input"],
+            "chunks": manifest["chunks"],
+            "files": files,
+            "file_count": len(files),
+            "uvprojx": uv_note,
+            "asm": asm_note,
+            "next_actions": [hint,
+                             "自证通过后再改：Want 改代码就改 asm/disassembly.asm 里那一份，"
+                             "但那样就不再逐字节相同了"],
+            "limits": [
+                "DCB 复刻 = 原字节原样，不表示这些字节的语义被恢复",
+                "启动代码与 .data 搬运沿用原固件，本工程不重建",
+                "多段 ROM（含间隔）时各段独立成区，与原镜像的拼接方式可能不同——以 verify 为准",
+            ]}
+
+
+def _uvprojx_template() -> dict:
+    """仓库内已知能编译的工程模板（只做文本改造，不凭空生成 XML）。"""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    p = os.path.join(root, "example_mdk_project", "mdk_test", "MDK-ARM",
+                     "mdk_test.uvprojx")
+    if not os.path.isfile(p):
+        return {"ok": False,
+                "error": "仓库内没有工程模板（%s）：宁可不出 uvprojx，也不给一个没验证过的 XML"
+                         % p}
+    with open(p, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    m = re.search(r"<Device>([^<]*)</Device>", text)
+    return {"ok": True, "path": p, "text": text, "device": m.group(1) if m else ""}
+
+
+def _run(cmd: list[str], cwd: str, timeout: float = 180.0) -> dict:
+    """跑一条工具链命令，把 stdout/stderr 都带回来（不吞错误）。"""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                           errors="replace", timeout=timeout)
+        return {"ok": p.returncode == 0, "rc": p.returncode,
+                "stdout": (p.stdout or "")[-4000:], "stderr": (p.stderr or "")[-4000:],
+                "cmd": " ".join(cmd)}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "rc": None, "error": "超时（%.0fs）" % timeout,
+                "cmd": " ".join(cmd)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "rc": None, "error": str(exc), "cmd": " ".join(cmd)}
+
+
+def _diff_summary(a: bytes, b: bytes, limit: int = 8) -> dict:
+    n = min(len(a), len(b))
+    offs = []
+    for i in range(n):
+        if a[i] != b[i]:
+            offs.append(i)
+            if len(offs) >= limit:
+                break
+    return {"length_expected": len(a), "length_actual": len(b),
+            "same_prefix_len": (offs[0] if offs else n),
+            "diff_offsets": offs,
+            "diff_count_first_scan": len(offs),
+            "byte_identical": (len(a) == len(b) and not offs)}
+
+
+def _build_via_keil(dest: str, name: str, timeout_s: float) -> dict:
+    """用 UV4 批处理编译**生成的 .uvprojx**（证明这份工程文件本身可用）。
+
+    UV4 的退出码：0 无错无警告 / 1 有警告但产物已生成 / ≥2 有错。
+    只认 0/1 为成功，且以「产物文件真的存在」为准，不靠退出码猜。
+    """
+    try:
+        from . import builder as _builder  # noqa: PLC0415
+        uv4 = _builder.find_uv4(None)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": "定位 UV4 失败：%s" % exc}
+    if not uv4:
+        return {"ok": False, "error": "找不到 UV4.exe：无法用 Keil 验证工程文件"}
+    proj = os.path.join(dest, "%s.uvprojx" % name)
+    if not os.path.isfile(proj):
+        return {"ok": False, "error": "目录里没有 %s.uvprojx" % name}
+    log = os.path.join(dest, "build", "keil_build.log")
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    r = _run([uv4, "-b", proj, "-j0", "-o", log], dest, timeout_s)
+    text = ""
+    try:
+        with open(log, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        text = (r.get("stdout") or "") + (r.get("stderr") or "")
+    ok = r.get("rc") in (0, 1)
+    return {"ok": bool(ok), "rc": r.get("rc"), "uv4": uv4, "log_path": log,
+            "log": text[-3000:], "cmd": r.get("cmd"),
+            "interpretation": ("UV4 rc=%s（0=无警告，1=有警告但产物已生成，≥2=有错误）"
+                               % r.get("rc"))}
+
+
+def verify_project(project_dir: str, image: str = "", *, base: int = 0,
+                   arm_bin: str = "", timeout_s: float = 240.0,
+                   keep_build: bool = True, via_uvprojx: bool = False) -> dict:
+    """**用真工具链重链接一遍**，再与原镜像的 bin 逐字节比对。
+
+    这是「工程级恢复」的判据本身：
+
+    1. ``armasm`` 汇编 ``src/image_exact.s``；
+    2. ``armlink`` 按 ``linker/recovered.sct`` 链接；
+    3. ``fromelf --bin`` 出 bin；
+    4. 与原镜像的 bin 比（ELF 用 ``fromelf --bin`` 抽，HEX 解码，BIN 直读）；
+    5. 报 ``byte_identical`` 与第一处差异偏移。
+
+    任何一步失败都**如实返回那一步的命令与 stderr**——不给「大概成功」。
+    """
+    dest = os.path.abspath(project_dir)
+    man_path = os.path.join(dest, "manifest.json")
+    if not os.path.isfile(man_path):
+        return {"ok": False,
+                "error": "目录里没有 manifest.json：%s" % dest,
+                "hint": "这份目录不是 recover_project_exact 的产物；"
+                        "骨架工程（recover_project）没有可重链接的字节表，无法这样自证"}
+    try:
+        with open(man_path, "r", encoding="utf-8") as f:
+            man = json.load(f)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": "manifest.json 读不出来：%s" % exc}
+
+    tools = find_arm_tools(arm_bin)
+    steps: list = []
+    if not tools.get("ok"):
+        return {"ok": False, "error": tools.get("error"),
+                "hint": tools.get("hint"), "tried": tools.get("tried"),
+                "manifest_input": man.get("input")}
+
+    build = os.path.join(dest, "build")
+    os.makedirs(build, exist_ok=True)
+    name = man.get("name") or "recovered"
+    asm = man.get("asm") or "src/image_exact.s"
+    sct = man.get("sct") or "linker/recovered.sct"
+    obj = os.path.join(build, "image_exact.o")
+    axf = os.path.join(build, "%s.axf" % name)
+    binf = os.path.join(build, "%s.bin" % name)
+
+    for f in (axf, binf):
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except OSError:
+            pass
+
+    notes_entry = ""
+    if via_uvprojx:
+        # 走 Keil：编译**生成的工程文件**本身，再拿它的产物比对。
+        # 这一路的证据最强——它同时证明了「工程文件可用」与「字节一致」。
+        kb = _build_via_keil(dest, name, timeout_s)
+        steps.append({"step": "UV4 -b（编译生成的 .uvprojx）",
+                      "ok": kb.get("ok"), "rc": kb.get("rc"),
+                      "cmd": kb.get("cmd"), "stderr": kb.get("log") or "",
+                      "interpretation": kb.get("interpretation")})
+        if not kb.get("ok"):
+            return {"ok": False, "failed_step": "keil_build", "steps": steps,
+                    "error": kb.get("error") or "Keil 编译失败（看 steps 里的日志）",
+                    "log_path": kb.get("log_path")}
+        if not os.path.isfile(axf):
+            return {"ok": False, "failed_step": "keil_build", "steps": steps,
+                    "error": "Keil 编译没报错但产物不存在：%s" % axf,
+                    "hint": "看 log_path 里的完整日志；多半是 OutputName/OutputDirectory 被改过"}
+        r3 = _run([tools["tools"]["fromelf"], "--bin", "-o", binf, axf], dest, timeout_s)
+        steps.append({"step": "fromelf --bin（Keil 产物）", **r3})
+        if not r3.get("ok") or not os.path.isfile(binf):
+            return {"ok": False, "failed_step": "fromelf", "steps": steps,
+                    "error": "fromelf --bin 失败（见 steps[-1] 的 stderr）"}
+    else:
+        r1 = _run([tools["tools"]["armasm"], "--32", "-o", obj, asm], dest, timeout_s)
+        steps.append({"step": "armasm", **r1})
+        if not r1.get("ok"):
+            return {"ok": False, "failed_step": "armasm", "steps": steps,
+                    "error": "汇编失败（见 steps[-1] 的 stderr）",
+                    "arm_tools": {k: v for k, v in tools.items() if k != "tried"}}
+
+        r2 = _run([tools["tools"]["armlink"], "--scatter", sct, "-o", axf, obj],
+                  dest, timeout_s)
+        steps.append({"step": "armlink", **r2})
+        if not r2.get("ok") or not os.path.isfile(axf):
+            return {"ok": False, "failed_step": "armlink", "steps": steps,
+                    "error": "链接失败（见 steps[-1] 的 stderr）"}
+        if "L6305W" in (r2.get("stderr") or ""):
+            notes_entry = ("armlink 的 L6305W（没有入口点）是**预期**的：Cortex-M 的入口是"
+                           "向量表里的复位地址，ELF entry 字段不参与启动")
+
+        r3 = _run([tools["tools"]["fromelf"], "--bin", "-o", binf, axf], dest, timeout_s)
+        steps.append({"step": "fromelf --bin", **r3})
+        if not r3.get("ok") or not os.path.isfile(binf):
+            return {"ok": False, "failed_step": "fromelf", "steps": steps,
+                    "error": "fromelf --bin 失败（见 steps[-1] 的 stderr）"}
+
+    with open(binf, "rb") as f:
+        actual = f.read()
+
+    # ---- 期望字节：优先用「真工具链抽原镜像」，抽不了才回退到 manifest 的拼接 ----
+    src = image or (man.get("input") or {}).get("path") or ""
+    expected = b""
+    expected_source = ""
+    notes: list = []
+    if notes_entry:
+        notes.append(notes_entry)
+    if src and os.path.isfile(src):
+        data, err = _read_file(src)
+        if err:
+            return {"ok": False, "error": err.get("error"), "steps": steps}
+        kind = detect_container(data[:4096])
+        if kind == "elf":
+            tmp = os.path.join(build, "original.bin")
+            rr = _run([tools["tools"]["fromelf"], "--bin", "-o", tmp, os.path.abspath(src)],
+                      dest, timeout_s)
+            steps.append({"step": "fromelf --bin 原镜像", **rr})
+            if rr.get("ok") and os.path.isfile(tmp):
+                with open(tmp, "rb") as f:
+                    expected = f.read()
+                expected_source = "fromelf --bin %s" % os.path.basename(src)
+        elif kind == "ihex":
+            flat = _flat_image(data, "ihex", base)
+            expected = flat.get("data") or b""
+            expected_source = "hex 解码（%s）" % os.path.basename(src)
+        else:
+            expected = data
+            expected_source = "裸 bin 直读（%s）" % os.path.basename(src)
+        if src and (man.get("input") or {}).get("sha256"):
+            if sha256_bytes(data) != man["input"]["sha256"]:
+                notes.append("image 与 manifest 记的输入**不是同一份**"
+                             "（sha256 不符）：本次比对的是你给的那份")
+    if not expected:
+        expected_source = "（无，未提供可比的原镜像）"
+        notes.append("没有可用的原镜像：**本次没有独立证据**——产物 bin 已生成在 "
+                     "build/ 下，请传 image= 原文件再比一次")
+
+    diff = _diff_summary(expected, actual) if expected else {
+        "byte_identical": None, "note": "无期望字节"}
+    # armasm 的 AREA 至少按 4 字节对齐：原镜像长度不是 4 的倍数时，重链接出的 bin
+    # 会多出 1..3 个**全零**尾字节（链接器补齐，不是内容差异）。这不是“相同”的
+    # 简化，而是把差异说清楚：前缀必须逐字节相同，多出来的只有在全是 0 且 <=3
+    # 字节时才记为 alignment_padding；否则照样判不同。
+    pad = len(actual) - len(expected)
+    if expected and 0 < pad <= 3 and actual[len(expected):] == b"\x00" * pad \
+            and actual[:len(expected)] == expected:
+        diff["byte_identical"] = True
+        diff["alignment_padding"] = pad
+        notes.append("重链接产物比原镜像多 %d 个全零尾字节：armasm 的 AREA 4 字节对齐填充，"
+                     "不属于镜像内容（原镜像长度 %d 不是 4 的倍数）" % (pad, len(expected)))
+    concat_sha = (man.get("expected_bin") or {}).get("concat_sha256")
+    manifest_match = (sha256_bytes(expected) == concat_sha) if (expected and concat_sha) else None
+    if manifest_match is False:
+        notes.append("原镜像抽出的 bin 与 manifest 记的 concat_sha256 不一致："
+                     "要么传入的 image 不是当初那份，要么镜像变了")
+
+    ok = bool(diff.get("byte_identical"))
+    out = {
+        "ok": True,
+        "byte_identical": ok,
+        "project_dir": dest,
+        "image": os.path.abspath(src) if src else "",
+        "expected_source": expected_source,
+        "expected": {"size": len(expected), "sha256": sha256_bytes(expected) if expected else "",
+                     "manifest_concat_sha256": concat_sha, "manifest_match": manifest_match},
+        "actual": {"size": len(actual), "sha256": sha256_bytes(actual)},
+        "diff": diff,
+        "build": {"dir": build, "axf": axf, "bin": binf, "kept": keep_build,
+                  "via": "uvprojx（Keil 编译生成的工程文件）" if via_uvprojx else "armasm+armlink"},
+        "steps": steps,
+        "arm_tools": {"bin_dir": tools.get("bin_dir"), "version": tools.get("version")},
+        "notes": notes,
+        "verdict": ("逐字节相同：地址、布局、可加载内容都复刻对了"
+                    if ok else
+                    "**不相同**：这份工程没有复刻成功，先看 diff.diff_offsets 的第一处差异"),
+    }
+    if not ok:
+        out["next_actions"] = [
+            "看 steps 里 armlink 的 stderr：区域放不下/重叠会在这里说清",
+            "diff.diff_offsets 是 bin 内偏移；加上 base 才是地址",
+            "长度不同（length_expected vs length_actual）通常是区域向上取整或原镜像有空洞",
+        ]
+    return out

@@ -138,6 +138,8 @@ NON_IDEMPOTENT = {
     # 取件要求输出目录不存在：第二次调用必然失败，效果不等价于一次。
     "image_carve",
     "recover_project",
+    # 批次80：出件同样独占目录；verify 会写 build/ 并真的跑工具链，重跑结果可能不同。
+    "recover_project_exact", "recover_verify",
     # 渲染默认每次生成一个带时间戳的新文件（重复调用会攒出多个页面），
     # 因此不是幂等——与 session_state 同口径。
     "view_render",
@@ -167,6 +169,7 @@ MUTATING = {
     # 取件会新建目录与文件（不改既有内容，但确实改变文件系统）
     "image_carve",
     "recover_project",
+    "recover_project_exact", "recover_verify",
     "itm_trace", "keil_command", "launch_uvision", "ocd_bp", "ocd_cmd",
     "ocd_control", "ocd_flash", "ocd_gdb", "ocd_load", "ocd_reg", "ocd_start",
     "ocd_stop", "ocd_wp", "ocd_write_mem", "profile_function",
