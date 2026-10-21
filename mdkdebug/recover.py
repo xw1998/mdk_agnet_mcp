@@ -1231,6 +1231,11 @@ def recover_functions(unit: Unit, *, deep: bool = True,
         if not sweep.get("ok"):
             gaps.append({"reason": "反汇编失败，深度扫描跳过：%s" % sweep.get("error")})
             sweep = None
+        elif sweep.get("truncated"):
+            # 批次90：截断以前是静默的——调用方看到「函数很少」却不知道是没扫完。
+            gaps.append({"reason": "深度扫描触到 max_insns=%d 上限，只扫了一部分代码："
+                                   "函数/调用关系可能不全；要看全就把 max_insns 调大"
+                                   "（代价是时间）" % int(max_insns)})
     strings = find_strings(unit)
     string_at = {s["addr"]: s for s in strings if "addr" in s}
     if sweep:
@@ -1414,6 +1419,61 @@ def recover_functions(unit: Unit, *, deep: bool = True,
 
 
 # ----------------------------------------------------------------------
+# 批次90：剖析结果的紧凑视图（裁剪**视图**，不改任何结论）
+# ----------------------------------------------------------------------
+COMPACT_FUNCTION_FIELDS = ("addr_hex", "name", "size", "confidence", "sources",
+                           "n_callers", "callee_count")
+
+
+def compact_view(an: dict, *, max_functions: int = 40, max_strings: int = 10,
+                 keep_relations_graph: bool = False) -> dict:
+    """把 :func:`analyze` 的输出裁成能直接塞进上下文的那一份。
+
+    只动**列表长度与字段宽度**：计数、结论、gaps、limitations 一个都不改，
+    被裁掉的条数写进 ``omitted``，肉眼可见（不是「悄悄少了」）。
+
+    为什么需要它：一份 14 KB 的固件，完整剖析就有 45 KB JSON，其中 33 KB 是
+    60 个函数各自的十几个字段（``terminals`` / ``arg_basis`` / ``callers`` 这些）。
+    1000 个函数的固件会到几百 KB，一次工具调用就把上下文吃掉。
+    """
+    import copy as _copy
+    # 下划线开头的是内部对象（_unit / _recover / _relations / _insns）：既不可 JSON
+    # 序列化，也不该出现在视图里——先剔掉再深拷贝，省一份几十 MB 的复制。
+    out = {k: v for k, v in an.items() if not str(k).startswith("_")}
+    for k in ("functions", "strings", "relations"):
+        if isinstance(out.get(k), (dict, list)):
+            out[k] = _copy.deepcopy(out[k])
+    fn = out.get("functions")
+    if isinstance(fn, dict):
+        top = fn.get("top") or []
+        keep = int(max_functions) if int(max_functions) > 0 else 0
+        rows = []
+        for f in top[:keep] if keep else top:
+            rows.append({k: f.get(k) for k in COMPACT_FUNCTION_FIELDS if k in f})
+        fn["top"] = rows
+        fn["omitted"] = max(0, len(top) - len(rows))
+        fn["view"] = "compact（字段裁到 %s；完整看 recover_symbols / 提高 max_functions）" \
+                     % ", ".join(COMPACT_FUNCTION_FIELDS)
+    st = out.get("strings")
+    if isinstance(st, dict):
+        sample = st.get("sample") or []
+        keep = int(max_strings) if int(max_strings) >= 0 else len(sample)
+        st["sample"] = sample[:keep]
+        st["omitted"] = max(0, len(sample) - len(st["sample"]))
+    rel = out.get("relations")
+    if isinstance(rel, dict):
+        cg = rel.get("call_graph")
+        if isinstance(cg, dict) and not keep_relations_graph:
+            rel["call_graph"] = {k: cg.get(k) for k in
+                                 ("n_nodes", "n_edges", "n_leaves", "cycles",
+                                  "max_depth", "truncated")}
+            rel["call_graph"]["view"] = ("只留计数：roots/by_name 要看完整剖析"
+                                         "（recover_symbols 的 report.json）")
+    out["view"] = {"kind": "compact", "full_json_bytes": len(json.dumps(an, default=str))}
+    return out
+
+
+# ----------------------------------------------------------------------
 # 顶层剖析
 # ----------------------------------------------------------------------
 def _layout_summary(unit: Unit) -> dict:
@@ -1533,6 +1593,10 @@ def analyze(path: str, *, base: int = 0, deep: bool = True,
         limitations.append("非 ARM 镜像：函数形状/参数推断按的是 **AAPCS（ARM）**口径，"
                            "换到 %s 上只保留了「控制流与调用目标」的部分——参数个数与"
                            "返回值不要按这里的结果读" % unit.arch.get("family"))
+        limitations.append("非 ARM 上的深度扫描沿用的是 ARM 口径的启发式（bl 目标、"
+                           "字面量池里的代码指针），收益很低：实测 600 KB 的 x86_64 DLL "
+                           "deep=True 用 117 s 只多认出 5 个函数。只想看布局/节/符号就用 "
+                           "deep=false；要读代码用 recover_disasm 指定区间")
     if not unit.code_ranges:
         gaps.append({"reason": "没有可执行区间：无法反汇编，函数只能来自符号表"})
 
@@ -2046,6 +2110,9 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
                          "没有最终地址，出不了可用的工程",
                 "hint": "先链接成 axf/elf（Keil 里编译工程或 armlink）再对本工具用；"
                         "现在可以先 recover_probe 看节与符号"}
+    bad = _arm_only_guard(unit, ident, "recover_project（骨架工程）")
+    if bad:
+        return bad
     an = analyze(path, base=base, deep=deep, max_functions=max_functions,
                  max_insns=max_insns)
     if not an.get("ok"):
@@ -2756,6 +2823,36 @@ def _exact_readme(an: dict, chunks: list[dict], copies: list[dict],
     return "\n".join(L)
 
 
+# 批次90：``armasm`` / ``armlink`` 是 ARM 32 位的工具链。判出来的家族不是 ARM 时，
+# 复刻链**从第一步就不成立**——以前要等到 verify 的 armlink 才炸，报「链接失败」，
+# 调用方只能从 stderr 里猜原因。这里提前拒，并说清楚「还能做什么」。
+NON_ARM_FAMILIES = ("arm64", "x86", "x86_64", "riscv", "mips", "ppc", "m68k",
+                    "sparc", "s390", "mos65xx")
+
+
+def _arm_only_guard(unit: "Unit", ident: dict, what: str) -> dict | None:
+    """家族明确不是 ARM ⇒ 返回拒收结果；ARM 或「未判定」⇒ None（放行）。
+
+    「未判定」放行是刻意的：裸 bin 没有头，判不出来时按 ARM 复刻仍然是**字节上**
+    成立的操作，只是这条链的目标对不对没有证据——那句限制由调用方写进 limitations。
+    """
+    fam = (unit.arch or {}).get("family") or "unknown"
+    if fam in ("arm", "unknown"):
+        return None
+    return {**ident, "ok": False,
+            "error": "这份镜像不是 ARM（判为 %s）：%s 用 armasm/armlink 复刻并自证，"
+                     "这条命令链在 %s 上不成立" % (fam, what, fam),
+            "hint": "① 只做分析：recover_probe / recover_symbols / recover_disasm "
+                    "（反汇编后端支持 arm / arm64 / riscv / x86 / x86_64 / mips / ppc / "
+                    "m68k / sparc / mos65xx），能看容器、布局、函数与控制流；"
+                    "② 要出可重链接工程，得用该架构自己的工具链（例如 RISC-V 的 "
+                    "riscv-none-embed-gcc + GNU ld），本仓库没有接；"
+                    "③ 别用 armasm 硬凑——那样会得到一份「字节对、目标错」的工程。",
+            "arch": unit.arch,
+            "what_would_work": ["recover_probe", "recover_symbols", "recover_disasm",
+                                "recover_diff", "image_split"]}
+
+
 def _ram_window(unit: "Unit", chunks: list[dict]) -> dict | None:
     if not unit.elf:
         return None
@@ -2797,6 +2894,12 @@ def project_exact(path: str, out_dir: str, *, name: str = "recovered",
         return {"ok": False,
                 "error": "这是可重定位目标文件（ET_REL，如 .o / 库成员）：没有最终地址，无法复刻",
                 "hint": "对单个目标文件用 recover_disasm 看指令；要出可链接工程请给已链接的 axf/elf"}
+    bad = _arm_only_guard(unit, {"path": os.path.abspath(path),
+                                "size": len(data),
+                                "sha256": sha256_bytes(data)},
+                          "recover_project_exact")
+    if bad:
+        return bad
     chunks = load_chunks(unit)
     if not chunks:
         return {"ok": False, "error": "没有可加载字节：这份输入里找不到能复刻的区间"}
@@ -2871,6 +2974,15 @@ def project_exact(path: str, out_dir: str, *, name: str = "recovered",
            "sha256": sha256_bytes(data), "arch": unit.arch}
     hint = ("**先跑 `recover_verify(project_dir=\"%s\", image=\"%s\")`**："
             "`byte_identical=true` 才说明这份工程真的复刻了原镜像。" % (dest, os.path.abspath(path)))
+    # 批次90：把「一条路」的下一句写成能直接复制的一行——窗口不再要调用方自己算。
+    # 漏窗口不是错答案，但会让向量表义务停在 unverified，值得在出件时就说清楚。
+    _f_lo = min(c["addr"] for c in chunks)
+    _f_hi = max(c["addr"] + c["size"] for c in chunks)
+    _windows = "flash_start=0x%08X, flash_size=0x%X" % (_f_lo, _f_hi - _f_lo)
+    if ram:
+        _windows += ", ram_start=0x%08X, ram_size=0x%X" % (ram["start"], ram["size"])
+    ledger_cmd = ('recover_ledger(project_dir="%s", image="%s", %s)'
+                  % (dest, os.path.abspath(path), _windows))
     _emit(dest, "README.md", _exact_readme(an2, chunks, copies, hint), files)
 
     manifest = {
@@ -2907,8 +3019,13 @@ def project_exact(path: str, out_dir: str, *, name: str = "recovered",
             "uvprojx": uv_note,
             "asm": asm_note,
             "next_actions": [hint,
-                             "自证通过后再改：Want 改代码就改 asm/disassembly.asm 里那一份，"
-                             "但那样就不再逐字节相同了"],
+                             "闭环台账直接抄这一行（窗口已按这份镜像的布局算好）：%s"
+                             % ledger_cmd]
+                            + ([] if ram else ["这份镜像里没有可写的节（没有 ELF 的 RW 段），"
+                                               "ram_start/ram_size 只能你自己给——不给的话"
+                                               "台账的向量表判据停在 unverified，不是通过"])
+                            + ["自证通过后再改：Want 改代码就改 asm/disassembly.asm 里那一份，"
+                               "但那样就不再逐字节相同了"],
             "limits": [
                 "DCB 复刻 = 原字节原样，不表示这些字节的语义被恢复",
                 "启动代码与 .data 搬运沿用原固件，本工程不重建",
@@ -3026,6 +3143,20 @@ def verify_project(project_dir: str, image: str = "", *, base: int = 0,
     if not tools.get("ok"):
         return {"ok": False, "error": tools.get("error"),
                 "hint": tools.get("hint"), "tried": tools.get("tried"),
+                "manifest_input": man.get("input")}
+
+    arch_doc = man.get("arch") if isinstance(man.get("arch"), dict) else {}
+    fam = (arch_doc or {}).get("family") or "unknown"
+    if fam in NON_ARM_FAMILIES:
+        # 老工程（批次90 之前 project_exact 没有这道闸门）会走到这里：
+        # 与其让 armlink 打一行看不懂的错，不如把「为什么必然失败」说清楚。
+        return {"ok": False,
+                "error": "manifest 记的架构是 %s：本工具的重链接链是 armasm + armlink"
+                         "（ARM 32 位），对 %s 不成立" % (fam, fam),
+                "hint": "这份工程只能当「字节与布局的记录」看；要验证得用 %s 自己的"
+                        "工具链（本仓库未接）。同一份输入用 recover_probe / "
+                        "recover_disasm 做分析是有效的。" % fam,
+                "arch": arch_doc,
                 "manifest_input": man.get("input")}
 
     build = os.path.join(dest, "build")

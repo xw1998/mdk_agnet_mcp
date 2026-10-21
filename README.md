@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.13）
+│   ├── __init__.py           # 包初始化（版本号 0.2.14）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -1304,6 +1304,24 @@ Flash 窗口 `0x08000000 + 2 MiB`、RAM 窗口 `0x20000000 + 128 KiB`）：扫�
   时钟树）**没有任何证据**，别把 `ready` 当通用背书；
 - 不给 RAM/Flash 窗口时，向量表判据只到 `unverified`（SP 是否落在 RAM、复位地址是否落在 Flash 两条为 `None`），
   台账会把这句限制写在 reason 里，而不是悄悄按通过处理。
+
+### 逆向这条路的三条预算与一道闸门（批次90）
+
+批次79~89 把能力补齐了，但把「AI 拿着一份固件走一遍」实测下来，路上有四处会卡：
+异构镜像要等 `armlink` 才失败、`recover_probe` 一次吐 45 KB JSON、深度扫描截断是静默的、
+dump 切出来的镜像还得调用方自己写文件。批次90 逐条补平（**不新增工具，仍是 213 个**）：
+
+| 卡点 | 以前 | 现在 |
+|---|---|---|
+| 非 ARM 镜像出工程 | `project_exact` 返回 ok，`verify` 到 armlink 才失败，只有一句「链接失败」 | `project_exact` / `project` 入口按架构**直接拒**，error 点名家族、hint 列可用动作（`recover_probe` / `recover_symbols` / `recover_disasm` / `recover_diff` / `image_split`）；老工程的 manifest 也挡住 `verify`，**不白跑工具链**。架构未判定不拒（判不出来 ≠ 不是 ARM），限制写进 limitations |
+| 剖析结果体量 | 14 KB 固件就 45 KB JSON（33 KB 是 60 个函数各自的十几个字段），1000 函数的固件到几百 KB | `recover_probe(detail="compact")`：函数只留 7 个字段、字符串前 10 条、调用图只留计数；**结论与计数一个不改**，裁掉的条数写进 `omitted`。实测 **45.1 KB → 8.9 KB（20%）** |
+| 深度扫描预算 | 触到 `max_insns` 上限是静默的（函数看着少，不知道为什么） | 触顶写进 `gaps`（「只扫了一部分代码，要看全就调大 max_insns」）；`max_functions` / `max_insns` 都暴露到 `recover_probe`。另在非 ARM 上明说：深层扫描用的是 ARM 口径启发式，实测 600 KB 的 x86_64 DLL `deep=True` 用 117 s 只多认出 5 个函数 |
+| dump 切片的交接 | `image_split` 只报 `offset + length`，要调用方自己读字节写文件 | `image_split(..., out_dir=...)` 把每个镜像切成 `image_00.bin` 并回读 SHA-256（目录必须不存在）；切片带 `offset` / `addr_hex` / `sha256`，可直接喂 `recover_project_exact`。不给 `out_dir` 一个字节都不写 |
+| 一条路的最后一步 | `exact → verify → ledger` 要人肉传同一个 `base` / 窗口，漏窗口时台账只到 `unverified` | `project_exact` 的 `next_actions` 直接给一行**可复制**的 `recover_ledger(...)`，Flash/RAM 窗口按这份镜像的布局算好；没有 RW 段时明说「ram 只能你自己给」 |
+
+实测（`mdk_test.axf`，本机 Keil）：照抄那一行的窗口得到 `ready=true`、`required_closed=5/5`；
+`image_split` 切出的 `image_00.bin` → `project_exact` → `verify` 得到 `byte_identical=true`；
+`msvcrt.dll`（x86_64）在入口就被拒，且**没有建出半个目录**。
 
 ### 主张等级与证据来源（批次89，吸收 REA reconstruction-coverage 的来源匹配口径）
 

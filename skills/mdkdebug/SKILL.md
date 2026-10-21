@@ -122,7 +122,7 @@ batch_debug_script(init_file=...)   # 每轮 15~25s；命令报错不改退出�
 ### 6. 只有固件没有工程：`.hex` / `.bin` / `.elf(.axf)` / `.lib` / `.so` → 工程骨架
 
 ```
-recover_probe(file)                          # 先看容器、架构、向量表、能恢复出多少
+recover_probe(file, detail="compact")         # 先看容器、架构、向量表、能恢复出多少（大固件用 compact）
 recover_symbols(file, deep=true)             # 函数清单（observed/inferred/weak 三档置信）
 recover_disasm(file, symbol="main")          # 按符号或地址区间反汇编（需要 capstone）
 recover_project(file, out_dir="...")         # 出 sct/ld/头文件/startup/stub/反汇编/map/report
@@ -130,6 +130,23 @@ recover_project_exact(file, out_dir="...")   # 出**字节精确可重链接**�
 recover_verify(project_dir, image=file)      # 真工具链重链接，逐字节比对（byte_identical）
 recover_ledger(project_dir, image=file, claim=...)  # 闭环台账：哪条义务被什么证据闭合了 + 主张等级
 ```
+
+**这条路的三条预算与闸门**（批次90，都是「别让工具替你猜」）：
+- `recover_project_exact` / `recover_project` **只对 ARM(32) 成立**（armasm + armlink）。
+  判出来是 arm64 / x86 / x86_64 / riscv / mips / ppc / m68k / sparc / mos65xx 时**直接拒**，
+  并列出还能做什么（`recover_probe` / `recover_symbols` / `recover_disasm` / `recover_diff` /
+  `image_split`）——以前要等到 `recover_verify` 的 armlink 才炸成一句「链接失败」。
+  架构**未判定**不拒（判不出来 ≠ 不是 ARM），但这条链的目标对不对没有证据。
+- `recover_probe(detail="compact")`：每函数只留 `addr_hex/name/size/confidence/sources/
+  n_callers/callee_count`，字符串前 10 条，调用图只留计数；**结论与计数一个不改**，
+  被裁掉的条数写进 `omitted`。实测同一份固件 45.1 KB → 8.9 KB（20%）。
+  另两个预算参数：`max_functions`（函数总数上限，超了 `truncated=true`）、
+  `max_insns`（深度扫描预算，触顶**如实写进 gaps**——以前是静默截断）。
+- `image_split(..., out_dir=...)`：把每个镜像按 `offset..offset+length` 切成
+  `image_00.bin` 并回读 SHA-256，切出来的字节直接喂 `recover_project_exact` / `recover_probe`
+  （目录必须不存在）。不给 `out_dir` 就一个文件都不写。
+- `recover_project_exact` 的 `next_actions` 里直接给一行**可复制**的 `recover_ledger(...)`，
+  Flash/RAM 窗口已按这份镜像的布局算好；没有 RW 段时会明说「ram 只能你自己给」。
 
 **先自证再用**：`recover_project_exact` 自己不说成功，判据是 `recover_verify` 的
 `byte_identical=true`。两条路分工：`recover_project` 出「能读能改的骨架」，

@@ -101,7 +101,9 @@ READONLY = {
     "firmware_precheck",
     # 镜像取证（批次78）：只读文件、只算哈希/熵/签名，不改任何东西。
     "image_inspect",
-    # 批次87：镜像切分——只读文件、只算向量表与擦除带，不写任何东西。
+    # 批次87：镜像切分——只读文件、只算向量表与擦除带。
+    # 批次90：只有显式给 out_dir 时才把切片写出去（同 recover_diff 的
+    # save_reference_sig：写不写由参数决定，默认路径一个字节都不碰）。
     "image_split",
     # 批次79：逆向的读操作——只解析字节，不改任何东西
     "recover_probe", "recover_symbols", "recover_disasm",

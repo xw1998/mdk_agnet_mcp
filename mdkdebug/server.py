@@ -7506,7 +7506,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "「不属于任何镜像、也不是擦除态」的字节——那里还有东西，但没有证据说是镜像。\n"
             "边界：只找 Cortex-M 向量表，RISC-V/ARM9 起点不在判据里；HEX 是稀疏文本，"
             "空隙被填 0x00、不据此判擦除；同两颗镜像之间没有擦除带时，前一块的尾部会被算进前一块。\n"
-            "想进一步确认某个镜像里有什么，用 recover_probe / recover_symbols 对该块取件后再分析。"
+            "想进一步确认某个镜像里有什么，用 recover_probe / recover_symbols 对该块取件后再分析。\n"
+            "**out_dir**（批次90）：给了就把每个镜像按 offset..offset+length **原样切成单独文件**"
+            "（image_00.bin …）并回读 SHA-256，切出来的字节可以直接喂 recover_project_exact / "
+            "recover_probe——一颗 dump 切出几份镜像之后，不用再自己读偏移写文件。"
+            "目录必须不存在（不覆盖既有证据）；不给 out_dir 就只报边界、不写任何东西。"
         ),
     )
     async def image_split(path: str, base: int = 0,
@@ -7514,7 +7518,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                           ram_start: int = -1, ram_size: int = 0,
                           erase: int = 255, erase_min: int = 256,
                           max_tables: int = 32, handler_ratio: float = 0.75,
-                          min_image: int = 256) -> str:
+                          min_image: int = 256, out_dir: str = "") -> str:
         try:
             out = _imagesplit.split_image(
                 str(path or "").strip(),
@@ -7528,6 +7532,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 max_tables=int(max_tables or 32),
                 handler_ratio=float(handler_ratio if handler_ratio is not None else 0.75),
                 min_image=int(min_image or 256),
+                out_dir=str(out_dir or "").strip(),
             )
             return _js(out)
         except Exception as e:  # noqa: BLE001
@@ -7552,18 +7557,46 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "裸 bin / 无头容器可以用 arch（arm / arm64 / x86 / x86_64 / mips / ppc / m68k / "
             "sparc / riscv / mos65xx）+ endian + bits + thumb + entry **显式指定**："
             "文件里没有的东西不猜——指定值会与文件头推断并列保留，冲突看得见。\n"
-            "口径：地址、布局、控制流是事实；**函数体语义没有恢复**。只读工具。"
+            "口径：地址、布局、控制流是事实；**函数体语义没有恢复**。只读工具。\n"
+            "**预算与体量（批次90）**：一份 14 KB 固件的完整剖析就有约 45 KB JSON（其中 33 KB 是 "
+            "60 个函数各自的十几个字段）；大固件会到几百 KB，一次调用就能吃掉上下文。于是："
+            "detail=\"full\"（默认，全部）/ \"compact\"（每函数只留 addr_hex / name / size / "
+            "confidence / sources / n_callers / callee_count，字符串只留前 10 条，调用图只留计数；"
+            "被裁掉的条数写在 omitted 里，**结论与计数一个不改**）。\n"
+            "max_functions 是**函数总数上限**（与 recover_symbols 同名同义，默认 4000）——它限制的是"
+            "分析产出，超了标 truncated=true；max_insns 给深度扫描一个指令预算，触到就如实写进 gaps"
+            "（不再静默截断）。两个都是「预算由调用方定」，工具不替你猜。\n"
+            "非 ARM 上深度扫描沿用的是 ARM 口径的启发式，收益很低（实测 600 KB 的 x86_64 DLL "
+            "deep=True 用 117 s 只多认出 5 个函数）：只想看布局就 deep=false，要读代码用 recover_disasm。"
         ),
     )
     async def recover_probe(path: str, base: int = 0, deep: bool = True,
                             arch: str = "", endian: str = "", bits: int = 0,
-                            thumb: bool = False, entry: int = 0) -> str:
+                            thumb: bool = False, entry: int = 0,
+                            detail: str = "full", max_functions: int = 0,
+                            max_insns: int = 0) -> str:
         try:
+            _detail = str(detail or "full").strip().lower()
+            if _detail not in ("full", "compact"):
+                return _js({"ok": False,
+                            "error": "未知的 detail：%s" % detail,
+                            "hint": "full = 完整剖析（默认）；compact = 裁剪视图"
+                                    "（只裁列表长度与字段宽度，不改任何结论）"})
+            kw = {}
+            if int(max_functions or 0) > 0:
+                kw["max_functions"] = int(max_functions)
+            if int(max_insns or 0) > 0:
+                kw["max_insns"] = int(max_insns)
             out = _recover.analyze(str(path or "").strip(), base=int(base or 0),
                                    deep=bool(deep), arch=str(arch or ""),
                                    endian=str(endian or ""), bits=int(bits or 0),
                                    thumb=(None if not thumb else True),
-                                   entry=int(entry or 0))
+                                   entry=int(entry or 0), **kw)
+            if out.get("ok") and _detail == "compact":
+                out = _recover.compact_view(
+                    out, max_functions=(int(max_functions) if int(max_functions or 0) > 0 else 40))
+                out.pop("_unit", None)
+                out.pop("_recover", None)
             out.pop("_unit", None)
             out.pop("_recover", None)
             return _js(out)

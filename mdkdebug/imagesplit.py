@@ -21,6 +21,7 @@
 零第三方依赖：只用 ``struct``（无）、``zlib``、``bz2``、``lzma`` 三个标准库。
 """
 import bz2
+import hashlib
 import lzma
 import os
 import zlib
@@ -325,8 +326,14 @@ def split_image(path: str, *, base=0,
                 n_handlers=DEFAULT_N_HANDLERS, min_spacing=DEFAULT_MIN_SPACING,
                 min_image=DEFAULT_MIN_IMAGE,
                 max_signatures=64, max_scan_bytes=32 * 1024 * 1024,
-                endian="little") -> dict:
-    """读一个镜像文件，报「这里面有几个镜像、各自的地址与边界依据」。"""
+                endian="little", out_dir: str = "") -> dict:
+    """读一个镜像文件，报「这里面有几个镜像、各自的地址与边界依据」。
+
+    ``out_dir``（批次90）：给了就把每个镜像按 ``offset..offset+length`` **原样切成
+    单独文件**（``image_00.bin`` …）并回读 SHA-256。切出来的字节可以直接喂
+    ``recover_project_exact`` / ``recover_probe``——一颗 dump 里切出几份镜像之后，
+    下一步不该还要调用方自己读偏移量写文件。目录必须不存在（不覆盖既有证据）。
+    """
     if not path or not os.path.isfile(path):
         return {"ok": False, "error": "文件不存在：%s" % path}
     size = os.path.getsize(path)
@@ -414,9 +421,41 @@ def split_image(path: str, *, base=0,
                        "没有擦除带，前一块的尾部数据会被算进前一块")
     limitations.append("本工具只找 Cortex-M 向量表；RISC-V/ARM9 等其他架构的镜像起点"
                        "不在判据里（可在 recover_probe / image_inspect 里另找证据）")
+    files = []
+    if out_dir:
+        dest = os.path.abspath(out_dir)
+        if os.path.exists(dest):
+            return {"ok": False,
+                    "error": "输出目录已存在：%s" % dest,
+                    "hint": "切片不复用目录（不覆盖既有证据）；换一个不存在的路径"}
+        os.makedirs(dest)
+        for i, im in enumerate(part["images"]):
+            off = int(im.get("offset") or 0)
+            ln = int(im.get("length") or 0)
+            blob = data[off:off + ln]
+            name = "image_%02d.bin" % i
+            fp = os.path.join(dest, name)
+            with open(fp, "wb") as f:
+                f.write(blob)
+            back = open(fp, "rb").read()
+            im["path"] = fp
+            im["sha256"] = hashlib.sha256(blob).hexdigest()
+            files.append({"path": fp, "bytes": len(blob),
+                          "sha256": im["sha256"],
+                          "readback_ok": back == blob,
+                          "offset": off, "offset_hex": im.get("offset_hex"),
+                          "addr_hex": im.get("addr_hex")})
+        bad = [f for f in files if not f["readback_ok"]]
+        if bad:
+            return {"ok": False,
+                    "error": "切片回读校验失败：%s" % ", ".join(f["path"] for f in bad),
+                    "files": files}
+
     out = {"ok": True, "input": {"path": os.path.abspath(path), "size": size,
                                  "sha256": IM.sha256_file(path)},
            "format": fmt, "base_hex": "0x%X" % int(base),
+           "out_dir": os.path.abspath(out_dir) if out_dir else "",
+           "files": files,
            "windows": {"flash": _win(flash), "ram": _win(ram)},
            "tables": tables,
            "images": part["images"],
