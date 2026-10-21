@@ -87,6 +87,9 @@ TOOLSETS = {
         # 批次78：镜像取证。与 build 同场景——「这一份产物/这一份 dump 到底是什么、
         # 和刚才烧进去的是不是同一份」。image_carve 会写文件，所以不放在默认面上。
         "image_inspect", "image_carve",
+        # 批次87：镜像切分（一颗 dump 里有几个镜像）。只读，但它回答的是「切到哪」——
+        # 与取证同场景，仍不进默认面。
+        "image_split",
         # 批次79：工程级逆向。与 build 同场景——「这份产物到底是个什么工程、
         # 能不能从中重建出可编译的骨架」。全部不进默认面（recover_project 会写文件）。
         "recover_probe", "recover_symbols", "recover_disasm", "recover_project",

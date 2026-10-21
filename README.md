@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.10）
+│   ├── __init__.py           # 包初始化（版本号 0.2.11）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -234,7 +234,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 211 个工具定义
+│   └── server.py             # MCP Server 与 212 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -283,9 +283,9 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **211** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **212** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
-- **MDK 族（111 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
+- **MDK 族（112 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
 - **非 MDK 族（68 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**、**任务表取名**，34 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 - **常驻元工具（6 个）**——`toolset`（工具面按需装载）/ `list_tools` / `capabilities` / `get_version` / `tools_groups` / `tools_load`：**永不被裁**，否则 AI 连工具清单都问不出来、也装不回来。
 - **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
@@ -621,13 +621,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-211 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 167 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+211 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 168 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 211 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 212 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -659,8 +659,8 @@ toolset(action="load",   toolsets="all")        # 一次全装 211 个（=full/*
 |---|---|---|---|---|
 | 默认（`core` 组 + 元工具，描述 `lean`） | 44 | 约 2.2 万 | **约 3.9 万**（−56%） | 不设环境变量 |
 | **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 6 千** | **约 1.5 万** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
-| `all`（全装，描述默认 `lean`） | 211 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
-| `all` + `MDKDEBUG_DESC=min` | 211 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
+| `all`（全装，描述默认 `lean`） | 212 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=min` | 212 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
 | 上述任一档 + `MDKDEBUG_DESC=full` | — | 逐字节还原全文 | — | 要逐字完整说明时 |
 
 - **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。
@@ -978,7 +978,7 @@ Copyright (c) 2026 <春雫>
   （签名命中是观察、区间长度是推导、缺窗口时有效性是未知而不是无效）、取件目标必须不存在
   （绝不覆盖既有证据）、诊断输出与解压有界并如实报截断。
   它的 **binwalk/unblob 依赖、Ghidra/IDA/Frida 供给、各平台镜像分析**都没有采纳：
-  这些要么需要外部引擎，要么与 MCU 无关。落地形态是 `image_inspect` / `image_carve`
+  这些要么需要外部引擎，要么与 MCU 无关。落地形态是 `image_inspect` / `image_carve` / `image_split`
   ——`mdkdebug/image.py` 纯标准库实现（ELF 程序头用 `struct` 直接读，不额外引包）
 
 ### 工程级逆向层（批次79）
@@ -1125,7 +1125,7 @@ Ghidra 最有名的那个功能——把机器码变成类 C——批次84 吸�
 `adcs/sbc.w` 需要 C 位表达式，链断时猜一个进位就是静默错答案；宁可留一行
 `/* 未支持: sbc.w ... */` 并计数。
 
-接线方式（**批次84 不新增 MCP 工具**；总数在批次86 变成 211，那是函数匹配用的 `recover_diff`）：
+接线方式（**批次84 不新增 MCP 工具**；总数在批次86/87 变成 212，那是函数匹配用的 `recover_diff` 与镜像切分用的 `image_split`）：
 
 - `recover_disasm(symbol="HAL_RCC_OscConfig", fmt="c")` —— 单个函数出伪 C；
 - `recover_project` 默认写一份 `src/pseudo_c.c`（`include_pseudo_c=False` 可关，
@@ -1230,6 +1230,37 @@ recover_diff(reference="old.axf", target="new.axf",
 - `coverage.inventory_complete` 恒为 `false`——本工具不知道「本该有多少个函数」。
 
 ar 归档（`.lib` / `.a`）拒绝建指纹库：成员是节内偏移、跨成员会撞地址，没有单一地址空间可比。
+
+### 镜像切分（批次87）：一颗 Flash dump 里有几个镜像
+
+批次78 的 `image_inspect` 只看**一个**向量表（bin 的 0 偏移 / ELF 的第一个 `PT_LOAD`）。
+真实现场拿到的往往是一整颗 Flash 的 dump：bootloader + app + 备份槽 + 几个压缩升级包。
+`image_split`（`mdkdebug/imagesplit.py`，仍是纯标准库）全文扫描，把边界钉下来：
+
+| 证据 | 强度 | 说明 |
+|---|---|---|
+| **向量表** | 正面 | 初值 SP 非 0/全 1 且 4 字节对齐、复位地址 bit0=1、复位地址落在代码窗口、随后 6 个 handler 字里 ≥75% 像代码地址。给了 Flash + RAM 窗口才是 `strong`，否则 `plausible` |
+| **擦除带**（连续 `0xFF` ≥ `erase_min`） | 正面 | 「这一段没有内容」的唯一正面证据；它天然把前后两块隔开，是**最可靠**的边界依据 |
+| **容器自报长度** | 正面 | gzip/zlib/bzip2/xz/lzma 解到流尾得**精确**压缩流长度（gzip 还核 `ISIZE`）；lz4/zstd 无标准库解到尾，明确标 `not_supported` 而不给估计值 |
+
+镜像长度是推导值，`size_basis` 会说清依据：`erase_gap`（到擦除带，最可靠）/
+`next_vector_table`（到下一个表）/ `end_of_file`。`coverage.unassigned_bytes` 单列
+「不属于任何镜像、也不是擦除态」的字节——那里还有东西，但没有证据说是镜像。
+
+实测（`fromelf --bin` 出来的 14124 字节 app，做成 `boot + 0xFF 带 + app` 的 79660 字节 dump，
+Flash 窗口 `0x08000000 + 2 MiB`、RAM 窗口 `0x20000000 + 128 KiB`）：扫出 **2 张向量表**
+（都在 `0x0` 与 `0x10000`，`strong`，handler 比例 0.833），切出 **2 个镜像**
+（`0x08000000` / 8192 字节，`size_basis=erase_gap`；`0x08010000` / 14124 字节，`end_of_file`），
+擦除带 57344 字节，`unassigned_bytes = 0`。
+
+几条不能不说清的边界：
+
+- 只找 **Cortex-M 向量表**；RISC-V / ARM9 的镜像起点不在判据里（得靠 `recover_probe` 的容器证据）；
+- 同一张表的 handler 区里，某些 handler 地址本身能凑出伪表——所以「已接受的表之后 `min_spacing`
+  （默认 0x80）内不接受新表」，把自证噪声挡掉；
+- 两个镜像之间**没有擦除带**时，前一块的尾部数据会被算进前一块（`size_basis=next_vector_table`
+  就是上界的意思）；
+- HEX 是稀疏文本，空隙被填 `0x00`，**不据此**判擦除带（会写进 `limitations`）。
 
 ### 底层库
 

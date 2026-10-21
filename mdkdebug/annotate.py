@@ -101,6 +101,8 @@ READONLY = {
     "firmware_precheck",
     # 镜像取证（批次78）：只读文件、只算哈希/熵/签名，不改任何东西。
     "image_inspect",
+    # 批次87：镜像切分——只读文件、只算向量表与擦除带，不写任何东西。
+    "image_split",
     # 批次79：逆向的读操作——只解析字节，不改任何东西
     "recover_probe", "recover_symbols", "recover_disasm",
     # 批次86：函数匹配/版本比对——只读两侧镜像并算指纹；只有显式给

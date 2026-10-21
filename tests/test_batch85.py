@@ -260,7 +260,7 @@ def section_h():
     from mdkdebug import server as SV
     tools = {t.name: t for t in asyncio.run(
         SV.create_server(port=15885, toolsets="all").list_tools())}
-    check("H4 工具总数 211（本批次不新增工具；+1 来自批次86 recover_diff）", len(tools) == 211, len(tools))
+    check("H4 工具总数 212（本批次不新增工具；+1 来自批次86 recover_diff）", len(tools) == 212, len(tools))
     probe = tools["recover_probe"].input_schema.get("properties") or {}
     check("H5 recover_probe 暴露 arch/endian/bits/thumb/entry",
           all(k in probe for k in ("arch", "endian", "bits", "thumb", "entry")),

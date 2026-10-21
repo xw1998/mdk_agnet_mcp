@@ -42,6 +42,7 @@ from . import uvprojx as _uvprojx
 from . import precheck as _precheck
 from . import verify as _verify
 from . import image as _image
+from . import imagesplit as _imagesplit
 from . import recover as _recover
 from . import session as _session
 from . import outctl as _outctl
@@ -7480,6 +7481,53 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 ids=want_ids or None, signatures=want_sigs or None,
                 max_files=int(max_files or 32),
                 max_file_bytes=int(max_file_bytes or 32 * 1024 * 1024),
+            )
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="image_split",
+        title="镜像切分：一颗 Flash dump 里装了哪几个镜像（向量表 + 擦除带）",
+        description=(
+            "回答「这一整颗 Flash 的 dump 里，有几个镜像、各自从哪开始到哪结束」。"
+            "image_inspect 只看一个向量表（bin 的 0 偏移 / ELF 第一个 PT_LOAD），"
+            "本工具**全文扫描**所有说得通的 Cortex-M 向量表。只读工具，不写文件。\n"
+            "判据（每条都写进输出，别只看结论）：\n"
+            "- **向量表**：初值 SP 非 0/全 1 且 4 字节对齐、复位地址 bit0=1、复位地址落在 Flash 窗口"
+            "（没给窗口时落在本文件地址范围内）、随后 6 个 handler 字里 ≥75% 像代码地址。"
+            "给了 flash_start/flash_size 与 ram_start/ram_size 才是 `strong`，否则只能 `plausible`；\n"
+            "- **擦除带**（连续 0xFF ≥ erase_min）：正向证据「这一段没有内容」，把前后两块隔开；\n"
+            "- **容器自报长度**：gzip/zlib/bzip2/xz/lzma 解到流尾得**精确**压缩流长度"
+            "（gzip 还核 ISIZE），比「到下一个签名」的上界可靠；lz4/zstd 无标准库解到尾，"
+            "明确标 not_supported 而不给估计值。\n"
+            "每个镜像的 length 都是**推导**：size_basis=erase_gap（到擦除带，最可靠）/ "
+            "next_vector_table（到下一个表）/ end_of_file。coverage 里另报 unassigned_bytes："
+            "「不属于任何镜像、也不是擦除态」的字节——那里还有东西，但没有证据说是镜像。\n"
+            "边界：只找 Cortex-M 向量表，RISC-V/ARM9 起点不在判据里；HEX 是稀疏文本，"
+            "空隙被填 0x00、不据此判擦除；同两颗镜像之间没有擦除带时，前一块的尾部会被算进前一块。\n"
+            "想进一步确认某个镜像里有什么，用 recover_probe / recover_symbols 对该块取件后再分析。"
+        ),
+    )
+    async def image_split(path: str, base: int = 0,
+                          flash_start: int = -1, flash_size: int = 0,
+                          ram_start: int = -1, ram_size: int = 0,
+                          erase: int = 255, erase_min: int = 256,
+                          max_tables: int = 32, handler_ratio: float = 0.75,
+                          min_image: int = 256) -> str:
+        try:
+            out = _imagesplit.split_image(
+                str(path or "").strip(),
+                base=int(base or 0),
+                flash_start=None if int(flash_start) < 0 else int(flash_start),
+                flash_size=int(flash_size or 0) or None,
+                ram_start=None if int(ram_start) < 0 else int(ram_start),
+                ram_size=int(ram_size or 0) or None,
+                erase=int(erase if erase is not None else 255),
+                erase_min=int(erase_min or 256),
+                max_tables=int(max_tables or 32),
+                handler_ratio=float(handler_ratio if handler_ratio is not None else 0.75),
+                min_image=int(min_image or 256),
             )
             return _js(out)
         except Exception as e:  # noqa: BLE001

@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 211 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 212 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -197,6 +197,20 @@ thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
 - 两侧共用一套 `arch/endian/bits/thumb/entry`；裸 bin 必须显式给 `arch`，
   `*_base` 用于把裸固件的装载地址对齐到 axf 的地址空间。
 
+**一颗 Flash dump 里切出几个镜像**（批次87）：`image_split(path, base=..., flash_start=...,
+flash_size=..., ram_start=..., ram_size=...)`。读法：
+- 证据只有三类：**向量表**（初值 SP 非 0/全 1 且 4 字节对齐、复位地址 bit0=1、随后 6 个
+  handler 字里 ≥75% 像代码地址）、**擦除带**（连续 0xFF ≥ `erase_min`，默认 256）、
+  **容器自报长度**（gzip/zlib/bz2/xz/lzma 解到流尾，精确；lz4/zstd 报 `not_supported`）。
+- 给了 `flash_start/flash_size` + `ram_start/ram_size` 才是 `strong`，否则是 `plausible`
+  （只判过「非 0 + 对齐 + 地址在文件范围内」）。
+- 每个镜像的 `length` 都是推导值，看 `size_basis`：`erase_gap`（到擦除带，最可靠）/
+  `next_vector_table`（到下一个表，上界）/ `end_of_file`。
+- `coverage.unassigned_bytes` 是「不属于任何镜像、也不是擦除态」的字节：那里还有东西，
+  但没有证据说是镜像，别当成空洞。
+- 只找 Cortex-M 向量表；RISC-V/ARM9 起点要靠 `recover_probe` 的容器证据。HEX 空隙被填
+  0x00，**不据此**判擦除带。
+
 **关系层与类型层**（批次82/83）：`recover_symbols` / `recover_project` 的
 `report.json` 里另有 `relations`：`xref_counts`（call/branch/data_read/data_write）、
 `call_graph`（根/叶/环/深度）、`switch_counts`、`types`（栈槽/结构体候选/数组元素
@@ -263,7 +277,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 167 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 168 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。
