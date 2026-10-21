@@ -37,6 +37,8 @@ import json
 import os
 import re
 import struct
+
+from . import reveng, rtypes
 import subprocess
 
 # ---- 上限：都是「防呆」，不是「性能调优」 ----
@@ -1234,6 +1236,39 @@ def recover_functions(unit: Unit, *, deep: bool = True,
                 f["is_thunk"] = True
                 f["thunk_to"] = sh["thunk_to"]
                 f["thunk_to_hex"] = "0x%08X" % sh["thunk_to"]
+    # ⑧ 关系层（批次82）：交叉引用 / 调用图 / 跳转表与 switch
+    #    吸收的是 Ghidra 的**产物口径**：一条关系必须能反查「谁碰过这个地址」，
+    #    switch 的 case 目标不能因为「不经过 bl」就从结果里消失。
+    rel = {"xrefs": None, "call_graph": None, "switches": None}
+    if sweep and sweep.get("insns"):
+        xr = reveng.build_xrefs(unit, sweep["insns"], funcs)
+        cg = reveng.call_graph(funcs, xr["xrefs"])
+        sw = reveng.switch_tables(unit, sweep["insns"], funcs)
+        out_by, in_by = {}, {}
+        for x in xr["xrefs"]:
+            if x["kind"] == "call":
+                out_by.setdefault(x["func"], []).append(x["to"])
+                in_by.setdefault(x["to"], []).append(x["func"])
+        for f in funcs:
+            f["call_targets"] = sorted(set(out_by.get(f["addr"], [])))
+            f["callers"] = sorted(set(in_by.get(f["addr"], [])))
+            f["n_callers"] = len(f["callers"])
+            f["n_cases"] = sum(s["n_cases"] for s in sw["switches"]
+                               if s["func"] == f["addr"])
+        ty = rtypes.analyze_types(sweep["insns"], funcs, xr)
+        for f in funcs:
+            fr = next((x for x in ty["stack_frames"] if x["func"] == f["addr"]), None)
+            f["stack_slots"] = fr["n_slots"] if fr else 0
+            f["frame_span"] = fr["frame_span"] if fr else 0
+        rel.update({"xrefs": xr, "call_graph": cg, "switches": sw, "types": ty})
+        if xr["truncated"]:
+            gaps.append({"reason": "交叉引用达到上限，输出被截断"})
+        if xr["n_unresolved"]:
+            gaps.append({"reason": "有 %d 条访存/间接调用的基址寄存器值无法静态确定"
+                                   "（不做符号执行就不猜）：这些**不是丢掉的证据**，"
+                                   "已按「基址寄存器 + 偏移」记下来，供结构体成员恢复用"
+                                   % xr["n_unresolved"]})
+
     # 置信度重算：observed > inferred(≥2 源) > weak
     for f in funcs:
         if f["confidence"] != "observed":
@@ -1273,6 +1308,22 @@ def recover_functions(unit: Unit, *, deep: bool = True,
                   "basis": "函数体到终止指令（返回/尾调用/间接跳转）为止；"
                            "参数按 AAPCS 寄存器首次访问推断"},
         "string_refs": string_refs[:2000],
+        "relations": {
+            "xref_counts": (rel["xrefs"]["counts"] if rel["xrefs"] else {}),
+            "n_xrefs": (len(rel["xrefs"]["xrefs"]) if rel["xrefs"] else 0),
+            "n_unresolved": (rel["xrefs"]["n_unresolved"] if rel["xrefs"] else 0),
+            "call_graph": ({k: v for k, v in rel["call_graph"].items()
+                            if k != "edges"} if rel["call_graph"] else None),
+            "switch_counts": (rel["switches"]["counts"] if rel["switches"] else {}),
+            "types": ({"n_frames": (rel["types"] or {}).get("n_frames", 0),
+                       "n_slots": (rel["types"] or {}).get("n_slots", 0),
+                       "n_struct_candidates": (rel["types"] or {}).get(
+                           "n_struct_candidates", 0),
+                       "n_globals": (rel["types"] or {}).get("n_globals", 0),
+                       "array_elem_sizes": (rel["types"] or {}).get(
+                           "array_elem_sizes", {})} if rel.get("types") else {}),
+        },
+        "_relations": rel,
         "code_pointers": {"count": cps["count"], "truncated": cps["truncated"]},
         "gaps": gaps,
         "evidence_rule": [
@@ -1407,6 +1458,9 @@ def analyze(path: str, *, base: int = 0, deep: bool = True,
                       "truncated": any(s.get("truncated") for s in strings)}
     out["xrefs"] = {"code_pointers": rec["code_pointers"],
                     "string_refs": len(rec["string_refs"])}
+    out["relations"] = rec.get("relations") or {}
+    _rel = rec.get("_relations") or {}
+    out["switch_cases"] = ((_rel.get("switches") or {}).get("switches") or [])[:200]
     out["gaps"] = gaps
     out["limitations"] = limitations + [
         "本工具还原的是**地址、布局、控制流**，不是语义：函数原型按「无参 void」推断，"
@@ -1858,7 +1912,8 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
                   base: int = 0, deep: bool = True,
                   max_functions: int = MAX_FUNCTIONS, max_insns: int = MAX_INSNS,
                   max_stub_functions: int = 300, max_asm_functions: int = 200,
-                  include_asm: bool = True) -> dict:
+                  include_asm: bool = True, include_pseudo_c: bool = True,
+                  max_pseudo_c_functions: int = 60) -> dict:
     """把一份固件变成**能打开的工程骨架**，写在 ``out_dir``（必须不存在）。"""
     if not out_dir:
         return {"ok": False, "error": "缺少 out_dir"}
@@ -1922,6 +1977,34 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
                 notes.append("汇编输出达到指令上限，后续函数未写入 asm/")
         else:
             notes.append("未生成汇编：%s" % dt.get("error"))
+    # 4b) 伪 C（批次84）：寄存器级 lifting；**不是**原始源码，类型/名字都是推断
+    pseudo_ok = False
+    if include_pseudo_c and funcs:
+        from . import decomp as _decomp            # noqa: PLC0415
+        try:
+            sw0 = ((an.get("_recover") or {}).get("_relations") or {}).get("switches")
+            pcr = _decomp.decompile(
+                unit, funcs, max_funcs=max(1, int(max_pseudo_c_functions)),
+                max_insns=max_insns,
+                names={f["addr"]: f["name"] for f in funcs if f.get("name")},
+                switches=(sw0 or {}).get("switches") if isinstance(sw0, dict) else None)
+            if pcr.get("ok") and pcr.get("functions"):
+                _emit(dest, "src/pseudo_c.c",
+                      _decomp.pseudo_c_file(pcr, title=name), files)
+                pseudo_ok = True
+                if pcr.get("n_failed"):
+                    notes.append("%d 个函数没能提升成伪 C" % pcr["n_failed"])
+                if pcr.get("truncated"):
+                    notes.append("伪 C 只覆盖了前 %d 个函数（max_pseudo_c_functions 上限）"
+                                 % len(pcr["functions"]))
+                if pcr.get("n_unsupported"):
+                    notes.append("伪 C 里有 %d 处指令未提升：%s"
+                                 % (pcr["n_unsupported"],
+                                    ", ".join(pcr.get("unsupported") or [])))
+            else:
+                notes.append("未生成伪 C：%s" % (pcr.get("error") or "无函数"))
+        except Exception as e:                     # noqa: BLE001
+            notes.append("伪 C 生成失败（已跳过，其余产物不受影响）：%s" % e)
     # 5) 表格
     # 新增列一律追加在末尾：既有列名与顺序是历史断言的一部分，不挪不改。
     _emit(dest, "map/functions.csv", _csv(
@@ -1957,6 +2040,47 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
     rows += [["code_pointer", h["from_hex"], h["to_hex"], "word", ""]
              for h in cps["hits"]]
     _emit(dest, "map/xrefs.csv", _csv(["type", "from", "to", "how", "text"], rows), files)
+    # 5b) 关系层（批次82）：完整交叉引用 / 调用图 / 跳转表
+    rel = (an.get("_recover") or {}).get("_relations") or {}
+    xr = (rel.get("xrefs") or {}).get("xrefs") or []
+    _emit(dest, "map/xrefs_full.csv", _csv(
+        ["kind", "from", "to", "func", "func_name", "how", "confidence", "insn"],
+        [[x["kind"], x["from_hex"], x.get("to_hex", ""), "0x%08X" % x["func"],
+          x["func_name"], x.get("how", ""), x.get("confidence", ""), x["insn"]]
+         for x in xr]), files)
+    cg = rel.get("call_graph") or {}
+    _emit(dest, "map/callgraph.csv", _csv(
+        ["caller", "caller_name", "callee", "callee_name", "callsite", "confidence"],
+        [[e["caller_hex"], e["caller_name"], e["callee_hex"], e["callee_name"],
+          e["callsite_hex"], e["confidence"]] for e in (cg.get("edges") or [])]), files)
+    sw = (rel.get("switches") or {}).get("switches") or []
+    ty = rel.get("types") or {}
+    _emit(dest, "map/stack_frames.csv", _csv(
+        ["func", "func_name", "slot_offset", "width", "reads", "writes",
+         "basis", "confidence"],
+        [["0x%08X" % fr["func"], fr["func_name"], s1["offset"], s1["width"],
+          s1["reads"], s1["writes"], s1["basis"], s1["confidence"]]
+         for fr in (ty.get("stack_frames") or []) for s1 in fr["slots"]]), files)
+    _emit(dest, "map/struct_candidates.csv", _csv(
+        ["func", "func_name", "base_reg", "kind", "n_fields", "span",
+         "offset", "width", "reads", "writes", "array_elem_size", "confidence"],
+        [["0x%08X" % fn["func"], fn["func_name"], c["base_reg"], c["kind"],
+          c["n_fields"], c["span"], f1["offset"], f1["width"], f1["reads"],
+          f1["writes"], f1["array_elem_size"], c["confidence"]]
+         for fn in (ty.get("structs") or []) for c in fn["candidates"]
+         for f1 in c["fields"]]), files)
+    _emit(dest, "map/globals.csv", _csv(
+        ["addr", "size_at_least", "reads", "writes", "how", "funcs", "confidence"],
+        [[g["addr_hex"], g["size_at_least"], g["reads"], g["writes"],
+          " ".join(g["how"]), " ".join(g["funcs"]), g["confidence"]]
+         for g in (ty.get("globals") or [])]), files)
+    _emit(dest, "map/switches.csv", _csv(
+        ["kind", "addr", "func", "func_name", "n_cases", "table_addr",
+         "targets", "confidence", "length_basis"],
+        [[s0["kind"], s0["addr_hex"], "0x%08X" % s0["func"], s0["func_name"],
+          s0["n_cases"], s0.get("table_addr_hex", ""),
+          " ".join(s0.get("targets_hex") or []), s0["confidence"],
+          s0.get("length_basis", "")] for s0 in sw]), files)
     # 6. 构建脚本
     _emit(dest, "Makefile", _makefile(name), files)
     _emit(dest, "CMakeLists.txt", _cmake_text(name), files)
@@ -1981,6 +2105,7 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
         "file_count": len(files),
         "sha256_verified": verified,
         "asm_generated": asm_ok,
+        "pseudo_c_generated": pseudo_ok,
         "gaps": an.get("gaps") or [],
         "notes": notes,
         "limitations": an.get("limitations") or [],
@@ -2042,8 +2167,12 @@ def _project_from_ar(path: str, data: bytes, dest: str, ident: dict, *,
 
 
 def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
-              symbol: str = "", max_insns: int = 5000) -> dict:
-    """按「符号名」或「地址区间」反汇编一段。符号找不到时**列出可选名字**再报错。"""
+              symbol: str = "", max_insns: int = 5000, fmt: str = "") -> dict:
+    """按「符号名」或「地址区间」反汇编一段。符号找不到时**列出可选名字**再报错。
+
+    ``fmt`` 给 ``c`` / ``pseudo`` 时不返回指令表，而是返回**寄存器级伪 C**
+    （批次84 的 lifting）：表达式与控制流保真，类型/结构体/变量名是推断。
+    """
     data, err = _read_file(path)
     if err:
         return err
@@ -2092,6 +2221,35 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
         end = min(code_end, start + max_insns * 4)
     if end <= start:
         return {"ok": False, "error": "end(0x%X) 必须大于 start(0x%X)" % (end, start)}
+
+    want = (fmt or "").strip().lower()
+    if want in ("c", "pseudo", "pseudo_c", "c_code"):
+        from . import decomp as _decomp           # noqa: PLC0415
+        st = symbol_table(unit)
+        allf = [{"addr": f["addr"], "end_addr": f["addr"] + (f["size"] or 0),
+                 "name": f["name"]} for f in st["functions"]]
+        nm = symbol or next((f["name"] for f in allf if f["addr"] == start), "")
+        one = _decomp.decompile_function(
+            unit, {"addr": start, "end_addr": end, "name": nm},
+            funcs=allf or [{"addr": start, "end_addr": end, "name": nm}],
+            names={f["addr"]: f["name"] for f in allf if f["name"]},
+            max_insns=max_insns)
+        if not one.get("ok"):
+            return one
+        one["format"] = "pseudo_c"
+        one["input"] = {"path": os.path.abspath(path), "size": len(data),
+                        "sha256": sha256_bytes(data)}
+        one["arch"] = unit.arch
+        one["span"] = {"start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end}
+        one["notes"] = note + (one.get("notes") or [])
+        one["limitations"] = [
+            "寄存器级伪 C：表达式与控制流保真；类型名/结构体/变量名是**推断**的",
+            "bl 按 AAPCS 传当前 r0..r3，返回值在 r0（多返回值/浮点未建模）",
+            "间接跳转（函数指针、未恢复的跳转表）保留成注释，不编造分支",
+            "只结构化「单块 if」与「单块 if/else」；循环保留 goto 并标回边",
+        ]
+        return one
+
     r = disassemble(unit, start, end, max_insns=max_insns)
     if not r.get("ok"):
         return r

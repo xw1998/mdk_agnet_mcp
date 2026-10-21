@@ -150,7 +150,27 @@ thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
   只能切到下一个入口，这一段的可信度最低（可能把数据算进来）；
 - `params_estimate` 是按 AAPCS 看 `r0..r3` 首次访问是读还是写估的，**只是估计**：
   头文件里仍声明 `void f(void)`，别拿它当真实签名去改调用方；
-- 真要读语义用 Ghidra/IDA 打开同一份 axf 对照；本工具不内置反编译器（也不该内置）。
+- 想要「能读的代码」用 `recover_disasm(..., fmt="c")`（见下），别再靠猜 `op_str`。
+
+**寄存器级伪 C**（批次84，零额外依赖）：`recover_disasm(file, symbol="X", fmt="c")`
+把单个函数提升成寄存器级 C；`recover_project` 默认额外写 `src/pseudo_c.c`
+（`include_pseudo_c=false` 可关，`max_pseudo_c_functions` 默认 60）。读法：
+- 它保的是**表达式与跳转的语义**，不是原始源码：变量名就是 `r0..r12`，类型一律
+  `uint32_t` 起步。判「这函数干什么」够用，判「原作者怎么写的」不够用。
+- `/* 未支持: <mnemonic> ... */` 是**故意降级**不是漏做（典型：进位链断了还碰
+  `adc/sbc/rrx`）。看到它就说明这几行的语义不保真，别当等价代码用。
+- `flag_<cond>` 表示条件依赖的 flags 找不到生产者（上游是逻辑指令或跨块），
+  此时 `if` 里的条件只是「按条件码读出来的那个标志」，不是从比较推出来的。
+- `switch` 的项数来自守卫 `cmp`：`bhs/bcs` ⇒ K 项，`bhi` ⇒ K+1 项，其它条件 ⇒
+  扫到越界（`confidence=weak`）。跳转表的数据不会伪装成指令出现在源码里。
+- 结构化只做**单块 if / 单块 if-else**，循环与其余多块控制流保留 `goto L_xxx`
+  与 `/* 回边（循环） */`。别拿「有没有 while」判生成质量。
+
+**关系层与类型层**（批次82/83）：`recover_symbols` / `recover_project` 的
+`report.json` 里另有 `relations`：`xref_counts`（call/branch/data_read/data_write）、
+`call_graph`（根/叶/环/深度）、`switch_counts`、`types`（栈槽/结构体候选/数组元素
+大小/全局对象）。全是**形状**，不带类型名：4 字节就是 4 字节，别读成 `int`；
+`n_unresolved` 是「基址寄存器静态定不下来」的条数，不做符号执行就不猜。
 
 要点：
 - **三档置信要当真**：`observed` 来自 `symtab`/DWARF；`inferred` 来自向量表或 `bl` 目标；
@@ -160,7 +180,7 @@ thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
   `recover_project` 对归档只做逐成员取件 + `manifest.json`，要反汇编请对单个成员调
   `recover_disasm`。
 - **`out_dir` 必须不存在**（独占写，绝不覆盖既有证据），默认生成物每个都回读 SHA-256。
-- **不会给你 C 源码**：参数个数/类型、结构体布局、局部变量名、宏、中断优先级都不在输入里，
+- **给的是寄存器级伪 C，不是原始源码**：参数个数/类型、结构体布局、局部变量名、宏、中断优先级都不在输入里，
   `report.json` 与生成的 `README.md` 专设「没有恢复什么」一节——那份清单是**边界声明**，
   不是待办。
 

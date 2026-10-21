@@ -7568,17 +7568,20 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "遇到无法解码的字节会**跳过并按指令对齐继续**（不把「一个坏字节」当成「后面没有指令」），"
             "跳过次数在 undefined_skips 里如实报。\n"
             "限制：反汇编只说明「这些字节被解码成这些指令」；把数据区当代码扫会产出看着正常的垃圾指令，"
-            "所以区间边界要自己负责（先用 recover_symbols 看函数边界）。"
+            "所以区间边界要自己负责（先用 recover_symbols 看函数边界）。\n"
+            "fmt=\"c\" 改为输出**寄存器级伪 C**（lifting）：表达式/条件/switch/循环保真，"
+            "类型名与变量名是推断值；未提升的指令在源码里逐条标注，不静默丢。"
         ),
     )
     async def recover_disasm(path: str, start: int = 0, end: int = 0,
                              symbol: str = "", base: int = 0,
-                             max_insns: int = 5000) -> str:
+                             max_insns: int = 5000, fmt: str = "") -> str:
         try:
             out = _recover.disasm_at(str(path or "").strip(), base=int(base or 0),
                                      start=int(start or 0), end=int(end or 0),
                                      symbol=str(symbol or "").strip(),
-                                     max_insns=int(max_insns or 5000))
+                                     max_insns=int(max_insns or 5000),
+                                     fmt=str(fmt or "").strip())
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -7593,6 +7596,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "src/startup_recovered.c——**照抄原镜像向量表**的启动向量；\n"
             "src/recovered_stubs.c——weak 占位实现，让骨架能编译链接（原函数体没有恢复）；\n"
             "asm/disassembly.asm——带符号标注的反汇编；\n"
+            "src/pseudo_c.c——寄存器级伪 C（批次84：表达式与控制流保真，"
+            "类型/结构体/变量名是推断；未提升的指令逐条标注）；\n"
             "map/functions.csv（含 DWARF 原始文件/行号）、objects.csv、vector_table.csv、strings.csv、xrefs.csv；\n"
             "report.json（机器可读）+ README.md（人读，含「没有恢复什么」）。\n"
             "输入是 .lib/.a 时改为取件：members/ 下原样取出每个成员 + manifest.json（成员是可重定位目标文件，"
@@ -7604,7 +7609,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                              base: int = 0, deep: bool = True,
                              max_stub_functions: int = 300,
                              max_asm_functions: int = 200,
-                             include_asm: bool = True) -> str:
+                             include_asm: bool = True,
+                             include_pseudo_c: bool = True,
+                             max_pseudo_c_functions: int = 60) -> str:
         try:
             out = _recover.build_project(
                 str(path or "").strip(), str(out_dir or "").strip(),
@@ -7612,7 +7619,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 base=int(base or 0), deep=bool(deep),
                 max_stub_functions=int(max_stub_functions or 300),
                 max_asm_functions=int(max_asm_functions or 200),
-                include_asm=bool(include_asm))
+                include_asm=bool(include_asm),
+                include_pseudo_c=bool(include_pseudo_c),
+                max_pseudo_c_functions=int(max_pseudo_c_functions or 60))
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
