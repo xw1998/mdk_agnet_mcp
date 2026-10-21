@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.3）
+│   ├── __init__.py           # 包初始化（版本号 0.2.4）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -234,7 +234,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 204 个工具定义
+│   └── server.py             # MCP Server 与 208 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -283,7 +283,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **204** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **208** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
 - **MDK 族（110 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
 - **非 MDK 族（68 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**、**任务表取名**，34 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
@@ -621,13 +621,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-204 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 160 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+208 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 164 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 204 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 208 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -639,7 +639,7 @@ toolset(action="load",   toolsets="all")        # 一次全装 204 个（=full/*
 | `core` | 进出调试 / 运行控制 / 状态 / 跨会话状态 / 环境一致性体检、符号工程绑定、断点硬件残留校验、复位循环识别、可视化出图（38 个） |
 | `mem` | 内存与外设读写 / D-Cache 一致性维护（11 个） |
 | `symbol` | 符号与源码定位（7 个；`set_symbol_file`/`list_symbol_projects` 已上移 `core`） |
-| `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑 / 固件契约预检、闭环验证与镜像取证（20 个） |
+| `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑 / 固件契约预检、闭环验证 / 镜像取证 / 固件逆向出工程骨架（24 个） |
 | `serial` | 宿主机串口监听与命令应答 + Modbus 主站（14 个） |
 | `advanced` | 诊断 / 剖析 / SVD / 工程编辑 / 复位循环识别等进阶能力（26 个） |
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
@@ -659,8 +659,8 @@ toolset(action="load",   toolsets="all")        # 一次全装 204 个（=full/*
 |---|---|---|---|---|
 | 默认（`core` 组 + 元工具，描述 `lean`） | 44 | 约 2.2 万 | **约 3.9 万**（−56%） | 不设环境变量 |
 | **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 6 千** | **约 1.5 万** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
-| `all`（全装，描述默认 `lean`） | 204 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
-| `all` + `MDKDEBUG_DESC=min` | 204 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
+| `all`（全装，描述默认 `lean`） | 208 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=min` | 208 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
 | 上述任一档 + `MDKDEBUG_DESC=full` | — | 逐字节还原全文 | — | 要逐字完整说明时 |
 
 - **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。
@@ -980,6 +980,43 @@ Copyright (c) 2026 <春雫>
   它的 **binwalk/unblob 依赖、Ghidra/IDA/Frida 供给、各平台镜像分析**都没有采纳：
   这些要么需要外部引擎，要么与 MCU 无关。落地形态是 `image_inspect` / `image_carve`
   ——`mdkdebug/image.py` 纯标准库实现（ELF 程序头用 `struct` 直接读，不额外引包）
+
+### 工程级逆向层（批次79）
+
+- [morluto/rea](https://github.com/morluto/rea)：同样是**口径**来源，不是代码来源——它的 firmware
+  模块实质是 `binwalk`/`unblob` 的包装，工程恢复该自己做。所以本层**没有抄它的实现**，只继承
+  已经写下来的四条：结论挂在身份（path+size+SHA-256）上、观察/推导/未知三分、
+  「恢复不到」必须明说而不是给一个能编译的空壳、产物目录必须不存在（`open(...,"xb")` 独占写）。
+- [capstone](https://github.com/capstone-engine/capstone)：**只在真要出汇编时**用（`recover_disasm`
+  与 `recover_project(include_asm=true)`）；缺失时明确报错，不返回空指令表冒充「没有代码」。
+- [pyelftools](https://github.com/eliben/pyelftools)：只用于读 DWARF（源文件清单 + 函数 file/line）；
+  缺失时降级，不强依赖。ELF 容器、`ar` 归档、HEX、向量表、交叉引用**全部纯 `struct`**。
+
+落地形态是 `recover_probe` / `recover_symbols` / `recover_disasm` / `recover_project`
+（`mdkdebug/recover.py`）。它回答的是「**这份固件里能确定地恢复出什么**」，而不是
+「把它反编译成 C」：
+
+| 能从哪来 | 拿到什么 |
+|---|---|
+| ELF (`e_type=EXEC`) 的 `.symtab`/`.dynsym` | 函数名、地址、大小、Thumb 位——**observed** |
+| DWARF（可选） | 源文件清单与每个函数的 `file:line` |
+| Cortex-M 向量表 | 复位入口 + 前 16 个内核异常 + IRQn，逐项带 thumb 位与是否在可执行区 |
+| `bl`/`blx` 的调用目标 | 没符号的代码地址——**inferred**（单条即可，bl 目标本身就是证据） |
+| 只被数据引用的代码地址 | 同上，但**只有这一条线索时降级为 weak** |
+
+- **HEX / BIN 没有 ELF 头**：架构从复位向量 bit0 推断（`basis: inferred_from_vector_table`），
+  并在 notes 里写清「这是推断、不是读到的」，不假装有符号。
+- **`.lib` / `ar` 归档**：成员是可重定位目标文件，地址是**节内偏移**，直接出工程会误导。
+  所以 `recover_project` 对 `ar` 只做「逐成员取件 + `manifest.json`」，并在报告里指路
+  `recover_disasm` 对单个成员用——宁可少做一步，不给一个地址全错的工程。
+- **产物**：`linker/recovered.sct`（MDK）与 `recovered.ld`（GNU ld，MEMORY 来自镜像实际占用）、
+  `include/recovered_memory.h`、`include/recovered_symbols.h`（原型一律按无参 `void` 并写明是推断）、
+  `src/startup_recovered.c`（照抄原向量表）、`src/recovered_stubs.c`（`weak` 占位）、
+  `asm/disassembly.asm`、`map/{functions,objects,vector_table,strings,xrefs}.csv`、`report.json`、
+  `README.md`（专设「**没有恢复什么**」一节）、`Makefile`、`CMakeLists.txt`。
+  每个文件回读 SHA-256 并写进报告（`sha256_verified`）。
+- **不恢复**：C 源码、结构体布局、参数个数与类型、局部变量名、宏、内联函数边界、中断优先级配置。
+  这些不是「还没做」，是这份输入里**不存在**的信息。
 
 ### 底层库
 

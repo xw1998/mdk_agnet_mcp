@@ -101,6 +101,8 @@ READONLY = {
     "firmware_precheck",
     # 镜像取证（批次78）：只读文件、只算哈希/熵/签名，不改任何东西。
     "image_inspect",
+    # 批次79：逆向的读操作——只解析字节，不改任何东西
+    "recover_probe", "recover_symbols", "recover_disasm",
 }
 
 # ----------------------------------------------------------------------
@@ -135,6 +137,7 @@ NON_IDEMPOTENT = {
     "build_flash_verify",
     # 取件要求输出目录不存在：第二次调用必然失败，效果不等价于一次。
     "image_carve",
+    "recover_project",
     # 渲染默认每次生成一个带时间戳的新文件（重复调用会攒出多个页面），
     # 因此不是幂等——与 session_state 同口径。
     "view_render",
@@ -163,6 +166,7 @@ MUTATING = {
     "build_flash_verify",
     # 取件会新建目录与文件（不改既有内容，但确实改变文件系统）
     "image_carve",
+    "recover_project",
     "itm_trace", "keil_command", "launch_uvision", "ocd_bp", "ocd_cmd",
     "ocd_control", "ocd_flash", "ocd_gdb", "ocd_load", "ocd_reg", "ocd_start",
     "ocd_stop", "ocd_wp", "ocd_write_mem", "profile_function",

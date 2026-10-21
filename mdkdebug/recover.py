@@ -1,0 +1,1967 @@
+# -*- coding: utf-8 -*-
+"""工程级逆向（批次79）——从 hex / bin / elf / lib / so 还原出**能用**的工程骨架。
+
+为什么值得单独做
+--------------
+拿到一份别人的固件（或者自己半年前烧进去、源码已经丢了的那份），真正要回答的
+不是「它多大」，而是**「这是什么工程」**：代码在哪段地址、有哪些函数、谁调谁、
+哪些是中断、数据/字符串在哪、链接布局是什么、源文件叫什么。
+回答了这些才能重建工程、才能在正确的地址上打断点、才能判断改动会不会踩到别人的函数。
+
+本模块的口径（沿用批次78 的四条，另加两条逆向专有的）：
+
+1. **身份先于解释**：一切结论挂在 ``path + size + sha256`` 上。
+2. **观察 / 推导 / 未知三分**：符号表里的函数是**观察**（observed）；向量表与 BL
+   目标推出来的入口是**推导**（inferred）；没有符号又没有交叉证据的字节是**未知**，
+   不编名字、不猜类型。
+3. **取件/出件不覆盖**：输出目录必须不存在（``xb`` 独占写 + 回读 SHA-256）。
+4. **有界**：输入、反汇编条数、函数数、成员数都有上限，超了如实进 gaps。
+5. **不假装恢复了语义**：反汇编能还原**地址、指令、控制流**，还原不了「这个函数在
+   算什么东西」。所以生成的函数原型一律按「无参、void 返回」写字，并在文件头写明
+   「原型是推断的」，避免下游把它当事实。
+6. **尽量不引依赖**：ELF / ar / Intel HEX / 向量表 / 交叉引用**全部纯 ``struct`` 实现**；
+   capstone 只用于「真要出汇编」的那一步，缺失就明确报错；pyelftools 只在有 DWARF
+   时用来读源文件清单（缺了降级，不影响其它结论）。
+
+公开入口
+--------
+``analyze(path)``        一次剖析（格式/架构/布局/符号/向量表/字符串/交叉引用）
+``symbols_report(path)`` 符号恢复报告（三档置信）
+``disasm_text(path)``    反汇编文本
+``build_project(...)``   生成工程骨架目录
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import struct
+
+# ---- 上限：都是「防呆」，不是「性能调优」 ----
+MAX_INPUT_BYTES = 128 * 1024 * 1024   # 与批次78 的镜像取证同口径
+MAX_FUNCTIONS = 4000                  # 恢复函数数上限
+MAX_INSNS = 400000                    # 单次反汇编指令数上限
+MAX_MEMBERS = 256                     # ar 成员数上限
+MAX_STRING_LEN = 200                  # 单个字符串采集上限
+MIN_STRING_LEN = 4
+
+# ELF 常量
+_ET = {0: "NONE", 1: "REL", 2: "EXEC", 3: "DYN", 4: "CORE"}
+_EM = {0x03: "x86", 0x08: "MIPS", 0x28: "ARM", 0x2A: "SuperH", 0x3E: "x86-64",
+       0xB7: "AArch64", 0xF3: "RISC-V", 0x14: "PowerPC", 0x2B: "SPARC"}
+_SHT = {0: "NULL", 1: "PROGBITS", 2: "SYMTAB", 3: "STRTAB", 4: "RELA", 5: "HASH",
+        6: "DYNAMIC", 7: "NOTE", 8: "NOBITS", 9: "REL", 11: "DYNSYM",
+        14: "INIT_ARRAY", 15: "FINI_ARRAY", 16: "PREINIT_ARRAY", 17: "GROUP",
+        18: "SYMTAB_SHNDX"}
+_STT = {0: "NOTYPE", 1: "OBJECT", 2: "FUNC", 3: "SECTION", 4: "FILE",
+        5: "COMMON", 6: "TLS"}
+_STB = {0: "LOCAL", 1: "GLOBAL", 2: "WEAK"}
+
+# Cortex-M 异常名（前 16 个向量是内核固定的）
+_EXC = ["Initial_SP", "Reset", "NMI", "HardFault", "MemManage", "BusFault",
+        "UsageFault", "", "", "", "SVCall", "DebugMon", "", "PendSV", "SysTick"]
+
+
+# ----------------------------------------------------------------------
+# 身份
+# ----------------------------------------------------------------------
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _identity(path: str, data: bytes) -> dict:
+    return {
+        "path": os.path.abspath(path),
+        "size": len(data),
+        "sha256": sha256_bytes(data),
+    }
+
+
+def _read_file(path: str):
+    """读入并做体积/存在性检查，返回 (data, error_dict_or_None)。"""
+    if not path:
+        return None, {"ok": False, "error": "缺少 path"}
+    if not os.path.isfile(path):
+        return None, {"ok": False, "error": "文件不存在：%s" % path}
+    size = os.path.getsize(path)
+    if size == 0:
+        return None, {"ok": False, "path": os.path.abspath(path), "size": 0,
+                      "error": "空文件：没有任何可判的事实"}
+    if size > MAX_INPUT_BYTES:
+        return None, {"ok": False, "path": os.path.abspath(path), "size": size,
+                      "error": "输入超过 %d MiB 上限（本工具不读半个文件去猜整体）"
+                               % (MAX_INPUT_BYTES // (1024 * 1024))}
+    with open(path, "rb") as f:
+        return f.read(), None
+
+
+# ----------------------------------------------------------------------
+# 容器判定
+# ----------------------------------------------------------------------
+def detect_container(head: bytes) -> str:
+    """``ar``（.lib/.a）/ ``elf``（.axf/.elf/.o/.so）/ ``ihex`` / ``bin``。"""
+    if head.startswith(b"!<arch>\n"):
+        return "ar"
+    if head.startswith(b"\x7fELF"):
+        return "elf"
+    sample = head[:4096].decode("latin-1", "replace")
+    lines = [ln for ln in sample.splitlines() if ln.strip()]
+    if lines and sum(1 for ln in lines if ln.lstrip().startswith(":")) >= max(1, len(lines) // 2):
+        return "ihex"
+    return "bin"
+
+
+# ----------------------------------------------------------------------
+# ELF（纯 struct，不用 pyelftools）
+# ----------------------------------------------------------------------
+def _cstr(buf: bytes, off: int) -> str:
+    if off < 0 or off >= len(buf):
+        return ""
+    end = buf.find(b"\x00", off)
+    if end < 0:
+        end = len(buf)
+    return buf[off:end].decode("utf-8", "replace")
+
+
+def parse_elf(data: bytes) -> dict:
+    """解析 ELF32/64（小端/大端）的**头 + 节 + 符号 + 程序头**。
+
+    刻意不用 pyelftools：这些字段位置在两种 class 里都是固定的，
+    ``struct`` 足够，且 ``.lib`` 里每个成员都要解析一次——多一个包不值得。
+    """
+    if not data.startswith(b"\x7fELF"):
+        return {"ok": False, "error": "不是 ELF"}
+    if len(data) < 52:
+        return {"ok": False, "error": "ELF 头不完整（短于 52 字节）"}
+    cls, enc = data[4], data[5]
+    if cls not in (1, 2):
+        return {"ok": False, "error": "ELF class=%d 不认识" % cls}
+    if enc not in (1, 2):
+        return {"ok": False, "error": "ELF 字节序字段=%d 不认识" % enc}
+    e = "<" if enc == 1 else ">"
+    out = {
+        "ok": True,
+        "class": 32 if cls == 1 else 64,
+        "endian": "little" if enc == 1 else "big",
+        "relocatable": False,
+    }
+    e_type, e_machine, _ver = struct.unpack(e + "HHI", data[16:24])
+    out["type"] = _ET.get(e_type, "type_%d" % e_type)
+    out["type_id"] = e_type
+    out["machine_id"] = e_machine
+    out["machine"] = _EM.get(e_machine, "machine_0x%X" % e_machine)
+    out["relocatable"] = e_type == 1
+    if cls == 1:
+        (e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum,
+         e_shentsize, e_shnum, e_shstrndx) = struct.unpack(e + "IIIIHHHHHH",
+                                                           data[24:52])
+    else:
+        (e_entry, e_phoff, e_shoff, e_flags) = struct.unpack(e + "QQQI", data[24:48])
+        (e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum,
+         e_shstrndx) = struct.unpack(e + "HHHHHH", data[52:64])
+    out.update({"entry": int(e_entry), "flags": int(e_flags)})
+
+    # ---- 程序头 ----
+    segs = []
+    if e_phoff and e_phnum and e_phentsize:
+        for i in range(min(e_phnum, 64)):
+            b = data[e_phoff + i * e_phentsize: e_phoff + (i + 1) * e_phentsize]
+            if len(b) < (32 if cls == 1 else 56):
+                break
+            if cls == 1:
+                p_type, p_off, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags = \
+                    struct.unpack(e + "IIIIIII", b[:28])
+            else:
+                p_type, p_flags = struct.unpack(e + "II", b[:8])
+                p_off, p_vaddr, p_paddr, p_filesz, p_memsz = \
+                    struct.unpack(e + "QQQQQ", b[8:48])
+            segs.append({"type": int(p_type), "offset": int(p_off),
+                         "vaddr": int(p_vaddr), "paddr": int(p_paddr),
+                         "filesz": int(p_filesz), "memsz": int(p_memsz),
+                         "flags": int(p_flags)})
+    out["segments"] = segs
+
+    # ---- 节头 ----
+    secs = []
+    sh = {}
+    if e_shoff and e_shnum and e_shentsize:
+        raw = data[e_shoff: e_shoff + e_shentsize * e_shnum]
+        for i in range(e_shnum):
+            b = raw[i * e_shentsize:(i + 1) * e_shentsize]
+            if len(b) < (40 if cls == 1 else 64):
+                break
+            if cls == 1:
+                (sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link,
+                 sh_info, sh_addralign, sh_entsize) = struct.unpack(e + "IIIIIIIIII", b[:40])
+            else:
+                (sh_name, sh_type) = struct.unpack(e + "II", b[:8])
+                (sh_flags, sh_addr, sh_offset, sh_size) = struct.unpack(e + "QQQQ", b[8:40])
+                (sh_link, sh_info) = struct.unpack(e + "II", b[40:48])
+                (sh_addralign, sh_entsize) = struct.unpack(e + "QQ", b[48:64])
+            secs.append({"name_off": int(sh_name), "type": int(sh_type),
+                         "flags": int(sh_flags), "addr": int(sh_addr),
+                         "offset": int(sh_offset), "size": int(sh_size),
+                         "link": int(sh_link), "info": int(sh_info),
+                         "entsize": int(sh_entsize)})
+        for s in secs:
+            s["name"] = ""
+        if e_shstrndx < len(secs):
+            strtab = secs[e_shstrndx]
+            blob = data[strtab["offset"]:strtab["offset"] + strtab["size"]]
+            for s in secs:
+                s["name"] = _cstr(blob, s["name_off"])
+        for s in secs:
+            s["type_name"] = _SHT.get(s["type"], "type_%d" % s["type"])
+            s["exec"] = bool(s["flags"] & 0x4)
+            s["writable"] = bool(s["flags"] & 0x1)
+            s["alloc"] = bool(s["flags"] & 0x2)
+    out["sections"] = secs
+
+    # ---- 符号（.symtab / .dynsym） ----
+    syms = []
+    for s in secs:
+        if s["type"] not in (2, 11):
+            continue
+        src = "symtab" if s["type"] == 2 else "dynsym"
+        strblob = b""
+        if s["link"] < len(secs):
+            st = secs[s["link"]]
+            strblob = data[st["offset"]:st["offset"] + st["size"]]
+        entsize = s["entsize"] or (16 if cls == 1 else 24)
+        n = min(s["size"] // entsize if entsize else 0, 200000)
+        base = s["offset"]
+        for i in range(1, n):   # 0 号是空符号
+            b = data[base + i * entsize: base + (i + 1) * entsize]
+            if len(b) < entsize:
+                break
+            if cls == 1:
+                st_name, st_value, st_size, st_info, st_other, st_shndx = \
+                    struct.unpack(e + "IIIBBH", b[:16])
+            else:
+                st_name, st_info, st_other, st_shndx = struct.unpack(e + "IBBH", b[:8])
+                st_value, st_size = struct.unpack(e + "QQ", b[8:24])
+            name = _cstr(strblob, int(st_name))
+            if not name:
+                continue
+            syms.append({"name": name, "value": int(st_value), "size": int(st_size),
+                         "type": _STT.get(st_info & 0xF, "t%d" % (st_info & 0xF)),
+                         "bind": _STB.get(st_info >> 4, "b%d" % (st_info >> 4)),
+                         "shndx": int(st_shndx), "source": src})
+    out["symbols"] = syms
+    return out
+
+
+# ----------------------------------------------------------------------
+# ar（Keil .lib / GNU .a）
+# ----------------------------------------------------------------------
+def parse_ar(data: bytes) -> dict:
+    """解析 ``!<arch>`` 归档，处理 GNU 长名表（``//`` + ``/偏移``）与 BSD ``#1/len``。
+
+    Keil 的 ``.lib`` 与 GNU ``.a`` 都是这个格式；成员一般是可重定位 ELF 目标文件。
+    符号索引成员（``/``、``/SYM64/``、``__.SYMDEF``）不是数据，跳过。
+    """
+    if not data.startswith(b"!<arch>\n"):
+        return {"ok": False, "error": "不是 ar 归档（缺 !<arch> 魔数）"}
+    pos = 8
+    longnames = b""
+    members, gaps = [], []
+    while pos + 60 <= len(data):
+        hdr = data[pos:pos + 60]
+        name = hdr[0:16].decode("latin-1").rstrip()
+        if hdr[58:60] not in (b"`\n", b"`\r"):
+            gaps.append({"offset": pos, "reason": "成员头结尾不是 `\\n，归档可能被截断"})
+            break
+        try:
+            size = int(hdr[48:58].decode("latin-1").strip() or 0)
+        except ValueError:
+            gaps.append({"offset": pos, "reason": "成员长度字段不可解析"})
+            break
+        body = data[pos + 60: pos + 60 + size]
+        if len(body) < size:
+            gaps.append({"offset": pos, "reason": "成员数据不足（文件被截断）"})
+            break
+        real = name
+        payload = body
+        if name == "//":
+            longnames = body
+            pos += 60 + size + (size & 1)
+            continue
+        if name in ("/", "/SYM64/", "__.SYMDEF", "__.SYMDEF SORTED"):
+            pos += 60 + size + (size & 1)
+            continue
+        if name.startswith("/") and name[1:].isdigit():
+            off = int(name[1:])
+            end = longnames.find(b"/\n", off)
+            if end < 0:
+                end = longnames.find(b"\x00", off)
+            if end < 0:
+                end = len(longnames)
+            real = longnames[off:end].decode("utf-8", "replace")
+        elif name.startswith("#1/"):
+            nlen = int(name[3:] or 0)
+            real = body[:nlen].decode("utf-8", "replace").rstrip("\x00")
+            payload = body[nlen:]
+        elif name.endswith("/"):
+            real = name[:-1]
+        members.append({"name": real or "member_%d" % len(members),
+                        "offset": pos + 60, "size": len(payload),
+                        "sha256": sha256_bytes(payload), "data": payload})
+        if len(members) >= MAX_MEMBERS:
+            gaps.append({"offset": pos, "reason": "成员数超过 %d，未继续解析" % MAX_MEMBERS})
+            break
+        pos += 60 + size + (size & 1)
+    if not members and not gaps:
+        gaps.append({"offset": pos, "reason": "归档里没有可解析的成员（头部不完整或只有索引成员）"})
+    elif pos < len(data) and not gaps:
+        gaps.append({"offset": pos, "reason": "归档尾部剩 %d 字节（不足一个成员头），未解析"
+                                              % (len(data) - pos)})
+    return {"ok": True, "members": members, "gaps": gaps}
+
+
+# ----------------------------------------------------------------------
+# 扁平镜像（hex / bin）与地址空间
+# ----------------------------------------------------------------------
+def _flat_image(data: bytes, kind: str, base: int) -> dict:
+    """把 hex/bin 变成 ``addr -> bytes`` 的连续块（带 base）。"""
+    if kind == "ihex":
+        from . import image as _image
+        text = data.decode("latin-1")
+        info = _image.parse_ihex(text)
+        if not info["spans"]:
+            return {"ok": False, "error": "HEX 里没有数据记录：没有任何可逆的字节"}
+        payload = _image._hex_bytes_to_sparse(text)
+        real_base = int(info["min_offset"] or 0)
+        return {"ok": True, "data": payload, "base": real_base, "hex": info}
+    return {"ok": True, "data": data, "base": int(base), "hex": None}
+
+
+# ----------------------------------------------------------------------
+# 架构判定与地址映射
+# ----------------------------------------------------------------------
+_CS_ARCH = {0x28: "arm", 0xB7: "arm64", 0xF3: "riscv"}
+
+
+def arch_of(elf: dict) -> dict:
+    """CPU 判定：family / 位宽 / 端序 / Thumb。
+
+    Thumb 判定**必须给依据**：Cortex-M 的函数地址末位为 1（指令集选择位），
+    所以「入口是奇数」或「有奇数值的函数符号」都能证明是 Thumb。
+    """
+    if not elf or not elf.get("ok"):
+        return {"family": "unknown", "bits": 32, "endian": "little",
+                "thumb": False, "supported": False, "why": "不是 ELF，无法判架构"}
+    mid = int(elf.get("machine_id") or 0)
+    family = _CS_ARCH.get(mid, "unknown")
+    bits = int(elf.get("class") or 32)
+    endian = elf.get("endian", "little")
+    thumb = False
+    why = ""
+    if family == "arm":
+        entry = int(elf.get("entry") or 0)
+        odd_funcs = any((s["type"] == "FUNC" and (s["value"] & 1))
+                        for s in elf.get("symbols", []))
+        has_t = any(s["name"] in ("$t", "$t.1") for s in elf.get("symbols", []))
+        thumb = bool(entry & 1) or odd_funcs or has_t
+        why = ("入口地址末位=%d、函数符号有奇数地址=%s、有 $t 映射符号=%s ⇒ %s"
+               % (entry & 1, odd_funcs, has_t, "Thumb" if thumb else "ARM"))
+    return {"family": family, "bits": bits, "endian": endian, "thumb": thumb,
+            "supported": family != "unknown", "why": why or "按 e_machine 判定"}
+
+
+def _make_cs(arch: dict):
+    """建 capstone 反汇编器。缺依赖时**报错**，不返回空结果冒充「没有指令」。"""
+    try:
+        import capstone
+    except ImportError as ie:  # noqa: BLE001
+        return None, "缺少 capstone 依赖（%s），无法反汇编；pip install capstone 后重试" % ie
+    fam = arch.get("family")
+    try:
+        if fam == "arm":
+            mode = capstone.CS_MODE_THUMB if arch.get("thumb") else capstone.CS_MODE_ARM
+            if arch.get("thumb"):
+                try:
+                    capstone.Cs(capstone.CS_ARCH_ARM, mode | capstone.CS_MODE_MCLASS)
+                    mode |= capstone.CS_MODE_MCLASS
+                except Exception:  # noqa: BLE001
+                    pass
+            if arch.get("endian") == "big":
+                mode |= capstone.CS_MODE_BIG_ENDIAN
+            return capstone.Cs(capstone.CS_ARCH_ARM, mode), ""
+        if fam == "arm64":
+            mode = capstone.CS_MODE_ARM
+            if arch.get("endian") == "big":
+                mode |= capstone.CS_MODE_BIG_ENDIAN
+            return capstone.Cs(capstone.CS_ARCH_ARM64, mode), ""
+        if fam == "riscv":
+            mode = capstone.CS_MODE_RISCV64 if arch.get("bits") == 64 else capstone.CS_MODE_RISCV32
+            return capstone.Cs(capstone.CS_ARCH_RISCV, mode), ""
+    except Exception as e:  # noqa: BLE001
+        return None, "capstone 初始化失败：%s" % e
+    return None, "不支持的架构：%s（本工具只反汇编 ARM / AArch64 / RISC-V）" % fam
+
+
+class Unit:
+    """一份可分析的镜像：ELF、或 HEX/BIN 展开后的扁平字节。"""
+
+    def __init__(self, data: bytes, name: str, base: int = 0, elf: dict | None = None):
+        self.data = data
+        self.name = name
+        self.elf = elf
+        self.base = int(base or 0)
+        self.relocatable = bool(elf and elf.get("relocatable"))
+        self.spans = []          # [(start, end, file_offset)] 覆盖的地址区间
+        self.code_ranges = []    # [(start, end)] 可执行区间
+        self.arch = arch_of(elf) if elf else {
+            "family": "unknown", "bits": 32, "endian": "little",
+            "thumb": True, "supported": False,
+            "why": "HEX/BIN 没有 ELF 头：CPU 只能由调用方指定或从向量表推断",
+        }
+        self.limitations = []
+        self._build_spans()
+        if elf is None:
+            self._infer_arch_from_vectors()
+
+    def _infer_arch_from_vectors(self):
+        """HEX/BIN 没有 ELF 头：只看前 8 字节——复位地址 bit0=1 说明是 Thumb（Cortex-M）。"""
+        head = self.read(self.base, 8)
+        if len(head) < 8:
+            self.limitations.append("镜像短于 8 字节：连向量表都不完整")
+            return
+        sp = int.from_bytes(head[0:4], "little")
+        reset = int.from_bytes(head[4:8], "little")
+        if reset & 1:
+            self.arch = {"family": "arm", "bits": 32, "endian": "little",
+                         "thumb": True, "supported": True,
+                         "why": "无 ELF 头，由向量表复位地址 bit0=1 推断为 Thumb（Cortex-M 形态）",
+                         "basis": "inferred_from_vector_table"}
+            self.limitations.append(
+                "架构是从向量表**推断**的（不是 ELF 头声明的）：若这份 bin 的基地址给错，"
+                "反汇编结果会整体错位")
+        elif sp and reset:
+            self.arch = {"family": "unknown", "bits": 32, "endian": "little",
+                         "thumb": False, "supported": False,
+                         "why": "向量表首字与复位地址都不像 Thumb 入口：架构未判定"}
+        if self.arch.get("supported") and not self.is_exec_address(reset):
+            self.limitations.append("复位地址不在镜像范围内：base 可能给错了")
+
+    def _build_spans(self):
+        if self.elf:
+            for s in self.elf.get("sections", []):
+                if not s.get("alloc") or s["type_name"] == "NOBITS" or not s["size"]:
+                    continue
+                self.spans.append((s["addr"], s["addr"] + s["size"], s["offset"]))
+                if s.get("exec"):
+                    self.code_ranges.append((s["addr"], s["addr"] + s["size"]))
+            if not self.spans:
+                for seg in self.elf.get("segments", []):
+                    if seg["filesz"]:
+                        self.spans.append((seg["vaddr"], seg["vaddr"] + seg["filesz"],
+                                           seg["offset"]))
+                        if seg["flags"] & 0x1:
+                            self.code_ranges.append((seg["vaddr"],
+                                                     seg["vaddr"] + seg["filesz"]))
+        else:
+            self.spans.append((self.base, self.base + len(self.data), 0))
+            self.code_ranges.append((self.base, self.base + len(self.data)))
+        self.spans.sort()
+        self.code_ranges.sort()
+
+    # ---- 地址访问 ----
+    def offset_of(self, addr: int):
+        for start, end, off in self.spans:
+            if start <= addr < end:
+                return off + (addr - start)
+        return None
+
+    def read(self, addr: int, n: int) -> bytes:
+        off = self.offset_of(addr)
+        if off is None:
+            return b""
+        return self.data[off:off + n]
+
+    def in_code(self, addr: int) -> bool:
+        return any(a <= addr < b for a, b in self.code_ranges)
+
+    def is_exec_address(self, value: int) -> bool:
+        """这个字**看起来**是代码指针吗：去 Thumb 位后落在可执行区间内。"""
+        return self.in_code(value & ~1)
+
+    def section_of(self, addr: int):
+        if not self.elf:
+            return None
+        for s in self.elf.get("sections", []):
+            if s.get("alloc") and s["size"] and s["addr"] <= addr < s["addr"] + s["size"]:
+                return s
+        return None
+
+
+def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
+    kind = detect_container(data[:4096])
+    if kind == "elf":
+        return Unit(data, name, base=base, elf=parse_elf(data))
+    if kind == "ihex":
+        flat = _flat_image(data, "ihex", base)
+        if not flat.get("ok"):
+            raise ValueError(flat.get("error", "HEX 解析失败"))
+        return Unit(flat["data"], name, base=flat["base"])
+    return Unit(data, name, base=base)
+
+
+# ----------------------------------------------------------------------
+# 向量表
+# ----------------------------------------------------------------------
+def vector_table(unit: Unit, base: int | None = None, max_entries: int = 128,
+                 endian: str | None = None) -> dict:
+    """按 Cortex-M 约定读前 N 个字：初值 SP + 异常/中断入口。
+
+    每一栏都是**观察到的事实**（地址、Thumb 位），但「这个入口属于哪个中断」只在
+    前 16 个（内核固定）里成立；外部中断编号的语义取决于具体芯片，所以标
+    ``semantics: "unverified"``——知道地址不等于知道它是哪个外设。
+    """
+    en = endian or (unit.arch.get("endian") or "little")
+    if base is None:
+        base = unit.base if not unit.elf else (unit.code_ranges[0][0] if unit.code_ranges else 0)
+    out = {"base_hex": "0x%08X" % int(base), "entries": [], "sp": None,
+           "reset": None, "count": 0, "semantics": "unverified", "gaps": []}
+    first = unit.read(base, 4 * max_entries)
+    if len(first) < 8:
+        out["gaps"].append({"reason": "镜像在向量表地址处不足 8 字节，读不到 SP/复位地址"})
+        return out
+    words = []
+    for i in range(len(first) // 4):
+        words.append(int.from_bytes(first[i * 4:i * 4 + 4], en))
+    sp = words[0]
+    out["sp_hex"] = "0x%08X" % sp
+    out["sp"] = sp
+    if sp == 0 or sp == 0xFFFFFFFF:
+        out["gaps"].append({"reason": "首字不是合理的栈顶（0 或 0xFFFFFFFF）："
+                                      "该地址可能不是向量表，或镜像是压缩/加密的"})
+    for i, w in enumerate(words):
+        if i > 0 and (w == 0 or w == 0xFFFFFFFF):
+            break
+        if i == 0:
+            continue
+        name = _EXC[i] if i < len(_EXC) else ("IRQ%d" % (i - 16) if i >= 16 else "")
+        entry = {
+            "index": i,
+            "handler_hex": "0x%08X" % w,
+            "thumb": bool(w & 1),
+            "in_code": unit.is_exec_address(w),
+            "name": name or ("vector%d" % i),
+        }
+        out["entries"].append(entry)
+        if i == 1:
+            out["reset"] = w
+            out["reset_hex"] = "0x%08X" % w
+    out["count"] = len(out["entries"])
+    if out["entries"] and not any(e["in_code"] for e in out["entries"]):
+        out["gaps"].append({"reason": "所有入口地址都不落在可执行区间内："
+                                      "要么 base 给错了，要么这不是一份可直接运行的镜像"})
+    out["limitations"] = [
+        "前 16 个是 Cortex-M 内核固定异常；IRQn 的**具体外设**取决于芯片，未判定",
+        "读到 0/0xFFFFFFFF 即停止：中间的空洞不会让后面被误当入口",
+    ]
+    return out
+
+
+# ----------------------------------------------------------------------
+# 符号恢复
+# ----------------------------------------------------------------------
+def _norm_addr(v: int, thumb: bool) -> int:
+    """Thumb 地址末位是「指令集选择位」，不是地址的一部分。"""
+    return (v & ~1) if (thumb and (v & 1)) else v
+
+
+def _clean_name(name: str) -> str:
+    """过滤 ARM 映射符号（$t/$d/$a/$t.1）与编译器内部符号。"""
+    n = name.strip()
+    if n in ("$t", "$d", "$a") or n.startswith(("$t.", "$d.", "$a.")):
+        return ""
+    return n
+
+
+def symbol_table(unit: Unit) -> dict:
+    """把 ELF 符号表分成函数/对象/其它，并**保留绑定与来源**（观察事实）。"""
+    funcs, objs, others = [], [], []
+    mapping = []
+    if not unit.elf:
+        return {"functions": [], "objects": [], "other": 0, "mapping_symbols": 0,
+                "counts": {"functions": 0, "objects": 0, "other": 0},
+                "available": False,
+                "why": "HEX/BIN 没有符号表：名字只能从向量表与交叉引用推断"}
+    for s in unit.elf.get("symbols", []):
+        raw = s["name"]
+        if raw in ("$t", "$d", "$a") or raw.startswith(("$t.", "$d.", "$a.")):
+            mapping.append({"name": raw, "value": s["value"]})
+            continue
+        name = _clean_name(raw)
+        if not name:
+            continue
+        rec = {"name": name, "value": s["value"], "addr": _norm_addr(s["value"], True),
+               "size": s["size"], "bind": s["bind"], "type": s["type"],
+               "source": s["source"], "confidence": "observed"}
+        if s["type"] == "FUNC":
+            funcs.append(rec)
+        elif s["type"] in ("OBJECT", "COMMON", "TLS"):
+            objs.append(rec)
+        else:
+            others.append(rec)
+    return {
+        "available": True,
+        "functions": funcs,
+        "objects": objs,
+        "other": len(others),
+        "mapping_symbols": len(mapping),
+        "counts": {"functions": len(funcs), "objects": len(objs),
+                   "other": len(others), "mapping_symbols": len(mapping)},
+        "limitations": ["符号表只能证明「这里有一个叫这个名字的函数」，"
+                        "不证明函数体没被内联/裁剪过；st_size=0 的符号边界未知"],
+    }
+
+
+# ----------------------------------------------------------------------
+# 反汇编
+# ----------------------------------------------------------------------
+_RET_MNEMONICS = {"bx": ("lr",), "pop": ("pc",), "mov": ("pc",),
+                  "ret": None, "ldr": ("pc",), "jmp": None}
+
+
+def _looks_like_return(mnemonic: str, op_str: str) -> bool:
+    m = mnemonic.lower()
+    if m in ("ret", "jr"):
+        return m == "ret"
+    if m == "bx":
+        return op_str.strip().endswith("lr")
+    if m == "pop":
+        return "pc" in op_str
+    if m == "mov":
+        return op_str.strip().endswith("pc") or ", pc" in op_str
+    if m == "ldr" and "pc" in op_str:
+        return True
+    return False
+
+
+def _branch_target(mnemonic: str, op_str: str):
+    """从 ``bl #0x8001234`` 这类操作数里取直接跳转目标（纯文本解析，跨架构通用）。"""
+    m = mnemonic.lower()
+    if m not in ("bl", "blx", "b", "b.w", "beq", "bne", "bcs", "bcc", "bmi",
+                 "bpl", "bvs", "bvc", "bhi", "bls", "bge", "blt", "bgt", "ble",
+                 "bal", "jal", "j", "call", "cbnz", "cbz"):
+        return None
+    s = op_str.strip().lstrip("#")
+    tok = s.split(",")[0].strip()
+    if not tok:
+        return None
+    if tok.startswith("0x"):
+        try:
+            return int(tok, 16)
+        except ValueError:
+            return None
+    return None
+
+
+def disassemble(unit: Unit, start: int, end: int, *, md=None,
+                max_insns: int = MAX_INSNS) -> dict:
+    """反汇编 ``[start, end)``。capstone 缺失/架构不支持时**明确报错**。"""
+    if md is None:
+        md, why = _make_cs(unit.arch)
+        if md is None:
+            return {"ok": False, "error": why}
+    blob = unit.read(start, end - start)
+    if not blob:
+        return {"ok": False, "error": "地址 0x%08X 不在镜像的映射范围内" % start,
+                "addr_hex": "0x%08X" % start}
+    try:
+        md.detail = True
+    except Exception:  # noqa: BLE001
+        pass
+    insns, truncated = [], False
+    unit_size = 2 if (unit.arch.get("thumb") or unit.arch.get("family") == "riscv") else 4
+    pos, skipped, addr = 0, 0, start
+    while pos < len(blob):
+        progressed = False
+        for ins in md.disasm(blob[pos:], start + pos):
+            rec = {"addr": ins.address, "addr_hex": "0x%08X" % ins.address,
+                   "mnemonic": ins.mnemonic, "op_str": ins.op_str,
+                   "bytes": ins.bytes.hex(), "size": ins.size}
+            tgt = _branch_target(ins.mnemonic, ins.op_str)
+            if tgt is not None:
+                rec["target"] = tgt
+                rec["target_hex"] = "0x%08X" % tgt
+            if _looks_like_return(ins.mnemonic, ins.op_str):
+                rec["ends_function"] = True
+            insns.append(rec)
+            addr = ins.address + ins.size
+            pos = addr - start
+            progressed = True
+            if len(insns) >= max_insns:
+                truncated = True
+                break
+        if truncated:
+            break
+        if not progressed or pos < len(blob):
+            # capstone 遇到无法解码的字节会停下：**跳过对齐单元继续**，
+            # 不把「一个坏字节」当成「这段再没有指令」（否则大段代码静默消失）。
+            pos = min(pos + unit_size, len(blob))
+            addr = start + pos
+            skipped += 1
+    out_skipped = skipped
+    out = {"ok": True, "start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end,
+           "count": len(insns), "truncated": truncated, "insns": insns,
+           "undefined_skips": out_skipped, "consumed": addr - start}
+    if out_skipped:
+        out["notes"] = ["有 %d 处无法解码的字节已跳过（指令对齐处继续），"
+                        "该处指令未纳入结果" % out_skipped]
+    if truncated:
+        out["gaps"] = [{"reason": "指令数超过 %d 上限，反汇编在该点截断" % max_insns}]
+    return out
+
+
+def disasm_text(unit: Unit, functions: list, *, max_insns: int = MAX_INSNS,
+                per_function: int = 20000) -> dict:
+    """给每个函数出汇编文本（带地址、机器码、符号名）。"""
+    md, why = _make_cs(unit.arch)
+    if md is None:
+        return {"ok": False, "error": why}
+    code_end = max((b for _, b in unit.code_ranges), default=unit.base)
+    lines, blocks, truncated = [], [], False
+    total = 0
+    for f in functions:
+        start = f["addr"]
+        end = f.get("end_addr") or min(start + (f.get("size") or 0) or (code_end - start),
+                                       code_end)
+        if end <= start:
+            continue
+        if total >= max_insns:
+            truncated = True
+            break
+        r = disassemble(unit, start, end, md=md,
+                        max_insns=min(per_function, max_insns - total))
+        if not r.get("ok"):
+            blocks.append({"name": f["name"], "addr_hex": "0x%08X" % start,
+                           "error": r.get("error")})
+            continue
+        total += r["count"]
+        blocks.append({"name": f["name"], "addr_hex": "0x%08X" % start,
+                       "end_hex": "0x%08X" % end, "count": r["count"],
+                       "truncated": r["truncated"], "insns": r["insns"]})
+        lines.append("")
+        lines.append("; ---- %s  @ %s  size=%s  (%s)" % (
+            f["name"], "0x%08X" % start, f.get("size") or "?", f.get("confidence")))
+        lines.append("%s:" % f["name"])
+        for ins in r["insns"]:
+            mark = ""
+            if "target" in ins:
+                mark = "   ; -> 0x%08X" % ins["target"]
+            lines.append("    %08X:  %-20s  %-24s%s" % (
+                ins["addr"], ins["bytes"], (ins["mnemonic"] + " " + ins["op_str"]).strip(),
+                mark))
+    return {"ok": True, "text": "\n".join(lines).strip() + "\n", "blocks": blocks,
+            "insn_count": total, "truncated": truncated}
+
+
+# ----------------------------------------------------------------------
+# 交叉引用与字符串
+# ----------------------------------------------------------------------
+def find_strings(unit: Unit, *, min_len: int = MIN_STRING_LEN,
+                 max_strings: int = 2000) -> list:
+    """扫描**所有已分配区间**找可打印字符串。
+
+    为什么代码区也扫：MDK 的 axf 常常只有一个 ``ER_IROM1``（代码 + 只读数据同一节），
+    只扫"非可执行区"会一个字符串都找不到——那是**漏**，不是"没有字符串"。
+    所以代码区里的命中保留并标 ``in_code=True``（它可能只是指令字节凑巧可打印，
+    也可能是字面量池里的常量字符串），交给调用方按需要过滤。
+    """
+    out, truncated = [], False
+    for start, end, off in unit.spans:
+        blob = unit.data[off:off + (end - start)]
+        in_code = any(a <= start < b for a, b in unit.code_ranges)
+        i = 0
+        while i < len(blob):
+            c = blob[i]
+            if 0x20 <= c <= 0x7E or c == 0x09:
+                j = i
+                while j < len(blob) and (0x20 <= blob[j] <= 0x7E or blob[j] == 0x09):
+                    j += 1
+                if j - i >= min_len:
+                    out.append({"addr": start + i, "addr_hex": "0x%08X" % (start + i),
+                                "len": j - i, "in_code": in_code,
+                                "text": blob[i:j][:MAX_STRING_LEN].decode("latin-1")})
+                    if len(out) >= max_strings:
+                        truncated = True
+                        break
+                i = j
+            else:
+                i += 1
+        if truncated:
+            break
+    if truncated:
+        out.append({"truncated": True, "reason": "字符串数超过 %d 上限" % max_strings})
+    return out
+
+
+def find_code_pointers(unit: Unit, *, max_hits: int = 4000,
+                       exclude=None) -> dict:
+    """扫 4 字节对齐的字，找出「值（去 Thumb 位）落在可执行区间内」的地址。
+
+    这是**推导**：字面量池、跳转表、结构体里的函数指针都会命中，也可能有巧合。
+    好处是剥离符号的固件里，它是唯一能证明「这个入口被当成指针用过」的证据。
+    """
+    hits, truncated = [], False
+    en = unit.arch.get("endian", "little")
+    for start, end, off in unit.spans:
+        n = (end - start) // 4
+        blob = unit.data[off:off + n * 4]
+        for i in range(n):
+            w = int.from_bytes(blob[i * 4:i * 4 + 4], en)
+            from_addr = start + i * 4
+            if exclude and any(a <= from_addr < b for a, b in exclude):
+                continue   # 向量表自己的字天然指向代码，那不是「交叉引用」
+            if exclude and any(a <= (w & ~1) < b for a, b in exclude):
+                continue   # 指向向量表自身的指针不是函数入口
+            if w and w != 0xFFFFFFFF and unit.is_exec_address(w):
+                hits.append({"from": from_addr, "from_hex": "0x%08X" % from_addr,
+                             "to": w & ~1, "to_hex": "0x%08X" % (w & ~1),
+                             "thumb": bool(w & 1), "type": "code_pointer"})
+                if len(hits) >= max_hits:
+                    truncated = True
+                    break
+        if truncated:
+            break
+    return {"ok": True, "hits": hits, "count": len(hits), "truncated": truncated,
+            "confidence": "inferred",
+            "why": "4 字节字的值（去 Thumb 位）落在可执行区间内——是指针的**证据**，不是函数定义"}
+
+
+# ----------------------------------------------------------------------
+# DWARF（可选：只用来回答「原始工程有哪些源文件、函数住在哪一行」）
+# ----------------------------------------------------------------------
+def dwarf_info(path: str, *, max_cus: int = 64, max_files: int = 512,
+               max_funcs: int = 4000) -> dict:
+    """读 ``.debug_info``/``.debug_line``：源文件清单 + 函数的文件/行号。
+
+    这是「工程级」逆向里**性价比最高**的一步：带 ``-g`` 编出来的 axf 里，
+    函数的原始文件名与行号是**观察事实**，能直接把一堆地址组织成工程目录。
+    没有 DWARF 就如实说没有——不猜源文件名。
+    """
+    try:
+        from elftools.elf.elffile import ELFFile
+    except ImportError:
+        return {"available": False,
+                "why": "pyelftools 未安装（可选依赖）：源文件清单不可得，"
+                       "其它结论不受影响"}
+    try:
+        with open(path, "rb") as f:
+            elf = ELFFile(f)
+            if not elf.has_dwarf_info():
+                return {"available": False,
+                        "why": "没有 .debug_info：编译时未开调试信息（-g），"
+                               "源文件名与行号**不可恢复**"}
+            d = elf.get_dwarf_info()
+            files, funcs, cus = [], [], []
+            seen = set()
+            for ci, cu in enumerate(d.iter_CUs()):
+                if ci >= max_cus:
+                    break
+                top = cu.get_top_DIE()
+                attrs = top.attributes
+                cu_name = ""
+                if "DW_AT_name" in attrs:
+                    v = attrs["DW_AT_name"].value
+                    cu_name = v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+                try:
+                    lp = d.line_program_for_CU(cu)
+                except Exception:  # noqa: BLE001
+                    lp = None
+                if lp:
+                    for fe in lp.header["file_entry"]:
+                        nm = fe.name
+                        nm = nm.decode("utf-8", "replace") if isinstance(nm, bytes) else str(nm)
+                        if nm and nm not in seen:
+                            seen.add(nm)
+                            files.append(nm)
+                            if len(files) >= max_files:
+                                break
+                cus.append({"name": cu_name, "n_files": len(files)})
+                for die in cu.iter_DIEs():
+                    if die.tag != "DW_TAG_subprogram":
+                        continue
+                    a = die.attributes
+                    nm = a.get("DW_AT_name")
+                    lo = a.get("DW_AT_low_pc")
+                    if not nm or lo is None:
+                        continue
+                    nm = nm.value
+                    nm = nm.decode("utf-8", "replace") if isinstance(nm, bytes) else str(nm)
+                    decl_file = a.get("DW_AT_decl_file")
+                    decl_line = a.get("DW_AT_decl_line")
+                    fn = ""
+                    if decl_file is not None and lp:
+                        idx = int(decl_file.value)
+                        entries = lp.header["file_entry"]
+                        if 0 <= idx < len(entries):
+                            v = entries[idx].name
+                            fn = (v.decode("utf-8", "replace") if isinstance(v, bytes)
+                                  else str(v))
+                    funcs.append({"name": nm, "low_pc": int(lo.value),
+                                  "file": fn,
+                                  "line": int(decl_line.value) if decl_line is not None else None})
+                    if len(funcs) >= max_funcs:
+                        break
+            return {"available": True, "files": files, "functions": funcs,
+                    "compilation_units": cus,
+                    "limitations": ["DWARF 只覆盖**编译时存在的**函数/文件；"
+                                    "内联、静态函数被裁剪后不可见",
+                                    "源文件路径是编译时的字符串，可能指向不存在的目录"]}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "why": "DWARF 解析失败：%s" % e}
+
+
+# ----------------------------------------------------------------------
+# 函数恢复
+# ----------------------------------------------------------------------
+def _sweep(unit: Unit, md, *, max_insns: int = MAX_INSNS) -> dict:
+    """线性扫过所有可执行区间，收集「调用目标 / 函数返回点 / 字面量引用」。"""
+    insns = {}
+    truncated = False
+    for start, end in unit.code_ranges:
+        r = disassemble(unit, start, end, md=md, max_insns=max_insns)
+        if not r.get("ok"):
+            return {"ok": False, "error": r.get("error")}
+        for ins in r["insns"]:
+            insns[ins["addr"]] = ins
+        if r.get("truncated"):
+            truncated = True
+            break
+        max_insns -= r["count"]
+        if max_insns <= 0:
+            truncated = True
+            break
+    return {"ok": True, "insns": insns, "truncated": truncated}
+
+
+def _imm_of(op_str: str):
+    for tok in op_str.replace("]", "").split(","):
+        tok = tok.strip()
+        if tok.startswith("#"):
+            try:
+                return int(tok[1:], 0)
+            except ValueError:
+                return None
+    return None
+
+
+def _pc_ref(ins: dict):
+    """识别 PC 相对寻址，返回 ``{"kind": ..., "addr": ...}``。
+
+    ARMCC 引用字符串常量**不走 ldr 字面量池**，而是 ``adr r1, #0xa8``
+    （地址 = 对齐后的 PC + 立即数）；只认 ldr 字面量会得出「0 处字符串引用」
+    这种看着干净其实是漏的结论。
+    ``kind="literal"`` 表示这条指令取的是**指针**（再读 4 字节才是目标）。
+    """
+    m = ins.get("mnemonic", "").lower()
+    op = ins.get("op_str", "")
+    pc = (ins["addr"] + 4) & ~3
+    if m in ("adr", "adr.w", "adrl"):
+        imm = _imm_of(op)
+        return {"kind": "address", "addr": pc + imm} if imm is not None else None
+    if m in ("ldr", "ldr.w") and "[pc" in op:
+        imm = _imm_of(op)
+        return {"kind": "literal", "addr": pc + imm} if imm is not None else None
+    if m in ("add", "add.w", "adds") and "pc" in op:
+        imm = _imm_of(op)
+        return {"kind": "address", "addr": pc + imm} if imm is not None else None
+    if m in ("sub", "sub.w") and "pc" in op:
+        imm = _imm_of(op)
+        return {"kind": "address", "addr": pc - imm} if imm is not None else None
+    return None
+
+
+def recover_functions(unit: Unit, *, deep: bool = True,
+                      max_functions: int = MAX_FUNCTIONS,
+                      max_insns: int = MAX_INSNS) -> dict:
+    """恢复函数入口，并把**证据来源**记在每条上（observed / inferred / weak）。"""
+    st = symbol_table(unit)
+    table: dict = {}
+    notes, gaps = [], []
+
+    def add(addr: int, name: str, source: str, *, size: int = 0,
+            confidence: str = "inferred", kind: str = "function"):
+        if addr <= 0:
+            return None
+        rec = table.get(addr)
+        if rec is None:
+            rec = {"addr": addr, "addr_hex": "0x%08X" % addr, "name": name,
+                   "size": size, "sources": [source], "confidence": confidence,
+                   "kind": kind, "bind": "", "file": "", "line": None}
+            table[addr] = rec
+        else:
+            if source not in rec["sources"]:
+                rec["sources"].append(source)
+            if not rec["size"] and size:
+                rec["size"] = size
+            if confidence == "observed":
+                rec["name"] = name
+                rec["confidence"] = "observed"
+        return rec
+
+    # ① 符号表：观察
+    for f in st["functions"]:
+        rec = add(f["addr"], f["name"], f["source"], size=f["size"],
+                  confidence="observed")
+        if rec:
+            rec["bind"] = f["bind"]
+    # ② DWARF：观察（原始文件名与行号）
+    dw = {"available": False}
+    if unit.elf and unit.elf.get("type") in ("EXEC", "DYN"):
+        try:
+            dw = dwarf_info(unit.name)
+        except Exception:  # noqa: BLE001
+            dw = {"available": False, "why": "DWARF 解析异常"}
+        if dw.get("available"):
+            for f in dw["functions"]:
+                rec = add(f["low_pc"], f["name"], "dwarf", confidence="observed")
+                if rec and not rec["file"]:
+                    rec["file"] = f.get("file") or ""
+                    rec["line"] = f.get("line")
+    # ③ 向量表：推导（中断入口天然是函数入口）
+    vt = vector_table(unit)
+    for e in vt["entries"]:
+        if not e["in_code"]:
+            continue
+        addr = int(e["handler_hex"], 16) & ~1
+        nm = e["name"]
+        if e["index"] == 1:
+            nm = "Reset_Handler"
+        elif nm.startswith("IRQ"):
+            nm = nm + "_Handler"
+        elif nm:
+            nm = nm + "_Handler"
+        else:
+            nm = "handler_%d" % e["index"]
+        add(addr, nm, "vector_table", confidence="inferred")
+
+    # ④ 反汇编：调用目标 / 返回点
+    md, why = _make_cs(unit.arch)
+    sweep, callers, string_refs = None, {}, []
+    if not deep:
+        gaps.append({"reason": "本次未做深度扫描（deep=False）：调用目标与代码指针"
+                               "都没采集，函数只来自符号表与向量表"})
+    elif md is None:
+        gaps.append({"reason": "未做深度扫描：%s" % why})
+    elif deep:
+        sweep = _sweep(unit, md, max_insns=max_insns)
+        if not sweep.get("ok"):
+            gaps.append({"reason": "反汇编失败，深度扫描跳过：%s" % sweep.get("error")})
+            sweep = None
+    strings = find_strings(unit)
+    string_at = {s["addr"]: s for s in strings if "addr" in s}
+    if sweep:
+        for addr, ins in sweep["insns"].items():
+            tgt = ins.get("target")
+            if tgt is not None and ins["mnemonic"].lower() in ("bl", "blx", "call", "jal"):
+                add(tgt & ~1, "sub_%08X" % (tgt & ~1), "call_target",
+                    confidence="inferred")
+                callers.setdefault(tgt & ~1, []).append(addr)
+            ref = _pc_ref(ins)
+            if ref is not None:
+                target = ref["addr"]
+                if ref["kind"] == "literal":
+                    w = unit.read(target, 4)
+                    target = (int.from_bytes(w, unit.arch.get("endian", "little"))
+                              if len(w) == 4 else 0)
+                st_rec = string_at.get(target)
+                if st_rec:
+                    string_refs.append({"from": addr, "from_hex": "0x%08X" % addr,
+                                        "to": target, "to_hex": "0x%08X" % target,
+                                        "type": "string_ref",
+                                        "how": ref["kind"],
+                                        "text": st_rec["text"]})
+        if sweep.get("truncated"):
+            gaps.append({"reason": "深度扫描达到 %d 条指令上限，其后未扫描" % max_insns})
+
+    # ⑤ 代码指针：推导（弱证据——只有它一条时 confidence=weak）
+    vt_base = int(vt["base_hex"], 16) if vt.get("base_hex") else 0
+    vt_end = vt_base + 4 * (vt.get("count", 0) + 1)
+    cps = find_code_pointers(unit, exclude=[(vt_base, vt_end)])
+    for h in cps["hits"]:
+        rec = add(h["to"], "ptr_%08X" % h["to"], "code_pointer", confidence="weak")
+
+    # ⑥ 定边界：有 size 用 size；没有就用「下一个已知入口」
+    funcs = sorted(table.values(), key=lambda r: r["addr"])
+    code_end = max((b for _, b in unit.code_ranges), default=0)
+    for i, f in enumerate(funcs):
+        nxt = funcs[i + 1]["addr"] if i + 1 < len(funcs) else code_end
+        if f["size"]:
+            f["end_addr"] = f["addr"] + f["size"]
+            f["size_basis"] = "symtab"
+        else:
+            f["end_addr"] = nxt
+            f["size_basis"] = "next_entry"
+        f["callees"] = sorted({c for c in callers.get(f["addr"], [])}) if callers else []
+        f["n_callers"] = len(callers.get(f["addr"], []))
+        if "string_ref" in f["sources"]:
+            pass
+    # 置信度重算：observed > inferred(≥2 源) > weak
+    for f in funcs:
+        if f["confidence"] != "observed":
+            strong = any(x in ("call_target", "vector_table") for x in f["sources"])
+            f["confidence"] = "inferred" if (len(f["sources"]) >= 2 or strong) else "weak"
+        f["callee_count"] = len(f.get("callees") or [])
+    truncated = len(funcs) > max_functions
+    if truncated:
+        gaps.append({"reason": "函数数超过 %d 上限，输出被截断" % max_functions})
+        funcs = funcs[:max_functions]
+    counts = {"observed": 0, "inferred": 0, "weak": 0}
+    for f in funcs:
+        counts[f["confidence"]] = counts.get(f["confidence"], 0) + 1
+    return {
+        "ok": True,
+        "functions": funcs,
+        "counts": counts,
+        "total": len(funcs),
+        "truncated": truncated,
+        "symbols": {"available": st["available"],
+                    "functions": st.get("counts", {}).get("functions", 0),
+                    "objects": st.get("counts", {}).get("objects", 0),
+                    "mapping_symbols": st.get("counts", {}).get("mapping_symbols", 0),
+                    "why": st.get("why", "")},
+        "dwarf": {k: dw.get(k) for k in ("available", "why")} if not dw.get("available")
+                 else {"available": True, "files": len(dw.get("files") or [])},
+        "string_refs": string_refs[:2000],
+        "code_pointers": {"count": cps["count"], "truncated": cps["truncated"]},
+        "gaps": gaps,
+        "evidence_rule": [
+            "observed = 符号表或 DWARF 直接写了这个入口与名字",
+            "inferred = 向量表或调用目标（这两条任一条就足以证明「这里是一个入口」），"
+            "或两条以上独立证据指向同一地址",
+            "weak = 只有一条间接证据（通常是字面量池里的代码指针）",
+        ],
+    }
+
+
+# ----------------------------------------------------------------------
+# 顶层剖析
+# ----------------------------------------------------------------------
+def _layout_summary(unit: Unit) -> dict:
+    out = {"spans": [{"start_hex": "0x%08X" % a, "end_hex": "0x%08X" % b,
+                      "length": b - a} for a, b in
+                     [(s, e) for s, e, _ in unit.spans]],
+           "code_ranges": [{"start_hex": "0x%08X" % a, "end_hex": "0x%08X" % b}
+                           for a, b in unit.code_ranges]}
+    rom = [(a, b) for a, b in unit.code_ranges]
+    out["rom"] = ({"start_hex": "0x%08X" % min(a for a, _ in rom),
+                   "end_hex": "0x%08X" % max(b for _, b in rom),
+                   "size": max(b for _, b in rom) - min(a for a, _ in rom)}
+                  if rom else None)
+    if unit.elf:
+        rw = [s for s in unit.elf["sections"]
+              if s.get("alloc") and (s.get("writable") or s["type_name"] == "NOBITS")
+              and s["size"]]
+        if rw:
+            lo = min(s["addr"] for s in rw)
+            hi = max(s["addr"] + s["size"] for s in rw)
+            out["ram"] = {"start_hex": "0x%08X" % lo, "end_hex": "0x%08X" % hi,
+                          "size": hi - lo}
+    else:
+        out["ram"] = None
+        out["limitations"] = ["HEX/BIN 没有节表：ROM/RAM 边界只能从向量表与内容推断，"
+                              "本次不猜，ram 为 null"]
+    return out
+
+
+def _sections_summary(unit: Unit, limit: int = 48) -> list:
+    if not unit.elf:
+        return []
+    rows = []
+    for s in unit.elf["sections"]:
+        if s["type_name"] in ("NULL", "SYMTAB", "STRTAB", "SYMTAB_SHNDX"):
+            continue
+        rows.append({"name": s["name"], "type": s["type_name"],
+                     "addr_hex": "0x%08X" % s["addr"], "size": s["size"],
+                     "exec": s.get("exec", False), "writable": s.get("writable", False),
+                     "alloc": s.get("alloc", False)})
+    return rows[:limit]
+
+
+def analyze(path: str, *, base: int = 0, deep: bool = True,
+            max_functions: int = MAX_FUNCTIONS,
+            max_insns: int = MAX_INSNS) -> dict:
+    """一次剖析：容器/架构/布局/向量表/符号/函数/字符串/交叉引用。
+
+    ``deep=True`` 会做线性反汇编以找回调用目标（较慢但能补上剥离符号的固件）；
+    ``deep=False`` 只读符号表与向量表，快且不依赖 capstone。
+    """
+    data, err = _read_file(path)
+    if err:
+        return err
+    container = detect_container(data[:4096])
+    out = {"ok": True}
+    out.update(_identity(path, data))
+    out["container"] = container
+
+    if container == "ar":
+        return _analyze_ar(path, data, deep=deep, max_functions=max_functions,
+                           max_insns=max_insns, ident=out)
+    try:
+        unit = _unit_from_data(data, path, base)
+    except ValueError as e:
+        out.update({"ok": False, "error": str(e)})
+        return out
+
+    limitations = list(unit.limitations)
+    gaps = []
+    if unit.elf and not unit.elf.get("ok"):
+        out.update({"ok": False, "error": unit.elf.get("error", "ELF 解析失败")})
+        return out
+    if unit.elf:
+        arch = unit.arch
+        out["elf"] = {"class": unit.elf["class"], "type": unit.elf["type"],
+                      "machine": unit.elf["machine"],
+                      "entry_hex": "0x%08X" % unit.elf["entry"],
+                      "relocatable": unit.relocatable,
+                      "segments": len(unit.elf["segments"])}
+        if unit.elf["type"] == "DYN":
+            limitations.append("这是**共享对象/动态可执行**（.so/ET_DYN）：符号地址是"
+                               "**相对加载基址**的偏移，加载基址未定——不要把这些地址当绝对地址用")
+        if unit.relocatable:
+            limitations.append("这是**可重定位目标文件**（.o/.lib 成员）："
+                               "符号地址是节内偏移，不是最终地址；链接后才能定址")
+    else:
+        arch = unit.arch
+    out["arch"] = arch
+    out["layout"] = _layout_summary(unit)
+    out["sections"] = _sections_summary(unit)
+    out["vector_table"] = vector_table(unit)
+    if unit.arch.get("family") == "unknown":
+        limitations.append("CPU 架构未判定（没有 ELF 头）：后续反汇编需要显式指定架构，"
+                           "否则不给结果而不是给错结果")
+    if not unit.code_ranges:
+        gaps.append({"reason": "没有可执行区间：无法反汇编，函数只能来自符号表"})
+
+    syms = symbol_table(unit)
+    rec = recover_functions(unit, deep=deep, max_functions=max_functions,
+                            max_insns=max_insns)
+    gaps.extend(rec.get("gaps") or [])
+    strings = find_strings(unit)
+    out["symbols"] = {
+        "available": syms["available"],
+        "counts": syms.get("counts", {}),
+        "why": syms.get("why", ""),
+    }
+    out["functions"] = {
+        "total": rec["total"],
+        "counts": rec["counts"],
+        "truncated": rec["truncated"],
+        "top": rec["functions"][:min(60, len(rec["functions"]))],
+        "evidence_rule": rec["evidence_rule"],
+    }
+    out["dwarf"] = rec["dwarf"]
+    out["strings"] = {"count": len([s for s in strings if "addr" in s]),
+                      "sample": [s for s in strings if "addr" in s][:20],
+                      "truncated": any(s.get("truncated") for s in strings)}
+    out["xrefs"] = {"code_pointers": rec["code_pointers"],
+                    "string_refs": len(rec["string_refs"])}
+    out["gaps"] = gaps
+    out["limitations"] = limitations + [
+        "本工具还原的是**地址、布局、控制流**，不是语义：函数原型按「无参 void」推断，"
+        "名字只代表符号表里写的那串字符",
+        "没有符号又没有交叉证据的字节保持未知，不编名字",
+    ]
+    out["verdict"] = "partial" if gaps else "ok"
+    out["_unit"] = unit
+    out["_recover"] = rec
+    return out
+
+
+def _analyze_ar(path: str, data: bytes, *, deep: bool, max_functions: int,
+                max_insns: int, ident: dict) -> dict:
+    """``.lib`` / ``.a``：逐成员剖析并汇总。成员字节可原样取出（不覆盖）。"""
+    ar = parse_ar(data)
+    out = dict(ident)
+    out["container"] = "ar"
+    if not ar.get("ok"):
+        out.update({"ok": False, "error": ar.get("error")})
+        return out
+    members = []
+    agg = {"observed": 0, "inferred": 0, "weak": 0}
+    for m in ar["members"]:
+        row = {"name": m["name"], "offset": m["offset"], "size": m["size"],
+               "sha256": m["sha256"]}
+        if m["data"][:4] == b"\x7fELF":
+            e = parse_elf(m["data"])
+            row["kind"] = "elf"
+            if e.get("ok"):
+                row["type"] = e["type"]
+                row["machine"] = e["machine"]
+                row["class"] = e["class"]
+                fns = [s for s in e["symbols"] if s["type"] == "FUNC"]
+                row["functions"] = len(fns)
+                row["func_names"] = [s["name"] for s in fns][:40]
+                agg["observed"] += len(fns)
+                row["arch"] = arch_of(e)
+            else:
+                row["error"] = e.get("error")
+        else:
+            row["kind"] = "data"
+        members.append(row)
+    out["members"] = members
+    out["member_count"] = len(members)
+    out["gaps"] = ar.get("gaps") or []
+    out["aggregate"] = {"functions_in_objects": agg["observed"]}
+    out["verdict"] = "partial" if out["gaps"] else "ok"
+    out["limitations"] = [
+        "库成员是**可重定位目标文件**：函数地址是节内偏移，库里没有最终地址",
+        "库成员之间可能重复定义同一符号（弱符号/多副本），本工具不去重",
+        "要出反汇编请对单个成员用 recover_disasm（先 recover_project 取出成员）",
+    ]
+    out["_members_raw"] = ar["members"]
+    return out
+
+
+# ----------------------------------------------------------------------
+# 工程骨架生成
+# ----------------------------------------------------------------------
+_C_KEYWORDS = {
+    "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
+    "else", "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long",
+    "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct",
+    "switch", "typedef", "union", "unsigned", "void", "volatile", "while", "asm",
+}
+
+
+def _c_name(name: str, used: set) -> str:
+    """把任意符号名变成可编译的 C 标识符，并保证工程内唯一。"""
+    s = "".join(c if (c.isalnum() or c == "_") else "_" for c in name) or "sym"
+    if s[0].isdigit():
+        s = "sym_" + s
+    if s in _C_KEYWORDS:
+        s = s + "_"
+    base = s
+    i = 2
+    while s in used:
+        s = "%s_%d" % (base, i)
+        i += 1
+    used.add(s)
+    return s
+
+
+def _emit(dest: str, rel: str, text: str, files: list, *, binary: bytes | None = None) -> dict:
+    """独占写（``xb``）+ 回读 SHA-256。已存在即报错——绝不覆盖上一次的证据。"""
+    full = os.path.join(dest, rel.replace("/", os.sep))
+    os.makedirs(os.path.dirname(full) or dest, exist_ok=True)
+    payload = binary if binary is not None else text.encode("utf-8")
+    with open(full, "xb") as f:
+        f.write(payload)
+    with open(full, "rb") as f:
+        back = f.read()
+    rec = {"path": full, "rel": rel, "size": len(payload),
+           "sha256": sha256_bytes(payload),
+           "sha256_verified": sha256_bytes(back) == sha256_bytes(payload)}
+    files.append(rec)
+    return rec
+
+
+def _round_up(n: int, unit: int = 1024) -> int:
+    return ((int(n) + unit - 1) // unit) * unit
+
+
+def _regions(unit: Unit) -> dict:
+    """推出 FLASH/RAM 窗口：有节表用节表，HEX/BIN 只用 ROM 覆盖区间。"""
+    rom_lo = rom_hi = None
+    if unit.code_ranges:
+        rom_lo = min(a for a, _ in unit.code_ranges)
+        rom_hi = max(b for _, b in unit.code_ranges)
+    else:
+        rom_lo = unit.base
+        rom_hi = unit.base + len(unit.data)
+    ram_lo = ram_hi = None
+    if unit.elf:
+        rw = [s for s in unit.elf["sections"]
+              if s.get("alloc") and (s.get("writable") or s["type_name"] == "NOBITS")
+              and s["size"]]
+        if rw:
+            ram_lo = min(s["addr"] for s in rw)
+            ram_hi = max(s["addr"] + s["size"] for s in rw)
+    return {"flash_start": rom_lo, "flash_end": rom_hi,
+            "flash_size": _round_up(rom_hi - rom_lo) if rom_lo is not None else None,
+            "ram_start": ram_lo, "ram_end": ram_hi,
+            "ram_size": _round_up(ram_hi - ram_lo) if ram_lo is not None else None,
+            "basis": "sections" if unit.elf else "image_span"}
+
+
+def _readme(an: dict, regions: dict, files_rel: list) -> str:
+    f = an["functions"]
+    counts = f["counts"]
+    vt = an.get("vector_table") or {}
+    arch = an.get("arch") or {}
+    L = []
+    L.append("# 逆向恢复的工程骨架：%s" % os.path.basename(an["path"]))
+    L.append("")
+    L.append("> 由 mdkdebug `recover_project` 生成。**地址、布局、控制流是事实；"
+             "函数体语义没有恢复。**")
+    L.append("")
+    L.append("## 1. 输入身份（一切结论挂在这三个值上）")
+    L.append("")
+    L.append("| 项 | 值 |")
+    L.append("| --- | --- |")
+    L.append("| 路径 | `%s` |" % an["path"])
+    L.append("| 大小 | %d 字节 |" % an["size"])
+    L.append("| SHA-256 | `%s` |" % an["sha256"])
+    L.append("| 容器 | %s |" % an.get("container"))
+    L.append("| 架构 | %s / %s 位 / %s%s |" % (
+        arch.get("family"), arch.get("bits"), arch.get("endian"),
+        " / Thumb" if arch.get("thumb") else ""))
+    L.append("")
+    L.append("架构依据：%s" % (arch.get("why") or "（无）"))
+    L.append("")
+    L.append("## 2. 内存布局")
+    L.append("")
+    if regions.get("flash_start") is not None:
+        L.append("- FLASH：`0x%08X` .. `0x%08X`（%d 字节，取整后 %s）" % (
+            regions["flash_start"], regions["flash_end"],
+            regions["flash_end"] - regions["flash_start"], regions["flash_size"]))
+    if regions.get("ram_start") is not None:
+        L.append("- RAM：`0x%08X` .. `0x%08X`（%d 字节，取整后 %s）" % (
+            regions["ram_start"], regions["ram_end"],
+            regions["ram_end"] - regions["ram_start"], regions["ram_size"]))
+    else:
+        L.append("- RAM：**未知**（HEX/BIN 无节表；不猜，`recovered.ld` 里用占位值并标注）")
+    L.append("- 布局依据：%s" % regions["basis"])
+    L.append("")
+    L.append("## 3. 恢复出的函数（%d 个）" % f["total"])
+    L.append("")
+    L.append("| 置信度 | 含义 | 数量 |")
+    L.append("| --- | --- | --- |")
+    L.append("| observed | 符号表/DWARF 里直接写了 | %d |" % counts.get("observed", 0))
+    L.append("| inferred | 至少两条独立证据指向同一地址 | %d |" % counts.get("inferred", 0))
+    L.append("| weak | 只有一条间接证据（通常是字面量池里的代码指针） | %d |"
+             % counts.get("weak", 0))
+    L.append("")
+    if vt.get("sp_hex"):
+        L.append("向量表：SP=`%s`，复位=`%s`，读到 %d 个有效入口。"
+                 % (vt.get("sp_hex"), vt.get("reset_hex"), vt.get("count", 0)))
+        L.append("")
+    dw = an.get("dwarf") or {}
+    if dw.get("available"):
+        L.append("## 4. 原始源码线索（DWARF）")
+        L.append("")
+        L.append("镜像里带着调试信息：**%d 个源文件**、函数的原始行号都在 "
+                 "`map/functions.csv` 的 file/line 列。这是重建工程目录最直接的一手依据。"
+                 % dw.get("files", 0))
+        L.append("")
+    L.append("## 5. 目录说明")
+    L.append("")
+    L.append("```")
+    for rel in files_rel:
+        L.append(rel)
+    L.append("```")
+    L.append("")
+    L.append("## 6. 怎么用它")
+    L.append("")
+    L.append("**Keil（MDK）**：新建工程 → 加入 `src/*.c` → Options → Linker 取消"
+             "「Use Memory Layout from Target Dialog」并选 `linker/recovered.sct` → "
+             "按原镜像的 Flash/RAM 填 Target 页。")
+    L.append("")
+    L.append("**GNU 工具链**：`make`（需要 `arm-none-eabi-gcc`），产物在 `build/`。"
+             "链接脚本 `linker/recovered.ld`。")
+    L.append("")
+    L.append("## 7. 没有恢复什么（必须知道）")
+    L.append("")
+    for lim in an.get("limitations") or []:
+        L.append("- %s" % lim)
+    if an.get("gaps"):
+        L.append("")
+        L.append("## 8. 未覆盖的区间（gaps）")
+        L.append("")
+        for g in an["gaps"]:
+            L.append("- %s" % g.get("reason", g))
+    L.append("")
+    return "\n".join(L)
+
+
+def _sct_text(regions: dict, note: str) -> str:
+    fs = regions.get("flash_start") or 0
+    fsz = regions.get("flash_size") or 0x40000
+    rs = regions.get("ram_start") or 0x20000000
+    rsz = regions.get("ram_size") or 0x10000
+    return """\
+; 由 mdkdebug recover_project 生成（批次79）——%s
+; ROM/FAM 长度来自原镜像布局并向上取整到 1 KiB；实际容量请按芯片手册确认。
+LR_IROM1 0x%08X 0x%08X  {
+  ER_IROM1 0x%08X 0x%08X  {
+   *.o (RESET, +First)
+   *(InRoot$$Sections)
+   .ANY (+RO)
+   .ANY (+XO)
+  }
+  RW_IRAM1 0x%08X 0x%08X  {
+   .ANY (+RW +ZI)
+  }
+}
+""" % (note, fs, fsz, fs, fsz, rs, rsz)
+
+
+def _ld_text(regions: dict, name: str, note: str) -> str:
+    fs = regions.get("flash_start") or 0
+    fsz = regions.get("flash_size") or 0x40000
+    rs = regions.get("ram_start") or 0x20000000
+    rsz = regions.get("ram_size") or 0x10000
+    return """\
+/* 由 mdkdebug recover_project 生成（批次79）——%s */
+ENTRY(Reset_Handler)
+
+MEMORY
+{
+  FLASH (rx)  : ORIGIN = 0x%08X, LENGTH = 0x%X
+  RAM   (rwx) : ORIGIN = 0x%08X, LENGTH = 0x%X
+}
+
+_estack = ORIGIN(RAM) + LENGTH(RAM);
+
+SECTIONS
+{
+  .isr_vector : {
+    KEEP(*(.isr_vector))
+  } > FLASH
+
+  .text : {
+    *(.text*)
+    *(.rodata*)
+  } > FLASH
+
+  .data : {
+    *(.data*)
+  } > RAM AT > FLASH
+
+  .bss : {
+    *(.bss*)
+    *(COMMON)
+  } > RAM
+
+  /DISCARD/ : { *(.comment) *(.ARM.attributes) }
+}
+""" % (note, fs, fsz, rs, rsz)
+
+
+def _symbols_header(an: dict, funcs: list, objs: list, limit: int) -> str:
+    vt = an.get("vector_table") or {}
+    L = ["/* 自动生成（mdkdebug recover_project，批次79）。",
+         " * 说明：地址取自镜像；**函数原型按「无参、void 返回」推断**——",
+         " * 反汇编能还原地址与控制流，还原不了参数类型与返回值语义。",
+         " * 已知参数/返回值的函数请手工改这里的声明，不要相信这里的签名。 */",
+         "#ifndef RECOVERED_SYMBOLS_H", "#define RECOVERED_SYMBOLS_H", "",
+         "#include <stdint.h>", "",
+         "#define REC_INITIAL_SP      0x%08Xu" % (vt.get("sp") or 0),
+         "#define REC_RESET_HANDLER   0x%08Xu" % (
+             (int(vt["reset_hex"], 16) & ~1) if vt.get("reset_hex") else 0),
+         ""]
+    used = set()
+    L.append("/* ---- 函数（%d 个，此处列出 %d 个） ---- */" % (len(funcs), min(len(funcs), limit)))
+    for f in funcs[:limit]:
+        nm = _c_name(f["name"], used)
+        L.append("void %s(void);   /* 0x%08X  size=%s  %s  [%s] */" % (
+            nm, f["addr"], f.get("size") or "?", f["confidence"],
+            ",".join(f.get("sources") or [])))
+    if len(funcs) > limit:
+        L.append("/* ... 其余 %d 个见 map/functions.csv */" % (len(funcs) - limit))
+    if objs:
+        L.append("")
+        L.append("/* ---- 数据对象（%d 个，此处列出 %d 个） ---- */" % (len(objs), min(len(objs), limit)))
+        for o in objs[:limit]:
+            nm = _c_name(o["name"], used)
+            L.append("#define ADDR_%s 0x%08Xu   /* size=%s %s */" % (
+                nm.upper(), o["addr"], o.get("size") or "?", o.get("bind")))
+    L.append("")
+    L.append("#endif /* RECOVERED_SYMBOLS_H */")
+    return "\n".join(L) + "\n"
+
+
+def _startup_text(an: dict, funcs: list, limit: int) -> str:
+    vt = an.get("vector_table") or {}
+    entries = vt.get("entries") or []
+    used = set()
+    names = {}
+    by_addr = {f["addr"]: f for f in funcs}
+    decls, table = [], []
+    for e in entries[:limit]:
+        addr = int(e["handler_hex"], 16) & ~1
+        f = by_addr.get(addr)
+        rawname = f["name"] if f else ("handler_%d" % e["index"])
+        nm = _c_name(rawname, used)
+        names[e["index"]] = (nm, addr)
+        decls.append("void %s(void);" % nm)
+        table.append("  (void *)%s,   /* [%02d] %-12s orig 0x%08X */" % (
+            nm, e["index"], e["name"], addr))
+    L = ["/* 自动生成（mdkdebug recover_project，批次79）。",
+         " * 这张表**照抄原镜像的向量表**：序号与地址是观察事实；",
+         " * 具体是哪个外设中断取决于芯片（未判定），不要把序号当结论。 */",
+         '#include "recovered_symbols.h"', "",
+         "void Default_Handler(void);",
+         ""]
+    L += decls
+    L.append("")
+    L.append("__attribute__((section(\".isr_vector\"), used))")
+    L.append("const void *const g_recovered_vectors[] = {")
+    L.append("  (void *)REC_INITIAL_SP,")
+    L += table
+    L.append("};")
+    L.append("")
+    L.append("void Default_Handler(void) { for (;;) { } }")
+    L.append("")
+    return "\n".join(L)
+
+
+def _stubs_text(funcs: list, limit: int) -> str:
+    used = set()
+    L = ["/* 自动生成（mdkdebug recover_project，批次79）。",
+         " * 这些是**占位实现**：原函数体没有恢复（反汇编不等于语义）。",
+         " * 作用只有一个——让骨架能链接、能上板、能让别人在原来的地址上做事。",
+         " * 全部是 weak：你自己写的同名强符号会覆盖它。 */",
+         '#include "recovered_symbols.h"', ""]
+    for f in funcs[:limit]:
+        nm = _c_name(f["name"], used)
+        L.append("__attribute__((weak)) void %s(void) { for (;;) { } }   /* 0x%08X */"
+                 % (nm, f["addr"]))
+    if len(funcs) > limit:
+        L.append("/* ... 其余 %d 个未生成占位实现（可用 max_stubs 放宽） */"
+                 % (len(funcs) - limit))
+    L.append("")
+    return "\n".join(L)
+
+
+def _makefile(name: str) -> str:
+    return """\
+# 由 mdkdebug recover_project 生成（批次79）
+# 需要 arm-none-eabi 工具链；链接脚本与原镜像布局一致。
+NAME    ?= %s
+BUILD   ?= build
+CC      := arm-none-eabi-gcc
+OBJCOPY := arm-none-eabi-objcopy
+SIZE    := arm-none-eabi-size
+
+CFLAGS  := -mcpu=cortex-m4 -mthumb -Os -g -ffunction-sections -fdata-sections \\
+           -Iinclude -Wall
+LDFLAGS := -T linker/recovered.ld -Wl,--gc-sections -nostartfiles
+
+SRCS := $(wildcard src/*.c)
+OBJS := $(patsubst src/%%.c,$(BUILD)/%%.o,$(SRCS))
+
+all: $(BUILD)/$(NAME).elf $(BUILD)/$(NAME).bin
+
+$(BUILD)/%%.o: src/%%.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/$(NAME).elf: $(OBJS) linker/recovered.ld | $(BUILD)
+	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
+	$(SIZE) $@
+
+$(BUILD)/$(NAME).bin: $(BUILD)/$(NAME).elf
+	$(OBJCOPY) -O binary $< $@
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+clean:
+	rm -rf $(BUILD)
+
+.PHONY: all clean
+""" % name
+
+
+def _cmake_text(name: str) -> str:
+    return """\
+# 由 mdkdebug recover_project 生成（批次79）
+cmake_minimum_required(VERSION 3.16)
+project(%s C ASM)
+
+set(CMAKE_C_STANDARD 11)
+add_compile_options(-mcpu=cortex-m4 -mthumb -Os -g
+                    -ffunction-sections -fdata-sections)
+add_link_options(-T ${CMAKE_SOURCE_DIR}/linker/recovered.ld
+                 -Wl,--gc-sections -nostartfiles)
+
+file(GLOB SRCS ${CMAKE_SOURCE_DIR}/src/*.c)
+add_executable(%s ${SRCS})
+target_include_directories(%s PRIVATE ${CMAKE_SOURCE_DIR}/include)
+""" % (name, name, name)
+
+
+def _csv(header: list, rows: list) -> str:
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(header)
+    w.writerows(rows)
+    return buf.getvalue()
+
+
+def _jsonable(an: dict) -> dict:
+    return {k: v for k, v in an.items() if not k.startswith("_")}
+
+
+def build_project(path: str, out_dir: str, *, name: str = "recovered",
+                  base: int = 0, deep: bool = True,
+                  max_functions: int = MAX_FUNCTIONS, max_insns: int = MAX_INSNS,
+                  max_stub_functions: int = 300, max_asm_functions: int = 200,
+                  include_asm: bool = True) -> dict:
+    """把一份固件变成**能打开的工程骨架**，写在 ``out_dir``（必须不存在）。"""
+    if not out_dir:
+        return {"ok": False, "error": "缺少 out_dir"}
+    dest = os.path.abspath(out_dir)
+    if os.path.exists(dest):
+        return {"ok": False, "output_directory": dest,
+                "error": "输出目录已存在：%s —— 本工具不覆盖任何既有内容，"
+                         "请换一个不存在的新目录" % dest}
+    data, err = _read_file(path)
+    if err:
+        return err
+    ident = _identity(path, data)
+    container = detect_container(data[:4096])
+
+    if container == "ar":
+        return _project_from_ar(path, data, dest, ident, deep=deep)
+    try:
+        unit = _unit_from_data(data, path, base)
+    except ValueError as e:
+        return {**ident, "ok": False, "error": str(e)}
+    an = analyze(path, base=base, deep=deep, max_functions=max_functions,
+                 max_insns=max_insns)
+    if not an.get("ok"):
+        return an
+    funcs = an["_recover"]["functions"]
+    objs = symbol_table(unit)["objects"]
+    regions = _regions(unit)
+    os.makedirs(dest)
+
+    files, notes = [], []
+    note = "%s  %s  sha256=%s" % (os.path.basename(path), an["size"],
+                                  an["sha256"][:16])
+
+    # 1) 链接布局
+    _emit(dest, "linker/recovered.sct", _sct_text(regions, note), files)
+    _emit(dest, "linker/recovered.ld", _ld_text(regions, name, note), files)
+    # 2) 头文件
+    _emit(dest, "include/recovered_memory.h",
+          "/* 自动生成（mdkdebug recover_project，批次79） */\n"
+          "#ifndef RECOVERED_MEMORY_H\n#define RECOVERED_MEMORY_H\n\n"
+          "#define REC_FLASH_BASE 0x%08Xu\n#define REC_FLASH_SIZE 0x%08Xu\n"
+          "#define REC_RAM_BASE   0x%08Xu\n#define REC_RAM_SIZE   0x%08Xu\n\n"
+          "#endif /* RECOVERED_MEMORY_H */\n" % (
+              regions.get("flash_start") or 0, regions.get("flash_size") or 0,
+              regions.get("ram_start") or 0, regions.get("ram_size") or 0), files)
+    _emit(dest, "include/recovered_symbols.h",
+          _symbols_header(an, funcs, objs, limit=max_stub_functions), files)
+    # 3) 源文件
+    _emit(dest, "src/startup_recovered.c", _startup_text(an, funcs, limit=64), files)
+    _emit(dest, "src/recovered_stubs.c", _stubs_text(funcs, max_stub_functions), files)
+    # 4) 汇编（可选，需要 capstone）
+    asm_ok = False
+    if include_asm and funcs:
+        dt = disasm_text(unit, funcs[:max_asm_functions], max_insns=max_insns)
+        if dt.get("ok"):
+            _emit(dest, "asm/disassembly.asm",
+                  "; 由 mdkdebug recover_project 生成（批次79）\n"
+                  "; 反汇编不等于源码：这里只有地址、机器码与指令。\n" + dt["text"], files)
+            asm_ok = True
+            if dt.get("truncated"):
+                notes.append("汇编输出达到指令上限，后续函数未写入 asm/")
+        else:
+            notes.append("未生成汇编：%s" % dt.get("error"))
+    # 5) 表格
+    _emit(dest, "map/functions.csv", _csv(
+        ["addr", "end_addr", "name", "size", "size_basis", "confidence",
+         "sources", "bind", "file", "line", "n_callers"],
+        [[f["addr_hex"], "0x%08X" % (f.get("end_addr") or 0), f["name"],
+          f.get("size") or "", f.get("size_basis") or "", f["confidence"],
+          "|".join(f.get("sources") or []), f.get("bind") or "",
+          f.get("file") or "", f.get("line") or "", f.get("n_callers") or 0]
+         for f in funcs]), files)
+    _emit(dest, "map/objects.csv", _csv(
+        ["addr", "name", "size", "bind", "type"],
+        [["0x%08X" % o["addr"], o["name"], o.get("size") or "", o.get("bind") or "",
+          o.get("type") or ""] for o in objs]), files)
+    vt = an.get("vector_table") or {}
+    _emit(dest, "map/vector_table.csv", _csv(
+        ["index", "name", "handler", "thumb", "in_code"],
+        [[e["index"], e["name"], e["handler_hex"], int(e["thumb"]), int(e["in_code"])]
+         for e in (vt.get("entries") or [])]), files)
+    strings = find_strings(unit)
+    _emit(dest, "map/strings.csv", _csv(
+        ["addr", "len", "in_code", "text"],
+        [["0x%08X" % s["addr"], s["len"], int(s["in_code"]), s["text"]]
+         for s in strings if "addr" in s]), files)
+    refs = an["_recover"].get("string_refs") or []
+    cps = find_code_pointers(unit)
+    rows = [["string_ref", r["from_hex"], r["to_hex"], r.get("how", ""), r["text"]]
+            for r in refs]
+    rows += [["code_pointer", h["from_hex"], h["to_hex"], "word", ""]
+             for h in cps["hits"]]
+    _emit(dest, "map/xrefs.csv", _csv(["type", "from", "to", "how", "text"], rows), files)
+    # 6. 构建脚本
+    _emit(dest, "Makefile", _makefile(name), files)
+    _emit(dest, "CMakeLists.txt", _cmake_text(name), files)
+    # 7. 机器可读报告
+    _emit(dest, "report.json",
+          json.dumps(_jsonable(an), ensure_ascii=False, indent=1), files)
+    # 8. 人读说明（最后写，好把文件清单列全）
+    rels = [f["rel"] for f in files] + ["README.md"]
+    _emit(dest, "README.md", _readme(an, regions, sorted(rels)), files)
+
+    verified = all(f["sha256_verified"] for f in files)
+    out = {
+        "ok": True,
+        "output_directory": dest,
+        "input": {"path": an["path"], "size": an["size"], "sha256": an["sha256"]},
+        "container": container,
+        "arch": an.get("arch"),
+        "regions": regions,
+        "counts": an["functions"]["counts"],
+        "functions": an["functions"]["total"],
+        "files": files,
+        "file_count": len(files),
+        "sha256_verified": verified,
+        "asm_generated": asm_ok,
+        "gaps": an.get("gaps") or [],
+        "notes": notes,
+        "limitations": an.get("limitations") or [],
+        "what_this_is": [
+            "可用工程骨架：链接布局（.sct/.ld）+ 向量表 + 符号头 + 占位实现 + 反汇编 + 表格",
+            "能编译、能链接、能在原地址上继续做事；**不是**还原出原作者的 C 代码",
+        ],
+    }
+    if not asm_ok:
+        out["next_actions"] = ["装 capstone 后重跑可拿到 asm/disassembly.asm"]
+    return out
+
+
+def _project_from_ar(path: str, data: bytes, dest: str, ident: dict, *,
+                     deep: bool) -> dict:
+    """``.lib`` / ``.a``：把成员原样取出 + 每成员一份剖析，方便逐个反汇编。"""
+    ar = parse_ar(data)
+    if not ar.get("ok"):
+        return {**ident, "ok": False, "error": ar.get("error")}
+    os.makedirs(dest)
+    files, members = [], []
+    for i, m in enumerate(ar["members"]):
+        nm = "".join(c if (c.isalnum() or c in "._-") else "_" for c in m["name"]) \
+            or ("member_%d" % i)
+        rel = "members/%02d_%s" % (i, nm)
+        rec = _emit(dest, rel, "", files, binary=m["data"])
+        row = {"name": m["name"], "file": rel, "size": m["size"],
+               "sha256": m["sha256"], "sha256_verified": rec["sha256_verified"]}
+        if m["data"][:4] == b"\x7fELF":
+            e = parse_elf(m["data"])
+            if e.get("ok"):
+                row["type"] = e["type"]
+                row["machine"] = e["machine"]
+                row["functions"] = [s["name"] for s in e["symbols"] if s["type"] == "FUNC"][:200]
+                row["objects"] = [s["name"] for s in e["symbols"]
+                                  if s["type"] in ("OBJECT", "COMMON")][:200]
+                row["arch"] = arch_of(e)
+        members.append(row)
+    _emit(dest, "members/manifest.json",
+          json.dumps({"input": ident, "members": members,
+                      "gaps": ar.get("gaps")}, ensure_ascii=False, indent=1), files)
+    _emit(dest, "README.md",
+          "# 库成员清单：%s\n\n"
+          "成员已原样取出（每个都回读校验过 SHA-256），并附符号清单。\n\n"
+          "成员是**可重定位目标文件**：里面的函数地址是节内偏移，不是最终地址。\n"
+          "要对某个成员出汇编，单独跑 `recover_disasm` 指向 `members/NN_xxx.o`。\n\n"
+          "| # | 成员 | 大小 | 函数数 |\n| --- | --- | --- | --- |\n%s\n"
+          % (os.path.basename(path), "\n".join(
+              "| %d | `%s` | %d | %d |" % (i, m["name"], m["size"],
+                                           len(m.get("functions") or []))
+              for i, m in enumerate(members))), files)
+    return {"ok": True, "output_directory": dest, "input": ident,
+            "container": "ar", "members": members, "member_count": len(members),
+            "files": files, "file_count": len(files),
+            "sha256_verified": all(f["sha256_verified"] for f in files),
+            "gaps": ar.get("gaps") or [],
+            "limitations": ["库成员是 relocatable：地址是节内偏移",
+                            "成员之间可能重复定义同名符号（弱符号），本工具不去重"]}
+
+
+def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
+              symbol: str = "", max_insns: int = 5000) -> dict:
+    """按「符号名」或「地址区间」反汇编一段。符号找不到时**列出可选名字**再报错。"""
+    data, err = _read_file(path)
+    if err:
+        return err
+    kind = detect_container(data[:4096])
+    if kind == "ar":
+        return {"ok": False,
+                "error": "这是库归档（.lib/.a），成员是独立目标文件："
+                         "先用 recover_project 取出成员，再对该成员反汇编"}
+    try:
+        unit = _unit_from_data(data, path, base)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    note = []
+    if not start and not symbol:
+        vt = vector_table(unit)
+        if vt.get("reset_hex"):
+            start = int(vt["reset_hex"], 16) & ~1
+            note.append("未给 start/symbol，从向量表复位入口 0x%08X 开始" % start)
+        elif unit.code_ranges:
+            start = unit.code_ranges[0][0]
+            note.append("未给 start/symbol，从可执行区间起点 0x%08X 开始" % start)
+        else:
+            return {"ok": False, "error": "没有可执行区间，也没有给 start"}
+    if symbol:
+        st = symbol_table(unit)
+        hit = None
+        for f in st["functions"]:
+            if f["name"] == symbol:
+                hit = f
+                break
+        if hit is None:
+            near = [f["name"] for f in st["functions"]
+                    if symbol.lower() in f["name"].lower()][:12]
+            return {"ok": False,
+                    "error": "符号 %r 不在符号表里" % symbol,
+                    "hint": "含该子串的符号：" + (", ".join(near) if near else "（无）"),
+                    "symbol_table": st["available"]}
+        start = hit["addr"]
+        if not end:
+            end = start + (hit["size"] or 64)
+            if not hit["size"]:
+                note.append("该符号 st_size=0（编译器没给长度），按 64 字节试读；"
+                            "要完整函数请给 end")
+    if not end:
+        code_end = max((b for _, b in unit.code_ranges), default=start + 256)
+        end = min(code_end, start + max_insns * 4)
+    if end <= start:
+        return {"ok": False, "error": "end(0x%X) 必须大于 start(0x%X)" % (end, start)}
+    r = disassemble(unit, start, end, max_insns=max_insns)
+    if not r.get("ok"):
+        return r
+    r["input"] = {"path": os.path.abspath(path), "size": len(data),
+                  "sha256": sha256_bytes(data)}
+    r["arch"] = unit.arch
+    r["span"] = {"start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end}
+    r["notes"] = note + (r.get("notes") or [])
+    cps = find_code_pointers(unit)
+    names = {}
+    if unit.elf:
+        for s in symbol_table(unit)["functions"]:
+            names[s["addr"]] = s["name"]
+    for ins in r["insns"]:
+        t = ins.get("target")
+        if t is not None and (t & ~1) in names:
+            ins["target_name"] = names[t & ~1]
+    r["limits"] = ["反汇编只说明「这些字节被解码成这些指令」；"
+                   "数据被误当代码（字面量池、跳转表）时会产出看着正常的垃圾指令"]
+    return r

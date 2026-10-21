@@ -68,6 +68,7 @@ BATCHES = [
     "test_batch75",
     "test_batch76",
     "test_batch77", "test_batch78",
+    "test_batch79",
     "test_viz",
     "test_component_link",
 ]

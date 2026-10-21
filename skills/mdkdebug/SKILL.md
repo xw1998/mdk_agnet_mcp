@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 204 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 208 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -32,7 +32,7 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
    - 收窗口用 `close_uvision(keep="oldest")`：**持 UVSOCK 4823 的是最早那个实例**，
      别按「留最新」关。
 
-## 二、五条主线工作流
+## 二、六条主线工作流
 
 ### 1. 编译 → 烧录 → 进调试 → 看现象（最常用）
 
@@ -119,6 +119,27 @@ batch_debug_script(init_file=...)   # 每轮 15~25s；命令报错不改退出�
 注意三条硬限制（工具会做静态告警）：命令报错不改退出码、`DISPLAY`/`SAVE` 与
 `Go main` 会挂死。可重复的冒烟回归适合它，交互式调试仍应走 UVSOCK。
 
+### 6. 只有固件没有工程：`.hex` / `.bin` / `.elf(.axf)` / `.lib` / `.so` → 工程骨架
+
+```
+recover_probe(file)                          # 先看容器、架构、向量表、能恢复出多少
+recover_symbols(file, deep=true)             # 函数清单（observed/inferred/weak 三档置信）
+recover_disasm(file, symbol="main")          # 按符号或地址区间反汇编（需要 capstone）
+recover_project(file, out_dir="...")         # 出 sct/ld/头文件/startup/stub/反汇编/map/report
+```
+
+要点：
+- **三档置信要当真**：`observed` 来自 `symtab`/DWARF；`inferred` 来自向量表或 `bl` 目标；
+  `weak` 只有一条「代码指针」线索。**别把 `weak` 当函数名用**，也别把 inferred 的
+  架构当成读到的（HEX/BIN 没有 ELF 头，架构是从复位向量 bit0 推的，报告里有 `basis`）。
+- **`.lib` / `.so` 不要直接出工程**：`ar` 成员是可重定位目标文件，地址是节内偏移；
+  `recover_project` 对归档只做逐成员取件 + `manifest.json`，要反汇编请对单个成员调
+  `recover_disasm`。
+- **`out_dir` 必须不存在**（独占写，绝不覆盖既有证据），默认生成物每个都回读 SHA-256。
+- **不会给你 C 源码**：参数个数/类型、结构体布局、局部变量名、宏、中断优先级都不在输入里，
+  `report.json` 与生成的 `README.md` 专设「没有恢复什么」一节——那份清单是**边界声明**，
+  不是待办。
+
 ## 三、接续上一次的上下文
 
 MCP 工具无状态，会话一断，工程/符号/断点清单就没了。开工与收工各一次：
@@ -167,7 +188,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 160 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 164 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。

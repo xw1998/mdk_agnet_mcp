@@ -42,6 +42,7 @@ from . import uvprojx as _uvprojx
 from . import precheck as _precheck
 from . import verify as _verify
 from . import image as _image
+from . import recover as _recover
 from . import session as _session
 from . import outctl as _outctl
 from . import toolchain as _toolchain
@@ -7480,6 +7481,138 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 max_files=int(max_files or 32),
                 max_file_bytes=int(max_file_bytes or 32 * 1024 * 1024),
             )
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_probe",
+        title="固件逆向：这是什么工程（格式/架构/布局/向量表/符号）",
+        description=(
+            "对一份**固件产物**回答「这是什么工程」，不碰硬件、不改文件：\n"
+            "① **容器与身份**：ELF(.axf/.elf/.o/.so) / Intel HEX / 裸 bin / ar 归档(.lib/.a)，"
+            "附 size + SHA-256；\n"
+            "② **架构**：CPU 家族、位宽、端序、Thumb。Thumb 判定给依据（入口末位 / 奇数函数符号 / $t 映射符号），"
+            "bin/hex 没有 ELF 头时**从向量表复位地址 bit0 推断并标注是推断的**；\n"
+            "③ **布局**：可执行区间、ROM/RAM 窗口（来自节表，不是猜的）；\n"
+            "④ **向量表**：初值 SP + 前 N 个入口（读到 0/0xFFFFFFFF 停）。前 16 个是 Cortex-M 内核固定异常，"
+            "IRQn 的**具体外设未判定**（semantics=unverified）；\n"
+            "⑤ **符号与函数**：符号表函数/对象数、恢复出的函数数与三档置信（observed / inferred / weak）；"
+            "有 .debug_info 时还会给出**原始源文件数**（DWARF 是重建工程目录最直接的依据）。\n"
+            "deep=True 会做线性反汇编以补上「剥离了符号」的固件（较慢，需要 capstone）；deep=False 只读符号表与向量表。\n"
+            "口径：地址、布局、控制流是事实；**函数体语义没有恢复**。只读工具。"
+        ),
+    )
+    async def recover_probe(path: str, base: int = 0, deep: bool = True) -> str:
+        try:
+            out = _recover.analyze(str(path or "").strip(), base=int(base or 0),
+                                   deep=bool(deep))
+            out.pop("_unit", None)
+            out.pop("_recover", None)
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_symbols",
+        title="固件逆向：恢复函数清单（三档置信 + 调用关系）",
+        description=(
+            "把固件里的函数入口全部列出来，每条都标**证据来源**：\n"
+            "observed = 符号表或 DWARF 直接写了这个入口与名字（包括原始文件名与行号）；\n"
+            "inferred = 向量表或 call 目标（任一条就足以证明「这里是一个入口」），或两条以上独立证据；\n"
+            "weak = 只有一条间接证据（通常是字面量池里的代码指针）。\n"
+            "每条给出 addr / end_addr / size 与其依据（size_basis=symtab 还是 next_entry）、"
+            "callee 数、caller 数。剥离符号的 bin/hex 也能跑（名字会变成 sub_XXXXXXXX / Reset_Handler 这类推导名）。\n"
+            "用途：重建工程时知道有哪些函数、在什么地址、谁在用它；在正确的地址上打断点。\n"
+            "限制：符号名只代表「符号表里写了这串字符」，不证明函数体没被内联/裁剪；"
+            "st_size=0 的符号边界按「下一个入口」推，不是精确长度。"
+        ),
+    )
+    async def recover_symbols(path: str, base: int = 0, deep: bool = True,
+                             max_functions: int = 400) -> str:
+        try:
+            an = _recover.analyze(str(path or "").strip(), base=int(base or 0),
+                                  deep=bool(deep), max_functions=int(max_functions or 400))
+            if not an.get("ok"):
+                return _js(an)
+            rec = an.get("_recover") or {}
+            out = {
+                "ok": True,
+                "input": {"path": an["path"], "size": an["size"], "sha256": an["sha256"]},
+                "container": an.get("container"),
+                "arch": an.get("arch"),
+                "symbols": an.get("symbols"),
+                "dwarf": an.get("dwarf"),
+                "counts": rec.get("counts"),
+                "total": rec.get("total"),
+                "truncated": rec.get("truncated"),
+                "functions": rec.get("functions"),
+                "string_refs": rec.get("string_refs"),
+                "code_pointers": rec.get("code_pointers"),
+                "gaps": an.get("gaps") or [],
+                "evidence_rule": rec.get("evidence_rule"),
+                "limitations": an.get("limitations") or [],
+            }
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_disasm",
+        title="固件逆向：按符号或地址区间反汇编",
+        description=(
+            "反汇编一段固件。给 symbol 就按符号表定位（st_size=0 时按 64 字节试读并提示给 end）；"
+            "都不给就从向量表复位入口开始。\n"
+            "输出每条指令的地址、机器码、助记符、操作数，直接跳转目标带 target_hex 与 target_name；"
+            "返回值识别（bx lr / pop {..pc} / ret）标 ends_function。\n"
+            "遇到无法解码的字节会**跳过并按指令对齐继续**（不把「一个坏字节」当成「后面没有指令」），"
+            "跳过次数在 undefined_skips 里如实报。\n"
+            "限制：反汇编只说明「这些字节被解码成这些指令」；把数据区当代码扫会产出看着正常的垃圾指令，"
+            "所以区间边界要自己负责（先用 recover_symbols 看函数边界）。"
+        ),
+    )
+    async def recover_disasm(path: str, start: int = 0, end: int = 0,
+                             symbol: str = "", base: int = 0,
+                             max_insns: int = 5000) -> str:
+        try:
+            out = _recover.disasm_at(str(path or "").strip(), base=int(base or 0),
+                                     start=int(start or 0), end=int(end or 0),
+                                     symbol=str(symbol or "").strip(),
+                                     max_insns=int(max_insns or 5000))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_project",
+        title="固件逆向：生成能打开的工程骨架（.sct/.ld + 向量表 + 符号头 + 汇编）",
+        description=(
+            "把一份固件变成**可用工程**，输出目录必须不存在（不覆盖任何既有内容，每个文件写完回读 SHA-256）：\n"
+            "linker/recovered.sct（MDK 分散加载）与 recovered.ld（GNU ld）——布局取自原镜像节表；\n"
+            "include/recovered_symbols.h——函数声明与地址（**原型按无参 void 推断**，文件头已写明）；\n"
+            "src/startup_recovered.c——**照抄原镜像向量表**的启动向量；\n"
+            "src/recovered_stubs.c——weak 占位实现，让骨架能编译链接（原函数体没有恢复）；\n"
+            "asm/disassembly.asm——带符号标注的反汇编；\n"
+            "map/functions.csv（含 DWARF 原始文件/行号）、objects.csv、vector_table.csv、strings.csv、xrefs.csv；\n"
+            "report.json（机器可读）+ README.md（人读，含「没有恢复什么」）。\n"
+            "输入是 .lib/.a 时改为取件：members/ 下原样取出每个成员 + manifest.json（成员是可重定位目标文件，"
+            "地址是节内偏移，需再对单个成员反汇编）。\n"
+            "边界：还原地址/布局/控制流，**不还原 C 语义**；类型、宏、注释、函数体逻辑都不会自己长出来。"
+        ),
+    )
+    async def recover_project(path: str, out_dir: str, name: str = "recovered",
+                             base: int = 0, deep: bool = True,
+                             max_stub_functions: int = 300,
+                             max_asm_functions: int = 200,
+                             include_asm: bool = True) -> str:
+        try:
+            out = _recover.build_project(
+                str(path or "").strip(), str(out_dir or "").strip(),
+                name=str(name or "recovered") or "recovered",
+                base=int(base or 0), deep=bool(deep),
+                max_stub_functions=int(max_stub_functions or 300),
+                max_asm_functions=int(max_asm_functions or 200),
+                include_asm=bool(include_asm))
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
