@@ -229,9 +229,11 @@ def section_g():
     print("\nG 诚实性（非 ARM 不做提升）")
     p = _tmp("t.exe", SB.make_pe())
     r = RC.disasm_at(p, symbol="func_a", fmt="c")
-    check("G1 非 ARM 请求伪 C → 明确拒绝并给替代动作",
-          r.get("ok") is False and "ARM" in (r.get("error") or "")
-          and r.get("hint"), r.get("error"))
+    # 批次93 起伪 C 也支持 riscv/mips，所以拒绝文案里列的是「可用家族」而不是 ARM
+    _e = r.get("error") or ""
+    check("G1 不支持的家族请求伪 C → 明确拒绝并给替代动作",
+          r.get("ok") is False and "x86_64" in _e and "riscv" in _e
+          and r.get("hint"), _e)
     an = RC.analyze(p)
     check("G2 非 ARM 的报告里写明「参数/返回值不要按 AAPCS 读」",
           any("AAPCS" in s for s in an.get("limitations") or []),

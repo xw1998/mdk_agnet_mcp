@@ -417,6 +417,9 @@ def _make_cs(arch: dict):
             return capstone.Cs(capstone.CS_ARCH_ARM64, mode), ""
         if fam == "riscv":
             mode = capstone.CS_MODE_RISCV64 if arch.get("bits") == 64 else capstone.CS_MODE_RISCV32
+            # RVC（压缩指令）是 RV32IC/RV64IC 的常态：真实固件里大量 c.addi/c.lw/c.j。
+            # 不开它就会把 2 字节指令当坏字节跳掉（看着像「函数很短」）。
+            mode |= getattr(capstone, "CS_MODE_RISCVC", 0)
             return capstone.Cs(capstone.CS_ARCH_RISCV, mode), ""
         if fam == "x86":
             mode = capstone.CS_MODE_64 if arch.get("bits") == 64 else capstone.CS_MODE_32
@@ -2428,9 +2431,21 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
         one["arch"] = unit.arch
         one["span"] = {"start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end}
         one["notes"] = note + (one.get("notes") or [])
+        # 调用约定按家族写：ARM 是 AAPCS（r0..r3），RISC-V/MIPS 是各自 ABI
+        from . import lift_isa as _lisa           # noqa: PLC0415
+        _fam = (unit.arch or {}).get("family")
+        _d = _lisa.descriptor(_fam)
+        if _fam == "arm" or not _d:
+            _cc = "bl 按 AAPCS 传当前 r0..r3，返回值在 r0（多返回值/浮点未建模）"
+        else:
+            _an = _d.get("arg_names") or []
+            _cc = ("bl 按 %s 传当前 %s..%s，返回值在 %s（多返回值/浮点未建模）"
+                   % (_d.get("abi"), _an[0] if _an else "?",
+                      _an[3] if len(_an) > 3 else (_an[-1] if _an else "?"),
+                      _d.get("ret_name") or "?"))
         one["limitations"] = [
             "寄存器级伪 C：表达式与控制流保真；类型名/结构体/变量名是**推断**的",
-            "bl 按 AAPCS 传当前 r0..r3，返回值在 r0（多返回值/浮点未建模）",
+            _cc,
             "间接跳转（函数指针、未恢复的跳转表）保留成注释，不编造分支",
             "只结构化「单块 if」与「单块 if/else」；循环保留 goto 并标回边",
         ]

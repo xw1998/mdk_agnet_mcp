@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.16）
+│   ├── __init__.py           # 包初始化（版本号 0.2.17）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -1116,9 +1116,9 @@ offset 0 就叫 0，不叫「成员名」。结构体成员的名字与类型只
 Ghidra 最有名的那个功能——把机器码变成类 C——批次84 吸收的是它**能零依赖做到的那一半**
 （`mdkdebug/decomp.py`）：每条指令变成一条赋值/存储/调用，控制流用 `if` / `goto` / `switch`。
 
-| 做了 | 批次92 补上的 | 仍然做不到（明确标注） |
+| 做了 | 批次92/93 补上的 | 仍然做不到（明确标注） |
 |---|---|---|
-| 算术/逻辑/移位/比较、`ubfx`/`sbfx`、`mvn`/`rsb`、`mla`/`mls`/`mul`/`umull`、`adc`/`sbc` **带进位链**（进位表达式跟着上一条 add/sub 走，链断就降级并标注）、`rrx`、`clz`、`rev`、条件执行（IT 块按 t/e 模式展开）、单块 `if` / `if-else` 结构化、循环回边标注、`switch`（跳转表连同表数据的伪指令一起剥掉） | 变量重命名（参数 `a0..a3`／计数器 `i,j`／基址 `p0,p1`／临时量 `v<N>`，每项带 basis，注释保留 `rN`）、类型恢复（宽度 + **符号性**：`int` vs `unsigned` 只看消费指令，冲突给 unknown）、结构体候选（字段表：偏移/宽度/读写次数；等步长且步长==宽度 ⇒ 数组候选）、跨函数数据流（调用点实参来源 + 一层返回值传递）、`cpsid`/`bkpt`/`vmsr` 注释并计数 | 还原**原始** `struct` 与成员名、`int` vs `unsigned` 的确定答案（没有调试信息时不可逆）、反内联（内联体没有调用点）、跨函数的全局变量传播、浮点/SIMD 语义 |
+| 算术/逻辑/移位/比较、`ubfx`/`sbfx`、`mvn`/`rsb`、`mla`/`mls`/`mul`/`umull`、`adc`/`sbc` **带进位链**（进位表达式跟着上一条 add/sub 走，链断就降级并标注）、`rrx`、`clz`、`rev`、条件执行（IT 块按 t/e 模式展开）、单块 `if` / `if-else` 结构化、循环回边标注、`switch`（跳转表连同表数据的伪指令一起剥掉） | 变量重命名（参数 `a0..a3`／计数器 `i,j`／基址 `p0,p1`／临时量 `v<N>`，每项带 basis，注释保留 `rN`）、类型恢复（宽度 + **符号性**：`int` vs `unsigned` 只看消费指令，冲突给 unknown）、结构体候选（字段表：偏移/宽度/读写次数；等步长且步长==宽度 ⇒ 数组候选）、跨函数数据流（调用点实参来源 + 一层返回值传递）、`cpsid`/`bkpt`/`vmsr` 注释并计数、**指令集不再只有 Cortex-M**：RISC-V（含 RVC 压缩指令）/ MIPS32（含分支延迟槽）/ ARMv5·ARM9 的 ARM 模式，三家族共用同一套提升器（见下一节） | 还原**原始** `struct` 与成员名、`int` vs `unsigned` 的确定答案（没有调试信息时不可逆）、反内联（内联体没有调用点）、跨函数的全局变量传播、浮点/SIMD 语义 |
 
 真镜像 `mdk_test.axf` 上：**175 个函数全部出码、0 个失败、4760 条指令、4 处未提升**
 （`adcs` / `rrx` / `sbc.w`，3 个函数里有）。这 4 处不是「漏了」，是**故意降级**：带借位的
@@ -1413,9 +1413,44 @@ dump 切出来的镜像还得调用方自己写文件。批次90 逐条补平（
 在数学上都不可逆。所以每条都带 basis，拿不出证据就给 `unknown`/`v<N>`，并在
 `limitations` 里逐条声明——宁可说「我不知道」，也不给一个看着权威的错答案。
 
+
+### 伪 C 的指令集：RISC-V / MIPS / ARM 模式（批次93）
+
+「只要嵌入式在用的指令集都要支持」——批次93 把伪 C 从 Cortex-M 扩到三个家族
+（**仍不新增工具**，`recover_disasm(fmt="c")` / `recover_project` 的口径不变）：
+
+| 家族 | 覆盖 | 寄存器与调用约定 | 特有处置 |
+|---|---|---|---|
+| `arm` | Cortex-M 的 Thumb（沿用批次84–92）+ **ARMv5/ARM9 的 ARM 模式**（`push/pop`、`ldm/stm`、`bx`、`movw/movt`、`bic`、`mla`） | `r0..r15` + AAPCS 命名阶梯 | 条件执行、IF-THEN 块、`ldr` 字面量池 |
+| `riscv` | RV32/RV64 的 `add/addi/sub/lui/auipc/lw/lb/lbu/sw/sb/slli/slt/slti/div/mul/beq/bne/blt/bge/bltu/bgeu/jal/jalr/csr*` + **RVC 压缩指令**（`c.addi/c.sub/c.lw/c.sw/c.j/c.beqz`…） | `a0..a7 / ra / sp / t0..`，RISC-V psABI，返回值 `a0` | 分支立即数是**相对偏移**（折算成绝对）；`lui/auipc` 的 imm 是未移位高 20 位 |
+| `mips` | MIPS32 的 `addiu/addu/subu/and/or/xor/sll/srl/sra/lui/lw/lb/lbu/sw/sb/slt/slti/beq/bne/blez/bgtz/j/jal/jr/jalr` | `a0..a3 / v0 / v1 / ra / sp`，o32，返回值 `v0` | **分支延迟槽整组提到分支之前**（伪 C 里的顺序是执行顺序）；`j/b/jal` 是绝对地址 |
+
+做法是**翻译层**（`mdkdebug/lift_isa.py`）而不是「再写三套提升器」：把别的指令集按等价
+语义翻成「ARM 形状的统一 IR」（`mov/add/sub/ldr/str/cmp+bcond/bl/bx lr`），再喂给
+批次84 起那同一个提升器。所以类型恢复、变量命名、结构体候选、内联边界、跨函数数据流
+对三个家族**全部生效**，不会四条分支各自腐烂。
+
+代价是「翻译」这一步要自己举证，边界写死在这三处：
+
+- **翻不动就留痕**：原子 `amo*`、MIPS 的 `rotr/mtlo/mthi`、RISC-V 的 `clz` 之类出
+  `/* 未支持: <mn> ... */` 并计入 `n_unsupported`——这是**没建模**，不是漏做。
+- **写零寄存器是丢弃**：`addi zero,zero,1` 出 `/* 结果丢弃 ... */` 并计数（`n_discard`），
+  绝不渲染成 `zero = 0x1;` 去骗读者追一个恒零的「变量」。
+- **明确不做就写理由**：`arm64`（本提升器是 32 位类型模型）、`x86/x86_64`（子寄存器 +
+  隐式栈）、`ppc`（CR 字段 + update 后缀）、`m68k`（两套寄存器组 + 前后自增）、
+  `sparc`（寄存器窗口）、`mos65xx`（8 位累加器机）。这些家族**拒绝提升**，并连同
+  「可用家族」一起返回，让调用方去看汇编。
+
+`recover.py` 里那条 **armasm/armlink 复刻链仍只对 ARM**：伪 C 放开家族 ≠ 能按 RISC-V
+目标出可编译工程（伪指令、ELF 布局、启动代码全是 ARM 细节），这两道闸门是两回事。
+
+测试 `tests/test_batch93.py` 用手写字节夹具（不依赖工具链）覆盖三个家族的
+算术/访存/分支/调用、零点丢弃、RVC、MIPS 延迟槽顺序、ARM 模式的 `push/pop` 与
+`movw/movt`，以及家族拒绝与「工具面仍 213 / 零新增依赖」。
+
 ### 底层库
 
 - [pyelftools](https://github.com/eliben/pyelftools)：`.axf` 调试符号解析
-- [capstone](https://github.com/capstone-engine/capstone)：Thumb 反汇编
+- [capstone](https://github.com/capstone-engine/capstone)：反汇编（ARM/Thumb、ARM 模式、RISC-V 含 RVC、MIPS32 等）
 - [mcp](https://github.com/modelcontextprotocol/python-sdk) / 
   [pydantic](https://github.com/pydantic/pydantic)：MCP Server 框架与类型模型

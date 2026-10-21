@@ -232,10 +232,10 @@ def _decode(unit, start: int, end: int, *, max_insns: int = 4000):
     from .recover import _make_cs           # 避免模块级循环导入
     md, why = _make_cs(unit.arch)
     if md is None:
-        return None, 0, why
+        return None, 0, why, {}
     blob = unit.read(start, end - start)
     if not blob:
-        return None, 0, "地址 0x%08X 不在镜像的映射范围内" % start
+        return None, 0, "地址 0x%08X 不在镜像的映射范围内" % start, {}
     md.detail = True
     insns, skipped = [], 0
     step = 2 if (unit.arch.get("thumb") or unit.arch.get("family") == "riscv") else 4
@@ -247,11 +247,23 @@ def _decode(unit, start: int, end: int, *, max_insns: int = 4000):
             pos = ins.address + ins.size - start
             got = True
             if len(insns) >= max_insns:
-                return insns, skipped, ""
+                return insns, skipped, "", {}
         if not got or pos < len(blob):
             pos = min(pos + step, len(blob))
             skipped += 1
-    return insns, skipped, ""
+    # 批次93：非 ARM 家族先把指令翻成「ARM 形状的 IR」，再进同一套提升器；
+    # MIPS 的分支延迟槽在这里整组提到分支之前（否则伪 C 的顺序是错的）。
+    meta = {"family": (unit.arch or {}).get("family") or "arm",
+            "delay_slots_hoisted": 0}
+    if meta["family"] in ("riscv", "mips"):
+        from . import lift_isa             # noqa: PLC0415
+        groups = [lift_isa.normalise(unit, i) for i in insns]
+        if meta["family"] == "mips":       # 只有 MIPS 有分支延迟槽
+            insns, moved = lift_isa.hoist_delay_slots(groups)
+            meta["delay_slots_hoisted"] = moved
+        else:
+            insns = [x for g in groups for x in g]
+    return insns, skipped, "", meta
 
 
 # ----------------------------------------------------------------------
@@ -400,6 +412,18 @@ def _cond_text(cond: str, flags) -> str:
 # ----------------------------------------------------------------------
 def _lift(unit, ins, ctx) -> list:
     """返回若干行 C；带条件的指令（含 IT 块）在这里统一包成 ``if``。"""
+    # 非 ARM 家族的 IR 可以自带「已经渲染好的 C 行」（翻译层有把握的形态），
+    # 或「未支持」的注释。这两类都不过 ARM 的条件/flags 逻辑。
+    fixed = getattr(ins, "fixed", None)
+    if fixed is not None:
+        note = getattr(ins, "note", "") or ""
+        if note == "unsupported":
+            ctx["unsupported"].append(getattr(ins, "src_mnemonic", ins.mnemonic))
+        elif note == "ctrl":
+            ctx["ctrl_note"] = ctx.get("ctrl_note", 0) + 1
+        elif note == "discard":
+            ctx["discard"] = ctx.get("discard", 0) + 1
+        return list(fixed)
     base, cond = _split_cond(ins.mnemonic)
     if base == "it":
         ctx["it"] = _it_conds(ins.mnemonic, ins.op_str)
@@ -428,6 +452,20 @@ def _lift(unit, ins, ctx) -> list:
         else:
             out.append("if (%s) { %s }" % (expr or "1", s))
     return out
+
+
+def _abi_of(ctx) -> dict:
+    return ctx.get("abi") or {}
+
+
+def _ret_name(ctx) -> str:
+    """返回寄存器在人读代码里的名字（ARM 是 r0，RISC-V 是 a0，MIPS 是 v0）。"""
+    return _abi_of(ctx).get("ret_name") or "r0"
+
+
+def _call_args(ctx) -> str:
+    names = (_abi_of(ctx).get("arg_names") or ["r0", "r1", "r2", "r3"])[:4]
+    return ", ".join(names)
 
 
 def _unsupported(ins, ctx, base) -> list:
@@ -773,20 +811,23 @@ def _lift_one(unit, ins, ctx, base) -> list:
         fn = _c_name(name, "sub_%08X" % (tgt or 0)) if name else (
             "sub_%08X" % tgt if tgt is not None else "sub_unknown")
         ctx["flags"] = None
-        return ["r0 = %s(r0, r1, r2, r3); /* bl %s */"
-                % (fn, _hex(tgt) if tgt is not None else "?")]
+        return ["%s = %s(%s); /* bl %s */"
+                % (_ret_name(ctx), fn, _call_args(ctx),
+                   _hex(tgt) if tgt is not None else "?")]
     if base == "blx":
         reg = _op_expr(unit, ins, ops[0]) if ops else "?"
         ctx["flags"] = None
         ctx["carry"] = None
-        return ["r0 = ((uint32_t (*)(uint32_t, uint32_t, uint32_t, uint32_t))%s)"
-                "(r0, r1, r2, r3); /* blx */" % reg]
+        return ["%s = ((uint32_t (*)(uint32_t, uint32_t, uint32_t, uint32_t))%s)"
+                "(%s); /* blx */" % (_ret_name(ctx), reg, _call_args(ctx))]
     if base == "bx":
-        reg = _op_expr(unit, ins, ops[0]) if ops else "lr"
+        reg = _op_expr(unit, ins, ops[0]) if ops else _abi_of(ctx).get(
+            "link_name", "lr")
         ctx["flags"] = None
-        if reg == "lr":
-            return ["return r0; /* bx lr */"]
-        return ["return r0; /* bx %s —— 尾调用/间接跳转，目标未解析 */" % reg]
+        if reg == _abi_of(ctx).get("link_name", "lr"):
+            return ["return %s; /* bx lr（链接寄存器） */" % _ret_name(ctx)]
+        return ["return %s; /* bx %s —— 尾调用/间接跳转，目标未解析 */"
+                % (_ret_name(ctx), reg)]
     if base in ("cbz", "cbnz"):
         r = _op_expr(unit, ins, ops[0]) if ops else "?"
         tgt = _target(ins)
@@ -992,7 +1033,17 @@ _UNSIGNED_BR = {"bhi", "bhs", "blo", "bls"}
 
 
 def _regnum(ins, reg_id) -> int:
-    """capstone 寄存器 id → 寄存器号（r0..r12 / sp=13 / lr=14 / pc=15 / -1 未知）。"""
+    """capstone 寄存器 id → 寄存器号（r0..r12 / sp=13 / lr=14 / pc=15 / -1 未知）。
+
+    非 ARM 家族的指令是 ``lift_isa`` 造的 IR，槽位由它自己给（``reg_slot``）：
+    这里先问 IR，问不到再按 ARM 的名字规则解析。
+    """
+    hook = getattr(ins, "reg_slot", None)
+    if hook is not None:
+        try:
+            return int(hook(reg_id))
+        except Exception:                  # noqa: BLE001
+            return -1
     try:
         name = reveng._norm_reg(ins.reg_name(reg_id))
     except Exception:                      # noqa: BLE001
@@ -1003,7 +1054,7 @@ def _regnum(ins, reg_id) -> int:
     return {"sp": 13, "lr": 14, "pc": 15}.get(name, -1)
 
 
-def _used_regs(insns) -> list:
+def _used_regs(insns, abi=None) -> list:
     """函数里出现过的寄存器号（按操作数扫，比 regs_access 完整——ldm/ldm.w 的
     基址寄存器在寄存器表里未必列全，早先的 locals 声明因此漏掉过 r10）。
 
@@ -1013,7 +1064,7 @@ def _used_regs(insns) -> list:
     used = set()
     for ins in insns:
         if _base_mn(ins.mnemonic) in ("bl", "blx"):
-            used.update((0, 1, 2, 3))
+            used.update(((abi or {}).get("arg_slots") or (0, 1, 2, 3))[:4])
         for op in ins.operands:
             t = int(getattr(op, "type", 0))
             if t == 1:
@@ -1026,7 +1077,7 @@ def _used_regs(insns) -> list:
     return sorted(n for n in used if n >= 0)
 
 
-def _accesses(insns) -> list:
+def _accesses(insns, abi=None) -> list:
     """所有栈外访存：基址寄存器 / 偏移 / 宽度 / 读还是写。"""
     out = []
     for ins in insns:
@@ -1039,7 +1090,7 @@ def _accesses(insns) -> list:
             if int(getattr(op, "type", 0)) != 3:
                 continue
             rn = _regnum(ins, op.mem.base) if getattr(op.mem, "base", 0) else -1
-            if rn < 0 or rn in (13, 15):
+            if rn < 0 or rn in ((abi or {}).get("skip_slots") or (13, 15)):
                 continue
             out.append({"addr": ins.address, "reg": rn,
                         "disp": int(op.mem.disp or 0), "width": width,
@@ -1307,8 +1358,34 @@ def _inline_candidates(insns, funcs, start, end) -> list:
     return out[:8]
 
 
-def _name_registers(used, acc, signs, counters) -> tuple:
-    """寄存器 → 名字（带 basis）。命名阶梯：参数 a0..a3 / 计数器 i,j / 基址 p0,p1 / v<N>。"""
+def _name_registers(used, acc, signs, counters, abi=None) -> tuple:
+    """寄存器 → 名字（带 basis）。命名阶梯：参数 a0..a3 / 计数器 i,j / 基址 p0,p1 / v<N>。
+
+    ``abi["naming"] == "abi"`` 的家族（RISC-V / MIPS）**不做阶梯**：它们的寄存器
+    本来就有约定俗成的 ABI 名（a0..a7、s0..s11、ra、sp），改成 i/j/p0 反而是
+    把有信息量的名字换成猜的。basis 里写明来源是 ABI。
+    """
+    if (abi or {}).get("naming") == "abi":
+        names = abi.get("slot_names") or {}
+        renames, vars_ = {}, []
+        # 前四个参数寄存器**一律**有 ABI 名（哪怕没用），否则签名会出现
+        # a0, a1, r12, r13 这种混排（与 ARM 那条「无条件映射」同源）
+        for n in list((abi.get("arg_slots") or [])[:4]) + [abi.get("stack_slot"),
+                                                           abi.get("link_slot")]:
+            if names.get(n):
+                renames["r%d" % n] = names[n]
+        for n in used:
+            nm = names.get(n) or ("r%d" % n)
+            renames["r%d" % n] = nm
+            sg = signs.get("r%d" % n) or {"kind": "unknown", "basis": []}
+            vars_.append({
+                "reg": "r%d" % n, "name": nm,
+                "type": "int32_t" if sg["kind"] == "signed" else "uint32_t",
+                "signedness": sg["kind"],
+                "signed_basis": sg.get("basis") or [],
+                "basis": "%s 的 ABI 寄存器名（%d 号）；非 ARM 家族不做命名阶梯"
+                         % (abi.get("abi") or abi.get("family"), n)})
+        return renames, vars_
     ptr = {}
     for a in acc:
         if a["disp"]:
@@ -1371,13 +1448,14 @@ def _apply_renames(code: str, renames: dict) -> str:
     return "".join(out)
 
 
-def _analyse(unit, insns, *, funcs=None, start: int = 0, end: int = 0) -> dict:
+def _analyse(unit, insns, *, funcs=None, start: int = 0, end: int = 0,
+             abi=None) -> dict:
     """一次性算齐命名/类型/结构体/内联/调用点数据流（都带 basis）。"""
-    used = _used_regs(insns)
-    acc = _accesses(insns)
+    used = _used_regs(insns, abi)
+    acc = _accesses(insns, abi)
     signs = _signedness(insns)
     counters = _loop_counters(insns)
-    renames, vars_ = _name_registers(used, acc, signs, counters)
+    renames, vars_ = _name_registers(used, acc, signs, counters, abi)
     calls = _call_sites(unit, insns)
     for cs in calls:                       # 实参来源里的寄存器名跟着改名
         for a in cs["args"]:
@@ -1400,20 +1478,27 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
     ``rename=False`` 时不改名、不按推断类型声明（输出与批次91 逐字节一致，
     用于对照与回归）。
     """
-    fam = (unit.arch or {}).get("family")
-    if fam != "arm":
+    from . import lift_isa                 # noqa: PLC0415
+    fam = (unit.arch or {}).get("family") or "unknown"
+    if fam == "unknown":
         return {"ok": False,
-                "error": "伪 C 提升只做了 ARM/Thumb（32 位寄存器模型：r0..r12/sp/lr/pc）；"
-                         "当前架构是 %s，不做提升——把 x86/MIPS/PPC 的指令塞进这个模型"
-                         "只会得到「看着像」的错答案" % (fam or "未知"),
-                "hint": "用 recover_disasm（不加 fmt=\"c\"）看该架构的汇编"}
+                "error": "架构未判定（裸 bin / S-record 里没有指令集信息）："
+                         "伪 C 必须知道指令集才能翻译，工具不猜",
+                "hint": "显式给 arch=（arm / riscv / mips）+ 必要的 bits/endian/thumb/entry，"
+                        "再请求 fmt=\"c\"；也可以先用 recover_probe 看能不能判出来"}
+    if not lift_isa.liftable(fam):
+        return {"ok": False, "error": lift_isa.refusal(fam),
+                "hint": "用 recover_disasm（不加 fmt=\"c\"）看该架构的汇编；"
+                        "反汇编后端支持 arm / arm64 / riscv / x86 / x86_64 / mips / "
+                        "ppc / m68k / sparc / mos65xx"}
+    abi = lift_isa.descriptor(fam)
     funcs = funcs or [func]
     code_end = max((b for _, b in unit.code_ranges), default=None)
     if code_end is None:
         return {"ok": False, "error": "没有可执行区间"}
     start, end = _span(func, funcs, code_end)
     sw_err = ""
-    insns, skipped, why = _decode(unit, start, end, max_insns=max_insns)
+    insns, skipped, why, meta = _decode(unit, start, end, max_insns=max_insns)
     if insns is None:
         return {"ok": False, "error": why}
     if not insns:
@@ -1461,7 +1546,10 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
 
     ctx = {"unit": unit, "names": names, "unsupported": [], "flags": None,
            "carry": None, "switches": sw_by_addr, "it": [],
-           "flag_unresolved": 0, "switch_unresolved": 0, "ctrl_note": 0}
+           "flag_unresolved": 0, "switch_unresolved": 0, "ctrl_note": 0,
+           "discard": 0,
+           "abi": abi, "fam": fam,
+           "delay_hoisted": (meta or {}).get("delay_slots_hoisted", 0)}
 
     blocks = _blocks(insns, start, case_targets)
     idx = {b["start"]: i for i, b in enumerate(blocks)}
@@ -1477,13 +1565,23 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
                 loop_targets.add(t)
 
     # 批次92：命名/符号性/结构体候选/内联边界/调用点数据流（全部带 basis）
-    ana = _analyse(unit, insns, funcs=funcs, start=start, end=end)
+    ana = _analyse(unit, insns, funcs=funcs, start=start, end=end, abi=abi)
     renames = ana["renames"] if rename else {}
     used = set(ana["used"])                # 按操作数扫：ldm/ldm.w 的基址寄存器也算
-    locals_ = ["r%d" % n for n in range(4, 13) if n in used]
-    if 14 in used:
-        locals_.append("lr")
-    locals_.append("sp")
+    if abi.get("naming") == "arm":
+        locals_ = ["r%d" % n for n in range(4, 13) if n in used]
+        if 14 in used:
+            locals_.append("lr")
+    else:
+        # 非 ARM：用到的都声明（槽位自己带 ABI 名），参数/栈/链接寄存器单独处理
+        # 只有前 4 个参数槽能进签名；RISC-V 的 a4..a7 之类的槽位仍要当局部变量声明
+        _skip = set((abi.get("arg_slots") or ())[:4]) | {abi.get("stack_slot"),
+                                                        abi.get("link_slot")}
+        locals_ = ["r%d" % n for n in used if n not in _skip]
+        if abi.get("link_slot") in used:
+            locals_.append("r%d" % abi["link_slot"])
+    locals_.append("r%d" % (abi.get("stack_slot") if abi.get("naming") != "arm"
+                            else 13))
 
     name0 = func.get("name") or ""
     fn_name = _c_name(name0, "") if name0 else ""
@@ -1496,7 +1594,7 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
         return renames.get(reg, reg)
 
     params = []
-    for _n in range(4):
+    for _n in (abi.get("arg_slots") or [0, 1, 2, 3])[:4]:
         _v = var_by_reg.get("r%d" % _n) or {}
         params.append("%s %s" % (_v.get("type") or "uint32_t", _vname("r%d" % _n)))
     decls = {}
@@ -1519,7 +1617,9 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
             "" if not skipped else " / %d 处坏字节已跳过" % skipped),
         " * 寄存器级伪 C（lifting）：表达式与控制流保真；类型/结构体/变量名是**推断**的，"
         "不是原始源码。",
-        " * bl 按 AAPCS 传当前前四个参数寄存器（返回值落第一个）；栈访问用 sp 偏移表达式。 */",
+        " * bl 按 %s 传前四个参数寄存器（%s，返回值落 %s）；栈访问用 %s 偏移表达式。 */"
+        % (abi.get("abi") or "AAPCS", _call_args(ctx), _ret_name(ctx),
+           abi.get("stack_name") or "sp"),
     ] + ana_lines + [
         "uint32_t %s(%s)" % (fn_name, ", ".join(params)),
         "{",
@@ -1569,8 +1669,8 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
         if not _is_term(last):
             return
         if _is_ret(last):
-            lines.append(ind + "return r0; /* %s %s */"
-                         % (last.mnemonic, last.op_str))
+            lines.append(ind + "return %s; /* %s %s */"
+                         % (_ret_name(ctx), last.mnemonic, last.op_str))
             state["ret"] = True
             return
         if (drop_jump_to is not None and _branch_cond(last.mnemonic) == ""
@@ -1601,7 +1701,8 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
         i += 1
 
     if not state["ret"]:
-        lines.append("    return r0; /* 末尾无显式返回：沿用 r0 */")
+        lines.append("    return %s; /* 末尾无显式返回：沿用返回寄存器 */"
+                     % _ret_name(ctx))
 
     # 紧接在其目标标签之前的 goto / if-goto 是空跳转，删掉（语义不变、可读性大幅提升）
     cleaned = []
@@ -1661,11 +1762,26 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
     if tbl_ranges and not insns:
         notes.append("剥掉跳转表后范围内没有指令，疑似函数体只有一次间接跳转")
     if ctx.get("ctrl_note"):
-        notes.append("%d 处控制/状态指令（bkpt/cpsid/cpsie/vmsr/vmrs）只保留为注释：未建模"
-                     % ctx["ctrl_note"])
+        if fam == "arm":
+            notes.append("%d 处控制/状态指令（bkpt/cpsid/cpsie/vmsr/vmrs）只保留为注释：未建模"
+                         % ctx["ctrl_note"])
+        else:
+            notes.append("%d 处控制/状态指令（csr/syscall/eret/fence 之类）只保留为注释：未建模"
+                         % ctx["ctrl_note"])
+    if ctx.get("discard"):
+        notes.append("%d 处写零寄存器（x0 / $zero 恒为 0）的结果丢弃：只保留为注释"
+                     % ctx["discard"])
     if ctx.get("assumed"):
         notes.append("%d 处独占访问（ldrex/strex）按普通访存 + 假设成功输出"
                      "（独占监视器未建模）" % ctx["assumed"])
+    if fam != "arm":
+        notes.append("%s 家族：指令已按等价语义翻译成统一 IR；寄存器用 ABI 名（%s），"
+                     "调用约定按 %s，不做命名阶梯"
+                     % (fam, ", ".join((abi.get("arg_names") or [])[:4]),
+                        abi.get("abi")))
+    if ctx.get("delay_hoisted"):
+        notes.append("%d 处分支延迟槽已提到分支之前（MIPS 延迟槽语义）"
+                     % ctx["delay_hoisted"])
     if skipped:
         notes.append("%d 处坏字节已跳过，对应指令不在源码里" % skipped)
     if missing:
@@ -1677,6 +1793,7 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
             "n_structured": len(if_at),
             "n_unsupported": len(ctx["unsupported"]),
             "unsupported": uns, "n_skipped": skipped,
+            "n_discard": ctx.get("discard", 0),
             "n_flag_unresolved": ctx["flag_unresolved"],
             "n_switch_unresolved": ctx["switch_unresolved"],
             "n_outside_targets": len(missing),
@@ -1701,12 +1818,14 @@ def _terminator_lines(unit, ins, ctx, blocks) -> tuple:
     """块末尾指令 → (行列表, 是否有显式控制转移)。"""
     m = _base_mn(ins.mnemonic)
     if _is_ret(ins):
-        return (["return r0; /* %s %s */" % (ins.mnemonic, ins.op_str)], True)
+        return (["return %s; /* %s %s */" % (_ret_name(ctx), ins.mnemonic,
+                                             ins.op_str)], True)
     if _is_table_term(ins):
         return (_switch_lines(unit, ins, ctx), True)
     if m == "bx":
-        reg = _op_expr(unit, ins, list(ins.operands)[0]) if ins.operands else "lr"
-        return (["return r0; /* bx %s */" % reg], True)
+        reg = _op_expr(unit, ins, list(ins.operands)[0]) if ins.operands \
+            else _abi_of(ctx).get("link_name", "lr")
+        return (["return %s; /* bx %s */" % (_ret_name(ctx), reg)], True)
     if m in ("cbz", "cbnz"):
         r = _op_expr(unit, ins, list(ins.operands)[0]) if ins.operands else "?"
         return (["if (%s %s 0) goto L_%08X;" % (r, "==" if m == "cbz" else "!=",
