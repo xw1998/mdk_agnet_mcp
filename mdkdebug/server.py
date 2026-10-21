@@ -7490,8 +7490,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         title="固件逆向：这是什么工程（格式/架构/布局/向量表/符号）",
         description=(
             "对一份**固件产物**回答「这是什么工程」，不碰硬件、不改文件：\n"
-            "① **容器与身份**：ELF(.axf/.elf/.o/.so) / Intel HEX / 裸 bin / ar 归档(.lib/.a)，"
-            "附 size + SHA-256；\n"
+            "① **容器与身份**：ELF(.axf/.elf/.o/.so) / Intel HEX / Motorola S-record / 裸 bin / "
+            "ar 归档(.lib/.a) / PE(.exe/.dll) / COFF(.obj) / Mach-O(.dylib/fat)，"
+            "每条都带**判据**（凭哪几个字节判成这个，不看扩展名）；附 size + SHA-256；\n"
             "② **架构**：CPU 家族、位宽、端序、Thumb。Thumb 判定给依据（入口末位 / 奇数函数符号 / $t 映射符号），"
             "bin/hex 没有 ELF 头时**从向量表复位地址 bit0 推断并标注是推断的**；\n"
             "③ **布局**：可执行区间、ROM/RAM 窗口（来自节表，不是猜的）；\n"
@@ -7500,13 +7501,21 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "⑤ **符号与函数**：符号表函数/对象数、恢复出的函数数与三档置信（observed / inferred / weak）；"
             "有 .debug_info 时还会给出**原始源文件数**（DWARF 是重建工程目录最直接的依据）。\n"
             "deep=True 会做线性反汇编以补上「剥离了符号」的固件（较慢，需要 capstone）；deep=False 只读符号表与向量表。\n"
+            "裸 bin / 无头容器可以用 arch（arm / arm64 / x86 / x86_64 / mips / ppc / m68k / "
+            "sparc / riscv / mos65xx）+ endian + bits + thumb + entry **显式指定**："
+            "文件里没有的东西不猜——指定值会与文件头推断并列保留，冲突看得见。\n"
             "口径：地址、布局、控制流是事实；**函数体语义没有恢复**。只读工具。"
         ),
     )
-    async def recover_probe(path: str, base: int = 0, deep: bool = True) -> str:
+    async def recover_probe(path: str, base: int = 0, deep: bool = True,
+                            arch: str = "", endian: str = "", bits: int = 0,
+                            thumb: bool = False, entry: int = 0) -> str:
         try:
             out = _recover.analyze(str(path or "").strip(), base=int(base or 0),
-                                   deep=bool(deep))
+                                   deep=bool(deep), arch=str(arch or ""),
+                                   endian=str(endian or ""), bits=int(bits or 0),
+                                   thumb=(None if not thumb else True),
+                                   entry=int(entry or 0))
             out.pop("_unit", None)
             out.pop("_recover", None)
             return _js(out)
@@ -7575,13 +7584,18 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
     )
     async def recover_disasm(path: str, start: int = 0, end: int = 0,
                              symbol: str = "", base: int = 0,
-                             max_insns: int = 5000, fmt: str = "") -> str:
+                             max_insns: int = 5000, fmt: str = "",
+                             arch: str = "", endian: str = "", bits: int = 0,
+                             thumb: bool = False) -> str:
         try:
             out = _recover.disasm_at(str(path or "").strip(), base=int(base or 0),
                                      start=int(start or 0), end=int(end or 0),
                                      symbol=str(symbol or "").strip(),
                                      max_insns=int(max_insns or 5000),
-                                     fmt=str(fmt or "").strip())
+                                     fmt=str(fmt or "").strip(),
+                                     arch=str(arch or ""), endian=str(endian or ""),
+                                     bits=int(bits or 0),
+                                     thumb=(None if not thumb else True))
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})

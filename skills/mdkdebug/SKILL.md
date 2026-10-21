@@ -166,6 +166,21 @@ thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
 - 结构化只做**单块 if / 单块 if-else**，循环与其余多块控制流保留 `goto L_xxx`
   与 `/* 回边（循环） */`。别拿「有没有 while」判生成质量。
 
+**多容器与多架构**（批次85）：`recover_probe` / `recover_disasm` 额外收
+`arch / endian / bits / thumb / entry`。口径：
+- 能识别的容器：ELF、Intel HEX、Motorola **S-record**（`fromelf --m32` 的产物，入口取自
+  `S7/S8/S9`）、裸 bin、ar、**PE32/PE32+**、**COFF `.obj`**、**Mach-O**（含 fat，取第一个
+  切片并明说）。识别按字节判、每条带判据（`container_evidence`），别看扩展名。
+- **裸 bin / S-record / .obj 里没有架构信息，工具不猜**：这时必须显式给
+  `arch="arm"`（+`thumb=true`、`endian`、`bits`）和 `entry=`。给了之后报告里
+  `arch_declared` 会保留文件自己给的说法，两者并列——冲突看得见，不会被悄悄覆盖。
+- 有后端的家族：`arm arm64 riscv x86 x86_64 mips ppc m68k sparc mos65xx`；
+  `sh` / `s390` 会明确报「无后端」并列出可用家族，不返回空结果。
+- **非 ARM 不要请求 `fmt="c"`**：伪 C 的寄存器模型是 ARM 的，工具会拒绝并让你改用汇编。
+- **可重定位目标（`.obj` / `ET_REL` / 库成员）不要拿去出工程**：地址是节内偏移，
+  `recover_project*` 一律拒并给替代动作（先链接，或先 `recover_probe` 看节与符号）。
+- PE 里的地址一律 `ImageBase + RVA`，`recover_disasm(addr=...)` 收的是**最终地址**。
+
 **关系层与类型层**（批次82/83）：`recover_symbols` / `recover_project` 的
 `report.json` 里另有 `relations`：`xref_counts`（call/branch/data_read/data_write）、
 `call_graph`（根/叶/环/深度）、`switch_counts`、`types`（栈槽/结构体候选/数组元素

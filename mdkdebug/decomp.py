@@ -966,6 +966,13 @@ def _span(func, funcs, code_end) -> tuple:
 def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
                        max_insns: int = 4000) -> dict:
     """单个函数 → 伪 C 文本 + 统计。失败时返回 ``{"ok": False, "error": ...}``。"""
+    fam = (unit.arch or {}).get("family")
+    if fam != "arm":
+        return {"ok": False,
+                "error": "伪 C 提升只做了 ARM/Thumb（32 位寄存器模型：r0..r12/sp/lr/pc）；"
+                         "当前架构是 %s，不做提升——把 x86/MIPS/PPC 的指令塞进这个模型"
+                         "只会得到「看着像」的错答案" % (fam or "未知"),
+                "hint": "用 recover_disasm（不加 fmt=\"c\"）看该架构的汇编"}
     funcs = funcs or [func]
     code_end = max((b for _, b in unit.code_ranges), default=None)
     if code_end is None:

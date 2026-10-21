@@ -38,7 +38,7 @@ import os
 import re
 import struct
 
-from . import reveng, rtypes
+from . import containers, reveng, rtypes
 import subprocess
 
 # ---- 上限：都是「防呆」，不是「性能调优」 ----
@@ -114,16 +114,12 @@ def _read_file(path: str):
 # 容器判定
 # ----------------------------------------------------------------------
 def detect_container(head: bytes) -> str:
-    """``ar``（.lib/.a）/ ``elf``（.axf/.elf/.o/.so）/ ``ihex`` / ``bin``。"""
-    if head.startswith(b"!<arch>\n"):
-        return "ar"
-    if head.startswith(b"\x7fELF"):
-        return "elf"
-    sample = head[:4096].decode("latin-1", "replace")
-    lines = [ln for ln in sample.splitlines() if ln.strip()]
-    if lines and sum(1 for ln in lines if ln.lstrip().startswith(":")) >= max(1, len(lines) // 2):
-        return "ihex"
-    return "bin"
+    """``ar`` / ``elf`` / ``ihex`` / ``srec`` / ``pe`` / ``coff`` / ``macho`` / ``bin``。
+
+    真判定在 ``containers.detect``（返回 kind + 证据）；这里只保留「只要 kind」的老接口，
+    不做第二套判据——两套判据迟早会给出两个答案。
+    """
+    return containers.detect(head)[0]
 
 
 # ----------------------------------------------------------------------
@@ -347,13 +343,19 @@ def _flat_image(data: bytes, kind: str, base: int) -> dict:
         payload = _image._hex_bytes_to_sparse(text)
         real_base = int(info["min_offset"] or 0)
         return {"ok": True, "data": payload, "base": real_base, "hex": info}
+    if kind == "srec":
+        return containers.srec_flat(data.decode("latin-1", "replace"), base)
     return {"ok": True, "data": data, "base": int(base), "hex": None}
 
 
 # ----------------------------------------------------------------------
 # 架构判定与地址映射
 # ----------------------------------------------------------------------
-_CS_ARCH = {0x28: "arm", 0xB7: "arm64", 0xF3: "riscv"}
+# ELF e_machine -> family。family 用 capstone 的名字（_make_cs 按它建反汇编器）；
+# 表里没有的明确报「不支持」，不猜。
+_CS_ARCH = {0x03: "x86", 0x3E: "x86_64", 0x08: "mips", 0x14: "ppc",
+            0x15: "ppc", 0x28: "arm", 0x2A: "sh", 0x2B: "sparc",
+            0x04: "m68k", 0xB7: "arm64", 0xF3: "riscv", 0x16: "s390"}
 
 
 def arch_of(elf: dict) -> dict:
@@ -366,7 +368,9 @@ def arch_of(elf: dict) -> dict:
         return {"family": "unknown", "bits": 32, "endian": "little",
                 "thumb": False, "supported": False, "why": "不是 ELF，无法判架构"}
     mid = int(elf.get("machine_id") or 0)
-    family = _CS_ARCH.get(mid, "unknown")
+    # PE/COFF/Mach-O 的 machine 编号与 ELF 的 e_machine 是两套编码，不能混查；
+    # 容器解析层已经翻译过，带了 family 就直接用（并保留 why 说明来源）。
+    family = elf.get("family") or _CS_ARCH.get(mid, "unknown")
     bits = int(elf.get("class") or 32)
     endian = elf.get("endian", "little")
     thumb = False
@@ -379,8 +383,12 @@ def arch_of(elf: dict) -> dict:
         thumb = bool(entry & 1) or odd_funcs or has_t
         why = ("入口地址末位=%d、函数符号有奇数地址=%s、有 $t 映射符号=%s ⇒ %s"
                % (entry & 1, odd_funcs, has_t, "Thumb" if thumb else "ARM"))
+    if not why and elf.get("container"):
+        why = "由 %s 的机器码字段判定（0x%X / %s）" % (
+            elf["container"].upper(), mid, elf.get("machine") or "?")
     return {"family": family, "bits": bits, "endian": endian, "thumb": thumb,
-            "supported": family != "unknown", "why": why or "按 e_machine 判定"}
+            "supported": family in containers.CAPSTONE_FAMILIES,
+            "why": why or "按 e_machine 判定"}
 
 
 def _make_cs(arch: dict):
@@ -410,9 +418,34 @@ def _make_cs(arch: dict):
         if fam == "riscv":
             mode = capstone.CS_MODE_RISCV64 if arch.get("bits") == 64 else capstone.CS_MODE_RISCV32
             return capstone.Cs(capstone.CS_ARCH_RISCV, mode), ""
+        if fam == "x86":
+            mode = capstone.CS_MODE_64 if arch.get("bits") == 64 else capstone.CS_MODE_32
+            return capstone.Cs(capstone.CS_ARCH_X86, mode), ""
+        if fam == "x86_64":
+            return capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64), ""
+        if fam == "mips":
+            mode = capstone.CS_MODE_MIPS64 if arch.get("bits") == 64 else capstone.CS_MODE_MIPS32
+            if arch.get("endian") == "big":
+                mode |= capstone.CS_MODE_BIG_ENDIAN
+            return capstone.Cs(capstone.CS_ARCH_MIPS, mode), ""
+        if fam == "ppc":
+            mode = capstone.CS_MODE_64 if arch.get("bits") == 64 else capstone.CS_MODE_32
+            # PowerPC 默认大端；小端变体要靠 ELF 的 e_flags 判，这里只在明确小端时切
+            if arch.get("endian") != "little":
+                mode |= capstone.CS_MODE_BIG_ENDIAN
+            return capstone.Cs(capstone.CS_ARCH_PPC, mode), ""
+        if fam == "m68k":
+            # 68k 是**大端**架构：按小端喂进去会得到一串看着像指令的垃圾
+            return capstone.Cs(capstone.CS_ARCH_M68K, capstone.CS_MODE_BIG_ENDIAN), ""
+        if fam == "sparc":
+            return capstone.Cs(capstone.CS_ARCH_SPARC, capstone.CS_MODE_BIG_ENDIAN), ""
+        if fam == "mos65xx":
+            return capstone.Cs(capstone.CS_ARCH_MOS65XX, 0), ""
     except Exception as e:  # noqa: BLE001
         return None, "capstone 初始化失败：%s" % e
-    return None, "不支持的架构：%s（本工具只反汇编 ARM / AArch64 / RISC-V）" % fam
+    return None, ("不支持的架构：%s（capstone 后端可用的家族：%s；"
+                  "不在其中的一律不给结果，而不是猜一个）"
+                  % (fam, " / ".join(containers.CAPSTONE_FAMILIES)))
 
 
 class Unit:
@@ -422,6 +455,8 @@ class Unit:
         self.data = data
         self.name = name
         self.elf = elf
+        self.container = "elf" if elf else "bin"   # elf/pe/coff/macho/ihex/srec/bin/ar
+        self.entry_hint = 0     # 调用方显式指定的入口（raw bin 靠它，不靠猜）
         self.base = int(base or 0)
         self.relocatable = bool(elf and elf.get("relocatable"))
         self.spans = []          # [(start, end, file_offset)] 覆盖的地址区间
@@ -514,12 +549,40 @@ def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
     kind = detect_container(data[:4096])
     if kind == "elf":
         return Unit(data, name, base=base, elf=parse_elf(data))
-    if kind == "ihex":
-        flat = _flat_image(data, "ihex", base)
+    if kind in ("ihex", "srec"):
+        flat = _flat_image(data, kind, base)
         if not flat.get("ok"):
-            raise ValueError(flat.get("error", "HEX 解析失败"))
-        return Unit(flat["data"], name, base=flat["base"])
-    return Unit(data, name, base=base)
+            raise ValueError(flat.get("error", "HEX/S-record 解析失败"))
+        unit = Unit(flat["data"], name, base=flat["base"])
+        unit.container = kind
+        if kind == "srec":
+            info = flat.get("srec") or {}
+            if info.get("entry"):
+                unit.arch = {"family": "arm", "bits": 32,
+                             "endian": "little", "thumb": bool(info["entry"] & 1),
+                             "supported": True,
+                             "why": "S7/S8/S9 起始地址末位=%d ⇒ %s"
+                                    % (info["entry"] & 1,
+                                       "Thumb" if info["entry"] & 1 else "ARM"),
+                             "basis": "inferred_from_srec_start"}
+            if info.get("gap_bytes"):
+                unit.limitations.append("S-record 有 %d 个地址空洞（未填字节按 0 放置）："
+                                        "空洞里的字节不是镜像内容"
+                                        % info["gap_bytes"])
+        return unit
+    if kind in ("pe", "coff", "macho"):
+        parsed = {"pe": containers.parse_pe, "coff": containers.parse_coff,
+                  "macho": containers.parse_macho}[kind](data)
+        if not parsed.get("ok"):
+            raise ValueError(parsed.get("error", "%s 解析失败" % kind))
+        unit = Unit(data, name, base=base, elf=parsed)
+        unit.container = kind
+        for n in parsed.get("notes") or []:
+            unit.limitations.append(n)
+        return unit
+    unit = Unit(data, name, base=base)
+    unit.container = kind
+    return unit
 
 
 # ----------------------------------------------------------------------
@@ -1201,6 +1264,17 @@ def recover_functions(unit: Unit, *, deep: bool = True,
     for h in cps["hits"]:
         rec = add(h["to"], "ptr_%08X" % h["to"], "code_pointer", confidence="weak")
 
+    # ⑤b 调用方显式指定的入口（raw bin / 无头镜像）：单独一个证据来源，
+    #     不冒充 observed——「有人告诉我这里是入口」与「符号表写着」不是同一件事。
+    hint = int(getattr(unit, "entry_hint", 0) or 0)
+    if hint and (unit.arch or {}).get("family") != "arm":
+        hint = hint          # 非 ARM 没有 Thumb 位，不能掩
+    elif hint:
+        hint &= ~1           # Thumb 位：入口地址末位是「指令集选择」，不是地址的一部分
+    if hint and unit.in_code(hint):
+        add(hint, "entry_%08X" % hint, "entry_hint", confidence="inferred")
+        notes.append("入口 0x%08X 由调用方指定（entry_hint），不是从文件里读到的" % hint)
+
     # ⑥ 定边界：有 size 用 size；没有就用「下一个已知入口」
     funcs = sorted(table.values(), key=lambda r: r["addr"])
     code_end = max((b for _, b in unit.code_ranges), default=0)
@@ -1325,6 +1399,7 @@ def recover_functions(unit: Unit, *, deep: bool = True,
         },
         "_relations": rel,
         "code_pointers": {"count": cps["count"], "truncated": cps["truncated"]},
+        "notes": notes,
         "gaps": gaps,
         "evidence_rule": [
             "observed = 符号表或 DWARF 直接写了这个入口与名字",
@@ -1381,7 +1456,9 @@ def _sections_summary(unit: Unit, limit: int = 48) -> list:
 
 def analyze(path: str, *, base: int = 0, deep: bool = True,
             max_functions: int = MAX_FUNCTIONS,
-            max_insns: int = MAX_INSNS) -> dict:
+            max_insns: int = MAX_INSNS,
+            arch: str = "", endian: str = "", bits: int = 0,
+            thumb: bool | None = None, entry: int = 0) -> dict:
     """一次剖析：容器/架构/布局/向量表/符号/函数/字符串/交叉引用。
 
     ``deep=True`` 会做线性反汇编以找回调用目标（较慢但能补上剥离符号的固件）；
@@ -1403,6 +1480,24 @@ def analyze(path: str, *, base: int = 0, deep: bool = True,
     except ValueError as e:
         out.update({"ok": False, "error": str(e)})
         return out
+    # 调用方显式指定架构：raw bin / 无头容器必须有这一条（没头就别猜）。
+    # 显式值**优先**于文件头推断，但把两者都留在结果里，冲突要看得见。
+    if arch:
+        ex = containers.arch_from_name(arch, bits=bits, endian=endian, thumb=thumb)
+        if not ex.get("ok"):
+            out.update({"ok": False, "error": ex["error"]})
+            return out
+        out["arch_declared"] = unit.arch
+        unit.arch = ex["arch"]
+        # 向量表推断出来的那条限制已经不适用了（架构不再来自推断），必须撤掉——
+        # 留着会让报告自相矛盾（「架构是推断的」+「架构由调用方指定」）。
+        unit.limitations = [x for x in unit.limitations
+                            if not x.startswith("架构是从向量表")]
+        unit.limitations.append(
+            "架构由调用方显式指定（%s）；文件头/向量表给出的说法是：%s"
+            % (arch, (out.get("arch_declared") or {}).get("why") or "无"))
+    if entry:
+        unit.entry_hint = int(entry)
 
     limitations = list(unit.limitations)
     gaps = []
@@ -1431,6 +1526,10 @@ def analyze(path: str, *, base: int = 0, deep: bool = True,
     if unit.arch.get("family") == "unknown":
         limitations.append("CPU 架构未判定（没有 ELF 头）：后续反汇编需要显式指定架构，"
                            "否则不给结果而不是给错结果")
+    elif unit.arch.get("family") != "arm":
+        limitations.append("非 ARM 镜像：函数形状/参数推断按的是 **AAPCS（ARM）**口径，"
+                           "换到 %s 上只保留了「控制流与调用目标」的部分——参数个数与"
+                           "返回值不要按这里的结果读" % unit.arch.get("family"))
     if not unit.code_ranges:
         gaps.append({"reason": "没有可执行区间：无法反汇编，函数只能来自符号表"})
 
@@ -1438,6 +1537,8 @@ def analyze(path: str, *, base: int = 0, deep: bool = True,
     rec = recover_functions(unit, deep=deep, max_functions=max_functions,
                             max_insns=max_insns)
     gaps.extend(rec.get("gaps") or [])
+    if rec.get("notes"):
+        out["notes"] = (out.get("notes") or []) + list(rec["notes"])
     strings = find_strings(unit)
     out["symbols"] = {
         "available": syms["available"],
@@ -1934,6 +2035,14 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
         unit = _unit_from_data(data, path, base)
     except ValueError as e:
         return {**ident, "ok": False, "error": str(e)}
+    if unit.relocatable:
+        # 骨架工程也一样：可重定位目标（ELF ET_REL / COFF .obj）里的地址是**节内偏移**，
+        # 出工程只会得到一份地址全错的东西。宁可拒，不给错答案。
+        return {**ident, "ok": False,
+                "error": "这是可重定位目标文件（ET_REL / COFF .obj，如 .o / 库成员 / .obj）："
+                         "没有最终地址，出不了可用的工程",
+                "hint": "先链接成 axf/elf（Keil 里编译工程或 armlink）再对本工具用；"
+                        "现在可以先 recover_probe 看节与符号"}
     an = analyze(path, base=base, deep=deep, max_functions=max_functions,
                  max_insns=max_insns)
     if not an.get("ok"):
@@ -2167,7 +2276,9 @@ def _project_from_ar(path: str, data: bytes, dest: str, ident: dict, *,
 
 
 def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
-              symbol: str = "", max_insns: int = 5000, fmt: str = "") -> dict:
+              symbol: str = "", max_insns: int = 5000, fmt: str = "",
+              arch: str = "", endian: str = "", bits: int = 0,
+              thumb: bool | None = None) -> dict:
     """按「符号名」或「地址区间」反汇编一段。符号找不到时**列出可选名字**再报错。
 
     ``fmt`` 给 ``c`` / ``pseudo`` 时不返回指令表，而是返回**寄存器级伪 C**
@@ -2185,6 +2296,11 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
         unit = _unit_from_data(data, path, base)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
+    if arch:
+        ex = containers.arch_from_name(arch, bits=bits, endian=endian, thumb=thumb)
+        if not ex.get("ok"):
+            return {"ok": False, "error": ex["error"]}
+        unit.arch = ex["arch"]
     note = []
     if not start and not symbol:
         vt = vector_table(unit)

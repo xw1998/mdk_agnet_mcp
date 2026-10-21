@@ -331,10 +331,12 @@ def section_d():
           r4["span"]["start_hex"] == "0x08000010"
           and any("复位入口" in n for n in r4["notes"]), r4.get("notes"))
 
-    md, why = RC._make_cs({"family": "mips", "bits": 32, "endian": "little",
+    # 批次85 起 mips/ppc/x86 等都有 capstone 后端了，改用确实没有后端的家族（sh）
+    # 来测「不支持的架构明确报错」这条语义
+    md, why = RC._make_cs({"family": "sh", "bits": 32, "endian": "little",
                            "thumb": False})
     check("D7 不支持的架构明确报错（不给假汇编）",
-          md is None and "不支持" in why, why)
+          md is None and "不支持" in why and "capstone" in why, why)
 
     real = RC.disasm_at(EXAMPLE_AXF, symbol="uart_handle_line", max_insns=60)
     check("D8 真实 axf 按符号反汇编可读（含 push/bl）",

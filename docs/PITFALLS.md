@@ -2114,3 +2114,47 @@ ARMv7-M 的 `s` 后缀表示「写 flags」，于是第一版用 `mnemonic.endsw
 2. **降级要留痕**：`/* 未支持 */` 逐条写在源码里并计数；`flag_<cond>` 表示条件背后
    找不到比较；跳转表数据被当作数据剥掉时记下地址与条数。这些痕迹是给读的人判断
    「这一段能信多少」用的，不是噪音。
+
+## 三十七、PE32 与 PE32+ 的数据目录不在同一个偏移（96 vs 112）
+
+PE 的可选头里，`NumberOfRvaAndSizes` + 数据目录（导出表/导入表/重定位…）的位置
+**随 magic 变**：
+
+| 可选头 | `SizeOfOptionalHeader` | 数据目录偏移 |
+|---|---|---|
+| PE32（`0x10b`，32 位） | 224 | **96** |
+| PE32+（`0x20b`，64 位） | 240 | **112** |
+
+第一版写死 `opt+92` 找数据目录，PE32+ 的导出表就永远读不到——不是「没有导出」，
+是**读到了别的字段**，`n_exports=0` 看起来像个正常结论。两种口径必须按 magic 分支，
+且判「有没有导出表」要看 `NumberOfRvaAndSizes > 0` 再加表项非零，不能只信偏移里的值。
+
+## 三十八、COFF 的字符串表起点是 `symptr + nsym*18`，不是「符号表之后」
+
+很多「COFF 格式」教程按 `20 + nsec*40` 算符号表位置，那只是**没有可选头**时的常见情形。
+真正的符号表位置由文件头 `PointerToSymbolTable` 给出，字符串表紧跟在
+`symptr + NumberOfSymbols*18` 之后（18 字节一个 `IMAGE_SYMBOL`，不是 20）。
+
+按「节表之后」算，短名符号恰好还能读对，**长名（`name[0]==0`，`name[4..8]` 是偏移）
+就全错位**——读出来的是一段别的字节，看起来像名字但不是。另外：
+- COFF **没有 magic**，只能结构自洽判（机器码已知 + `SizeOfOptionalHeader==0` +
+  节数 1..96 + 符号表偏移在文件内）；
+- 符号 `Value` 是**节内偏移**，不是 VA；`SectionNumber` 是 1 起算，0=未定义、
+  负数=调试符号。
+
+## 三十九、Mach-O 的「小端」说的是文件里那四个字节，`mach_header_64` 还多一个 `reserved`
+
+两处都能一次写错而「解析看起来跑通了」：
+
+1. **magic 的字节序**：小端 64 位文件的前四个字节是 `CF FA ED FE`，按小端读成整数是
+   `0xFEEDFACF`。反过来写 `0xCFFAEDFE` 再 `struct.pack("<I")`，得到的是
+   `FE ED FA CF`（大端文件）——文件能生成，读的时候 magic 对不上，于是全线错位。
+   判据要拿**字节串**对，不要先转成「你以为的整数」。
+2. **`mach_header_64` 是 8 个字段**：`magic cputype cpusubtype filetype ncmds sizeofcmds
+   flags **reserved**`，共 32 字节。少写 `reserved` 会让第一个 load command 从错误
+   偏移开始，`LC_SEGMENT_64`/`LC_SYMTAB`/`LC_MAIN` 全部读成垃圾值（`ncmds` 却还是对的，
+   所以「找到了 N 个命令」这条自检不会报警）。
+
+fat（`CA FE BA BE`）包里每个切片自带 `cputype/cpusubtype/offset/size/align`，
+只取第一个切片时必须把这件事写进 notes——「只分析了其中一种架构」不能被读成
+「这张图里只有一种架构」。
