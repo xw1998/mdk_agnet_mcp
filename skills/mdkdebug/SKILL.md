@@ -142,6 +142,16 @@ recover_verify(project_dir, image=file)      # 真工具链重链接，逐字节
 - 产物的 `.uvprojx` 是模板改造来的，**器件是占位**，烧录前必须改成你的芯片；
 - `.lib` / `.o` 仍被拒（重定位目标没有最终地址）。
 
+**函数形状与参数推断**（批次81 吸收 Ghidra 的口径，零额外依赖）：`recover_symbols` /
+`recover_project` 的每个函数现在带 `body_basis`（`return` / `tail_call` /
+`indirect_branch` / `next_entry`）、`params_estimate`、`returns_estimate`，
+thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
+- `body_basis` 说明函数体是**怎么结束的**；`next_entry` 表示没找到终止指令、
+  只能切到下一个入口，这一段的可信度最低（可能把数据算进来）；
+- `params_estimate` 是按 AAPCS 看 `r0..r3` 首次访问是读还是写估的，**只是估计**：
+  头文件里仍声明 `void f(void)`，别拿它当真实签名去改调用方；
+- 真要读语义用 Ghidra/IDA 打开同一份 axf 对照；本工具不内置反编译器（也不该内置）。
+
 要点：
 - **三档置信要当真**：`observed` 来自 `symtab`/DWARF；`inferred` 来自向量表或 `bl` 目标；
   `weak` 只有一条「代码指针」线索。**别把 `weak` 当函数名用**，也别把 inferred 的

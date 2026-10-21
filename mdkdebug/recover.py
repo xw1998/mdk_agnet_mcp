@@ -674,8 +674,13 @@ def _branch_target(mnemonic: str, op_str: str):
 
 
 def disassemble(unit: Unit, start: int, end: int, *, md=None,
-                max_insns: int = MAX_INSNS) -> dict:
-    """反汇编 ``[start, end)``。capstone 缺失/架构不支持时**明确报错**。"""
+                max_insns: int = MAX_INSNS, with_regs: bool = False) -> dict:
+    """反汇编 ``[start, end)``。capstone 缺失/架构不支持时**明确报错**。
+
+    ``with_regs=True`` 时每条指令多带 ``reads`` / ``writes``（capstone 的寄存器访问集合，
+    含隐式访问）。默认关闭：这两个字段只服务于调用约定推断（批次81），
+    关掉可以让所有既有输出逐字节不变。
+    """
     if md is None:
         md, why = _make_cs(unit.arch)
         if md is None:
@@ -703,6 +708,14 @@ def disassemble(unit: Unit, start: int, end: int, *, md=None,
                 rec["target_hex"] = "0x%08X" % tgt
             if _looks_like_return(ins.mnemonic, ins.op_str):
                 rec["ends_function"] = True
+            if with_regs:
+                try:
+                    rd, wr = ins.regs_access()
+                    rec["reads"] = sorted({ins.reg_name(r) for r in rd})
+                    rec["writes"] = sorted({ins.reg_name(r) for r in wr})
+                except Exception:      # noqa: BLE001
+                    # capstone 在某些架构/版本上不提供寄存器访问，就当「不知道」
+                    rec["reads"], rec["writes"] = [], []
             insns.append(rec)
             addr = ins.address + ins.size
             pos = addr - start
@@ -933,12 +946,17 @@ def dwarf_info(path: str, *, max_cus: int = 64, max_files: int = 512,
 # ----------------------------------------------------------------------
 # 函数恢复
 # ----------------------------------------------------------------------
-def _sweep(unit: Unit, md, *, max_insns: int = MAX_INSNS) -> dict:
-    """线性扫过所有可执行区间，收集「调用目标 / 函数返回点 / 字面量引用」。"""
+def _sweep(unit: Unit, md, *, max_insns: int = MAX_INSNS,
+           with_regs: bool = False) -> dict:
+    """线性扫过所有可执行区间，收集「调用目标 / 函数返回点 / 字面量引用」。
+
+    ``with_regs=True`` 时每条指令带 ``reads`` / ``writes``（批次81 的调用约定推断要用）。
+    """
     insns = {}
     truncated = False
     for start, end in unit.code_ranges:
-        r = disassemble(unit, start, end, md=md, max_insns=max_insns)
+        r = disassemble(unit, start, end, md=md, max_insns=max_insns,
+                        with_regs=with_regs)
         if not r.get("ok"):
             return {"ok": False, "error": r.get("error")}
         for ins in r["insns"]:
@@ -989,6 +1007,85 @@ def _pc_ref(ins: dict):
         return {"kind": "address", "addr": pc - imm} if imm is not None else None
     return None
 
+
+# ----------------------------------------------------------------------
+# 函数体形状与调用约定（批次81：吸收 Ghidra 的两条分析口径，零依赖）
+#
+# 这里吸收的是**思路**，不是代码：
+#   ① 函数体到「终止指令」为止（返回 / 跳出本区的无条件跳转 / 间接跳转），
+#      而不是「切到下一个已知入口」。线性扫描遇到数据岛时，后者会把数据算进函数体。
+#   ② 按 AAPCS 看 r0..r3 的**首次访问是读还是写**来估参数个数（Ghidra 的 proto 分析做的
+#      是同一件事，只是它带了完整的类型传播）。
+# 两条都是**推断**：结果一律标证据与置信度，绝不写进「事实」字段。
+# ----------------------------------------------------------------------
+_UNCOND_BRANCH = ("b", "b.w", "j", "bal")
+_INDIRECT_BRANCH = ("bx", "br")
+_ARG_REGS = ("r0", "r1", "r2", "r3")
+
+def _shape_function(insns_by_addr: dict, start: int, limit_end: int) -> dict:
+    """沿**线性地址顺序**走到终止指令，给出函数体边界与终止点。"""
+    out = {"end_addr": limit_end, "body_basis": "next_entry",
+           "terminals": [], "thunk_to": None, "truncated_body": False}
+    addrs = sorted(a for a in insns_by_addr if start <= a < limit_end)
+    if not addrs:
+        out["body_basis"] = "no_instructions"
+        return out
+    for a in addrs:
+        ins = insns_by_addr[a]
+        m = (ins.get("mnemonic") or "").lower()
+        nxt = a + int(ins.get("size") or 2)
+        why = "%s %s" % (ins.get("mnemonic") or "", ins.get("op_str") or "")
+        if ins.get("ends_function"):
+            out["terminals"].append({"addr_hex": ins["addr_hex"],
+                                     "kind": "return", "how": why.strip()})
+            out["end_addr"], out["body_basis"] = nxt, "return"
+            break
+        if m in _INDIRECT_BRANCH and not (ins.get("op_str") or "").strip().endswith("lr"):
+            out["terminals"].append({"addr_hex": ins["addr_hex"],
+                                     "kind": "indirect_branch", "how": why.strip()})
+            out["end_addr"], out["body_basis"] = nxt, "indirect_branch"
+            break
+        tgt = ins.get("target")
+        if tgt is not None and m in _UNCOND_BRANCH and not (start <= tgt < limit_end):
+            # 跳出本区间的无条件跳转 = 尾调用：函数体在这里就结束了
+            out["terminals"].append({"addr_hex": ins["addr_hex"],
+                                     "kind": "tail_call", "how": why.strip(),
+                                     "target_hex": ins.get("target_hex") or ""})
+            out["end_addr"], out["body_basis"] = nxt, "tail_call"
+            break
+    if out["end_addr"] < start + 2:
+        out["end_addr"], out["body_basis"] = limit_end, "next_entry"
+    # thunk：整条函数只有一条指令，且是跳到本函数之外的无条件跳转
+    one = insns_by_addr[addrs[0]]
+    m0 = (one.get("mnemonic") or "").lower()
+    t0 = one.get("target")
+    if m0 in _UNCOND_BRANCH and t0 is not None and not (start <= t0 < start + 2):
+        out["thunk_to"] = t0 & ~1
+    return out
+
+def _arg_hint(insns_by_addr: dict, start: int, end: int) -> dict:
+    """估参数个数与「有没有返回值」：看 r0..r3 的首次访问是读还是写。"""
+    first = {}
+    for a in sorted(k for k in insns_by_addr if start <= k < end):
+        ins = insns_by_addr[a]
+        rd = set(ins.get("reads") or [])
+        wr = set(ins.get("writes") or [])
+        for r in _ARG_REGS:
+            if r in first:
+                continue
+            if r in rd:
+                first[r] = "read"
+            elif r in wr:
+                first[r] = "write"
+    n = 0
+    for i, r in enumerate(_ARG_REGS):
+        if first.get(r) == "read":
+            n = i + 1
+        elif r in first:
+            break          # 中间某个寄存器先被写：后面的不再算参数
+    returns = ("likely_value" if first.get("r0") == "write"
+               else "no_evidence" if "r0" in first else "unknown")
+    return {"params": n, "returns": returns, "first_touch": first}
 
 def recover_functions(unit: Unit, *, deep: bool = True,
                       max_functions: int = MAX_FUNCTIONS,
@@ -1063,7 +1160,9 @@ def recover_functions(unit: Unit, *, deep: bool = True,
     elif md is None:
         gaps.append({"reason": "未做深度扫描：%s" % why})
     elif deep:
-        sweep = _sweep(unit, md, max_insns=max_insns)
+        # with_regs：调用约定推断要用寄存器读写集合（只在需要时才算，
+        # 其它输出不受影响）
+        sweep = _sweep(unit, md, max_insns=max_insns, with_regs=True)
         if not sweep.get("ok"):
             gaps.append({"reason": "反汇编失败，深度扫描跳过：%s" % sweep.get("error")})
             sweep = None
@@ -1113,8 +1212,28 @@ def recover_functions(unit: Unit, *, deep: bool = True,
             f["size_basis"] = "next_entry"
         f["callees"] = sorted({c for c in callers.get(f["addr"], [])}) if callers else []
         f["n_callers"] = len(callers.get(f["addr"], []))
-        if "string_ref" in f["sources"]:
-            pass
+        # ⑦ 函数体形状 + 调用约定（批次81，吸收 Ghidra 的口径；只作推断，不改 size_basis）
+        #    size_basis 保留原有语义（symtab / next_entry），形状另存 body_basis：
+        #    既有字段一旦改含义，所有历史断言都会变成「碰巧过」。
+        f.setdefault("body_basis", "not_analyzed")
+        f.setdefault("terminals", [])
+        f.setdefault("params_estimate", None)
+        f.setdefault("returns_estimate", "unknown")
+        if sweep and sweep.get("insns"):
+            sh = _shape_function(sweep["insns"], f["addr"], f["end_addr"])
+            hint = _arg_hint(sweep["insns"], f["addr"], sh["end_addr"])
+            f["body_basis"] = sh["body_basis"]
+            f["terminals"] = sh["terminals"][:4]
+            f["params_estimate"] = hint["params"]
+            f["returns_estimate"] = hint["returns"]
+            f["arg_basis"] = "aapcs:r0..r3 首次访问为读"
+            if f["size_basis"] != "symtab" and sh["end_addr"] < f["end_addr"]:
+                # 控制流说这里就结束了：比「切到下一个入口」更有依据，缩到控制流边界
+                f["end_addr"] = sh["end_addr"]
+            if sh["thunk_to"]:
+                f["is_thunk"] = True
+                f["thunk_to"] = sh["thunk_to"]
+                f["thunk_to_hex"] = "0x%08X" % sh["thunk_to"]
     # 置信度重算：observed > inferred(≥2 源) > weak
     for f in funcs:
         if f["confidence"] != "observed":
@@ -1128,6 +1247,15 @@ def recover_functions(unit: Unit, *, deep: bool = True,
     counts = {"observed": 0, "inferred": 0, "weak": 0}
     for f in funcs:
         counts[f["confidence"]] = counts.get(f["confidence"], 0) + 1
+    shape_counts = {}
+    for f in funcs:
+        shape_counts[f.get("body_basis") or "not_analyzed"] = \
+            shape_counts.get(f.get("body_basis") or "not_analyzed", 0) + 1
+    n_thunk = sum(1 for f in funcs if f.get("is_thunk"))
+    if sweep and sweep.get("insns"):
+        gaps.append({"reason": "参数个数与返回值是**推断**（AAPCS：r0..r3 首次访问为读 / "
+                               "r0 是否先被写），不是从二进制里读出来的类型信息；"
+                               "原型里仍按 void f(void) 声明，别信这里的签名"})
     return {
         "ok": True,
         "functions": funcs,
@@ -1141,6 +1269,9 @@ def recover_functions(unit: Unit, *, deep: bool = True,
                     "why": st.get("why", "")},
         "dwarf": {k: dw.get(k) for k in ("available", "why")} if not dw.get("available")
                  else {"available": True, "files": len(dw.get("files") or [])},
+        "shape": {"counts": shape_counts, "thunks": n_thunk,
+                  "basis": "函数体到终止指令（返回/尾调用/间接跳转）为止；"
+                           "参数按 AAPCS 寄存器首次访问推断"},
         "string_refs": string_refs[:2000],
         "code_pointers": {"count": cps["count"], "truncated": cps["truncated"]},
         "gaps": gaps,
@@ -1269,6 +1400,7 @@ def analyze(path: str, *, base: int = 0, deep: bool = True,
         "top": rec["functions"][:min(60, len(rec["functions"]))],
         "evidence_rule": rec["evidence_rule"],
     }
+    out["shape"] = rec.get("shape") or {}
     out["dwarf"] = rec["dwarf"]
     out["strings"] = {"count": len([s for s in strings if "addr" in s]),
                       "sample": [s for s in strings if "addr" in s][:20],
@@ -1562,6 +1694,8 @@ def _symbols_header(an: dict, funcs: list, objs: list, limit: int) -> str:
     L = ["/* 自动生成（mdkdebug recover_project，批次79）。",
          " * 说明：地址取自镜像；**函数原型按「无参、void 返回」推断**——",
          " * 反汇编能还原地址与控制流，还原不了参数类型与返回值语义。",
+         " * 每行注释里的「推断 n 参」是按 AAPCS 看 r0..r3 首次访问是读还是写算出来的",
+         " * （批次81），只是个**估计**：函数可能少用/多用寄存器，也可能参数是指针结构。",
          " * 已知参数/返回值的函数请手工改这里的声明，不要相信这里的签名。 */",
          "#ifndef RECOVERED_SYMBOLS_H", "#define RECOVERED_SYMBOLS_H", "",
          "#include <stdint.h>", "",
@@ -1573,9 +1707,15 @@ def _symbols_header(an: dict, funcs: list, objs: list, limit: int) -> str:
     L.append("/* ---- 函数（%d 个，此处列出 %d 个） ---- */" % (len(funcs), min(len(funcs), limit)))
     for f in funcs[:limit]:
         nm = _c_name(f["name"], used)
-        L.append("void %s(void);   /* 0x%08X  size=%s  %s  [%s] */" % (
+        hint = ""
+        if f.get("params_estimate") is not None:
+            hint = "  推断 %d 参/%s" % (
+                f["params_estimate"],
+                {"likely_value": "可能返回值", "no_evidence": "无返回值证据",
+                 "unknown": "返回值不明"}.get(f.get("returns_estimate"), "?"))
+        L.append("void %s(void);   /* 0x%08X  size=%s  %s  [%s]%s */" % (
             nm, f["addr"], f.get("size") or "?", f["confidence"],
-            ",".join(f.get("sources") or [])))
+            ",".join(f.get("sources") or []), hint))
     if len(funcs) > limit:
         L.append("/* ... 其余 %d 个见 map/functions.csv */" % (len(funcs) - limit))
     if objs:
@@ -1783,13 +1923,18 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
         else:
             notes.append("未生成汇编：%s" % dt.get("error"))
     # 5) 表格
+    # 新增列一律追加在末尾：既有列名与顺序是历史断言的一部分，不挪不改。
     _emit(dest, "map/functions.csv", _csv(
         ["addr", "end_addr", "name", "size", "size_basis", "confidence",
-         "sources", "bind", "file", "line", "n_callers"],
+         "sources", "bind", "file", "line", "n_callers",
+         "body_basis", "params", "returns", "thunk_to"],
         [[f["addr_hex"], "0x%08X" % (f.get("end_addr") or 0), f["name"],
           f.get("size") or "", f.get("size_basis") or "", f["confidence"],
           "|".join(f.get("sources") or []), f.get("bind") or "",
-          f.get("file") or "", f.get("line") or "", f.get("n_callers") or 0]
+          f.get("file") or "", f.get("line") or "", f.get("n_callers") or 0,
+          f.get("body_basis") or "", f.get("params_estimate")
+          if f.get("params_estimate") is not None else "",
+          f.get("returns_estimate") or "", f.get("thunk_to_hex") or ""]
          for f in funcs]), files)
     _emit(dest, "map/objects.csv", _csv(
         ["addr", "name", "size", "bind", "type"],
