@@ -1302,8 +1302,51 @@ Flash 窗口 `0x08000000 + 2 MiB`、RAM 窗口 `0x20000000 + 128 KiB`）：扫�
 - `ready=true` 的严格含义是**字节/布局/工具链链路**被观察证据闭合，**不表示它能跑**，也不表示它是好固件；
 - 义务清单就是「什么才算恢复成功」的定义：不在清单里的能力（中断优先级、外设初始化顺序、
   时钟树）**没有任何证据**，别把 `ready` 当通用背书；
-- 不给 RAM/Flash 窗口时，向量表判据只到 `unverified`（SP 是否落在 RAM、复位地址是否落在 Flash 两条为 `None`），
-  台账会把这句限制写在 reason 里，而不是悄悄按通过处理。
+- 不传 RAM/Flash 窗口时，台账按布局**推**（批次91，Flash 取 chunks 覆盖范围、RAM 取 ELF 的 RW 段）：
+  推出来的只当**下界**，落点在范围内只把判据抬到 `plausible`，落空记 `unverified` 而**不判 invalid**；
+  要按器件手册核完、并保留判 `invalid` 的权力，就显式给窗口。每种情形都写在 reason 里，而不是悄悄按通过处理。
+
+### 主张等级与证据来源（批次89，吸收 REA reconstruction-coverage 的来源匹配口径）
+
+台账回答的是「证据有多强」；批次89 补上正交的第二问：**这句话是拿什么来源的证据说的**。
+两问严格分开——**强度够，不代表来源能支撑这句主张**（把回放当实跑，是这里最容易犯的错）。
+
+四个来源类别（`source_class`，逐条证据标注）：
+
+| 来源 | 意思 |
+|---|---|
+| `shipped-artifact` | 交付的那份字节本身（原始镜像 / hex / bin / elf 内容） |
+| `controlled-replay` | 我们自己用真工具链重链接出来的产物（`armasm` / `armlink` / `UV4 -b`） |
+| `live-observation` | 调试器或板上实测（`runtime.bootable` 这类） |
+| `external-service` | 外部工具给出的结论 |
+
+四级主张（`claim=`），每级只对**它覆盖的那几条义务**负责：
+
+| 主张 | 覆盖义务 | 允许来源 | 最低强度 |
+|---|---|---|---|
+| `shipped-artifact` | `artifact.identity`、`vector.entry` | shipped-artifact | derived |
+| `controlled-replay`（默认） | 上面两条 + `build.toolchain`、`bytes.loadable`、`layout.regions` | controlled-replay、shipped-artifact | observed |
+| `live-observation` | 上面五条 + `runtime.bootable` | live-observation、controlled-replay、external-service | observed |
+| `external` | `artifact.identity`、`bytes.loadable`、`layout.regions` | external-service | observed |
+
+判定规则：
+
+- 只看该主张覆盖的义务：其中任何一条没闭合，`claim_supported=false` 并把那几条具名写进
+  `claim_blockers`；
+- 来源不在允许集合里 → blocker「**强度够不等于来源对**」，该行 `claim_status=unknown`
+  （不是 `closed`，也不改它自己的 `status`）；
+- 一条合格证据都没有 → 「没有任何一条证据达到该主张要求的最低强度 X」；
+- **主张不改义务自身 status**：`closure_digest` 只由「义务 + 状态」组成，所以换 `claim=` 得到的是
+  同一个 digest（四个主张实测完全相同），可以拿它跨调用对账。
+
+三种取证方式各自带 `source_mode`：真跑=`live-run`；`verify_json=` 复评=`recorded-replay`；
+`skip_build=true`=`no-build`。**回放的既有记录不能顶替本次实跑**：它不支撑 `live-observation`
+与 `external`（写进 `claim_note`），`controlled-replay` 不受此限——它本来就是我们重链接的产物。
+
+实测（同一份 `mdk_test.axf`）：`shipped-artifact` 与 `controlled-replay` 的 `claim_supported=true`；
+`live-observation=false`（`artifact.identity`/`vector.entry` 来源是 shipped-artifact、
+`runtime.bootable` 是 unknown、且本次是回放）；`external=false`（没有任何 external-service 证据）。
+四个主张的 `closure_digest` 完全一致。
 
 ### 逆向这条路的三条预算与一道闸门（批次90）
 
@@ -1347,48 +1390,6 @@ dump 切出来的镜像还得调用方自己写文件。批次90 逐条补平（
 输出里 `derived` 为空、`basis` 写「调用方显式给」。实测：`mdk_test.axf` 的精确工程
 不传任何窗口跑 `recover_ledger` 得到 `ready=true`、`required_closed=5/5`，且每条义务
 状态与显式给窗口时**逐条一致**。
-
-### 主张等级与证据来源（批次89，吸收 REA reconstruction-coverage 的来源匹配口径）
-
-台账回答的是「证据有多强」；批次89 补上正交的第二问：**这句话是拿什么来源的证据说的**。
-两问严格分开——**强度够，不代表来源能支撑这句主张**（把回放当实跑，是这里最容易犯的错）。
-
-四个来源类别（`source_class`，逐条证据标注）：
-
-| 来源 | 意思 |
-|---|---|
-| `shipped-artifact` | 交付的那份字节本身（原始镜像 / hex / bin / elf 内容） |
-| `controlled-replay` | 我们自己用真工具链重链接出来的产物（`armasm` / `armlink` / `UV4 -b`） |
-| `live-observation` | 调试器或板上实测（`runtime.bootable` 这类） |
-| `external-service` | 外部工具给出的结论 |
-
-四级主张（`claim=`），每级只对**它覆盖的那几条义务**负责：
-
-| 主张 | 覆盖义务 | 允许来源 | 最低强度 |
-|---|---|---|---|
-| `shipped-artifact` | `artifact.identity`、`vector.entry` | shipped-artifact | derived |
-| `controlled-replay`（默认） | 上面两条 + `build.toolchain`、`bytes.loadable`、`layout.regions` | controlled-replay、shipped-artifact | observed |
-| `live-observation` | 上面五条 + `runtime.bootable` | live-observation、controlled-replay、external-service | observed |
-| `external` | `artifact.identity`、`bytes.loadable`、`layout.regions` | external-service | observed |
-
-判定规则：
-
-- 只看该主张覆盖的义务：其中任何一条没闭合，`claim_supported=false` 并把那几条具名写进
-  `claim_blockers`；
-- 来源不在允许集合里 → blocker「**强度够不等于来源对**」，该行 `claim_status=unknown`
-  （不是 `closed`，也不改它自己的 `status`）；
-- 一条合格证据都没有 → 「没有任何一条证据达到该主张要求的最低强度 X」；
-- **主张不改义务自身 status**：`closure_digest` 只由「义务 + 状态」组成，所以换 `claim=` 得到的是
-  同一个 digest（四个主张实测完全相同），可以拿它跨调用对账。
-
-三种取证方式各自带 `source_mode`：真跑=`live-run`；`verify_json=` 复评=`recorded-replay`；
-`skip_build=true`=`no-build`。**回放的既有记录不能顶替本次实跑**：它不支撑 `live-observation`
-与 `external`（写进 `claim_note`），`controlled-replay` 不受此限——它本来就是我们重链接的产物。
-
-实测（同一份 `mdk_test.axf`）：`shipped-artifact` 与 `controlled-replay` 的 `claim_supported=true`；
-`live-observation=false`（`artifact.identity`/`vector.entry` 来源是 shipped-artifact、
-`runtime.bootable` 是 unknown、且本次是回放）；`external=false`（没有任何 external-service 证据）。
-四个主张的 `closure_digest` 完全一致。
 
 ### 底层库
 
