@@ -2408,7 +2408,10 @@ def project_exact(path: str, out_dir: str, *, name: str = "recovered",
     for f in funcs[:600]:
         hdr.append("#define ADDR_%s 0x%08Xu  /* %s, %s */"
                    % (_c_name(f["name"], used).upper(), f["addr"] & ~1,
-                      f.get("confidence", "?"), f.get("source", "?")))
+                      f.get("confidence", "?"),
+                      # 证据来源在 analyze 里叫 sources（列表），不是 source——
+                      # 曾经这里写过 "?"，等于把「证据是什么」丢了（批次80 实测发现）。
+                      ",".join(f.get("sources") or []) or f.get("source") or "?"))
     hdr += ["", "#endif", ""]
     _emit(dest, "include/recovered_symbols.h", "\n".join(hdr), files)
 

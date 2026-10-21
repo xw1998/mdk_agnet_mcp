@@ -1967,3 +1967,32 @@ FIFO 空闲字从 64 掉到 62（数据确实进了该端点的 TX FIFO），而
 3. 真要做到自愈，方向是**保持 EP IN 的翻转与主机同步**：`EPDIS` 退场 + 重新 `EPENA` 会重置
    设备侧翻转，而主机侧翻转不受控；DWC2 可用 `DIEPCTL.SETD0PID`/`SETEVNFRM` 显式指定，
    但需先确定主机期望值。
+
+---
+
+## 三十一、端口探测：connect 探测会把活着的服务判成「没人监听」（批次80 收尾）
+
+`port_listening()` 早先用 `socket.create_connection()` 连一下，连上就算有监听。这个做法在
+本机被实测打穿：对**同一个活着的** mock（`listen(1)`）连探 60 次，**18 次失败，且全部是
+`socket.timeout`，不是 `ConnectionRefusedError`**；同一时刻 accept 线程还活着、把 backlog 加到
+16 之后仍是 27/40 成功。也就是说失败来自本机对瞬时 SYN 的干扰（防火墙/安全软件的常见行为），
+不是服务端不在。
+
+**为什么这不是「测试环境的小毛病」**：`port_listening` 的结论会被 `keil_health` /
+`restart_keil` 拿去做「Keil 没跑就重启」的决定。把探测手段的抖动报成「端口未监听」，就会让
+人/AI 去杀掉一个本来正常的 Keil 实例——这正是「宁可报错，不给错答案」要防的那类误判。
+
+**改法**：Windows 上对本机回环 host **先查操作系统记账**——`GetExtendedTcpTable` 的
+IPv4 监听表（`_tcp_listener_rows_v4` / `_listener_ports_v4`），表里有就是有；表查不到（非
+Windows、远端 host、iphlpapi 失败）才回退 connect 探测（被拒重试 3 次，超时不重试）。
+表是内核记账，不受 SYN 抖动影响。
+
+同时修了测试夹具的两处「放大器」：
+
+| 位置 | 原来 | 问题 |
+|---|---|---|
+| `tests/mock_uvsock_server.py` | `sock.listen(1)` | backlog 只有 1，短连接连探时队列满会丢/延后 SYN |
+| 同文件的 `_accept_loop` | `except OSError: break` | 任何瞬时错误都会**永久杀死** accept 线程，而端口还在监听 → 之后所有探测都失败，看起来像服务没了 |
+
+**可操作的判据**：要回答「这个端口有人在监听吗」，在 Windows 上不要用 connect 探测当唯一
+证据；连接成功可以证明有监听，连接超时**不能**证明没有。

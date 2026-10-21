@@ -13,6 +13,7 @@ import re
 import socket
 import struct
 import threading
+import time
 
 from mdkdebug import uvsock
 
@@ -153,7 +154,9 @@ class MockUVSOCKServer:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
-        self.sock.listen(1)
+        # backlog 不能只给 1：主机侧频繁短连接探测时，队列满会把 SYN 丢掉/延后，
+        # 表现为客户端 timeout（而不是 refused），于是“端口有监听”被误判成没监听。
+        self.sock.listen(16)
         self._thread = None
 
     def _init_periph_regs(self):
@@ -212,7 +215,17 @@ class MockUVSOCKServer:
             try:
                 conn, _ = self.sock.accept()
             except OSError:
-                break
+                # 只有“自己已被关闭”才该退出：把瞬时错误也当成关闭会让 accept 线程
+                # 永久死掉，而监听端口还在——之后所有连接探测都失败，看起来像
+                # “端口没人监听”，非常难查。
+                try:
+                    closed = self.sock.fileno() < 0
+                except Exception:      # noqa: BLE001
+                    closed = True
+                if closed:
+                    break
+                time.sleep(0.01)
+                continue
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     # ------------------------------------------------------------------

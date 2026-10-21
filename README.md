@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.5）
+│   ├── __init__.py           # 包初始化（版本号 0.2.6）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -1026,11 +1026,12 @@ Copyright (c) 2026 <春雫>
 | 问题 | 口径 |
 |---|---|
 | 复刻什么 | ELF 的 `PT_LOAD` 段的 `filesz`。**段**才是「下载进 flash 的字节」的权威定义；按节表会把 `.data` 的 64 字节初值摆到 RAM 地址 `0x20000000` 上，链接结果就与原镜像不同了 |
-| 怎么复刻 | `src/image_exact.s`：每块一个 `AREA \|.recNN\|, CODE, READONLY` + 逐行 16 字节 `DCB`。**不反汇编回源码**——反汇编文本无法保证原字节（字面量池、对齐、`adr` 都会被改写成等价但不同的编码）；可读指令另给 `asm/disassembly.asm` |
+| 怎么复刻 | `src/image_exact.s`：每块一个 `AREA` 区（区名形如 `.recNN`，CODE / READONLY，ALIGN=2）+ 逐行 16 字节 `DCB`。**不反汇编回源码**——反汇编文本无法保证原字节（字面量池、对齐、`adr` 都会被改写成等价但不同的编码）；可读指令另给 `asm/disassembly.asm` |
 | 地址怎么钉死 | `linker/recovered.sct`：每块一个 `LR_ROMn`/`ER_ROMn`，基址/大小取原值，用 `*.o (.recNN)` 选择器钉死。**不用 `*(+RO)`**（放置顺序由链接器定，块一多就会挪位） |
 | 判据 | `recover_verify` 的 `byte_identical`。期望字节优先由 `fromelf --bin` 抽**原镜像**（独立证据），不给「自己比自己」的循环论证；没传原镜像时如实说「本次没有独立证据」 |
 | 长度差一点怎么办 | armasm 的 AREA 至少 4 字节对齐，原镜像长度不是 4 的倍数时会多出 1~3 个**全零**尾字节。这不算内容差异，但也绝不悄悄吞掉：只在「前缀逐字节相同 + 多出的部分全是 0 + 不超过 3 字节」时记为 `diff.alignment_padding=N`，否则照样判不同 |
 | 入口点 | **不发 `ENTRY`**：Cortex-M 的入口是向量表里的复位地址，ELF entry 不参与启动。armasm 的 `ENTRY` 在整段 DCB 的 AREA 上会被 armlink 判 `L6204E: Entry point does not point to an instruction`；反过来 armlink 会警告 `L6305W`（没有入口点），那是**预期**，`notes` 里会写明 |
+| hex 的起始地址记录 | 因为没有 ELF entry，`fromelf --i32` 出的 hex 里**类型 05 记录**（起始地址）会是 `00000000`，原工程那份是复位地址——其余 885/886 行数据记录逐字节相同，**bin 则完全一致**。烧写器按数据记录写 flash，这条记录不参与烧录；要逐字节相同的 hex 只能改成出真指令（那就不是 DCB 复刻了）。`armlink --entry=` 也不行：armlink 会判 `L6204E`（地址不在指令上） |
 | `.lib` / `.o` | **直接拒绝**：重定位目标的地址是节内偏移，出工程只会误导。先链接成 axf 再来 |
 | 工程文件 | `recover_project_exact` 默认出 `.uvprojx`，做法是**改造仓库内那份已知能编译的模板**（改器件/输出名/ScatterFile/文件组/RTE 目标名），不凭空写 XML；模板不在时**不出**而不是给一份没验证过的东西。`<umfTarg>` 必须强制为 `0`——`1` 是「用 Target 对话框的内存布局」，它会忽略 ScatterFile 自己生成一份 scatter，一编译就 `L6236E: No section matches selector` |
 | 工具链从哪来 | `armasm`/`armlink`/`fromelf` 三路定位：显式目录 → `MDK_ARMCC_BIN` → 从 `UV4.exe` 反推 `<root>\ARM\ARMCC\bin`。找不到就报错并列出试过哪些目录，不猜 |

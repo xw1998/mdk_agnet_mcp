@@ -224,6 +224,10 @@ def section_a():
     ahdr = _text(os.path.join(pa["_dir"], "include/recovered_symbols.h"))
     check("A23 符号头文件写明「函数原型没有恢复」并给出 ADDR_ 常量",
           "没有恢复" in ahdr and "#define ADDR_" in ahdr, ahdr[:200])
+    # 证据来源在 analyze 里叫 sources（列表）；写成 source 会静默变成 "?"（批次80 实测发现）
+    check("A24 符号头注释里带证据来源，不是问号占位",
+          "/* observed, symtab" in ahdr and ", ? */" not in ahdr,
+          [l for l in ahdr.splitlines() if "ADDR_" in l][:2])
 
 def section_b():
     print("B. 自证（verify_project）")

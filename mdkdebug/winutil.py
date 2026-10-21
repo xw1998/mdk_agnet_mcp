@@ -199,15 +199,14 @@ class _MIB_TCPROW_OWNER_PID(ctypes.Structure):
                 ("dwRemotePort", wintypes.DWORD), ("dwOwningPid", wintypes.DWORD)]
 
 
-def _listening_pids_v4(port: int) -> dict:
-    """IPv4 监听表里占着该端口的 PID 列表。
+def _tcp_listener_rows_v4() -> dict:
+    """读 Windows 的 IPv4 监听表 → {ok, rows: [(local_port, pid), ...]} / {ok: False, reason}。
 
-    返回 {ok, pids, method} / {ok: False, reason}。**只查 IPv4 监听表**（如实声明）：
-    UVSOCK 监听 127.0.0.1，真机实测在 IPv4 表里；表里没有 ≠ 端口没人监听（只说明不是
-    IPv4 监听者），所以调用方还要用 port_listening 兜一下。
+    一次系统调用拿到全表，`_listener_ports_v4` 与 `_listening_pids_v4` 共用，避免为了
+    「有没有监听」和「谁在监听」各查一次。
     """
     if sys.platform != "win32":
-        return {"ok": False, "reason": "仅 Windows 支持端口归属查询（iphlpapi）"}
+        return {"ok": False, "reason": "仅 Windows 支持（iphlpapi）"}
     try:
         iphlpapi = ctypes.windll.iphlpapi
         size = wintypes.DWORD(0)
@@ -217,7 +216,7 @@ def _listening_pids_v4(port: int) -> dict:
         if ret not in (0, 122):
             return {"ok": False, "reason": "GetExtendedTcpTable 探测失败（返回 %d）" % ret}
         if not size.value:
-            return {"ok": True, "pids": [], "method": "GetExtendedTcpTable-ipv4-listener"}
+            return {"ok": True, "rows": []}
         buf = ctypes.create_string_buffer(size.value)
         ret = iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False,
                                            _AF_INET, _TCP_TABLE_OWNER_PID_LISTENER, 0)
@@ -226,19 +225,40 @@ def _listening_pids_v4(port: int) -> dict:
         n = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0]
         rows = ctypes.cast(ctypes.addressof(buf) + ctypes.sizeof(wintypes.DWORD),
                            ctypes.POINTER(_MIB_TCPROW_OWNER_PID))
-        pids = []
+        out = []
         for i in range(int(n)):
             row = rows[i]
             try:
                 # dwLocalPort 的端口号在低 16 位、且是网络字节序
                 local_port = socket.ntohs(int(row.dwLocalPort) & 0xFFFF)
+                out.append((local_port, int(row.dwOwningPid)))
             except Exception:            # noqa: BLE001
                 continue
-            if local_port == int(port) and int(row.dwOwningPid):
-                pids.append(int(row.dwOwningPid))
-        return {"ok": True, "pids": pids, "method": "GetExtendedTcpTable-ipv4-listener"}
+        return {"ok": True, "rows": out}
     except Exception as e:               # noqa: BLE001
-        return {"ok": False, "reason": "端口归属查询异常：%s" % e}
+        return {"ok": False, "reason": "监听表查询异常：%s" % e}
+
+def _listener_ports_v4() -> dict:
+    """IPv4 监听表里所有被监听的端口集合 → {ok, ports: set} / {ok: False, reason}。"""
+    r = _tcp_listener_rows_v4()
+    if not r.get("ok"):
+        return {"ok": False, "reason": r.get("reason")}
+    return {"ok": True,
+            "ports": set(p for p, _pid in r.get("rows") or [])}
+
+def _listening_pids_v4(port: int) -> dict:
+    """IPv4 监听表里占着该端口的 PID 列表。
+
+    返回 {ok, pids, method} / {ok: False, reason}。**只查 IPv4 监听表**（如实声明）：
+    UVSOCK 监听 127.0.0.1，真机实测在 IPv4 表里；表里没有 ≠ 端口没人监听（只说明不是
+    IPv4 监听者），所以调用方还要用 port_listening 兜一下。
+    """
+    r = _tcp_listener_rows_v4()
+    if not r.get("ok"):
+        return {"ok": False, "reason": r.get("reason")}
+    pids = sorted(set(pid for p, pid in r.get("rows") or []
+                      if p == int(port) and pid))
+    return {"ok": True, "pids": pids, "method": "GetExtendedTcpTable-ipv4-listener"}
 
 
 def uvsock_owner(port: int = DEFAULT_UVSOCK_PORT) -> dict:
@@ -333,14 +353,37 @@ def focus_window(hwnd) -> bool:
         return False
 
 
+# 本机回环别名：这些 host 上的监听者一定在 IPv4 监听表里，可用 OS 记账判定
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "0.0.0.0", "", None)
+
 def port_listening(port: int = DEFAULT_UVSOCK_PORT, host: str = "127.0.0.1",
-                   timeout: float = 0.3) -> bool:
-    """探测端口是否有服务监听（connect 探测，比 netstat 快且不依赖外部命令）。"""
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+                   timeout: float = 0.3, attempts: int = 3) -> bool:
+    """探测端口是否有服务监听。
+
+    **Windows 上对本机回环端口先查操作系统记账**（GetExtendedTcpTable 的 IPv4 监听表）：
+    表里有就是有。这一条不是优化而是修 bug——早先只用 connect 探测，本机实测对同一个
+    活着的 mock 连探 60 次有 18 次 `socket.timeout`（不是 refused，accept 线程还活着），
+    于是「端口有监听」被判成 False。而这个判据的结论会被拿去决定“Keil 没跑就重启”，
+    误判会杀掉一个本来正常的实例——把探测手段的抖动说成事实，正是“宁可报错不给错答案”
+    要防的。表查不到（非 Windows / 非回环 host / iphlpapi 失败）时回退 connect 探测：
+    被拒（ECONNREFUSED）重试几次，超时不重试（那本来就是慢，不该翻倍等）。
+    """
+    if sys.platform == "win32" and host in _LOOPBACK_HOSTS:
+        lp = _listener_ports_v4()
+        if lp.get("ok"):
+            return int(port) in lp["ports"]
+    attempts = max(1, int(attempts))
+    for i in range(attempts):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except ConnectionRefusedError:
+            if i + 1 >= attempts:
+                return False
+            time.sleep(0.02)
+        except OSError:
+            return False
+    return False
 
 
 def keil_health(port: int = DEFAULT_UVSOCK_PORT, with_dialogs: bool = False) -> dict:
