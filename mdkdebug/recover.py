@@ -3400,6 +3400,9 @@ def _vector_entry_fact(project_dir: str, image: str, base: int, man: dict, *,
     value = bool(base_ok and vt["verdict"] != "invalid")
     return {"value": value, "authority": "observed",
             "source": "%s + image.check_vector_table" % w.get("source"),
+            # 来源是**交付字节本身**（我们读的是原镜像的前两个字），不是我们重建的产物；
+            # 工程首区地址只用来核对「向量表在不在 base 上」，不改变这条证据的来源。
+            "source_class": "shipped-artifact",
             "note": note,
             "vector_table": {"addr": "0x%08X" % int(w.get("addr") or 0),
                              "sp": vt["sp_hex"], "reset": vt["reset_hex"],
@@ -3410,7 +3413,8 @@ def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
                          timeout_s: float = 240.0, skip_build: bool = False,
                          via_uvprojx: bool = False, keep_build: bool = True,
                          flash_start: int = 0, flash_size: int = 0,
-                         ram_start: int = 0, ram_size: int = 0) -> dict:
+                         ram_start: int = 0, ram_size: int = 0,
+                         claim: str = "") -> dict:
     """对一份 ``recover_project_exact`` 产物出**闭环台账**：哪条义务被什么证据闭合。
 
     三种取证方式（按证据强度从强到弱）：
@@ -3421,7 +3425,22 @@ def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
 
     ``ready=true`` 的含义严格限定为：**这份固件的字节/布局/工具链链路被观察证据闭合**，
     不表示它能跑（``runtime.bootable`` 恒为 unknown，除非另有一次上板观察）。
+
+    ``claim=`` 是**主张等级**（批次89，口径见 REA reconstruction-coverage）：
+    ``shipped-artifact`` / ``controlled-replay``（默认）/ ``live-observation`` /
+    ``external``。它回答的是「这些证据能不能对外这么讲」——强度够但来源不对时
+    ``summary.claim_supported=false`` 并逐条给出理由，绝不把证据改写成合格的样子。
     """
+    if claim:
+        if claim not in closure.CLAIM_AUTHORITIES:
+            return {"ok": False,
+                    "error": "未知的主张等级：%s" % claim,
+                    "hint": "可选：%s" % "、".join(closure.CLAIM_AUTHORITIES),
+                    "claims": {k: {"title": v["title"],
+                                   "allowed_sources": v["allowed_sources"],
+                                   "min_authority": v["min_authority"]}
+                               for k, v in closure.CLAIM_AUTHORITIES.items()}}
+    claim = claim or closure.DEFAULT_CLAIM
     dest = os.path.abspath(project_dir)
     man_path = os.path.join(dest, "manifest.json")
     if not os.path.isfile(man_path):
@@ -3448,10 +3467,12 @@ def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
         if not isinstance(verify, dict):
             return {"ok": False, "error": "verify_json 不是 JSON 对象"}
         evidence_source = "verify_json（复评已保存的证据，未重跑工具链）"
+        source_mode = "recorded-replay"
         notes.append("证据来自 %s：本层没有重新取证，结论的强度取决于那次运行" % p)
     elif skip_build:
         verify = {}
         evidence_source = "skip_build（只盘点材料，没跑工具链）"
+        source_mode = "no-build"
         notes.append("skip_build=true：没有重链接，所以字节一致/工具链两条义务都开不了")
     else:
         verify = verify_project(dest, image, base=base, arm_bin=arm_bin,
@@ -3459,6 +3480,7 @@ def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
                                 via_uvprojx=via_uvprojx)
         evidence_source = "recover_verify（本次实跑 %s）" % (
             "UV4 -b" if via_uvprojx else "armasm+armlink+fromelf")
+        source_mode = "live-run"
 
     facts = closure.facts_from_verify(verify, manifest=man)
     ram = (ram_start, ram_start + ram_size - 1) if (ram_start and ram_size) else None
@@ -3467,7 +3489,7 @@ def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
     vf = _vector_entry_fact(dest, image, base, man, ram=ram, flash=flash)
     if vf is not None:
         facts["vector.entry"] = vf
-    led = closure.evaluate(facts)
+    led = closure.evaluate(facts, claim=claim, source_mode=source_mode)
 
     out = dict(led)
     out.update({
@@ -3480,6 +3502,7 @@ def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
                      "input": man.get("input"),
                      "base": "0x%08X" % _manifest_chunk0(man)},
         "evidence_source": evidence_source,
+        "claim": claim,
         "verify": {
             "ok": verify.get("ok"),
             "byte_identical": (verify.get("diff") or {}).get("byte_identical"),

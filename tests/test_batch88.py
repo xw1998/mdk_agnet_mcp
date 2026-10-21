@@ -70,8 +70,8 @@ def section_a():
           led["summary"]["ready"] is True
           and led["summary"]["required_closed"] == led["summary"]["required_total"]
           and led["summary"]["blocking_obligations"] == [], led["summary"])
-    check("A1b 台账带 8 条义务与 6 条口径（口径随结果走）",
-          len(led["obligations"]) == 8 and len(led["rules"]) == 6, len(led["rules"]))
+    check("A1b 台账带 8 条义务与 9 条口径（口径随结果走；批次89 加了 3 条来源/主张纪律）",
+          len(led["obligations"]) == 8 and len(led["rules"]) == 9, len(led["rules"]))
 
     led = CL.evaluate(all_closed(**{"bytes.loadable": fact(True, "derived")}))
     check("A2 derived 证据不能闭合要求 observed 的义务（open，不是通过）",

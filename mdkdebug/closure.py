@@ -102,6 +102,64 @@ OBLIGATIONS = [
 
 OBLIGATION_BY_ID = {o["id"]: o for o in OBLIGATIONS}
 
+# ----------------------------------------------------------------------
+# 证据来源（批次89）：与「强度」正交的第二个轴
+# ----------------------------------------------------------------------
+# 强度回答「这条证据有多硬」，来源回答「这条证据是谁给的」。两者都满足，才能支撑一个
+# 具体的主张：观察到的**我们自己的产物**永远不能证明**交付字节**的性质，反之亦然。
+SOURCE_CLASSES = {
+    "shipped-artifact": "交付的镜像本身：直接读它（hash、前几个字）得到的证据",
+    "controlled-replay": "受控重建：我们自己用工具链重链接出的产物/工程给出的证据",
+    "live-observation": "现场观察：调试器/目标板实测（SWD 读、运行、trace）给出的证据",
+    "external-service": "外部工具或服务给出的结果（UV4 命令行、第三方分析器）",
+}
+
+# 主张等级（claim）：调用方说「我要主张到哪一步」，每条允许的证据来源与最低强度。
+# 口径照 REA reconstruction-coverage：**一个通过的摘要不能把推断证据提升成重放观察**，
+# 也不能把「我们重建的产物」折成「交付字节的性质」。
+CLAIM_AUTHORITIES = {
+    # 每一级主张只覆盖**它自己那几条义务**：主张是「我对外要说这句话」，
+    # 不是「所有义务一起过关」。等级越高，要求的义务越多（下面按这个顺序累加）。
+    "shipped-artifact": {
+        "title": "这份交付字节里有什么（只靠读它本身）",
+        "obligations": ["artifact.identity", "vector.entry"],
+        "allowed_sources": ["shipped-artifact"],
+        "min_authority": "derived",
+        "why": "对交付字节的主张只能由那份字节自己的观察/推导支撑；"
+               "自己重建的产物证明不了原件是什么",
+    },
+    "controlled-replay": {
+        "title": "我们能把这颗固件重造出同样的可加载字节",
+        "obligations": ["artifact.identity", "build.toolchain", "bytes.loadable",
+                        "vector.entry", "layout.regions"],
+        "allowed_sources": ["controlled-replay", "shipped-artifact"],
+        "min_authority": "observed",
+        "why": "重造是「我们做的」这件事，必须有一次我们自己的观察；"
+               "读原件的观察可以作陪衬，但不能独自支撑重造",
+    },
+    "live-observation": {
+        "title": "它在目标板上真的跑起来了",
+        "obligations": ["artifact.identity", "build.toolchain", "bytes.loadable",
+                        "vector.entry", "layout.regions", "runtime.bootable"],
+        "allowed_sources": ["live-observation", "controlled-replay", "external-service"],
+        "min_authority": "observed",
+        "why": "「能跑」需要一次运行期观察；离线重链接再像也不能替代上板",
+    },
+    "external": {
+        "title": "外部工具/服务对它的结论",
+        "obligations": ["artifact.identity", "bytes.loadable", "layout.regions"],
+        "allowed_sources": ["external-service"],
+        "min_authority": "observed",
+        "why": "转述别人的结论，就必须有别人给的观察；不能拿自己的推导冒充",
+    },
+}
+
+DEFAULT_CLAIM = "controlled-replay"
+
+# 取证方式：回放既有输出（verify_json=）与本次实跑必须区分开——
+# 回放能复现当时的状态，但它不是「现在这条工具链能跑」的观察。
+SOURCE_MODES = ("live-run", "recorded-replay", "no-build")
+
 RULES = [
     "义务只有『证据强度 ≥ 要求』且证据本身通过时才算闭合（closed）；"
     "derived 证据不能闭合要求 observed 的义务",
@@ -110,11 +168,24 @@ RULES = [
     "缺失证据一律是 open 并附 required_next_evidence，不当成 failed（fail 需要观察到反证）",
     "closure_digest 只由义务与状态决定：同样的证据重算一次得到同一个值（可复算、可比对）",
     "任何一条 failed（含 required=false）都会让 ready=false：观察到反证不能靠数量摊平",
+    "主张（claim）另有一道门：证据来源不在该主张允许的范围内时，该义务在 claim 视图里"
+    "记 unknown（既不算 closed，也不算 failed）——强度够不等于来源对",
+    "回放的既有记录（verify_json=）不能顶替本次实跑，也不能支撑高于 controlled-replay 的主张",
+    "台账不改写证据来源去迎合调用方声明的主张：来源由采集它的那段代码判定",
 ]
 
 
-def _fact(value, authority, source, note=""):
-    return {"value": value, "authority": authority, "source": source, "note": note}
+def _fact(value, authority, source, note="", source_class=None):
+    """一条证据：``value`` 是它自己的结论，``authority`` 是强度，``source_class`` 是来源。
+
+    ``source_class`` 必须是 :data:`SOURCE_CLASSES` 的键，或 ``None``（没有证据）。
+    只有**明确**标注的来源才能支撑主张——不猜、不从 ``source`` 的中文描述里反推。
+    """
+    if source_class is not None and source_class not in SOURCE_CLASSES:
+        raise ValueError("未知的证据来源: %r（可选 %s）"
+                         % (source_class, "、".join(SOURCE_CLASSES)))
+    return {"value": value, "authority": authority, "source": source,
+            "note": note, "source_class": source_class}
 
 
 def _status_for(ob, fact):
@@ -140,11 +211,75 @@ def _status_for(ob, fact):
     return STATUS_CLOSED, fact.get("note") or "证据强度 %s ≥ 要求 %s" % (auth, need), need
 
 
-def evaluate(facts, *, include_optional_in_summary=True) -> dict:
+def _claim_view(rows, *, claim, source_mode):
+    """按主张等级复评一遍：只看该主张**覆盖的那几条义务**。
+
+    这里**不改**义务自身的 status（那是强度判定），只回答「这些证据能不能支撑
+    调用方声明的那句话」。缺资格时给出可行动的理由，而不是把证据改写成合格的样子。
+    """
+    rule = CLAIM_AUTHORITIES[claim]
+    wanted = list(rule["obligations"])
+    allowed = list(rule["allowed_sources"])
+    min_rank = AUTHORITY_RANK.get(rule["min_authority"], 3)
+    by_id = {r["obligation_id"]: r for r in rows}
+    blockers, qualifying = [], []
+    for oid in wanted:
+        r = by_id.get(oid)
+        if r is None:  # 清单与义务表不一致时宁可报错，不静默跳过
+            blockers.append({"obligation_id": oid, "why": "义务表里没有这一条（内部不一致）"})
+            continue
+        if r["status"] != STATUS_CLOSED:
+            blockers.append({"obligation_id": oid,
+                             "why": "义务未闭合（status=%s）：%s" % (r["status"], r["reason"])})
+            continue
+        ev = r.get("evidence") or {}
+        sc = ev.get("source_class")
+        if sc not in allowed:
+            blockers.append({
+                "obligation_id": oid,
+                "why": "证据来源是 %s，主张 %s 只接受 %s——强度够不等于来源对"
+                       % (sc or "未标注", claim, " / ".join(allowed))})
+            continue
+        qualifying.append(oid)
+    if not any(AUTHORITY_RANK.get(((by_id[o].get("evidence") or {}).get("authority")), 0)
+               >= min_rank for o in qualifying):
+        blockers.append({"obligation_id": None,
+                         "why": "没有任何一条证据达到该主张要求的最低强度 %s"
+                                % rule["min_authority"]})
+    if source_mode == "recorded-replay" and claim in ("live-observation", "external"):
+        blockers.append({"obligation_id": None,
+                         "why": "本次用的是回放的既有记录（verify_json=）："
+                                "它不能支撑 %s 级的主张" % claim})
+    qset = set(qualifying)
+    for r in rows:
+        if r["status"] != STATUS_CLOSED:
+            r["claim_status"] = r["status"]
+        elif r["obligation_id"] not in wanted:
+            r["claim_status"] = "not_in_claim"
+        else:
+            r["claim_status"] = STATUS_CLOSED if r["obligation_id"] in qset else STATUS_UNKNOWN
+    return {
+        "claim": claim,
+        "claim_title": rule["title"],
+        "claim_obligations": wanted,
+        "claim_supported": not blockers,
+        "claim_blockers": blockers,
+        "qualifying_obligations": qualifying,
+        "source_mode": source_mode,
+    }
+
+def evaluate(facts, *, include_optional_in_summary=True,
+             claim=DEFAULT_CLAIM, source_mode="live-run") -> dict:
     """按义务清单评估一份证据集合，给出 fail-closed 的闭环结论。
 
     ``facts``：``{obligation_id: {"value": bool, "authority": "observed",
-    "source": "…", "note": "…"}}``。没给到的义务视为**没有证据**（open）。
+    "source": "…", "note": "…", "source_class": "controlled-replay"}}``。
+    没给到的义务视为**没有证据**（open）。
+
+    两个判据分开：``summary.ready`` 只看强度与反证（「我们证到了哪一步」），
+    ``summary.claim_supported`` 再看**证据来源**能不能支撑 ``claim`` 那句话
+    （「能不能对外这么讲」）。强度够而来源不对时，后者为 false、理由具名——
+    这正是「一次通过的摘要不能把推断证据提升成重放观察」的落地。
     """
     facts = facts or {}
     rows, required_open = [], []
@@ -162,6 +297,7 @@ def evaluate(facts, *, include_optional_in_summary=True) -> dict:
                 "value": fact.get("value"),
                 "authority": fact.get("authority"),
                 "source": fact.get("source"),
+                "source_class": fact.get("source_class"),
             }),
         }
         if status in (STATUS_OPEN, STATUS_UNKNOWN, STATUS_UNSUPPORTED) and ob["required"]:
@@ -187,8 +323,21 @@ def evaluate(facts, *, include_optional_in_summary=True) -> dict:
     required_closed = [r for r in required_rows if r["status"] == STATUS_CLOSED]
     ready = (len(required_closed) == len(required_rows)
              and not any(r["status"] == STATUS_FAILED for r in rows))
+    claim_view = _claim_view(rows, claim=claim, source_mode=source_mode)
     summary = {
         "ready": ready,
+        "claim": claim,
+        "claim_title": claim_view["claim_title"],
+        "claim_supported": bool(ready and claim_view["claim_supported"]),
+        "claim_blockers": claim_view["claim_blockers"],
+        "qualifying_obligations": claim_view["qualifying_obligations"],
+        "source_mode": source_mode,
+        "claim_note": ({"live-run": "证据来自本次实跑",
+                        "recorded-replay": "证据来自回放的既有记录（verify_json=）："
+                                           "它复现的是当时的状态，不能顶替本次实跑，"
+                                           "也不能支撑高于 controlled-replay 的主张",
+                        "no-build": "没跑工具链（skip_build=true）：只有材料盘点级证据"}
+                       [source_mode]),
         "required_total": len(required_rows),
         "required_closed": len(required_closed),
         "closed": counts.get(STATUS_CLOSED, 0),
@@ -212,12 +361,18 @@ def evaluate(facts, *, include_optional_in_summary=True) -> dict:
         "rules": list(RULES),
         "verdict": ("required 义务全部被证据闭合" if ready else
                     "**没有闭合**：%s" % "、".join(summary["blocking_obligations"])),
+        "claim_verdict": ("证据来源足以支撑主张 %s" % claim
+                          if summary["claim_supported"] else
+                          "**不足以支撑主张 %s**：%s"
+                          % (claim, "；".join(b["why"] for b in summary["claim_blockers"]))),
         "limitations": [
             "台账只覆盖上面列出的义务；这份清单就是「什么才算恢复成功」的定义，"
             "不在清单里的能力（例如中断优先级、外设初始化顺序）没有任何证据",
             "ready=true 只说明**这份固件**的字节/布局/工具链链路闭合，不说明它能跑、"
             "也不说明它是好固件",
             "evidence 的 authority 由采集它的工具判定；本层不做二次取证，只做一致性聚合",
+            "claim 视图只回答「这些证据能不能支撑这句话」，它不会把证据改写成合格的样子；"
+            "来源不对的义务在该视图里记 unknown",
         ],
     }
     return out
@@ -240,14 +395,17 @@ def facts_from_verify(verify: dict, *, manifest: dict | None = None) -> dict:
     #   机器码里没有 C 语义（unsupported，不是「还没做」）；
     #   没接硬件就没有上板证据（unknown，不是「通过」）。
     facts["c.semantics"] = _fact(False, "unsupported", "机器码不含类型/宏/变量名",
-                                 "不是「还没做」，是输入里没有这段信息")
+                                 "不是「还没做」，是输入里没有这段信息",
+                                 source_class=None)
     facts["runtime.bootable"] = _fact(False, "unknown", "本次没有上板观察",
-                                      "要说「能跑」需要 flash_download 后的一次真机 trace")
+                                      "要说「能跑」需要 flash_download 后的一次真机 trace",
+                                      source_class=None)
     if not verify:
         facts.setdefault("symbols.addresses", _fact(
             False, "unknown", "本次没有独立的符号原文可比",
             "可选义务：recover_project_exact 的符号是对同一份输入分析出的地址常量，"
-            "与之一并比较属循环论证；stripped 固件更无从比。不闭合也不阻塞 ready"))
+            "与之一并比较属循环论证；stripped 固件更无从比。不闭合也不阻塞 ready",
+            source_class=None))
         return facts
     steps = verify.get("steps") or []
     built = bool(verify.get("build", {}).get("bin")) and any(
@@ -257,10 +415,13 @@ def facts_from_verify(verify: dict, *, manifest: dict | None = None) -> dict:
     if verify.get("failed_step") in ("keil_build", "armasm", "armlink"):
         facts["build.toolchain"] = _fact(False, "observed",
                                         "recover_verify 的 %s 步骤" % verify["failed_step"],
-                                        "工具链报错（看 verify.steps 的 stderr）")
+                                        "工具链报错（看 verify.steps 的 stderr）",
+                                        source_class="controlled-replay")
     elif built and toolchain_ran:
-        facts["build.toolchain"] = _fact(True, "observed",
-                                        "recover_verify：armasm/armlink（或 UV4）+ fromelf 产物存在")
+        facts["build.toolchain"] = _fact(
+            True, "observed",
+            "recover_verify：armasm/armlink（或 UV4）+ fromelf 产物存在",
+            source_class="controlled-replay")
 
     diff = verify.get("diff") or {}
     ident = diff.get("byte_identical")
@@ -269,15 +430,18 @@ def facts_from_verify(verify: dict, *, manifest: dict | None = None) -> dict:
                  if diff.get("alignment_padding") else "")
         facts["bytes.loadable"] = _fact(True, "observed",
                                         verify.get("expected_source") or "recover_verify",
-                                        "逐字节相同" + extra)
+                                        "逐字节相同" + extra,
+                                        source_class="controlled-replay")
         facts["layout.regions"] = _fact(True, "derived",
                                         "由 bytes.loadable 推出",
-                                        "同一份 bin 的两种读法：字节一致 ⇒ 布局一致")
+                                        "同一份 bin 的两种读法：字节一致 ⇒ 布局一致",
+                                        source_class="controlled-replay")
     elif ident is False:
         facts["bytes.loadable"] = _fact(False, "observed",
                                         verify.get("expected_source") or "recover_verify",
                                         "第一处差异在 bin 偏移 0x%X"
-                                        % ((diff.get("diff_offsets") or [0])[0]))
+                                        % ((diff.get("diff_offsets") or [0])[0]),
+                                        source_class="controlled-replay")
     elif ident is None:
         facts["bytes.loadable"] = None   # 无期望字节：没有证据，不是「一致」
 
@@ -286,11 +450,13 @@ def facts_from_verify(verify: dict, *, manifest: dict | None = None) -> dict:
         facts["artifact.identity"] = _fact(
             True, "observed", "recover_verify 的 expected.sha256",
             "本次比的就是 manifest 记的那一份" if exp.get("manifest_match") is not False
-            else "⚠ manifest 记的输入与本次 image 不是同一份")
+            else "⚠ manifest 记的输入与本次 image 不是同一份",
+            source_class="shipped-artifact")
         if exp.get("manifest_match") is False:
             facts["artifact.identity"] = _fact(
                 False, "observed", "expected.manifest_match=false",
-                "传入的 image 与 manifest 的 concat_sha256 不符：结论要按新的那份重算")
+                "传入的 image 与 manifest 的 concat_sha256 不符：结论要按新的那份重算",
+                source_class="shipped-artifact")
     # 注意：manifest.json 里**没有**符号表/向量表字段——不要凭想象去取键。
     # 向量表证据必须由字节本身给出（见 recover.build_closure_ledger 的
     # `_vector_entry_fact`：读原镜像 base 处的前两个字并过 image.check_vector_table）；
@@ -299,7 +465,8 @@ def facts_from_verify(verify: dict, *, manifest: dict | None = None) -> dict:
     facts.setdefault("symbols.addresses", _fact(
         False, "unknown", "本次没有独立的符号原文可比",
         "可选义务：recover_project_exact 的符号是对同一份输入分析出的地址常量，"
-        "与之一并比较属循环论证；stripped 固件更无从比。不闭合也不阻塞 ready"))
+        "与之一并比较属循环论证；stripped 固件更无从比。不闭合也不阻塞 ready",
+        source_class=None))
     return facts
 
 

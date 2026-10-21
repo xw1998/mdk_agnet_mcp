@@ -7824,8 +7824,14 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "也**不表示它是好固件**；C 语义（类型/结构体/变量名/宏）恒为 unsupported（输入里根本没有这段信息）。\n"
             "给 RAM/Flash 窗口（ram_start+ram_size / flash_start+flash_size）才能把向量表的"
             "「SP 落在 RAM、复位地址落在 Flash」两条判据核完，否则判据只到 unverified。\n"
-            "输出 summary{ready,required_total,required_closed,closed,open,failed,unknown,unsupported,blocking_obligations}"
-            " + obligations[]（含 reason 与证据来源）+ closure_digest（可复算）+ manifest.digest。"
+            "**主张等级 claim**（吸收 REA reconstruction-coverage 的 source 匹配口径）："
+            "shipped-artifact（只靠读交付字节）/ controlled-replay（默认，我们能重造出同样的字节）/"
+            "live-observation（它在板上跑起来了）/ external（外部工具的结论）。"
+            "强度够不等于来源对：读原件的证据证明不了我们重造过，我们自己重链的产物也证明不了原件是什么；"
+            "来源不匹配的义务在 claim 视图里记 unknown，summary.claim_supported=false 并逐条给理由。"
+            "另外 verify_json= 是**回放**，不能顶替本次实跑，也不能支撑高于 controlled-replay 的主张。\n"
+            "输出 summary{ready,claim,claim_supported,claim_blockers,required_total,required_closed,closed,open,failed,unknown,unsupported,blocking_obligations}"
+            " + obligations[]（含 reason、证据来源与 claim_status）+ closure_digest（可复算）+ manifest.digest。"
             "默认会往 <project_dir>/build/ 写中间产物（不是只读工具）。"
         ),
     )
@@ -7834,7 +7840,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                              skip_build: bool = False, via_uvprojx: bool = False,
                              flash_start: int = 0, flash_size: int = 0,
                              ram_start: int = 0, ram_size: int = 0,
-                             timeout_s: float = 240.0) -> str:
+                             claim: str = "", timeout_s: float = 240.0) -> str:
         try:
             out = _recover.build_closure_ledger(
                 str(project_dir or "").strip(), str(image or "").strip(),
@@ -7843,6 +7849,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 via_uvprojx=bool(via_uvprojx),
                 flash_start=int(flash_start or 0), flash_size=int(flash_size or 0),
                 ram_start=int(ram_start or 0), ram_size=int(ram_size or 0),
+                claim=str(claim or "").strip(),
                 timeout_s=float(timeout_s or 240.0))
             return _js(out)
         except Exception as e:  # noqa: BLE001

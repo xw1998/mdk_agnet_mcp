@@ -128,7 +128,7 @@ recover_disasm(file, symbol="main")          # 按符号或地址区间反汇编
 recover_project(file, out_dir="...")         # 出 sct/ld/头文件/startup/stub/反汇编/map/report
 recover_project_exact(file, out_dir="...")   # 出**字节精确可重链接**工程（armasm + sct + uvprojx）
 recover_verify(project_dir, image=file)      # 真工具链重链接，逐字节比对（byte_identical）
-recover_ledger(project_dir, image=file)      # 闭环台账：哪条义务被什么证据闭合了
+recover_ledger(project_dir, image=file, claim=...)  # 闭环台账：哪条义务被什么证据闭合了 + 主张等级
 ```
 
 **先自证再用**：`recover_project_exact` 自己不说成功，判据是 `recover_verify` 的
@@ -226,6 +226,13 @@ ram_start=..., ram_size=...)` 出**闭环台账**（批次88，吸收 REA obliga
 - 三种取证：默认跑 `recover_verify`（真工具链）；`verify_json=` 复评一份已保存的 verify 输出
   （不重跑，`closure_digest` 与实跑相同，可用于对账）；`skip_build=true` 只盘点材料。
   不给 RAM/Flash 窗口时向量表判据只到 `unverified`（SP 落点与复位落点未核），台账会写在 reason 里。
+- 主张等级 `claim=`（批次89）是**正交的第二问**：`shipped-artifact` / `controlled-replay`（默认）/
+  `live-observation` / `external`，每级只对**它覆盖的义务子集**负责，并限定**允许的来源类别**
+  （`shipped-artifact` 读交付字节 / `controlled-replay` 我们自己重链接 / `live-observation`
+  调试器或板上实测 / `external-service` 外部工具结论）。**强度够不等于来源对**：来源不合规的那条
+  会被写成 `claim_status=unknown` 并进 `claim_blockers`，但它自己的 `status` 不变，
+  `closure_digest` 也不变（换 claim 得同一个 digest，可跨调用对账）。
+  `verify_json=` 是回放，`claim_note` 会写明它**不能顶替本次实跑**，也不支撑 `live-observation`/`external`。
 
 **关系层与类型层**（批次82/83）：`recover_symbols` / `recover_project` 的
 `report.json` 里另有 `relations`：`xref_counts`（call/branch/data_read/data_write）、
