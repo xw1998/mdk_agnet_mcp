@@ -148,6 +148,18 @@ recover_ledger(project_dir, image=file, claim=...)  # 闭环台账：哪条义�
 - `recover_project_exact` 的 `next_actions` 里直接给一行**可复制**的 `recover_ledger(...)`，
   Flash/RAM 窗口已按这份镜像的布局算好；没有 RW 段时会明说「ram 只能你自己给」。
 
+**台账的窗口也可以不传**（批次91）：`recover_ledger(project_dir=…, image=…)` 就够——
+Flash 窗口按 manifest 的 `chunks` **实际覆盖范围**推，RAM 窗口按 `manifest.windows.ram`
+（出件时由 ELF 的 RW 段算出）推，老产物没有这一项就现读原镜像的 ELF；纯 bin 推不出来
+就如实写进 `notes`，不编一个。**推出来的窗口只当上下界**：
+- 落点在范围内 → 判据从 `unverified` 抬到 `plausible`（说明「没落空」，不等于按手册核过）；
+- 落点在范围外 → 记 `unverified` 并写明「不判 invalid」——「落在我没 dump 到的那一段」
+  和「向量表坏了」不是一回事；
+- 硬错误（SP=0 / 全 1、复位地址 bit0=0）照样判 `invalid`，不被这条豁免。
+要按器件手册把落点核完、并允许判 `invalid`，就显式给 `flash_start/flash_size`、
+`ram_start/ram_size`——输出里 `windows{flash,ram,basis,derived,note}` 会说明用的是哪一套。
+裸 bin 也不再要求另传 `base`：没给就取 manifest 的首块地址。
+
 **先自证再用**：`recover_project_exact` 自己不说成功，判据是 `recover_verify` 的
 `byte_identical=true`。两条路分工：`recover_project` 出「能读能改的骨架」，
 `recover_project_exact` 出「原样复刻、能证明」。要点：

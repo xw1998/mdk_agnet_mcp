@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.14）
+│   ├── __init__.py           # 包初始化（版本号 0.2.15）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -1322,6 +1322,31 @@ dump 切出来的镜像还得调用方自己写文件。批次90 逐条补平（
 实测（`mdk_test.axf`，本机 Keil）：照抄那一行的窗口得到 `ready=true`、`required_closed=5/5`；
 `image_split` 切出的 `image_00.bin` → `project_exact` → `verify` 得到 `byte_identical=true`；
 `msvcrt.dll`（x86_64）在入口就被拒，且**没有建出半个目录**。
+批次91 起，这一行里的窗口也可以不传（见下一节）。
+
+### 台账的窗口不用再抄，但推出来的只算「上下界」（批次91）
+
+批次90 的最后一步是「照抄那一行窗口」。抄对了没事，抄错了是**错答案**，而且漏抄时
+台账只会停在 `unverified`。批次91 把这一半也省掉（**仍不新增工具**）：
+
+| 以前 | 现在 |
+|---|---|
+| 要传 `flash_start/flash_size`、`ram_start/ram_size`，否则向量表的两条落点判据是 `None` | `recover_ledger(project_dir=…, image=…)` 就够：Flash 按 manifest 的 `chunks` **覆盖范围**推，RAM 按 `manifest.windows.ram`（出件时由 ELF 的 RW 段算出）推，老产物现读原镜像 ELF；纯 bin 推不出来就写进 `notes`，不编 |
+| 裸 bin 还得另传一遍 `base` | 不给就取 manifest 的首块地址（「这份字节放在哪」manifest 早就记了） |
+| 窗口只有「有」和「没有」两种 | 输出 `windows{flash,ram,basis,derived,note}`：哪一套、凭什么是推出来的、推到什么程度，全写清 |
+
+**关键口径：推出来的窗口只当下界，不用来判错。** 它是「我手上这些字节/节的范围」，
+不是器件手册上的容量。所以：
+
+- 落点在范围内 → 判据从 `unverified` 抬到 `plausible`（说明**没落空**，不等于按手册核过）；
+- 落点在范围外 → 记 `unverified` 并写明「不判 invalid」——「落在我没 dump 到的那一段」
+  和「向量表坏了」是两件事，把前者当后者会毁掉一份好固件；
+- 硬错误照样判 `invalid`：SP=0 或全 1、复位地址 bit0=0（进 HardFault）不被这条豁免。
+
+要按器件手册把落点核完、并保留判 `invalid` 的权力，就显式给窗口——显式窗口优先，
+输出里 `derived` 为空、`basis` 写「调用方显式给」。实测：`mdk_test.axf` 的精确工程
+不传任何窗口跑 `recover_ledger` 得到 `ready=true`、`required_closed=5/5`，且每条义务
+状态与显式给窗口时**逐条一致**。
 
 ### 主张等级与证据来源（批次89，吸收 REA reconstruction-coverage 的来源匹配口径）
 

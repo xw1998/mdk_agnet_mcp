@@ -2359,3 +2359,27 @@ if isize == len(out):            # 这里量到的是 dict 的**键数**
 但没有任何提示。`max_insns` / `max_functions` 这类预算参数，触顶就必须进 `gaps`
 （「只扫了一部分代码，要看全就调大」）——预算由调用方定，**工具不替调用方猜**，
 更不能用「看着没报错」冒充「扫完了」。
+
+## 五十三、推出来的窗口只能当下界，不能拿来判错
+
+批次91 让 `recover_ledger` 不用再人工传 Flash/RAM 窗口：Flash 按 manifest 的 `chunks`
+**覆盖范围**推、RAM 按 `manifest.windows.ram`（出件时由 ELF 的 RW 段算出）推。
+省事的同时埋了一个陷阱——**这两个窗口不是器件手册上的容量，只是「我手上这些字节/节」的范围。**
+
+拿它去判对错就会毁掉好固件：一份只 dump 了前 16 KB 的固件，复位地址 `0x08008001`
+落在外面，`check_vector_table` 会给出 `reset_in_flash=false` → `invalid` → 台账判
+「向量表与复位地址不是取自原镜像」**failed**。可那份固件很可能完全正常，只是剩下的
+Flash 没被读出来。**「落在我没 dump 到的那一段」和「向量表坏了」是两件事。**
+
+处置（三条，缺一条就会重新变成假答案）：
+
+- **标来源**：每个窗口带 `basis`，推出来的写清依据（chunks 覆盖 / manifest.windows.ram /
+  现读 ELF），台账输出 `windows.derived` 点名哪几个是推的；
+- **降级不判错**：推出来的窗口只负责把判据从 `unverified` **抬到** `plausible`（说明「没落空」），
+  落空时退回 `unverified` 并写明「不判 invalid」；显式给的窗口才保留判 `invalid` 的权力；
+- **硬错误不豁免**：`sp_nonzero` / `sp_4byte_aligned` / `reset_thumb_bit` 这几条与窗口无关，
+  推出来的窗口一律不能把它们洗成通过（SP=0、复位地址 bit0=0 照样 `invalid`）。
+
+反例测试是必须的：同样一份字节，**推窗口 → 记未核**、**显式给窄窗口 → 判 failed**，
+两条同时成立才算没放水。另一个同源细节：裸 bin 的 `base` 没给时取 manifest 的首块地址——
+「这份字节放在哪」manifest 里已经记了，再让调用方抄一遍就是给错答案留门。

@@ -2865,6 +2865,55 @@ def _ram_window(unit: "Unit", chunks: list[dict]) -> dict | None:
     hi = max(s["addr"] + s["size"] for s in rw)
     return {"start": lo, "size": _round_up(hi - lo)}
 
+def _derive_windows(man: dict, image: str = "") -> dict:
+    """从 manifest（必要时再读原镜像的 ELF）推 Flash / RAM 窗口（批次91）。
+
+    这是「不用再人工抄窗口」的那一步，但有两条口径必须说死：
+
+    - Flash 窗口 = manifest 里 chunks **实际覆盖**的字节范围，不是整片芯片的容量。
+      所以它只是**下界**：复位地址落在外面，可能是我们没 dump 到的那一段，
+      **不是**「向量表坏了」——判 invalid 需要器件级的窗口，而那是调用方的事。
+    - RAM 窗口优先取 ``manifest.windows.ram``（出件时从 ELF 的 RW 段算出），
+      老产物没有这一项就现读原镜像的 ELF；纯 bin 输入推不出来，就老实说推不出来。
+
+    每个窗口都带 ``basis``，调用方据此决定它能不能当器件窗口用。
+    """
+    out = {"flash": None, "ram": None, "notes": []}
+    spans = []
+    for c in (man.get("chunks") or []):
+        a = c.get("addr", 0)
+        if isinstance(a, str):
+            a = int(a, 16) if a.lower().startswith("0x") else int(a)
+        n = int(c.get("size") or 0)
+        if n:
+            spans.append((int(a), int(a) + n))
+    if spans:
+        lo = min(s[0] for s in spans)
+        hi = max(s[1] for s in spans)
+        out["flash"] = {"start": lo, "size": hi - lo,
+                        "basis": "manifest.chunks（这批镜像实际覆盖的字节范围，是下界、不是整片芯片）"}
+    w = man.get("windows") if isinstance(man.get("windows"), dict) else {}
+    ram = w.get("ram") if isinstance(w.get("ram"), dict) else None
+    if ram and ram.get("start") and ram.get("size"):
+        out["ram"] = {"start": int(ram["start"]), "size": int(ram["size"]),
+                      "basis": "manifest.windows.ram（出件时从 ELF 的 RW 段算出）"}
+    elif image and os.path.isfile(image):
+        data, err = _read_file(image)
+        if not err and detect_container(data[:4096]) == "elf":
+            elf = parse_elf(data)
+            rw = [s for s in elf.get("sections") or []
+                  if s.get("alloc") and (s.get("writable") or s["type_name"] == "NOBITS")
+                  and s["size"]]
+            if rw:
+                lo = min(s["addr"] for s in rw)
+                hi = max(s["addr"] + s["size"] for s in rw)
+                out["ram"] = {"start": lo, "size": _round_up(hi - lo),
+                              "basis": "现读原镜像 ELF 的 RW 段"}
+    if out["ram"] is None:
+        out["notes"].append(
+            "推不出 RAM 窗口：manifest 里没有 RW 段记录、原镜像也不是 ELF"
+            "（纯 bin 没有地址信息）——SP 是否落在 RAM 这条判据只能停在 unverified")
+    return out
 
 def project_exact(path: str, out_dir: str, *, name: str = "recovered",
                   base: int = 0, device: str = "", vendor: str = "",
@@ -2996,6 +3045,10 @@ def project_exact(path: str, out_dir: str, *, name: str = "recovered",
                     "area": ".rec%02d" % i} for i, c in enumerate(chunks)],
         "expected_bin": {"concat_sha256": sha256_bytes(b"".join(c["data"] for c in chunks)),
                          "total": sum(c["size"] for c in chunks)},
+        "windows": {"flash": {"start": _f_lo, "size": _f_hi - _f_lo,
+                              "basis": "本镜像 chunks 覆盖的字节范围（下界）"},
+                    "ram": ({"start": ram["start"], "size": ram["size"],
+                             "basis": "原镜像 ELF 的 RW 段"} if ram else None)},
         "sct": "linker/recovered.sct",
         "asm": "src/image_exact.s",
         "data_copies": copies,
@@ -3020,7 +3073,12 @@ def project_exact(path: str, out_dir: str, *, name: str = "recovered",
             "asm": asm_note,
             "next_actions": [hint,
                              "闭环台账直接抄这一行（窗口已按这份镜像的布局算好）：%s"
-                             % ledger_cmd]
+                             % ledger_cmd,
+                             '或者省掉窗口这一半：recover_ledger(project_dir="%s", '
+                             'image="%s")——flash 从 manifest 的 chunks 推、ram 从 manifest 的 '
+                             "RW 段推（批次91）；推出来的窗口是**下界**，只把判据从 unverified "
+                             "抬到 plausible，不会因为落在外面就判 invalid"
+                             % (dest, os.path.abspath(path))]
                             + ([] if ram else ["这份镜像里没有可写的节（没有 ELF 的 RW 段），"
                                                "ram_start/ram_size 只能你自己给——不给的话"
                                                "台账的向量表判据停在 unverified，不是通过"])
@@ -3504,30 +3562,63 @@ def _vector_words(image: str, base: int, project_dir: str) -> dict:
     return {"ok": False, "error": "没有原镜像可取向量表两个字"}
 
 def _vector_entry_fact(project_dir: str, image: str, base: int, man: dict, *,
-                       ram=None, flash=None) -> dict | None:
+                       ram=None, flash=None, derived_windows=()) -> dict | None:
     """向量表义务的证据：原镜像 base 处的前两个字 + 工程首区确实从 base 起。
 
     判据（全部要为真才算观察到）：
       1. 工程第一块 ``.rec00`` 的起始地址 == 原可加载字节的首地址（否则向量表不在 base 上）；
       2. ``image.check_vector_table`` 的 verdict 不是 ``invalid``
          （SP 非 0/全 1、4 字节对齐、复位地址 bit0=1；给了 RAM/Flash 窗口才核落点）。
+
+    ``derived_windows`` 里点名的那几个窗口是**按布局推出来的下界**（批次91）：
+    用它落点落空时只把判据退成 unverified（未核），**不判 invalid**——
+    「落在我们没 dump 到的那一段」和「向量表是坏的」不是一回事。
     """
     from . import image as _image  # noqa: PLC0415
-    w = _vector_words(image, base, project_dir)
+    c0 = _manifest_chunk0(man)
+    # 裸 bin 里没有地址信息：base 没给就用 manifest 记的首块地址（批次91）——
+    # 「这份字节被放在哪」manifest 里已经有了，不该再让调用方抄一遍。
+    w = _vector_words(image, base or c0, project_dir)
     if not w.get("ok"):
         return None
     head = w.get("head") or b""
     if len(head) < 8:
         return None
-    c0 = _manifest_chunk0(man)
     vt = _image.check_vector_table(head[0:4], head[4:8], ram=ram, flash=flash)
     base_ok = (int(w.get("addr") or 0) == c0)
+    _derived = set(derived_windows or ())
+    _downgraded = False
+    if vt["verdict"] == "invalid" and _derived:
+        _bad_contain = [k for k in ("sp_in_ram", "reset_in_flash")
+                        if vt["checks"].get(k) is False]
+        _bad_hard = [k for k, v in vt["checks"].items()
+                     if v is False and k not in ("sp_in_ram", "reset_in_flash")]
+        _derived_bad = [k for k in _bad_contain
+                        if ("ram" if k == "sp_in_ram" else "flash") in _derived]
+        if _derived_bad and not _bad_hard and len(_derived_bad) == len(_bad_contain):
+            _downgraded = True
+            vt = dict(vt, verdict="unverified",
+                      why=list(vt.get("why") or []) + [
+                          "这一条落点判据是拿**推出来的**窗口核的（%s）：推出来的只是"
+                          "手上这些字节的范围，落在外面说明不了向量表是错的"
+                          % "、".join(sorted(_derived_bad))])
     note = ("原镜像 0x%08X 处 SP=%s reset=%s（判据 %s）；工程首区 .rec00 起始 0x%08X %s"
             % (int(w.get("addr") or 0), vt["sp_hex"], vt["reset_hex"], vt["verdict"],
                c0, "与之一致" if base_ok else "**不一致**：向量表不在工程首区上"))
     if vt["verdict"] == "unverified":
-        note += ("；没有 RAM/Flash 窗口：SP 是否落在 RAM、复位地址是否落在 Flash 这两条"
-                 "判据是 None（未核），给了窗口才是 plausible")
+        _miss = ([("SP 是否落在 RAM", "RAM")] if not ram else []) + \
+                ([("复位地址是否落在 Flash", "Flash")] if not flash else [])
+        if _miss:
+            note += ("；没有 %s 窗口：%s 这条判据是 None（未核），给了窗口才是 plausible"
+                     % ("/".join(m[1] for m in _miss), "、".join(m[0] for m in _miss)))
+    if _downgraded:
+        note += ("；按布局推出来的窗口（%s）核不上落点：这只能说明它落在我手上这些字节之外，"
+                 "**不判 invalid**（判 invalid 要器件级窗口）" % "、".join(sorted(_derived)))
+    elif _derived and vt["verdict"] == "plausible":
+        note += ("；窗口是按布局推出来的（%s）：落点在范围内这一条只说明**没落空**，"
+                 "不等于按器件手册核过" % "、".join(sorted(_derived)))
+    elif _derived:
+        note += "；用到的窗口是按布局推出来的（%s）" % "、".join(sorted(_derived))
     value = bool(base_ok and vt["verdict"] != "invalid")
     return {"value": value, "authority": "observed",
             "source": "%s + image.check_vector_table" % w.get("source"),
@@ -3614,10 +3705,35 @@ def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
         source_mode = "live-run"
 
     facts = closure.facts_from_verify(verify, manifest=man)
+    # 批次91：窗口可以不传——按 manifest（必要时读原镜像 ELF）推，并把「推出来的」
+    # 与「调用方给的」分开记，因为前者只是下界，不能拿来判 invalid。
+    win = {}
+    derived = []
+    der = _derive_windows(man, image)
+    if flash_start and flash_size:
+        win["flash"] = {"start": flash_start, "size": flash_size,
+                        "basis": "调用方显式给"}
+    elif der["flash"]:
+        win["flash"] = der["flash"]
+        flash_start, flash_size = der["flash"]["start"], der["flash"]["size"]
+        derived.append("flash")
+        notes.append("Flash 窗口没显式给，按%s推出 0x%08X+0x%X"
+                     % (der["flash"]["basis"], flash_start, flash_size))
+    if ram_start and ram_size:
+        win["ram"] = {"start": ram_start, "size": ram_size, "basis": "调用方显式给"}
+    elif der["ram"]:
+        win["ram"] = der["ram"]
+        ram_start, ram_size = der["ram"]["start"], der["ram"]["size"]
+        derived.append("ram")
+        notes.append("RAM 窗口没显式给，按%s推出 0x%08X+0x%X"
+                     % (der["ram"]["basis"], ram_start, ram_size))
+    if not der["ram"]:
+        notes.extend(n for n in der["notes"] if n not in notes)
     ram = (ram_start, ram_start + ram_size - 1) if (ram_start and ram_size) else None
     flash = ((flash_start, flash_start + flash_size - 1)
              if (flash_start and flash_size) else None)
-    vf = _vector_entry_fact(dest, image, base, man, ram=ram, flash=flash)
+    vf = _vector_entry_fact(dest, image, base, man, ram=ram, flash=flash,
+                            derived_windows=tuple(derived))
     if vf is not None:
         facts["vector.entry"] = vf
     led = closure.evaluate(facts, claim=claim, source_mode=source_mode)
@@ -3634,6 +3750,18 @@ def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
                      "base": "0x%08X" % _manifest_chunk0(man)},
         "evidence_source": evidence_source,
         "claim": claim,
+        "windows": {"flash": ({"start": "0x%08X" % win["flash"]["start"],
+                               "size": "0x%X" % win["flash"]["size"],
+                               "basis": win["flash"]["basis"]}
+                              if win.get("flash") else None),
+                    "ram": ({"start": "0x%08X" % win["ram"]["start"],
+                             "size": "0x%X" % win["ram"]["size"],
+                             "basis": win["ram"]["basis"]}
+                            if win.get("ram") else None),
+                    "derived": derived,
+                    "note": ("推出来的窗口是下界（我们手上这些字节/节的范围），只用来把"
+                             "判据从 unverified 抬到 plausible；判 invalid 必须给器件级窗口"
+                             if derived else "窗口由调用方给")},
         "verify": {
             "ok": verify.get("ok"),
             "byte_identical": (verify.get("diff") or {}).get("byte_identical"),
@@ -3647,7 +3775,9 @@ def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
         },
         "notes": notes + (verify.get("notes") or [])[:4],
     })
-    out["limitations"] = led["limitations"] + [
+    out["limitations"] = led["limitations"] + ([] if not derived else [
+        "窗口 %s 是按布局推出来的下界（不是器件手册上的容量）：落在外面记未核，不判 invalid"
+        % "、".join(sorted(derived))]) + [
         "台账里的 authority 由采集它的那一层判定（verify/manifest/本层读字节）；"
         "本层只做一致性聚合，不额外取证",
     ]
