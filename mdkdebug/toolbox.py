@@ -84,6 +84,9 @@ TOOLSETS = {
         # 批次77：固件契约预检（只读）与「编译→烧录→串口等令牌」闭环入口。
         # 两者都围绕「这次烧进去的固件能不能自证跑起来了」，与编译烧录同场景。
         "firmware_precheck", "build_flash_verify",
+        # 批次78：镜像取证。与 build 同场景——「这一份产物/这一份 dump 到底是什么、
+        # 和刚才烧进去的是不是同一份」。image_carve 会写文件，所以不放在默认面上。
+        "image_inspect", "image_carve",
     },
     "serial": {
         "serial_list_ports", "serial_monitor_start", "serial_monitor_status",

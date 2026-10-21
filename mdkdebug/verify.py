@@ -28,6 +28,7 @@ VERDICTS = {
     "build_failed": "编译没通过：先改代码，别上板",
     "serial_unavailable": "串口不可用：**未烧录**（烧了也无法判定），先把串口搞定",
     "flash_failed": "烧录失败：这是探针/接线/供电/读保护的问题，**不是代码问题**",
+    "artifact_changed": "编译后被改写：烧录前发现产物字节与编译时不同，**本轮没有烧录**",
     "passed": "烧录后在串口收到了通过令牌（且有新鲜度证据）",
     "token_stale": "等到的令牌出现在烧录完成之前——那是旧固件还在刷，不算本次通过",
     "token_timeout": "串口有新增输出，但等不到通过令牌：测试可能没跑到输出点",
@@ -116,6 +117,12 @@ def run_closed_loop(*, build_fn=None, flash_fn=None, monitor_start_fn=None,
         _step("flash", f.get("ok", False), _brief(f), int((_t.time() - t0) * 1000))
         flash_done_t = _t.time()
         if not f.get("ok", False):
+            # 产物被改写不是"烧录失败"：探针可能是好的，问题在产物目录被并发写。
+            # 混在一起会让调用方去查接线/供电，方向完全错。
+            if str(f.get("verdict") or "") == "artifact_changed":
+                return _verdict("artifact_changed", flash=f,
+                                next_actions=list(f.get("next_actions") or []) or [
+                                    "先确认没有第二个 Keil/烧录工具在写产物目录，再重跑一次（本轮没烧录）。"])
             return _verdict(
                 "flash_failed", flash=f,
                 next_actions=["这是探针/接线/供电/读保护问题，**不要改源码**。",

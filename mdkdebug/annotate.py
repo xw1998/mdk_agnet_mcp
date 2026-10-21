@@ -99,6 +99,8 @@ READONLY = {
     # 固件契约预检（批次77）：只读工程文件与源码文本，查编码/字面量/令牌/
     # 调试信息是否具备；不写文件、不碰目标。
     "firmware_precheck",
+    # 镜像取证（批次78）：只读文件、只算哈希/熵/签名，不改任何东西。
+    "image_inspect",
 }
 
 # ----------------------------------------------------------------------
@@ -131,6 +133,8 @@ NON_IDEMPOTENT = {
     "uvprojx_edit", "batch", "batch_debug_script", "flash_debug",
     # 闭环入口：编译 + 烧录 + 等令牌，重复调用不是「只做一次的效果」。
     "build_flash_verify",
+    # 取件要求输出目录不存在：第二次调用必然失败，效果不等价于一次。
+    "image_carve",
     # 渲染默认每次生成一个带时间戳的新文件（重复调用会攒出多个页面），
     # 因此不是幂等——与 session_state 同口径。
     "view_render",
@@ -157,6 +161,8 @@ MUTATING = {
     "clear_watchpoint", "close_uvision", "dismiss_dialog", "dwt",
     "enter_debug", "exit_debug", "fill_mem", "flash_debug", "flash_download",
     "build_flash_verify",
+    # 取件会新建目录与文件（不改既有内容，但确实改变文件系统）
+    "image_carve",
     "itm_trace", "keil_command", "launch_uvision", "ocd_bp", "ocd_cmd",
     "ocd_control", "ocd_flash", "ocd_gdb", "ocd_load", "ocd_reg", "ocd_start",
     "ocd_stop", "ocd_wp", "ocd_write_mem", "profile_function",

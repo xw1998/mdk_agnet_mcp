@@ -41,6 +41,7 @@ from . import svd as _svd
 from . import uvprojx as _uvprojx
 from . import precheck as _precheck
 from . import verify as _verify
+from . import image as _image
 from . import session as _session
 from . import outctl as _outctl
 from . import toolchain as _toolchain
@@ -7293,14 +7294,49 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                     notes_pre.append("本机有 %d 个串口，未指定 port 时取了 %s；不对就带 port 重调"
                                      % (len(_ports), want))
 
+            # 产物身份（批次78）：编译出一份、烧进去一份，必须是**同一份字节**。
+            # 磁盘上同名同大小但内容不同（重编了一半 / 另一个 Keil 实例正在写 / 用户手改）
+            # 时，「编译通过、烧录成功、串口超时」会被读成代码缺陷。这里用 SHA-256 对账。
+            _art = {"before": None, "at_flash": None, "after": None}
+
+            def _snap_artifact():
+                try:
+                    arts = builder._find_artifacts(p)
+                except Exception:  # noqa: BLE001
+                    return None
+                for key in ("axf", "elf", "hex", "bin"):
+                    a = arts.get(key) or {}
+                    if a.get("path") and os.path.isfile(a["path"]):
+                        try:
+                            return {"kind": key, "path": a["path"],
+                                    "size": os.path.getsize(a["path"]),
+                                    "sha256": _image.sha256_file(a["path"])}
+                        except OSError:
+                            return None
+                return None
+
             def _build():
                 if uv4 is None:
                     return {"ok": False, "error": "未定位到 UV4.exe，请用 --uv4-path 指定"}
-                return builder.build_project(uv4, p, tgt, builder.DEFAULT_BUILD_TIMEOUT)
+                r = builder.build_project(uv4, p, tgt, builder.DEFAULT_BUILD_TIMEOUT)
+                if r.get("ok"):
+                    _art["before"] = _snap_artifact()
+                return r
 
             def _flash():
                 if uv4 is None:
                     return {"ok": False, "error": "未定位到 UV4.exe，请用 --uv4-path 指定"}
+                # 烧之前再取一次身份：与编译后那次不一致就**不烧**——
+                # 烧了也无法证明板上跑的是哪一份，只会多一次不可复核的副作用。
+                now = _snap_artifact()
+                _art["at_flash"] = now
+                before = _art["before"]
+                if before and now and before["sha256"] != now["sha256"]:
+                    return {"ok": False, "verdict": "artifact_changed",
+                            "error": "产物在编译后被改写：编译时 %s…，烧录前 %s…（%s）"
+                                     % (before["sha256"][:12], now["sha256"][:12], now["path"]),
+                            "next_actions": ["别再烧：先确认没有第二个 Keil/烧录工具在写产物目录，"
+                                             "然后重新 build_flash_verify（这一轮不烧录）"]}
                 # 注意：这里刻意**不走** flash_download 工具层的收尾逻辑——
                 # 那一步会在烧录后立刻 stop 目标（退出旧调试会话），可能把刚开机的启动输出截断。
                 # 收尾挪到 expect 之后再做。
@@ -7335,19 +7371,115 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 release_serial=bool(release_serial))
             if notes_pre:
                 out.setdefault("notes", []).extend(notes_pre)
+            # 产物对账结果（前后同一份才算「烧的就是编的」）
+            try:
+                _art["after"] = _snap_artifact()
+            except Exception:  # noqa: BLE001
+                _art["after"] = None
+            b, f_, a = _art["before"], _art["at_flash"], _art["after"]
+            if b or f_:
+                out["artifact"] = {
+                    "built": b,
+                    "at_flash": f_,
+                    "after_flash": a,
+                    "same_bytes_built_and_flashed": (
+                        bool(b and f_ and b["sha256"] == f_["sha256"]) if (b and f_) else None),
+                    "changed_after_flash": (bool(f_ and a and f_["sha256"] != a["sha256"])
+                                            if (f_ and a) else None),
+                }
+                if out["artifact"]["same_bytes_built_and_flashed"] is None:
+                    out.setdefault("limitations", []).append(
+                        "未取到编译后/烧录前的产物身份：本次无法证明「烧的就是刚编的那份」")
+                if out["artifact"]["changed_after_flash"]:
+                    out.setdefault("notes", []).append(
+                        "产物在烧录后又被改写（另一进程/编辑器在动产物目录）：本轮判定针对的是"
+                        "烧录前那份字节，磁盘上现存的已不是它")
             if out.get("verdict") == "passed":
                 _note_firmware_event("build_flash_verify")
                 fw = _record_flashed_firmware(p, tgt or "", "build_flash_verify")
                 if fw.get("symbol_rebind"):
                     out["symbol_rebind"] = fw["symbol_rebind"]
             # 判定做完再收尾旧调试会话（符号已过期），避免提前 stop 截断启动输出
-            if do_flash and out.get("verdict") not in ("flash_failed", "serial_unavailable"):
+            if do_flash and out.get("verdict") not in ("flash_failed", "serial_unavailable",
+                                                       "artifact_changed"):
                 try:
                     out["debug_session"] = _post_flash_debug_state(_get_client(), do_exit=True)
                 except Exception as e:  # noqa: BLE001
                     out["debug_session"] = {"error": str(e)}
             if release_serial:
                 _release_serial("build_flash_verify 收尾", out)
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="image_inspect",
+        title="镜像取证（axf / hex / bin 里到底是什么）",
+        description=(
+            "对一个**镜像文件**给出可复核的事实，不碰硬件、不改文件：\n"
+            "① **身份**：绝对路径 + 大小 + SHA-256（同一路径内容变了，结论就作废——"
+            "build_flash_verify 用它做 artifact_changed 判定）；\n"
+            "② **格式**：ELF（.axf/.elf）/ Intel HEX / 裸 bin。HEX 按扩展线性地址记录（type 04）"
+            "还原真实地址，报数据覆盖区间、空隙、地址重叠、校验和错误——"
+            "**不认 type 04 的解析器会把所有记录压到 0 附近**，镜像看着存在其实已经毁了；\n"
+            "③ **向量表**（Cortex-M 前 8 字节）：初值 SP、复位地址、Thumb 位。给了 flash_start/flash_size "
+            "与 ram_start/ram_size 才判**有效性**，否则判据是 unverified（**未知，不是无效**）："
+            "SP 必须在 RAM 内且 4 字节对齐、复位地址去 bit0 后在 Flash 内、bit0 必须为 1（否则进 HardFault）；\n"
+            "④ **内容画像**：分块香农熵（压缩/加密区近似 8）、内嵌签名（gzip/zlib/xz/bz2/lz4/zstd/"
+            "littlefs/FAT/PNG/JPEG/ZIP…）。压缩类命中会顺手试解压验证：只报「字节像」会把噪声当证据，"
+            "流校验失败的命中列为 stream_rejected 且不进 regions。\n"
+            "口径：签名命中是**观察**；区间长度是「到下一个签名」的**推导上界**"
+            "（size_basis=next_signature_upper_bound）；两者都不证明后面是合法分区或可运行代码。"
+            "只读工具。大文件只扫前 32 MiB 并明说。"
+        ),
+    )
+    async def image_inspect(path: str, base: int = 0, flash_start: int = -1,
+                            flash_size: int = 0, ram_start: int = -1,
+                            ram_size: int = 0, block: int = 1024,
+                            max_regions: int = 64) -> str:
+        try:
+            out = _image.inspect_image(
+                str(path or "").strip(),
+                base=int(base or 0),
+                flash_start=None if int(flash_start) < 0 else int(flash_start),
+                flash_size=int(flash_size or 0) or None,
+                ram_start=None if int(ram_start) < 0 else int(ram_start),
+                ram_size=int(ram_size or 0) or None,
+                block=int(block or 1024),
+                max_regions=int(max_regions or 64),
+            )
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="image_carve",
+        title="从镜像里取件（按签名/区间导出成文件）",
+        description=(
+            "把 image_inspect 报出的区间取成文件（例如从 Flash dump 里取出一段资源、"
+            "一个压缩包、一张图）。规则与取证口径一致：\n"
+            "① **输出目录必须不存在**——已有目录一律拒绝，绝不覆盖任何既有证据；"
+            "② 压缩类区间先**有界解压**再落盘，单文件/总量/文件数都有上限，超限如实进 gaps，"
+            "不悄悄截断当完整结果；\n"
+            "③ 每个文件落盘后回读 SHA-256 并与内存中的字节比对（sha256_verified），"
+            "source_range_basis 说明区间长度是**解压流真实消耗**还是**签名上界**；\n"
+            "④ 解压出来的内容与原文件字节**没有一一映射**（content_range 为 null）。\n"
+            "ids 为区间 id（逗号分隔，如 \"0,3\"）；signatures 为签名名（逗号分隔，如 \"gzip,png\"）；"
+            "两者都不给则取全部（受 max_files 限制）。HEX 是稀疏文本，需先转 bin。"
+        ),
+    )
+    async def image_carve(path: str, out_dir: str, ids: str = "",
+                          signatures: str = "", max_files: int = 32,
+                          max_file_bytes: int = 32 * 1024 * 1024) -> str:
+        try:
+            want_ids = [int(x) for x in str(ids or "").replace(" ", "").split(",") if x]
+            want_sigs = [x.strip() for x in str(signatures or "").split(",") if x.strip()]
+            out = _image.carve_image(
+                str(path or "").strip(), str(out_dir or "").strip(),
+                ids=want_ids or None, signatures=want_sigs or None,
+                max_files=int(max_files or 32),
+                max_file_bytes=int(max_file_bytes or 32 * 1024 * 1024),
+            )
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
