@@ -7601,6 +7601,60 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="recover_diff",
+        title="固件逆向：两版固件函数比对 / 库函数指纹识别（FID）",
+        description=(
+            "把两份镜像的函数集合配对：reference（通常是**带符号的 axf/elf**，或一份已存的"
+            "指纹库）与 target（通常是**剥离符号的新固件**，也可以是另一版本）。两条主用途：\n"
+            "① **版本比对**：哪个函数没变（basis=bytes）、哪个改过（basis=name 但 "
+            "bytes_equal=false）、哪些是新增/消失（only_left / only_right）；\n"
+            "② **库函数指纹识别（FID）**：拿带符号的库/旧版当指纹库，认出裸固件里哪些函数"
+            "是同一份代码（连带给出它们在库里的名字）。\n"
+            "判据（按顺序，每种 basis 的含义不同，别混读）：\n"
+            "- **basis=name**：两侧符号表写了同一个名字且各自唯一。这是**对应关系**，"
+            "不是「代码没变」——`bytes_equal` 才说明函数体字节是否相同（null 表示区间或"
+            "架构证据不足，判不了）；\n"
+            "- **basis=bytes**：函数体原始字节 SHA-256 相同，且区间**有证据**（符号长度或"
+            "沿控制流走到终止指令）、两侧长度相等、指纹在两侧都唯一、架构相同；\n"
+            "- **state=candidate / basis=insn_fingerprint**：规范化指令序列相同（代码地址"
+            "已归一）。这**只是候选**：可能是同一份代码被整体搬移，也可能是不同源码编出"
+            "同样的指令，不作等价断言；\n"
+            "- **unresolved**：指纹重复（一侧多条同指纹）的组，不做笛卡尔积展开；\n"
+            "- **only_left / only_right**：在本次两份清单里没有精确对应。重命名、内联、"
+            "strip、字节变动、发现不全都能解释，**不证明源码有增删**。\n"
+            "覆盖度永远报 inventory_complete=false：本工具不知道「本该有多少个函数」。\n"
+            "两侧共用一套 arch/endian/bits/thumb/entry（同一颗芯片的两个版本）；"
+            "两侧架构不同会直接报错，不做跨指令集比对。裸 bin 必须显式给 arch。\n"
+            "reference_sig / target_sig 可以直接给**已保存的指纹库**（省掉重复分析）；"
+            "save_reference_sig 把参考侧指纹库存盘复用（默认不覆盖既有库）。"
+        ),
+    )
+    async def recover_diff(reference: str, target: str,
+                           reference_sig: str = "", target_sig: str = "",
+                           save_reference_sig: str = "", overwrite_sig: bool = False,
+                           reference_base: int = 0, target_base: int = 0,
+                           arch: str = "", endian: str = "", bits: int = 0,
+                           thumb: bool = False, entry: int = 0,
+                           min_insns: int = 6, full: bool = False,
+                           max_rows: int = 40) -> str:
+        try:
+            out = _recover.compare_images(
+                str(reference or "").strip(), str(target or "").strip(),
+                reference_base=int(reference_base or 0),
+                target_base=int(target_base or 0),
+                reference_sig=str(reference_sig or "").strip(),
+                target_sig=str(target_sig or "").strip(),
+                save_reference_sig=str(save_reference_sig or "").strip(),
+                overwrite_sig=bool(overwrite_sig),
+                arch=str(arch or ""), endian=str(endian or ""), bits=int(bits or 0),
+                thumb=(None if not thumb else True), entry=int(entry or 0),
+                min_insns=int(min_insns or 6), full=bool(full),
+                max_rows=int(max_rows or 40))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="recover_project",
         title="固件逆向：生成能打开的工程骨架（.sct/.ld + 向量表 + 符号头 + 汇编）",
         description=(

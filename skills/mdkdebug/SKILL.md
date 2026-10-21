@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 210 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 211 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -181,6 +181,22 @@ thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
   `recover_project*` 一律拒并给替代动作（先链接，或先 `recover_probe` 看节与符号）。
 - PE 里的地址一律 `ImageBase + RVA`，`recover_disasm(addr=...)` 收的是**最终地址**。
 
+**两版固件比对 / 库函数指纹识别**（批次86）：`recover_diff(reference, target, ...)`。
+读法只有一条：**「名字对上了」和「代码对上了」是两件事**。
+- `basis="name"` 只是对应关系（两侧符号表同名且唯一），真正回答「代码没变」的是
+  `bytes_equal`：`true` / `false`（改过）/ `null`（区间或架构证据不足，判不了）。
+- `basis="bytes"` 才是字节相同，且要过四道：区间**有证据**（`size_trust` 为 `symtab`
+  或 `control_flow`，`guessed` 一律不进）、长度相等、指纹两侧唯一、架构相同。
+- `state="candidate"` / `basis="insn_fingerprint"` 是**线索不是结论**：指令序列规范化后
+  相同（代码内地址归一成 `<CODE>`），可能是整块搬移，也可能是不同源码编出同样指令。
+- `only_left` / `only_right` 只说「本次清单里没有精确对应」——重命名、内联、strip、
+  字节变动、发现不全都能解释，**不证明源码有增删**；`inventory_complete` 恒 `false`。
+- 重名/重指纹进 `unresolved`，工具**不展开**这些组的配对（`bx lr` 桩会炸出噪声）。
+- 建库：`save_reference_sig="x.sig.json"`（默认不覆盖，写了回读校验）；之后两侧都可以
+  用 `reference_sig` / `target_sig` 直接吃库，省掉重复分析。ar 归档不给建库（地址是节内偏移）。
+- 两侧共用一套 `arch/endian/bits/thumb/entry`；裸 bin 必须显式给 `arch`，
+  `*_base` 用于把裸固件的装载地址对齐到 axf 的地址空间。
+
 **关系层与类型层**（批次82/83）：`recover_symbols` / `recover_project` 的
 `report.json` 里另有 `relations`：`xref_counts`（call/branch/data_read/data_write）、
 `call_graph`（根/叶/环/深度）、`switch_counts`、`types`（栈槽/结构体候选/数组元素
@@ -247,7 +263,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 166 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 167 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。

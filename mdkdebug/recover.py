@@ -38,7 +38,7 @@ import os
 import re
 import struct
 
-from . import containers, reveng, rtypes
+from . import containers, fid, reveng, rtypes
 import subprocess
 
 # ---- 上限：都是「防呆」，不是「性能调优」 ----
@@ -1398,6 +1398,9 @@ def recover_functions(unit: Unit, *, deep: bool = True,
                            "array_elem_sizes", {})} if rel.get("types") else {}),
         },
         "_relations": rel,
+        # 批次86：指纹要用「指令 + 操作数」算规范化序列，重扫一遍纯属浪费；
+        # 这个字段只在内存里传给 fid，任何对外输出都会 pop 掉 _recover。
+        "_insns": (sweep or {}).get("insns") or {},
         "code_pointers": {"count": cps["count"], "truncated": cps["truncated"]},
         "notes": notes,
         "gaps": gaps,
@@ -3172,4 +3175,148 @@ def verify_project(project_dir: str, image: str = "", *, base: int = 0,
             "diff.diff_offsets 是 bin 内偏移；加上 base 才是地址",
             "长度不同（length_expected vs length_actual）通常是区域向上取整或原镜像有空洞",
         ]
+    return out
+
+
+# ----------------------------------------------------------------------
+# 批次86：库指纹与函数匹配（吸收 Ghidra FID / REA match_native_functions 的口径）
+# ----------------------------------------------------------------------
+def build_signature(path: str, base: int = 0, *, arch: str = "", endian: str = "",
+                    bits: int = 0, thumb: bool | None = None, entry: int = 0,
+                    deep: bool = True, max_functions: int = MAX_FUNCTIONS,
+                    max_insns: int = MAX_INSNS) -> dict:
+    """分析一份镜像 → 函数指纹库（不写盘；写盘用 :func:`save_signature`）。
+
+    指纹库的用途是 **FID**：拿一份**带符号**的 axf/elf 当「库」，去识别另一份
+    剥离了符号的固件里哪些函数是同一份代码。所以指纹必须能被独立保存、跨会话复用。
+    """
+    an = analyze(path, base=base, deep=deep, max_functions=max_functions,
+                 max_insns=max_insns, arch=arch, endian=endian, bits=bits,
+                 thumb=thumb, entry=entry)
+    if not an.get("ok"):
+        return an
+    unit = an.get("_unit")
+    if unit is None:
+        return {"ok": False,
+                "error": "这份输入没有单一地址空间（ar 归档的成员各自从节内偏移算起，"
+                         "不同成员会撞到同一个地址），出不了可比对的指纹库",
+                "hint": "先链接成 axf/elf；或对单个成员用 recover_disasm 看代码"}
+    rec = an.get("_recover") or {}
+    if not (rec.get("functions") or []):
+        return {"ok": False,
+                "error": "没有恢复出任何函数：没有可比对的对象",
+                "hint": "deep=true 会做线性反汇编找调用目标；裸 bin 记得给 arch（+entry）"}
+    idx = fid.index_functions(unit, rec["functions"], rec.get("_insns") or {},
+                              rec.get("string_refs") or [],
+                              notes=an.get("notes") or [])
+    sig = {k: idx[k] for k in ("format", "version", "arch", "container",
+                               "functions", "fingerprint_rule", "notes")}
+    return {
+        "ok": True,
+        "input": {"path": an.get("path"), "size": an.get("size"),
+                  "sha256": an.get("sha256")},
+        "container": an.get("container"),
+        "arch": an.get("arch"),
+        "counts": fid.side_coverage(idx["functions"]),
+        "sig": sig,
+        "limitations": (an.get("limitations") or []) + [
+            "指纹只覆盖**恢复出来的函数**：没有被识别成函数的字节不进指纹库，"
+            "所以「库里没有」不等于「固件里没有」",
+        ],
+        "gaps": an.get("gaps") or [],
+    }
+
+
+def save_signature(path: str, sig_path: str, *, base: int = 0, arch: str = "",
+                   endian: str = "", bits: int = 0, thumb: bool | None = None,
+                   entry: int = 0, deep: bool = True,
+                   max_functions: int = MAX_FUNCTIONS, max_insns: int = MAX_INSNS,
+                   overwrite: bool = False) -> dict:
+    """分析一份镜像并把指纹库写到 ``sig_path``（默认不覆盖既有库）。"""
+    b = build_signature(path, base, arch=arch, endian=endian, bits=bits, thumb=thumb,
+                        entry=entry, deep=deep, max_functions=max_functions,
+                        max_insns=max_insns)
+    if not b.get("ok"):
+        return b
+    w = fid.save_sig(sig_path, b["sig"],
+                     source={"input": b["input"], "container": b.get("container")},
+                     overwrite=overwrite)
+    if not w.get("ok"):
+        return w
+    return {"ok": True, "input": b["input"], "counts": b["counts"], "signature": w,
+            "limitations": b["limitations"]}
+
+
+def _sig_side(path: str, base: int, sig_path: str, *, arch: str, endian: str,
+              bits: int, thumb, entry, max_functions: int, max_insns: int) -> dict:
+    if sig_path:
+        s = fid.load_sig(sig_path)
+        if not s.get("ok"):
+            return s
+        return {"ok": True,
+                "sig": {k: s.get(k) for k in ("format", "version", "arch", "container",
+                                              "functions", "fingerprint_rule", "notes")},
+                "input": {"path": sig_path, "via": "signature-file",
+                          "source": s.get("source") or {}},
+                "container": s.get("container"),
+                "counts": fid.side_coverage(s.get("functions") or [])}
+    return build_signature(path, base, arch=arch, endian=endian, bits=bits,
+                           thumb=thumb, entry=entry, max_functions=max_functions,
+                           max_insns=max_insns)
+
+
+def compare_images(reference: str, target: str, *, reference_base: int = 0,
+                   target_base: int = 0,
+                   reference_sig: str = "", target_sig: str = "",
+                   save_reference_sig: str = "", overwrite_sig: bool = False,
+                   arch: str = "", endian: str = "", bits: int = 0,
+                   thumb: bool | None = None, entry: int = 0,
+                   min_insns: int = 6, max_functions: int = MAX_FUNCTIONS,
+                   max_insns: int = MAX_INSNS, full: bool = False,
+                   max_rows: int = 40) -> dict:
+    """比对两份镜像的函数集合（同一芯片的两个固件版本，或「带符号库 vs 裸固件」）。
+
+    每一侧都可以是**镜像路径**或**已保存的指纹库**（避免重复分析）。两侧的架构
+    参数共用一套（同一颗芯片的两个版本）——两侧架构不同会直接报错，不做跨指令集比对。
+    """
+    lb = _sig_side(reference, reference_base, reference_sig, arch=arch, endian=endian, bits=bits,
+                   thumb=thumb, entry=entry, max_functions=max_functions,
+                   max_insns=max_insns)
+    if not lb.get("ok"):
+        return {**lb, "side": "reference"}
+    rb = _sig_side(target, target_base, target_sig, arch=arch, endian=endian, bits=bits,
+                   thumb=thumb, entry=entry, max_functions=max_functions,
+                   max_insns=max_insns)
+    if not rb.get("ok"):
+        return {**rb, "side": "target"}
+    rep = fid.match(lb["sig"], rb["sig"], min_insns=int(min_insns or 6))
+    if not rep.get("ok"):
+        return rep
+    out = {
+        "ok": True,
+        "reference": {"input": lb["input"], "container": lb.get("container"),
+                      "counts": lb["counts"]},
+        "target": {"input": rb["input"], "container": rb.get("container"),
+                   "counts": rb["counts"]},
+        "counts": rep["counts"],
+        "coverage": rep["coverage"],
+        "fingerprint_rule": rep["fingerprint_rule"],
+        "limitations": rep["limitations"],
+    }
+    cap = 0 if full else max(1, int(max_rows or 40))
+    out["matches"] = rep["matches"] if not cap else rep["matches"][:cap]
+    out["matches_total"] = len(rep["matches"])
+    out["matches_truncated"] = bool(cap and len(rep["matches"]) > cap)
+    out["unresolved"] = rep["unresolved"]
+    out["unresolved_truncated"] = rep["unresolved_truncated"]
+    out["only_left"] = rep["only_left"] if not cap else rep["only_left"][:cap]
+    out["only_left_total"] = len(rep["only_left"])
+    out["only_right"] = rep["only_right"] if not cap else rep["only_right"][:cap]
+    out["only_right_total"] = len(rep["only_right"])
+    if save_reference_sig:
+        w = fid.save_sig(save_reference_sig, lb["sig"],
+                         source={"input": lb["input"],
+                                 "container": lb.get("container")},
+                         overwrite=overwrite_sig)
+        out["reference_signature"] = w
     return out

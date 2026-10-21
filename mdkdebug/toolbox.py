@@ -93,6 +93,9 @@ TOOLSETS = {
         # 批次80：字节精确的重链接工程 + 自证。recover_project_exact 会写文件、
         # recover_verify 会写 build/ 并调 armasm/armlink/UV4，两者都不进默认面。
         "recover_project_exact", "recover_verify",
+        # 批次86：库指纹与函数匹配（同一颗芯片两个版本的比对 / FID 库识别）。
+        # 只读，属逆向场景，不进默认面。
+        "recover_diff",
     },
     "serial": {
         "serial_list_ports", "serial_monitor_start", "serial_monitor_status",

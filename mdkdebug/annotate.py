@@ -103,6 +103,9 @@ READONLY = {
     "image_inspect",
     # 批次79：逆向的读操作——只解析字节，不改任何东西
     "recover_probe", "recover_symbols", "recover_disasm",
+    # 批次86：函数匹配/版本比对——只读两侧镜像并算指纹；只有显式给
+    # save_reference_sig 时才写一个 .sig.json（那一步由参数控制，不在默认路径上）。
+    "recover_diff",
 }
 
 # ----------------------------------------------------------------------

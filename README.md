@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.9）
+│   ├── __init__.py           # 包初始化（版本号 0.2.10）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -234,7 +234,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 210 个工具定义
+│   └── server.py             # MCP Server 与 211 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -283,9 +283,9 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **210** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **211** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
-- **MDK 族（110 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
+- **MDK 族（111 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
 - **非 MDK 族（68 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**、**任务表取名**，34 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 - **常驻元工具（6 个）**——`toolset`（工具面按需装载）/ `list_tools` / `capabilities` / `get_version` / `tools_groups` / `tools_load`：**永不被裁**，否则 AI 连工具清单都问不出来、也装不回来。
 - **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
@@ -621,13 +621,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-210 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 166 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+211 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 167 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 210 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 211 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -659,8 +659,8 @@ toolset(action="load",   toolsets="all")        # 一次全装 210 个（=full/*
 |---|---|---|---|---|
 | 默认（`core` 组 + 元工具，描述 `lean`） | 44 | 约 2.2 万 | **约 3.9 万**（−56%） | 不设环境变量 |
 | **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 6 千** | **约 1.5 万** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
-| `all`（全装，描述默认 `lean`） | 210 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
-| `all` + `MDKDEBUG_DESC=min` | 210 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
+| `all`（全装，描述默认 `lean`） | 211 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=min` | 211 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
 | 上述任一档 + `MDKDEBUG_DESC=full` | — | 逐字节还原全文 | — | 要逐字完整说明时 |
 
 - **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。
@@ -1125,7 +1125,7 @@ Ghidra 最有名的那个功能——把机器码变成类 C——批次84 吸�
 `adcs/sbc.w` 需要 C 位表达式，链断时猜一个进位就是静默错答案；宁可留一行
 `/* 未支持: sbc.w ... */` 并计数。
 
-接线方式（**不新增 MCP 工具**，仍是 210 个）：
+接线方式（**批次84 不新增 MCP 工具**；总数在批次86 变成 211，那是函数匹配用的 `recover_diff`）：
 
 - `recover_disasm(symbol="HAL_RCC_OscConfig", fmt="c")` —— 单个函数出伪 C；
 - `recover_project` 默认写一份 `src/pseudo_c.c`（`include_pseudo_c=False` 可关，
@@ -1179,6 +1179,57 @@ recover_disasm("fw.bin", addr=0x140001000, arch="x86_64")   # PE 里也能反汇
 **边界**：PE/COFF/Mach-O 的测试夹具是按各规范逐字段手造的（本机没有 MSVC / Mach-O 工具链），
 它们证明的是「按规范实现正确」，不证明「能解析真实世界所有变体」；S-record 那条用的是真
 `fromelf --m32` 产物，逐字节对得上 bin。
+
+### 库指纹与函数匹配（批次86，吸收 REA `match_native_functions` / Ghidra FID 的口径）
+
+两个最常见的现场问题：「这版固件和上一版到底改了什么」，以及「裸固件里这段代码是不是某份
+库里嵌进来的那个函数」。两者都要先回答「这两条记录能不能算同一个函数」——Ghidra FID 和
+REA 的 `match_native_functions` 给的是同一套答案：**分开记「名字对上了」和「代码对上了」**。
+批次86 把它落成 `mdkdebug/fid.py`（纯函数、零新增依赖）与工具 `recover_diff`：
+
+```python
+recover_diff(reference="old/mdk_test.axf", target="new/app.bin",
+             arch="arm", bits=32, thumb=True, reference_base=0, target_base=0x08000000)
+recover_diff(reference="lib.sig.json", target="app.bin")          # 复用已存的指纹库
+recover_diff(reference="old.axf", target="new.axf",
+             save_reference_sig="old.sig.json")                    # 把参考侧存成库
+```
+
+| `basis` | 含义 | 能不能说「代码没变」 |
+|---|---|---|
+| `name` | 两侧符号表写了同一个名字且各自唯一 | **不能**。这只是对应关系；`bytes_equal` 才回答字节是否相同（`true/false/null`，`null` = 区间或架构证据不足，判不了） |
+| `bytes` | 函数体原始字节 SHA-256 相同 | 能（在有证据的区间内） |
+| `insn_fingerprint`（`state="candidate"`） | 规范化指令序列相同（**代码区间内的地址归一成 `<CODE>`**，外设地址/立即数保留） | **不能**。只是候选：可能是同一份代码被整体搬移，也可能是不同源码编出同样的指令 |
+
+「有证据的区间」是这条判据的闸门。函数边界按三档记 `size_trust`：
+
+| `size_trust` | 来源 | 给出字节指纹 | 进字节配对 |
+|---|---|---|---|
+| `symtab` | 符号表里的真实 size | 是 | 是 |
+| `control_flow` | 沿控制流走到终止指令（返回 / 跳出本区间 / 间接跳转） | 是 | 是 |
+| `guessed` | 切到「下一个已知入口」 | **否** | **否**（防御到匹配层再守一次） |
+
+所以「FID 认 stripped 固件」这条路仍然通：控制流终点不算猜，只有「下个入口」才算。
+`bytes` 还要再过三道：两侧长度相等、指纹在两侧都唯一、架构相同。重名 / 重指纹的组进
+`unresolved`，**不展开笛卡尔积**（`bx lr` 桩满街都是，展开出来的配对全是噪声）。
+指令指纹另有 `min_insns`（默认 6）门槛，挡掉「两条指令满街都是」的候选。
+
+实测（`example_mdk_project` 的 `mdk_test.axf`，175 个函数）：
+
+| 场景 | 结果 |
+|---|---|
+| 自比对 | 174 matched（172 `by_name` + 2 `by_bytes`）+ 1 `candidate`（`ptr_08003446`，8 条指令） |
+| axf（带符号）vs 裸 bin（`fromelf --bin`，base `0x08000000`） | bin 侧 107 个函数 / 89 个可信边界；**21 个 `by_bytes`** 且 `addr_equal` 全为 true（认出 `__scatterload_*`、`_ll_udiv`、`__rt_memcpy_w`）；7 个候选；2 组 `duplicate_bytes`（1v3、12v6） |
+| 指纹库复用 | 存一次 `.sig.json`，之后两侧都能直接吃库，省掉重复分析 |
+
+判据写在报告里随结果一起走（`fingerprint_rule` 四条）。三条边界必须跟着结果一起读：
+
+- `only_left` / `only_right` 只表示「**在本次两份清单里**没有精确对应」，重命名、内联、strip、
+  字节变动、发现不全都能解释，**不证明源码有增删**；
+- 候选不是等价证明；
+- `coverage.inventory_complete` 恒为 `false`——本工具不知道「本该有多少个函数」。
+
+ar 归档（`.lib` / `.a`）拒绝建指纹库：成员是节内偏移、跨成员会撞地址，没有单一地址空间可比。
 
 ### 底层库
 

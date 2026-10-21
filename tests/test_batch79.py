@@ -463,15 +463,15 @@ def section_g():
         SV.create_server(port=15879, toolsets="all").list_tools())]
     core_names = [t.name for t in asyncio.run(
         SV.create_server(port=15879, toolsets="core").list_tools())]
-    check("G1 注册总数 210", len(all_names) == 210, len(all_names))
-    check("G2 build 组 26（含 6 个逆向工具）", len(TB.TOOLSETS["build"]) == 26,
+    check("G1 注册总数 211", len(all_names) == 211, len(all_names))
+    check("G2 build 组 27（含 7 个逆向工具）", len(TB.TOOLSETS["build"]) == 27,
           len(TB.TOOLSETS["build"]))
     check("G3 四个工具都在 build 组",
           {"recover_probe", "recover_symbols", "recover_disasm",
            "recover_project"} <= set(TB.TOOLSETS["build"]))
     check("G4 默认面仍是 44（逆向工具不进默认面，省上下文）",
           len(core_names) == 44, len(core_names))
-    check("G5 收起后是 166", len(all_names) - len(core_names) == 166,
+    check("G5 收起后是 167", len(all_names) - len(core_names) == 167,
           len(all_names) - len(core_names))
     check("G6 三个读操作在 READONLY，recover_project 在 MUTATING 且不在 DESTRUCTIVE",
           {"recover_probe", "recover_symbols", "recover_disasm"} <= AN.READONLY
