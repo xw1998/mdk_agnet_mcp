@@ -185,8 +185,27 @@ thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
 **寄存器级伪 C**（批次84，零额外依赖）：`recover_disasm(file, symbol="X", fmt="c")`
 把单个函数提升成寄存器级 C；`recover_project` 默认额外写 `src/pseudo_c.c`
 （`include_pseudo_c=false` 可关，`max_pseudo_c_functions` 默认 60）。读法：
-- 它保的是**表达式与跳转的语义**，不是原始源码：变量名就是 `r0..r12`，类型一律
-  `uint32_t` 起步。判「这函数干什么」够用，判「原作者怎么写的」不够用。
+- 它保的是**表达式与跳转的语义**，不是原始源码。批次92 起变量不再一律叫 `rN`：
+  依次尝试 `a0..a3`（入口四个参数位）→ `i` / `j`（回边里自增自己被 `cmp` 的计数器）→
+  `p0` / `p1`（基址，≥2 个不同非零偏移）→ `v<N>`。**这四个名字都是推断**，
+  判断依据写在返回的 `renamed[].basis` 里，别把 `p0` 当成「真的有个指针变量」。
+- 类型默认 `uint32_t`；只有当**消费这个值的指令**给出了单向证据才改成 `int32_t`
+  （`ldrsb/ldrsh/ldrsw`、`asr`、有符号比较分支…；`ldrb/ldrh`、`lsr`、无符号分支…
+  反推 unsigned）。两向证据都在 ⇒ `types.by_reg[..].signed = null` + `note`
+  写明冲突，**不猜**。看汇总用 `n_signed_vars` / `n_unknown_signed`。
+- 结构体**只给字段表不给结论**：`structs[]` 是「同一基址寄存器上 ≥2 个不同非零偏移」
+  的候选，字段宽度按访问指令的存取宽度推，成员名一律 `f_0x<off>`。还原原始
+  `struct` 与成员名做不到——类型信息在编译时就没了。
+- 内联**只能标边界不能反演**：`inline[]` 给的是「这段指令与另一个函数逐条指纹相同，
+  且窗口里有 `bl`」，两种情况（真内联 / 共享尾段）工具都承认，所以措辞是
+  「内联或共享尾段；两种情况都没有调用点可还原」。反内联做不到。
+- 跨函数只做**一层** `return` 直传：`flow.calls[]` 记每个调用点的实参来源
+  （`entry` / `ret:<函数>` / `reg:<N>` / `const`），`ipa.edges[]` 记「A 的返回值
+  经 C 传给 B」。不做全局变量传播、不做递归/多层归纳。
+- `cpsid/cpsie/bkpt/vmsr/msr/svc/dsb/isb` 只留注释并计数（`control[]`），
+  不参与数据流——它们不改任何寄存器值。
+- `rename=False`（`recover_disasm` / `recover_project` 的 `pseudo_c_rename`）逐字节
+  回到批次91 口径，出问题时的兜底开关。
 - `/* 未支持: <mnemonic> ... */` 是**故意降级**不是漏做（典型：进位链断了还碰
   `adc/sbc/rrx`）。看到它就说明这几行的语义不保真，别当等价代码用。
 - `flag_<cond>` 表示条件依赖的 flags 找不到生产者（上游是逻辑指令或跨块），

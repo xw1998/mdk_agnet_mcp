@@ -963,9 +963,443 @@ def _span(func, funcs, code_end) -> tuple:
     return start, min(max(end, start + 2), code_end)
 
 
+# ----------------------------------------------------------------------
+# 批次92：变量命名 / 符号性 / 结构体候选 / 内联边界 / 跨函数数据流
+#   每一项都是**推断**：所以每项都带 basis；证据冲突时给 unknown，不猜。
+# ----------------------------------------------------------------------
+_REG_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])r(\d+)(?![A-Za-z0-9_])")
+
+_LOAD_MN = {"ldr", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrd", "ldrex",
+            "ldrexb", "ldrexh", "ldrexd", "ldm", "ldmia", "ldmib", "ldmdb",
+            "pop", "ldrt", "ldrbt", "ldrht"}
+_STORE_MN = {"str", "strb", "strh", "strd", "strex", "strexb", "strexh",
+             "strexd", "stm", "stmia", "stmib", "stmdb", "push",
+             "strt", "strbt", "strht"}
+_ACCESS_WIDTH = {"ldrb": 1, "ldrsb": 1, "strb": 1, "ldrbt": 1, "strbt": 1,
+                 "ldrh": 2, "ldrsh": 2, "strh": 2, "ldrht": 2, "strht": 2,
+                 "ldrd": 8, "strd": 8, "ldrexd": 8, "strexd": 8,
+                 "ldrexb": 1, "strexb": 1, "ldrexh": 2, "strexh": 2}
+
+# 符号性证据：**只收「消费该值的指令」，不收「猜」**。
+_SIGNED_MN = {"ldrsb", "ldrsh", "sxtb", "sxth", "sxtb16", "asr", "asrs",
+              "sdiv", "sdivs", "smull", "smlal", "smmul", "smulbb", "smulwb",
+              "smmla", "ssat"}
+_UNSIGNED_MN = {"ldrb", "ldrh", "ldrbt", "ldrht", "uxtb", "uxth",
+                "uxtb16", "lsr", "lsrs", "udiv", "udivs", "umull", "umlal",
+                "usat"}
+_SIGNED_BR = {"bgt", "bge", "blt", "ble"}
+_UNSIGNED_BR = {"bhi", "bhs", "blo", "bls"}
+
+
+def _regnum(ins, reg_id) -> int:
+    """capstone 寄存器 id → 寄存器号（r0..r12 / sp=13 / lr=14 / pc=15 / -1 未知）。"""
+    try:
+        name = reveng._norm_reg(ins.reg_name(reg_id))
+    except Exception:                      # noqa: BLE001
+        return -1
+    name = _REG_ALIAS.get(name, name)
+    if len(name) > 1 and name[0] == "r" and name[1:].isdigit():
+        return int(name[1:])
+    return {"sp": 13, "lr": 14, "pc": 15}.get(name, -1)
+
+
+def _used_regs(insns) -> list:
+    """函数里出现过的寄存器号（按操作数扫，比 regs_access 完整——ldm/ldm.w 的
+    基址寄存器在寄存器表里未必列全，早先的 locals 声明因此漏掉过 r10）。
+
+    ``bl`` 在 capstone 里只有立即数操作数，但它隐式读 r0..r3、写 r0，
+    所以调用指令要单独补上这四个（否则「只做转发」的函数一个寄存器都用不到）。
+    """
+    used = set()
+    for ins in insns:
+        if _base_mn(ins.mnemonic) in ("bl", "blx"):
+            used.update((0, 1, 2, 3))
+        for op in ins.operands:
+            t = int(getattr(op, "type", 0))
+            if t == 1:
+                used.add(_regnum(ins, op.reg))
+            elif t == 3:
+                if getattr(op.mem, "base", 0):
+                    used.add(_regnum(ins, op.mem.base))
+                if getattr(op.mem, "index", 0):
+                    used.add(_regnum(ins, op.mem.index))
+    return sorted(n for n in used if n >= 0)
+
+
+def _accesses(insns) -> list:
+    """所有栈外访存：基址寄存器 / 偏移 / 宽度 / 读还是写。"""
+    out = []
+    for ins in insns:
+        base = _base_mn(ins.mnemonic)
+        store = base in _STORE_MN
+        if base not in _LOAD_MN and not store:
+            continue
+        width = _ACCESS_WIDTH.get(base, 4)
+        for op in ins.operands:
+            if int(getattr(op, "type", 0)) != 3:
+                continue
+            rn = _regnum(ins, op.mem.base) if getattr(op.mem, "base", 0) else -1
+            if rn < 0 or rn in (13, 15):
+                continue
+            out.append({"addr": ins.address, "reg": rn,
+                        "disp": int(op.mem.disp or 0), "width": width,
+                        "store": store, "mnemonic": ins.mnemonic})
+    return out
+
+
+def _signedness(insns) -> dict:
+    """寄存器号 → {"kind": signed/unsigned/unknown, "basis": [...]}。
+
+    证据只有两类真凭据：① 谁在读这个值（`asr`/`lsr`/`ldrsb`/`uxtb`…）；
+    ② 比较之后用哪种条件下的跳（`bgt` vs `bhi`）。两向证据都在 ⇒ unknown。
+    """
+    votes = {}
+
+    def say(rn, kind, why):
+        if rn is None or rn < 0:
+            return
+        votes.setdefault(int(rn), {"signed": [], "unsigned": []})[kind].append(why)
+
+    last_cmp = []
+    for ins in insns:
+        base = _base_mn(ins.mnemonic)
+        ops = list(ins.operands)
+        regs = [_regnum(ins, o.reg) for o in ops if int(getattr(o, "type", 0)) == 1]
+        dest = regs[0] if regs else -1
+        if base in _SIGNED_MN:
+            say(dest, "signed", base)
+        elif base in _UNSIGNED_MN:
+            say(dest, "unsigned", base)
+        elif base == "cmp":
+            last_cmp = [n for n in regs if 0 <= n < 13]
+        elif base in _SIGNED_BR or base in _UNSIGNED_BR:
+            kind = "signed" if base in _SIGNED_BR else "unsigned"
+            for n in last_cmp:
+                say(n, kind, "由 %s 判定" % base)
+    out = {}
+    for rn, v in votes.items():
+        s, u = v["signed"], v["unsigned"]
+        if s and not u:
+            out["r%d" % rn] = {"kind": "signed", "basis": s}
+        elif u and not s:
+            out["r%d" % rn] = {"kind": "unsigned", "basis": u}
+        else:
+            out["r%d" % rn] = {
+                "kind": "unknown",
+                "basis": ["证据冲突，不猜：有符号(%s) / 无符号(%s)"
+                          % (", ".join(s), ", ".join(u))]}
+    return out
+
+
+def _struct_candidates(acc) -> list:
+    """同一个基址寄存器上多个非零偏移 ⇒ 疑似结构体；等步长且步长==访问宽度 ⇒ 疑似数组。
+
+    只给「候选」与字段表（偏移/宽度/读写次数），不发明成员名。
+    """
+    by = {}
+    for a in acc:
+        by.setdefault(a["reg"], []).append(a)
+    out = []
+    for rn, items in sorted(by.items()):
+        disps = sorted({it["disp"] for it in items})
+        nonzero = [d for d in disps if d != 0]
+        if len(nonzero) < 2:
+            continue
+        fields = {}
+        for it in items:
+            f = fields.setdefault(it["disp"], {"offset": it["disp"], "reads": 0,
+                                               "writes": 0, "widths": set()})
+            f["writes" if it["store"] else "reads"] += 1
+            f["widths"].add(it["width"])
+        for f in fields.values():
+            f["width"] = max(f["widths"])
+            f.pop("widths", None)
+        steps = [b - a for a, b in zip(nonzero, nonzero[1:])]
+        widths = {fields[d]["width"] for d in nonzero}
+        kind, stride = "struct_candidate", None
+        if len(set(steps)) == 1 and steps[0] in widths:
+            kind, stride = "array_candidate", steps[0]
+        out.append({"base_reg": "r%d" % rn, "kind": kind, "stride": stride,
+                    "n_fields": len(fields),
+                    "fields": [fields[d] for d in sorted(fields)],
+                    "basis": "同一基址寄存器上 %d 个不同偏移（%s）"
+                             % (len(disps),
+                                ", ".join(_hex(d) for d in disps[:8]))})
+    return out
+
+
+def _loop_counters(insns) -> dict:
+    """回边范围内「自增自己 + 被 cmp 比较」的寄存器 → 计数器的证据文本。"""
+    at = {ins.address: k for k, ins in enumerate(insns)}
+    out = {}
+    for k, ins in enumerate(insns):
+        base = _base_mn(ins.mnemonic)
+        if _branch_cond(ins.mnemonic) is None and base not in ("cbz", "cbnz"):
+            continue
+        tgt = _target(ins)
+        if tgt is None or tgt > ins.address:
+            continue
+        j = at.get(tgt)
+        if j is None:
+            continue
+        for m in range(j, k):
+            x = insns[m]
+            b2 = _base_mn(x.mnemonic)
+            ops = list(x.operands)
+            if b2 in ("add", "adds", "sub", "subs") and len(ops) >= 2:
+                if int(getattr(ops[0], "type", 0)) != 1:
+                    continue
+                d = _regnum(x, ops[0].reg)
+                src = d
+                if len(ops) >= 3 and int(getattr(ops[1], "type", 0)) == 1:
+                    src = _regnum(x, ops[1].reg)
+                elif len(ops) == 2 and int(getattr(ops[1], "type", 0)) == 1:
+                    src = _regnum(x, ops[1].reg)
+                if d >= 0 and d == src:
+                    out.setdefault(d, "回边 0x%08X..0x%08X 里自增/自减自己"
+                                      % (tgt, ins.address))
+            elif b2 == "cmp" and ops and int(getattr(ops[0], "type", 0)) == 1:
+                d = _regnum(x, ops[0].reg)
+                if d in out:
+                    out[d] += "，并在循环内被 cmp 判定"
+    return out
+
+
+def _call_sites(unit, insns) -> list:
+    """每个 bl 点：目标 + 四个实参的来源（局部 copy-propagation，32 条指令窗口）。"""
+    out = []
+    for k, ins in enumerate(insns):
+        base = _base_mn(ins.mnemonic)
+        if base not in ("bl", "blx"):
+            continue
+        tgt = _target(ins) if base == "bl" else None
+        out.append({"addr": ins.address, "callee_addr": tgt,
+                    "callee": ("sub_%08X" % tgt) if tgt is not None else None,
+                    "args": [_arg_source(unit, insns, k, n) for n in range(4)]})
+    return out
+
+
+def _arg_source(unit, insns, k, rn) -> dict:
+    """从 bl 往前找最近一次写 rN 的指令 → 来源描述。找不到就是入口值。"""
+    for j in range(k - 1, max(-1, k - 32), -1):
+        ins = insns[j]
+        base = _base_mn(ins.mnemonic)
+        if base in ("bl", "blx"):
+            if rn == 0:                    # 只有 r0 被调用改写，r1..r3 按 AAPCS 保留
+                tgt = _target(ins) if base == "bl" else None
+                return {"kind": "return",
+                        "of": ("sub_%08X" % tgt) if tgt is not None else "blx",
+                        "addr_hex": "0x%08X" % ins.address}
+            continue
+        try:
+            _rd, wr = ins.regs_access()    # capstone 返回 (读到的, 写到的)
+        except Exception:                  # noqa: BLE001
+            return {"kind": "unknown"}
+        if rn not in {_regnum(ins, r) for r in wr}:
+            continue
+        ops = list(ins.operands)
+        if base in ("mov", "movs", "movw", "movt") and len(ops) >= 2:
+            t1 = int(getattr(ops[1], "type", 0))
+            if base in ("mov", "movs") and t1 == 1:
+                return {"kind": "copy", "of": "r%d" % _regnum(ins, ops[1].reg)}
+            if t1 == 2:
+                return {"kind": "const", "value": _hex(ops[1].imm)}
+        if base in _LOAD_MN:
+            mem = next((o for o in ops if int(getattr(o, "type", 0)) == 3), None)
+            if mem is not None:
+                return {"kind": "mem", "expr": _addr_text(unit, ins, mem)}
+        if base in ("add", "adds", "sub", "subs") and len(ops) >= 3:
+            return {"kind": "calc",
+                    "expr": "%s %s %s" % (_op_expr(unit, ins, ops[1]),
+                                          "+" if base.startswith("add") else "-",
+                                          _op_expr(unit, ins, ops[2]))}
+        return {"kind": "computed", "by": ins.mnemonic}
+    return {"kind": "entry"}
+
+
+def _arg_text(a) -> str:
+    k = a.get("kind")
+    if k == "const":
+        return "常量 %s" % a.get("value")
+    if k == "copy":
+        return "复制 %s" % a.get("of")
+    if k == "mem":
+        return "内存 %s" % a.get("expr")
+    if k == "calc":
+        return "算式 %s" % a.get("expr")
+    if k == "return":
+        return "%s 的返回值" % a.get("of")
+    if k == "computed":
+        return "%s 的结果" % a.get("by")
+    if k == "entry":
+        return "入口值"
+    return "未追踪"
+
+
+def _insn_fp(ins) -> tuple:
+    """位置无关的指令指纹：分支按相对位移比，寄存器按编号比。"""
+    base = _base_mn(ins.mnemonic)
+    ops = []
+    for o in ins.operands:
+        t = int(getattr(o, "type", 0))
+        if t == 1:
+            sh = getattr(o, "shift", None)
+            ops.append(("r", _regnum(ins, o.reg),
+                        int(getattr(sh, "type", 0) or 0),
+                        int(getattr(sh, "value", 0) or 0)))
+        elif t == 2:
+            v = int(o.imm or 0)
+            if (_branch_cond(ins.mnemonic) is not None
+                    or _base_mn(ins.mnemonic) in ("bl", "blx")):
+                v = v - ins.address        # 分支/调用按相对位移比，位置无关
+            ops.append(("i", v))
+        elif t == 3:
+            ops.append(("m",
+                        _regnum(ins, o.mem.base) if o.mem.base else -1,
+                        _regnum(ins, o.mem.index) if o.mem.index else -1,
+                        int(o.mem.disp or 0)))
+        else:
+            ops.append(("?",))
+    return (base,) + tuple(ops)
+
+
+def _inline_candidates(insns, funcs, start, end) -> list:
+    """内联**只能标边界与来源**：内联进来就是一串普通指令，没有调用点可还原。
+
+    两种证据：① 同函数内 4 条指令的窗口逐条等价（含分支/调用，排除纯模板重排）；
+    ② 另一个函数的整段区间落在本函数范围内。
+    """
+    out = []
+    win = 6                              # 4 条指令的窗口太容易巧合（重复的模板代码）
+    if len(insns) >= 2 * win:
+        seen = {}
+        for i in range(len(insns) - win + 1):
+            frag = insns[i:i + win]
+            # 内联函数体通常**含调用**；纯算术/纯访存的重复片段更可能是同一模板代码
+            if not any(_base_mn(x.mnemonic) in ("bl", "blx") for x in frag):
+                continue
+            seen.setdefault(tuple(_insn_fp(x) for x in frag), []).append(insns[i].address)
+        for fp, addrs in seen.items():
+            if len(addrs) < 2:
+                continue
+            gaps = [b - a for a, b in zip(addrs, addrs[1:])]
+            if min(gaps) < win * 2:        # 窗口互相重叠，是同一段代码不是两份
+                continue
+            out.append({"kind": "dup_window", "n_insns": win,
+                        "addrs_hex": ["0x%08X" % a for a in addrs[:4]],
+                        "basis": "同函数内 %d 段指令逐条等价（寄存器/立即数/位移一致）"
+                                 "⇒ 疑似内联或宏展开" % len(addrs)})
+    for f in funcs or []:
+        try:
+            fs = int(f.get("addr") or 0)
+            fe = int(f.get("end_addr") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not fs or not fe or (fs, fe) == (start, end):
+            continue
+        if start <= fs and fe <= end and (fe - fs) >= 8:
+            out.append({"kind": "contains_function",
+                        "name": f.get("name") or ("sub_%08X" % fs),
+                        "start_hex": "0x%08X" % fs, "end_hex": "0x%08X" % fe,
+                        "basis": "%s 的整段区间被本函数覆盖（内联或共享尾段；"
+                                 "两种情况都没有调用点可还原）"
+                                 % (f.get("name") or "").strip()})
+    return out[:8]
+
+
+def _name_registers(used, acc, signs, counters) -> tuple:
+    """寄存器 → 名字（带 basis）。命名阶梯：参数 a0..a3 / 计数器 i,j / 基址 p0,p1 / v<N>。"""
+    ptr = {}
+    for a in acc:
+        if a["disp"]:
+            ptr.setdefault(a["reg"], set()).add(a["disp"])
+    renames, picked, pi, ci = {}, [], 0, 0
+    for n in range(4):                     # 四个参数寄存器一律有 ABI 名字
+        renames["r%d" % n] = "a%d" % n     # （即使函数体没用到，签名里也要一致）
+        if n in used:
+            picked.append((n, "a%d" % n,
+                           "AAPCS：入口第 %d 个参数（调用方填，本函数没写它就是入口值）"
+                           % (n + 1)))
+    for n in used:
+        if n < 4 or n >= 13:
+            continue
+        if n in counters:
+            nm = "i" if ci == 0 else ("j" if ci == 1 else "i%d" % ci)
+            ci += 1
+            basis = counters[n]
+        elif len(ptr.get(n) or ()) >= 2:
+            nm = "p%d" % pi
+            pi += 1
+            basis = "疑似结构体/数组基址：%d 个不同偏移的访存（%s）" % (
+                len(ptr[n]), ", ".join(_hex(d) for d in sorted(ptr[n])[:6]))
+        else:
+            nm = "v%d" % n
+            basis = "命名证据不足，保留寄存器号（v=本函数内的临时量）"
+        renames["r%d" % n] = nm
+        picked.append((n, nm, basis))
+    vars_ = []
+    for n, nm, basis in sorted(picked):
+        sg = signs.get("r%d" % n) or {"kind": "unknown", "basis": []}
+        vars_.append({"reg": "r%d" % n, "name": nm,
+                      "type": "int32_t" if sg["kind"] == "signed" else "uint32_t",
+                      "signedness": sg["kind"],
+                      "signed_basis": sg.get("basis") or [],
+                      "basis": basis})
+    return renames, vars_
+
+
+def _apply_renames(code: str, renames: dict) -> str:
+    """把文本里的 rN 换成新名字。
+
+    两条边界：① 词边界替换（``L_0800…`` / ``sub_0800…`` 不会被误伤）；
+    ② **注释里不改**——注释是汇编注记，保持 rN 才能和反汇编对照。
+    """
+    if not renames:
+        return code
+    table = {int(k[1:]): v for k, v in renames.items()
+             if k.startswith("r") and k[1:].isdigit()}
+
+    def one(text):
+        return _REG_TOKEN_RE.sub(lambda m: table.get(int(m.group(1)), m.group(0)), text)
+
+    out, pos = [], 0
+    for m in re.finditer(r"/\*.*?\*/", code, re.S):
+        out.append(one(code[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(one(code[pos:]))
+    return "".join(out)
+
+
+def _analyse(unit, insns, *, funcs=None, start: int = 0, end: int = 0) -> dict:
+    """一次性算齐命名/类型/结构体/内联/调用点数据流（都带 basis）。"""
+    used = _used_regs(insns)
+    acc = _accesses(insns)
+    signs = _signedness(insns)
+    counters = _loop_counters(insns)
+    renames, vars_ = _name_registers(used, acc, signs, counters)
+    calls = _call_sites(unit, insns)
+    for cs in calls:                       # 实参来源里的寄存器名跟着改名
+        for a in cs["args"]:
+            of = a.get("of") or ""
+            if of.startswith("r") and of[1:].isdigit():
+                a["of_reg"] = of
+                a["of"] = renames.get(of, of)
+    structs = _struct_candidates(acc)
+    for st in structs:
+        st["base"] = renames.get(st["base_reg"], st["base_reg"])
+    return {"used": used, "renames": renames, "vars": vars_, "signs": signs,
+            "structs": structs, "calls": calls,
+            "inline": _inline_candidates(insns, funcs, start, end)}
+
+
 def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
-                       max_insns: int = 4000) -> dict:
-    """单个函数 → 伪 C 文本 + 统计。失败时返回 ``{"ok": False, "error": ...}``。"""
+                       max_insns: int = 4000, rename: bool = True) -> dict:
+    """单个函数 → 伪 C 文本 + 统计。失败时返回 ``{"ok": False, "error": ...}``。
+
+    ``rename=False`` 时不改名、不按推断类型声明（输出与批次91 逐字节一致，
+    用于对照与回归）。
+    """
     fam = (unit.arch or {}).get("family")
     if fam != "arm":
         return {"ok": False,
@@ -1042,16 +1476,12 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
             if t is not None:
                 loop_targets.add(t)
 
-    used = set()
-    for ins in insns:
-        try:
-            rd, wr = ins.regs_access()
-            used.update(reveng._norm_reg(ins.reg_name(r))
-                        for r in list(rd) + list(wr))
-        except Exception:                  # noqa: BLE001
-            pass
-    locals_ = ["r%d" % n for n in range(4, 13) if "r%d" % n in used]
-    if "lr" in used:
+    # 批次92：命名/符号性/结构体候选/内联边界/调用点数据流（全部带 basis）
+    ana = _analyse(unit, insns, funcs=funcs, start=start, end=end)
+    renames = ana["renames"] if rename else {}
+    used = set(ana["used"])                # 按操作数扫：ldm/ldm.w 的基址寄存器也算
+    locals_ = ["r%d" % n for n in range(4, 13) if n in used]
+    if 14 in used:
         locals_.append("lr")
     locals_.append("sp")
 
@@ -1060,18 +1490,49 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
     if not fn_name:
         fn_name = "sub_%08X" % start
 
+    var_by_reg = {v["reg"]: v for v in ana["vars"]}
+
+    def _vname(reg):
+        return renames.get(reg, reg)
+
+    params = []
+    for _n in range(4):
+        _v = var_by_reg.get("r%d" % _n) or {}
+        params.append("%s %s" % (_v.get("type") or "uint32_t", _vname("r%d" % _n)))
+    decls = {}
+    for _reg in locals_:
+        _v = var_by_reg.get(_reg) or {}
+        decls.setdefault(_v.get("type") or "uint32_t", []).append(_vname(_reg))
+    ana_lines = []
+    for st in ana["structs"][:3]:
+        ana_lines.append(" * %s 上 %d 个字段（%s）：%s" % (
+            st["base"], st["n_fields"], st["kind"],
+            ", ".join("[%s w%d 读%d 写%d]" % (_hex(f["offset"]), f["width"],
+                                              f["reads"], f["writes"])
+                      for f in st["fields"][:8])))
+    for c in ana["inline"][:2]:
+        ana_lines.append(" * 内联候选：%s" % c.get("basis"))
+
     lines = [
         "/* %s —— 0x%08X..0x%08X，%d 条指令 / %d 个基本块%s" % (
             fn_name, start, end, len(insns), len(blocks),
             "" if not skipped else " / %d 处坏字节已跳过" % skipped),
         " * 寄存器级伪 C（lifting）：表达式与控制流保真；类型/结构体/变量名是**推断**的，"
         "不是原始源码。",
-        " * bl 按 AAPCS 传当前 r0..r3（返回值落 r0）；栈访问用 sp 偏移表达式。 */",
-        "uint32_t %s(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3)" % fn_name,
+        " * bl 按 AAPCS 传当前前四个参数寄存器（返回值落第一个）；栈访问用 sp 偏移表达式。 */",
+    ] + ana_lines + [
+        "uint32_t %s(%s)" % (fn_name, ", ".join(params)),
         "{",
-        "    uint32_t %s;" % ", ".join(locals_),
-        "",
     ]
+    for _ty, _names in decls.items():
+        lines.append("    %s %s;" % (_ty, ", ".join(_names)))
+    for cs in ana["calls"][:8]:
+        _parts = ["a%d=%s" % (i, _arg_text(a))
+                  for i, a in enumerate(cs["args"][:4]) if a.get("kind") != "entry"]
+        lines.append("    /* 调用 0x%08X → %s(%s) */" % (
+            cs["addr"], cs["callee"] or "间接",
+            ", ".join(_parts) if _parts else "四个实参都是入口值"))
+    lines.append("")
     state = {"ret": False}
 
     def emit_body_lines(b, ind):
@@ -1177,6 +1638,8 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
             lines.append("L_%s: ;" % a)
     lines.append("}")
     code = "\n".join(lines) + "\n"
+    if renames:
+        code = _apply_renames(code, renames)
 
     uns = sorted(set(ctx["unsupported"]))
     notes = []
@@ -1217,6 +1680,20 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
             "n_flag_unresolved": ctx["flag_unresolved"],
             "n_switch_unresolved": ctx["switch_unresolved"],
             "n_outside_targets": len(missing),
+            "vars": ana["vars"],
+            "types": {"by_reg": {v["reg"]: v["type"] for v in ana["vars"]},
+                      "n_signed": sum(1 for v in ana["vars"]
+                                      if v["signedness"] == "signed"),
+                      "n_unknown": sum(1 for v in ana["vars"]
+                                       if v["signedness"] == "unknown"),
+                      "note": "类型由访问宽度与消费指令推断；镜像里没有调试信息，"
+                              "int vs unsigned 只在有消费指令作证时才区分，冲突时 unknown"},
+            "structs": ana["structs"],
+            "inline": ana["inline"],
+            "flow": {"n_calls": len(ana["calls"]), "calls": ana["calls"],
+                     "note": "实参来源按「最近一次写该寄存器」推断（32 条指令窗口）；"
+                             "不做跨函数的全局传播"},
+            "renamed": bool(renames),
             "notes": notes}
 
 
@@ -1293,8 +1770,47 @@ def _switch_index(ins) -> str:
 # ----------------------------------------------------------------------
 # 批量 / 文件
 # ----------------------------------------------------------------------
+def _ipa(items) -> dict:
+    """跨函数数据流的一层合成：调用边 + 「A 的返回值 → B 的实参」链。
+
+    只做一层（不再往下传播），因为实参来源本身已经是局部推断。
+    """
+    edges = {}
+    for it in items:
+        for cs in (it.get("flow") or {}).get("calls") or []:
+            key = (it["name"], cs.get("callee") or "间接")
+            e = edges.setdefault(key, {"caller": key[0], "callee": key[1],
+                                       "n_calls": 0, "addrs_hex": []})
+            e["n_calls"] += 1
+            if len(e["addrs_hex"]) < 8:
+                e["addrs_hex"].append("0x%08X" % cs["addr"])
+    by = {it["name"]: it for it in items}
+    chains = []
+    for it in items:
+        for cs in (it.get("flow") or {}).get("calls") or []:
+            for i, a in enumerate(cs.get("args") or []):
+                if a.get("kind") != "return":
+                    continue
+                src = by.get(a.get("of") or "")
+                dst = by.get(cs.get("callee") or "")
+                if src is None or dst is None:
+                    continue
+                chains.append({"from": src["name"], "via": it["name"],
+                               "to": dst["name"], "param": "a%d" % i,
+                               "text": "%s 的返回值经 %s 传给 %s 的 a%d"
+                                       % (src["name"], it["name"], dst["name"], i)})
+                if len(chains) >= 12:
+                    break
+            if len(chains) >= 12:
+                break
+    return {"n_edges": len(edges), "edges": list(edges.values()),
+            "chains": chains,
+            "note": "只做一层组合（被调函数返回值 → 另一被调函数的实参）；"
+                    "不做更深传播，也不跟踪全局变量"}
+
+
 def decompile(unit, funcs, *, max_funcs: int = 60, max_insns: int = 4000,
-              names=None, switches=None) -> dict:
+              names=None, switches=None, rename: bool = True) -> dict:
     """按函数清单批量出伪 C（默认最多 60 个，避免一次吐几 MB）。"""
     names = names or {}
     code_end = max((b for _, b in unit.code_ranges), default=None)
@@ -1304,7 +1820,8 @@ def decompile(unit, funcs, *, max_funcs: int = 60, max_insns: int = 4000,
     items, failed = [], []
     for f in funcs[:max_funcs]:
         r = decompile_function(unit, f, funcs=funcs, names=names,
-                               switches=switches, max_insns=max_insns)
+                               switches=switches, max_insns=max_insns,
+                               rename=rename)
         if not r.get("ok"):
             failed.append({"addr_hex": "0x%08X" % int(f.get("addr") or 0),
                            "name": f.get("name") or "", "error": r.get("error")})
@@ -1318,13 +1835,28 @@ def decompile(unit, funcs, *, max_funcs: int = 60, max_insns: int = 4000,
             "n_unsupported": sum(int(it.get("n_unsupported") or 0) for it in items),
             "unsupported": uns_all,
             "n_with_unsupported": sum(1 for it in items if it.get("unsupported")),
+            "n_renamed": sum(1 for it in items if it.get("renamed")),
+            "n_signed_vars": sum(int((it.get("types") or {}).get("n_signed") or 0)
+                                 for it in items),
+            "n_unknown_signed": sum(int((it.get("types") or {}).get("n_unknown") or 0)
+                                    for it in items),
+            "n_structs": sum(len(it.get("structs") or []) for it in items),
+            "n_inline": sum(len(it.get("inline") or []) for it in items),
+            "ipa": _ipa(items),
             "functions": items, "failed": failed,
             "limitations": [
                 "寄存器级伪 C：表达式与控制流保真，**类型/结构体/变量名是推断的**",
-                "bl 按 AAPCS 传当前 r0..r3；返回值在 r0（多返回值/浮点未建模）",
+                "bl 按 AAPCS 传当前前四个参数寄存器；返回值在第一个（多返回值/浮点未建模）",
                 "间接跳转（函数指针、未恢复的跳转表）保留为注释，不编造分支",
                 "只做「单块 if」与「单块 if/else」结构化；循环保留 goto 并标回边",
                 "函数范围外的跳转目标只补空标签（共享尾段/内联体不展开）",
+                "变量名按「参数 a0..a3 / 计数器 i,j / 基址 p0,p1 / 临时量 v<N>」推断，"
+                "注释里保留原始寄存器号便于对照汇编",
+                "类型是推断：访问宽度定 uintN_t，int vs unsigned 只看消费指令"
+                "（asr/ldrsb/bgt vs lsr/ldrb/bhi…），两向证据冲突时给 unknown，不猜",
+                "结构体只给字段候选表（偏移/宽度/读写次数），不发明成员名与嵌套结构",
+                "内联只标边界与来源——内联体就是一串普通指令，没有调用点可还原成 call",
+                "跨函数数据流只到「实参来源 + 一层返回值传递」，不做全局变量传播",
             ]}
 
 
@@ -1335,6 +1867,8 @@ def pseudo_c_file(results: dict, *, title: str = "recovered") -> str:
         " *",
         " * 这不是原始源码。证据链：指令 -> 表达式/控制流（保真）；",
         " * 类型名、结构体划分、变量名、注释（推断/缺失）。",
+        " * 变量名按参数/计数器/基址/临时量推断，注释里保留原始寄存器号；",
+        " * int vs unsigned 只在有消费指令作证时才区分，冲突处写 unknown。",
         " * 未提升的指令在源码里逐条留下「未支持」注释。",
         " */",
         "#include <stdint.h>",

@@ -116,13 +116,13 @@ def section_b():
           (res["n_functions"], res["n_failed"], res["n_unsupported"]))
 
     f = by["field_stuff"]["code"]
-    check("B1 ubfx 提升成「右移+掩码」", "(r0 >> 5) & 0x1FF" in f, f)
+    check("B1 ubfx 提升成「右移+掩码」", "(a0 >> 5) & 0x1FF" in f, f)
     check("B2 sbfx 提升成「左移+掩码+算术右移」",
           ">> (32 - 12)" in f and "(int32_t)" in f, f)
 
     f = by["mac"]["code"]
     check("B3 mla 提升成「加+乘」且不丢累加项",
-          "r0 = r0 + r1 * r2;" in f and "/* mla */" in f, f)
+          "a0 = a0 + a1 * a2;" in f and "/* mla */" in f, f)
 
     f = by["wide_mul"]["code"]
     check("B4 umull 提升成 64 位中间变量（无空括号 (uint64_t)()）",
@@ -135,12 +135,12 @@ def section_b():
 
     f = by["use_struct"]["code"]
     check("B6 访存宽度按指令给（uint32_t / uint16_t / uint8_t）",
-          "*(uint32_t *)(r0)" in f and "*(uint16_t *)(r0 + 0x4)" in f
-          and "*(uint8_t *)(r0 + 0x9)" in f, f)
+          "*(uint32_t *)(a0)" in f and "*(uint16_t *)(a0 + 0x4)" in f
+          and "*(uint8_t *)(a0 + 0x9)" in f, f)
 
     f = by["carry_flags"]["code"]
     check("B7 无符号比较标注出来、有符号才加 int32_t",
-          "r0 >= 0x10000 /* 无符号 */" in f, f)
+          "a0 >= 0x10000 /* 无符号 */" in f, f)
 
     f = by["it_block"]["code"]
     check("B8 IT 块展开成 if，且不出现裸条件码 if (eq)",
@@ -148,7 +148,7 @@ def section_b():
 
     f = by["swap32"]["code"]
     check("B9 3 操作数移位（移位量走操作数）不丢移位",
-          "(r0 >> 8) & 0xFF" in f and "(r2 << 16)" in f, f)
+          "(a0 >> 8) & 0xFF" in f and "(a2 << 16)" in f, f)
 
 
 # ==================================================================
@@ -159,7 +159,7 @@ def section_c():
     f = by["dispatch"]["code"]
     cases = [ln for ln in f.splitlines() if ln.strip().startswith("case ")]
     check("C1 tbb 跳转表恢复成 switch，8 个 case",
-          "switch (r0)" in f and len(cases) == 8, (len(cases), f[:400]))
+          "switch (a0)" in f and len(cases) == 8, (len(cases), f[:400]))
     labels = {ln.strip().rstrip(":") for ln in f.splitlines()
               if ln.strip().startswith("L_")}
     tgt = {ln.split("goto ")[1].split(";")[0] for ln in cases}
@@ -170,8 +170,8 @@ def section_c():
 
     f = by["sparse_switch"]["code"]
     check("C4 稀疏 switch 保留比较链（不硬造 switch）",
-          "switch (" not in f and "if (r0 == 0x1) goto" in f
-          and "if (r0 == 0x28) goto" in f, f)
+          "switch (" not in f and "if (a0 == 0x1) goto" in f
+          and "if (a0 == 0x28) goto" in f, f)
 
     f = by["while_loop"]["code"]
     check("C5 循环保留 goto 并标回边（不假装成 while）",
@@ -183,7 +183,7 @@ def section_c():
 
     f = by["divmod"]["code"]
     check("C7 单块 if 结构化（条件用相反条件包裹）",
-          by["divmod"]["n_structured"] >= 1 and "if (r1 != 0x0) {" in f, f)
+          by["divmod"]["n_structured"] >= 1 and "if (a1 != 0x0) {" in f, f)
 
     check("C8 夹具内没有「条件找不到 flags」的降级（结构自由但语义确定）",
           sum(it["n_flag_unresolved"] for it in res["functions"]) == 0)
@@ -331,7 +331,7 @@ def section_h():
     r = RC.disasm_at(FX, symbol="dispatch", fmt="c")
     check("H1 recover_disasm(fmt=c) 出伪 C 且带 format 标记",
           r.get("ok") and r.get("format") == "pseudo_c"
-          and "switch (r0)" in (r.get("code") or ""), list(r)[:6])
+          and "switch (a0)" in (r.get("code") or ""), list(r)[:6])
     check("H2 fmt=c 保留老字段（arch/span/input/notes/limitations）",
           r.get("arch") and (r.get("span") or {}).get("start_hex")
           and (r.get("input") or {}).get("sha256") and r.get("limits") is None,
