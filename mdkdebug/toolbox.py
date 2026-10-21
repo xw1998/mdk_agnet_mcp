@@ -99,6 +99,9 @@ TOOLSETS = {
         # 批次86：库指纹与函数匹配（同一颗芯片两个版本的比对 / FID 库识别）。
         # 只读，属逆向场景，不进默认面。
         "recover_diff",
+        # 批次88：闭环台账。默认会跑 recover_verify（写 build/、调 armasm/armlink/UV4），
+        # 不进默认面，也不进只读白名单。
+        "recover_ledger",
     },
     "serial": {
         "serial_list_ports", "serial_monitor_start", "serial_monitor_status",

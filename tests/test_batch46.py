@@ -418,10 +418,12 @@ def section_c():
     fake = FakeLink([_dhcsr()] * 100)
     restore = patch(fake)
     try:
-        r = call("watch_reset", duration_ms=200, interval_ms=50)
+        r = call("watch_reset", duration_ms=400, interval_ms=50)
     finally:
         restore()
-    check("C1 真 sleep 路径可用（约 200ms 窗口，采样 >=3 次）",
+    # 窗口 400ms 而非 200ms：全量回归是 4 路并发，机器满载时 200ms 窗只剩 2 次采样
+    # （数学期望 4~5 次），会把「真 sleep 路径可用」误判成失败。判据仍是「采样 >=3 次」。
+    check("C1 真 sleep 路径可用（约 400ms 窗口，采样 >=3 次）",
           r.get("ok") and r.get("pattern") == "none" and r.get("samples") >= 3, r)
 
     fake = FakeLink([_dhcsr()] * 100, flags=[b"\x00\x00\x00\x00"])

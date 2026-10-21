@@ -38,7 +38,7 @@ import os
 import re
 import struct
 
-from . import containers, fid, reveng, rtypes
+from . import closure, containers, fid, reveng, rtypes
 import subprocess
 
 # ---- 上限：都是「防呆」，不是「性能调优」 ----
@@ -3319,4 +3319,182 @@ def compare_images(reference: str, target: str, *, reference_base: int = 0,
                                  "container": lb.get("container")},
                          overwrite=overwrite_sig)
         out["reference_signature"] = w
+    return out
+
+# ----------------------------------------------------------------------
+# 批次88：固件恢复的闭环台账（吸收 REA obligation-ledger 的 fail-closed 口径）
+# ----------------------------------------------------------------------
+def _manifest_chunk0(man: dict) -> int:
+    """manifest 里第一个可加载区的起始地址（写成字符串或整数都要认）。"""
+    ch = (man.get("chunks") or [{}])[0]
+    v = ch.get("addr", man.get("base") or 0)
+    if isinstance(v, str):
+        return int(v, 16) if v.lower().startswith("0x") else int(v)
+    return int(v or 0)
+
+def _vector_words(image: str, base: int, project_dir: str) -> dict:
+    """取「原镜像可加载字节」的开头 8 字节，并给出它落在哪个地址上。
+
+    只做取字节，不做判断——判断在 :func:`_vector_entry_fact` 里，便于测试。
+    """
+    from . import image as _image  # noqa: PLC0415
+    if image and os.path.isfile(image):
+        data, err = _read_file(image)
+        if err:
+            return {"ok": False, "error": err.get("error")}
+        kind = detect_container(data[:4096])
+        if kind == "elf":
+            elf = parse_elf(data)
+            for seg in elf.get("segments") or []:
+                if int(seg.get("type") or 0) != 1 or int(seg.get("filesz") or 0) < 8:
+                    continue
+                off = int(seg["offset"])
+                addr = int(seg.get("paddr") or 0) or int(seg.get("vaddr") or 0)
+                return {"ok": True, "head": data[off:off + 8], "addr": addr,
+                        "source": "ELF 第一个 PT_LOAD（%s）" % os.path.basename(image)}
+            return {"ok": False, "error": "ELF 里没有足够长的 PT_LOAD 段：取不到向量表两个字"}
+        if kind in ("ihex", "srec"):
+            flat = _flat_image(data, kind, base)
+            if not flat.get("ok"):
+                return {"ok": False, "error": flat.get("error") or "稀疏文本解码失败"}
+            return {"ok": True, "head": (flat.get("data") or b"")[:8],
+                    "addr": int(flat.get("base") or 0),
+                    "source": "%s 解码后的首个数据字节" % kind}
+        return {"ok": True, "head": data[:8], "addr": int(base or 0),
+                "source": "裸 bin 的前 8 字节"}
+    # 没有原镜像时，只能靠 verify 抽出来的 build/original.bin（ELF 输入会留这份）
+    for name in ("original.bin",):
+        p = os.path.join(project_dir, "build", name)
+        if os.path.isfile(p):
+            with open(p, "rb") as f:
+                head = f.read(8)
+            return {"ok": True, "head": head, "addr": int(base or 0),
+                    "source": "verify 抽出的 build/%s（ELF 的 fromelf --bin 产物）" % name}
+    return {"ok": False, "error": "没有原镜像可取向量表两个字"}
+
+def _vector_entry_fact(project_dir: str, image: str, base: int, man: dict, *,
+                       ram=None, flash=None) -> dict | None:
+    """向量表义务的证据：原镜像 base 处的前两个字 + 工程首区确实从 base 起。
+
+    判据（全部要为真才算观察到）：
+      1. 工程第一块 ``.rec00`` 的起始地址 == 原可加载字节的首地址（否则向量表不在 base 上）；
+      2. ``image.check_vector_table`` 的 verdict 不是 ``invalid``
+         （SP 非 0/全 1、4 字节对齐、复位地址 bit0=1；给了 RAM/Flash 窗口才核落点）。
+    """
+    from . import image as _image  # noqa: PLC0415
+    w = _vector_words(image, base, project_dir)
+    if not w.get("ok"):
+        return None
+    head = w.get("head") or b""
+    if len(head) < 8:
+        return None
+    c0 = _manifest_chunk0(man)
+    vt = _image.check_vector_table(head[0:4], head[4:8], ram=ram, flash=flash)
+    base_ok = (int(w.get("addr") or 0) == c0)
+    note = ("原镜像 0x%08X 处 SP=%s reset=%s（判据 %s）；工程首区 .rec00 起始 0x%08X %s"
+            % (int(w.get("addr") or 0), vt["sp_hex"], vt["reset_hex"], vt["verdict"],
+               c0, "与之一致" if base_ok else "**不一致**：向量表不在工程首区上"))
+    if vt["verdict"] == "unverified":
+        note += ("；没有 RAM/Flash 窗口：SP 是否落在 RAM、复位地址是否落在 Flash 这两条"
+                 "判据是 None（未核），给了窗口才是 plausible")
+    value = bool(base_ok and vt["verdict"] != "invalid")
+    return {"value": value, "authority": "observed",
+            "source": "%s + image.check_vector_table" % w.get("source"),
+            "note": note,
+            "vector_table": {"addr": "0x%08X" % int(w.get("addr") or 0),
+                             "sp": vt["sp_hex"], "reset": vt["reset_hex"],
+                             "verdict": vt["verdict"], "checks": vt["checks"]}}
+
+def build_closure_ledger(project_dir: str, image: str = "", base: int = 0, *,
+                         verify_json: str = "", arm_bin: str = "",
+                         timeout_s: float = 240.0, skip_build: bool = False,
+                         via_uvprojx: bool = False, keep_build: bool = True,
+                         flash_start: int = 0, flash_size: int = 0,
+                         ram_start: int = 0, ram_size: int = 0) -> dict:
+    """对一份 ``recover_project_exact`` 产物出**闭环台账**：哪条义务被什么证据闭合。
+
+    三种取证方式（按证据强度从强到弱）：
+
+    1. 默认：跑 ``verify_project``（armasm+armlink+fromelf 或 UV4），拿到 observed 级证据；
+    2. ``verify_json=``：读一份**已保存的** verify 输出（证据复评，不重跑工具链）；
+    3. ``skip_build=true``：只盘点材料，不跑任何工具链（这时几乎没有义务能闭合）。
+
+    ``ready=true`` 的含义严格限定为：**这份固件的字节/布局/工具链链路被观察证据闭合**，
+    不表示它能跑（``runtime.bootable`` 恒为 unknown，除非另有一次上板观察）。
+    """
+    dest = os.path.abspath(project_dir)
+    man_path = os.path.join(dest, "manifest.json")
+    if not os.path.isfile(man_path):
+        return {"ok": False,
+                "error": "目录里没有 manifest.json：%s" % dest,
+                "hint": "台账只针对 recover_project_exact 的产物（有可重链接字节表那份）；"
+                        "骨架工程（recover_project）没有可量的字节表"}
+    try:
+        with open(man_path, "r", encoding="utf-8") as f:
+            man = json.load(f)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": "manifest.json 读不出来：%s" % exc}
+
+    notes: list = []
+    if verify_json:
+        p = os.path.abspath(verify_json)
+        if not os.path.isfile(p):
+            return {"ok": False, "error": "verify_json 不存在：%s" % p}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                verify = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "verify_json 读不出来：%s" % exc}
+        if not isinstance(verify, dict):
+            return {"ok": False, "error": "verify_json 不是 JSON 对象"}
+        evidence_source = "verify_json（复评已保存的证据，未重跑工具链）"
+        notes.append("证据来自 %s：本层没有重新取证，结论的强度取决于那次运行" % p)
+    elif skip_build:
+        verify = {}
+        evidence_source = "skip_build（只盘点材料，没跑工具链）"
+        notes.append("skip_build=true：没有重链接，所以字节一致/工具链两条义务都开不了")
+    else:
+        verify = verify_project(dest, image, base=base, arm_bin=arm_bin,
+                                timeout_s=timeout_s, keep_build=keep_build,
+                                via_uvprojx=via_uvprojx)
+        evidence_source = "recover_verify（本次实跑 %s）" % (
+            "UV4 -b" if via_uvprojx else "armasm+armlink+fromelf")
+
+    facts = closure.facts_from_verify(verify, manifest=man)
+    ram = (ram_start, ram_start + ram_size - 1) if (ram_start and ram_size) else None
+    flash = ((flash_start, flash_start + flash_size - 1)
+             if (flash_start and flash_size) else None)
+    vf = _vector_entry_fact(dest, image, base, man, ram=ram, flash=flash)
+    if vf is not None:
+        facts["vector.entry"] = vf
+    led = closure.evaluate(facts)
+
+    out = dict(led)
+    out.update({
+        "ok": True,
+        "ready": led["summary"]["ready"],
+        "project_dir": dest,
+        "image": os.path.abspath(image) if image else "",
+        "manifest": {"path": man_path, "digest": sha256_file(man_path),
+                     "name": man.get("name"), "format": man.get("format"),
+                     "input": man.get("input"),
+                     "base": "0x%08X" % _manifest_chunk0(man)},
+        "evidence_source": evidence_source,
+        "verify": {
+            "ok": verify.get("ok"),
+            "byte_identical": (verify.get("diff") or {}).get("byte_identical"),
+            "failed_step": verify.get("failed_step"),
+            "expected_source": verify.get("expected_source"),
+            "via": (verify.get("build") or {}).get("via"),
+            "error": verify.get("error"),
+            "hint": verify.get("hint"),
+            "steps": [{"step": s.get("step"), "ok": s.get("ok")}
+                      for s in (verify.get("steps") or [])],
+        },
+        "notes": notes + (verify.get("notes") or [])[:4],
+    })
+    out["limitations"] = led["limitations"] + [
+        "台账里的 authority 由采集它的那一层判定（verify/manifest/本层读字节）；"
+        "本层只做一致性聚合，不额外取证",
+    ]
     return out

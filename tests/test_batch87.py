@@ -280,7 +280,7 @@ def section_f():
     from mdkdebug import server as SV
     srv = SV.create_server(port=15897, toolsets="all")
     tools = {t.name: t for t in asyncio.run(srv.list_tools())}
-    check("F8 注册总数 212（批次87 +1）", len(tools) == 212, len(tools))
+    check("F8 注册总数 213（批次87 +1）", len(tools) == 213, len(tools))
     props = (tools.get("image_split").input_schema.get("properties") or {})
     check("F9 参数齐全（path/base/窗口/erase/阈值）",
           all(k in props for k in ("path", "base", "flash_start", "flash_size",

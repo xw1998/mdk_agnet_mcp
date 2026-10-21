@@ -7809,6 +7809,46 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="recover_ledger",
+        title="固件逆向：闭环台账——这份「恢复好的工程」到底有哪些义务被证据闭合了",
+        description=(
+            "对 recover_project_exact 的产物出**闭环台账**（吸收 REA obligation-ledger 的 fail-closed 口径）："
+            "把「恢复成功」拆成 8 条具名义务，每条要求特定强度的证据，逐条给 closed/open/failed/unknown/unsupported。\n"
+            "证据强度：unsupported < unknown < derived < observed；"
+            "**derived 不能闭合要求 observed 的义务**，unknown/unsupported **永不算通过**；"
+            "缺证据是 open 并附 required_next_evidence，failed 需要 observed 级反证。\n"
+            "三种取证：默认跑 recover_verify（armasm+armlink+fromelf 或 via_uvprojx）；"
+            "verify_json= 复评一份已保存的 verify 输出（不重跑工具链）；skip_build=true 只盘点材料。\n"
+            "ready=true 的严格含义：这份固件的**字节/布局/工具链链路**被观察证据闭合——"
+            "**不表示它能跑**（runtime.bootable 恒为 unknown，除非另有一次上板观察），"
+            "也**不表示它是好固件**；C 语义（类型/结构体/变量名/宏）恒为 unsupported（输入里根本没有这段信息）。\n"
+            "给 RAM/Flash 窗口（ram_start+ram_size / flash_start+flash_size）才能把向量表的"
+            "「SP 落在 RAM、复位地址落在 Flash」两条判据核完，否则判据只到 unverified。\n"
+            "输出 summary{ready,required_total,required_closed,closed,open,failed,unknown,unsupported,blocking_obligations}"
+            " + obligations[]（含 reason 与证据来源）+ closure_digest（可复算）+ manifest.digest。"
+            "默认会往 <project_dir>/build/ 写中间产物（不是只读工具）。"
+        ),
+    )
+    async def recover_ledger(project_dir: str, image: str = "", base: int = 0,
+                             verify_json: str = "", arm_bin: str = "",
+                             skip_build: bool = False, via_uvprojx: bool = False,
+                             flash_start: int = 0, flash_size: int = 0,
+                             ram_start: int = 0, ram_size: int = 0,
+                             timeout_s: float = 240.0) -> str:
+        try:
+            out = _recover.build_closure_ledger(
+                str(project_dir or "").strip(), str(image or "").strip(),
+                base=int(base or 0), verify_json=str(verify_json or "").strip(),
+                arm_bin=str(arm_bin or ""), skip_build=bool(skip_build),
+                via_uvprojx=bool(via_uvprojx),
+                flash_start=int(flash_start or 0), flash_size=int(flash_size or 0),
+                ram_start=int(ram_start or 0), ram_size=int(ram_size or 0),
+                timeout_s=float(timeout_s or 240.0))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="flash_debug",
         description=(
             "「关旧 Keil→编烧→开新→进调试」一体闭环：先关闭所有 Keil 实例（避免残留旧工程窗口导致调试到旧代码），"

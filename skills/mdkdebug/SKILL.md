@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 212 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 213 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -128,6 +128,7 @@ recover_disasm(file, symbol="main")          # 按符号或地址区间反汇编
 recover_project(file, out_dir="...")         # 出 sct/ld/头文件/startup/stub/反汇编/map/report
 recover_project_exact(file, out_dir="...")   # 出**字节精确可重链接**工程（armasm + sct + uvprojx）
 recover_verify(project_dir, image=file)      # 真工具链重链接，逐字节比对（byte_identical）
+recover_ledger(project_dir, image=file)      # 闭环台账：哪条义务被什么证据闭合了
 ```
 
 **先自证再用**：`recover_project_exact` 自己不说成功，判据是 `recover_verify` 的
@@ -211,6 +212,21 @@ flash_size=..., ram_start=..., ram_size=...)`。读法：
 - 只找 Cortex-M 向量表；RISC-V/ARM9 起点要靠 `recover_probe` 的容器证据。HEX 空隙被填
   0x00，**不据此**判擦除带。
 
+**恢复好之后**：`recover_ledger(project_dir, image=file, flash_start=..., flash_size=...,
+ram_start=..., ram_size=...)` 出**闭环台账**（批次88，吸收 REA obligation-ledger 的 fail-closed 口径）。
+读法只有三句话：
+
+- 8 条具名义务，每条要求特定证据强度：`unsupported < unknown < derived < observed`。
+  **derived 不能闭合要求 observed 的义务**；`unknown`（判不了）与 `unsupported`（做不到）
+  **永不算通过**，也不算失败；缺证据是 `open` 并附 `required_next_evidence`，
+  `failed` 必须有 observed 级反证。
+- `ready=true` 的含义严格限定为**字节/布局/工具链链路**被观察证据闭合：**不表示它能跑**
+  （`runtime.bootable` 恒 unknown），也不表示它是好固件；C 语义恒 `unsupported`。
+  没闭合就去看 `summary.blocking_obligations` 与那几条的 `reason`。
+- 三种取证：默认跑 `recover_verify`（真工具链）；`verify_json=` 复评一份已保存的 verify 输出
+  （不重跑，`closure_digest` 与实跑相同，可用于对账）；`skip_build=true` 只盘点材料。
+  不给 RAM/Flash 窗口时向量表判据只到 `unverified`（SP 落点与复位落点未核），台账会写在 reason 里。
+
 **关系层与类型层**（批次82/83）：`recover_symbols` / `recover_project` 的
 `report.json` 里另有 `relations`：`xref_counts`（call/branch/data_read/data_write）、
 `call_graph`（根/叶/环/深度）、`switch_counts`、`types`（栈槽/结构体候选/数组元素
@@ -277,7 +293,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 168 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 169 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。

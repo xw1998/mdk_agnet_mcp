@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.11）
+│   ├── __init__.py           # 包初始化（版本号 0.2.12）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -234,7 +234,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 212 个工具定义
+│   └── server.py             # MCP Server 与 213 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -283,10 +283,10 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **212** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **213** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
-- **MDK 族（112 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
-- **非 MDK 族（68 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**、**任务表取名**，34 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **MDK 族（121 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
+- **非 MDK 族（86 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**·**任务表取名**，34 个）/ **其余非 MDK 能力**（RTOS 分析、复位循环观测、分散加载文件、C 代码索引、可视化出图与 trace 统计，18 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 - **常驻元工具（6 个）**——`toolset`（工具面按需装载）/ `list_tools` / `capabilities` / `get_version` / `tools_groups` / `tools_load`：**永不被裁**，否则 AI 连工具清单都问不出来、也装不回来。
 - **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
 
@@ -621,13 +621,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-211 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 168 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+213 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 169 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 212 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 213 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -639,7 +639,7 @@ toolset(action="load",   toolsets="all")        # 一次全装 212 个（=full/*
 | `core` | 进出调试 / 运行控制 / 状态 / 跨会话状态 / 环境一致性体检、符号工程绑定、断点硬件残留校验、复位循环识别、可视化出图（38 个） |
 | `mem` | 内存与外设读写 / D-Cache 一致性维护（11 个） |
 | `symbol` | 符号与源码定位（7 个；`set_symbol_file`/`list_symbol_projects` 已上移 `core`） |
-| `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑 / 固件契约预检、闭环验证 / 镜像取证 / 固件逆向（骨架与字节精确复刻）（26 个） |
+| `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑 / 固件契约预检、闭环验证 / 镜像取证 / 固件逆向（骨架/字节精确复刻/镜像切分/闭环台账）（29 个） |
 | `serial` | 宿主机串口监听与命令应答 + Modbus 主站（14 个） |
 | `advanced` | 诊断 / 剖析 / SVD / 工程编辑 / 复位循环识别等进阶能力（26 个） |
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
@@ -659,8 +659,8 @@ toolset(action="load",   toolsets="all")        # 一次全装 212 个（=full/*
 |---|---|---|---|---|
 | 默认（`core` 组 + 元工具，描述 `lean`） | 44 | 约 2.2 万 | **约 3.9 万**（−56%） | 不设环境变量 |
 | **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 6 千** | **约 1.5 万** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
-| `all`（全装，描述默认 `lean`） | 212 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
-| `all` + `MDKDEBUG_DESC=min` | 212 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
+| `all`（全装，描述默认 `lean`） | 213 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=min` | 213 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
 | 上述任一档 + `MDKDEBUG_DESC=full` | — | 逐字节还原全文 | — | 要逐字完整说明时 |
 
 - **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。
@@ -1125,7 +1125,7 @@ Ghidra 最有名的那个功能——把机器码变成类 C——批次84 吸�
 `adcs/sbc.w` 需要 C 位表达式，链断时猜一个进位就是静默错答案；宁可留一行
 `/* 未支持: sbc.w ... */` 并计数。
 
-接线方式（**批次84 不新增 MCP 工具**；总数在批次86/87 变成 212，那是函数匹配用的 `recover_diff` 与镜像切分用的 `image_split`）：
+接线方式（**批次84 不新增 MCP 工具**；总数在批次86/87/88 变成 213，那是函数匹配的 `recover_diff`、镜像切分的 `image_split` 与闭环台账的 `recover_ledger`）：
 
 - `recover_disasm(symbol="HAL_RCC_OscConfig", fmt="c")` —— 单个函数出伪 C；
 - `recover_project` 默认写一份 `src/pseudo_c.c`（`include_pseudo_c=False` 可关，
@@ -1261,6 +1261,49 @@ Flash 窗口 `0x08000000 + 2 MiB`、RAM 窗口 `0x20000000 + 128 KiB`）：扫�
 - 两个镜像之间**没有擦除带**时，前一块的尾部数据会被算进前一块（`size_basis=next_vector_table`
   就是上界的意思）；
 - HEX 是稀疏文本，空隙被填 `0x00`，**不据此**判擦除带（会写进 `limitations`）。
+
+### 闭环台账（批次88，吸收 REA obligation-ledger 的 fail-closed 口径）
+
+`recover_project_exact` + `recover_verify` 已经能说清「重链接出来的字节和原镜像一样」，
+但一句话的 `byte_identical` 回答不了调用方真正的问题：**这份「恢复好的工程」到底证明了什么、
+还有什么没被证明、为什么没被证明。** `recover_ledger`（`mdkdebug/closure.py`，纯函数）把结论
+拆成 8 条**具名义务**，每条要求特定强度的证据：
+
+| 义务 | required | 要求证据 | 说明 |
+|---|---|---|---|
+| `artifact.identity` | 是 | observed | 被恢复的那份镜像有身份，且本次比的就是同一份（`path+size+SHA-256`） |
+| `build.toolchain` | 是 | observed | 生成的工程被真工具链编译链接过（`armasm+armlink` 或 `UV4 -b`） |
+| `bytes.loadable` | 是 | observed | 重链接产物与原镜像的**可加载字节**逐字节一致——这是判据本身 |
+| `vector.entry` | 是 | observed | 向量表的两个初始字取自原镜像字节（不是推断），且工程首区就在那个地址上 |
+| `layout.regions` | 是 | **derived** | 区域划分与装载地址一致——由字节一致**推出**，所以只要推导级 |
+| `symbols.addresses` | — | observed | 符号地址集合与原文对得上；本工具是对同一份输入分析的，**独立**符号原文拿不到就是 unknown |
+| `runtime.bootable` | — | observed | 上板跑起来；不接硬件就没有这条证据（unknown） |
+| `c.semantics` | — | observed | C 类型/结构体/变量名/宏；优化已擦除，输入里根本没有 → **unsupported** |
+
+证据强度 `unsupported < unknown < derived < observed`，只有「强度 ≥ 要求」**且证据本身通过**才 `closed`：
+
+- `derived` 证据**不能**闭合要求 `observed` 的义务（把推导卖成事实的第一步就在这里）；
+- `unknown`（判不了）与 `unsupported`（做不到）**都不算通过**，也都不算失败；
+- 缺证据是 `open` 并附 `required_next_evidence`；`failed` 需要 **observed 级反证**（推导级反证只能是 open）；
+- 任何 `failed`（含 optional）都让 `ready=false`——观察到反证不能靠数量摊平；
+- `closure_digest` 只由「义务 + 状态」决定：同一份证据重算得到同一个值（另有 `canonical_digest` 供对账）。
+
+三种取证方式：默认跑 `recover_verify`（真工具链）；`verify_json=` 复评一份**已保存的** verify 输出
+（不重跑工具链，digest 与实跑相同）；`skip_build=true` 只盘点材料（这时几乎没有义务能闭合）。
+
+实测（`example_mdk_project` 的 `mdk_test.axf` → `recover_project_exact` → 台账，给 RAM/Flash 窗口）：
+`ready=true`、`required_closed=5/5`，`vector.entry` 的判据是
+「原镜像 `0x08000000` 处 `SP=0x20000728` / `reset=0x080002E1`（`plausible`），工程首区 `.rec00` 起始
+`0x08000000` 与之一致」；同时 `c.semantics=unsupported`、`runtime.bootable=unknown`、
+`symbols.addresses=unknown`——**三条都不算通过**，也确实不该算。
+
+几条不能不说清的边界：
+
+- `ready=true` 的严格含义是**字节/布局/工具链链路**被观察证据闭合，**不表示它能跑**，也不表示它是好固件；
+- 义务清单就是「什么才算恢复成功」的定义：不在清单里的能力（中断优先级、外设初始化顺序、
+  时钟树）**没有任何证据**，别把 `ready` 当通用背书；
+- 不给 RAM/Flash 窗口时，向量表判据只到 `unverified`（SP 是否落在 RAM、复位地址是否落在 Flash 两条为 `None`），
+  台账会把这句限制写在 reason 里，而不是悄悄按通过处理。
 
 ### 底层库
 
