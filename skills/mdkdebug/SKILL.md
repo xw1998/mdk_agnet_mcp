@@ -249,6 +249,16 @@ thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
 - **可重定位目标（`.obj` / `ET_REL` / 库成员）不要拿去出工程**：地址是节内偏移，
   `recover_project*` 一律拒并给替代动作（先链接，或先 `recover_probe` 看节与符号）。
 - PE 里的地址一律 `ImageBase + RVA`，`recover_disasm(addr=...)` 收的是**最终地址**。
+- **读字节必须有出处，而且要能重读校验**（批次94）：`recover_disasm` 的输出多两项——
+  `source{file_offset_hex, span, requested, got, clipped, reason}` 说明这批字节从文件
+  哪个偏移读的、落在哪个映射段、有没有读不全；`address_map{container, base_hex,
+  base_applied, note, spans}` 说明 `base` 到底有没有生效。三条读法：
+  - `source.clipped=true`：请求越过了段尾/文件尾，**只拿到 `got` 字节**，原因在
+    `reason`。这时结果只覆盖到那儿，别当成「函数就这么长」。
+  - `address_map.base_applied=false` 是正常的：ELF/HEX 自带地址，`base` 对它们
+    **不叠加**（以前是静默忽略，调用方以为自己平移过了）；裸 bin 才是 `true`。
+  - 工具会**逐条回填校验**（解码用的字节 vs 按同一地址重读），不一致直接 `ok=false`
+    + `mismatches[]`。看到它别重试同一组参数，先看 `address_map.spans` 与 `base`。
 
 **两版固件比对 / 库函数指纹识别**（批次86）：`recover_diff(reference, target, ...)`。
 读法只有一条：**「名字对上了」和「代码对上了」是两件事**。

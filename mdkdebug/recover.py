@@ -470,6 +470,9 @@ class Unit:
             "why": "HEX/BIN 没有 ELF 头：CPU 只能由调用方指定或从向量表推断",
         }
         self.limitations = []
+        # 批次94：base 到底有没有生效必须能自证（ELF/HEX/S-record 自带地址）
+        self.base_applied = (not elf)
+        self.base_note = ""
         self._build_spans()
         if elf is None:
             self._infer_arch_from_vectors()
@@ -520,17 +523,61 @@ class Unit:
         self.code_ranges.sort()
 
     # ---- 地址访问 ----
-    def offset_of(self, addr: int):
+    def _locate(self, addr: int):
+        """地址 → ``(file_offset, 该段内还能连续读到多少字节, 段起点, 段终点)``。
+
+        **base 只在这里应用一次**：span 的起点里已经含 base（见 ``_build_spans``），
+        所以传进来的地址就是最终地址，这里不再做任何平移。找不到返回
+        ``(None, 0, None, None)``。
+        """
         for start, end, off in self.spans:
             if start <= addr < end:
-                return off + (addr - start)
-        return None
+                return off + (addr - start), end - addr, start, end
+        return None, 0, None, None
+
+    def offset_of(self, addr: int):
+        off, _avail, _s, _e = self._locate(addr)
+        return off
 
     def read(self, addr: int, n: int) -> bytes:
-        off = self.offset_of(addr)
+        """读 ``[addr, addr+n)``。**不跨地址空洞**：只读到所在段的结尾。
+
+        批次94 之前这里是 ``data[off:off+n]`` 裸切片：一旦 ``addr`` 靠近段尾，切片会
+        **越过段边界**，把文件里紧邻的其它节的字节当成这些地址的字节返回，而标签仍是
+        原地址——指令流、分支目标、字面量池全错位，调用方却看不出任何异常。
+        需要知道「为什么短了」用 :meth:`read_ex`。"""
+        return self.read_ex(addr, n)["data"]
+
+    def read_ex(self, addr: int, n: int) -> dict:
+        """带出处的读：``{data, file_offset, span, requested, got, clipped, reason}``。
+
+        ``file_offset`` 是这批字节在**文件里**的偏移（不是地址），用于自证；
+        ``clipped`` 为真表示请求越过了所在段/文件尾，``reason`` 说明原因，
+        调用方**必须**把这种情况透出去，不能当成读到了完整数据。
+        """
+        n = int(n or 0)
+        addr = int(addr)
+        off, avail, sp_start, sp_end = self._locate(addr)
         if off is None:
-            return b""
-        return self.data[off:off + n]
+            return {"data": b"", "file_offset": None, "span": None,
+                    "requested": n, "got": 0, "clipped": False,
+                    "reason": "地址 0x%08X 不在镜像映射范围内" % addr}
+        take = min(n, avail, max(0, len(self.data) - off))
+        data = self.data[off:off + take]
+        out = {"data": data, "file_offset": off,
+               "span": {"start_hex": "0x%08X" % sp_start,
+                        "end_hex": "0x%08X" % sp_end},
+               "requested": n, "got": len(data), "clipped": len(data) < n,
+               "reason": ""}
+        if len(data) < n:
+            if off + take >= len(self.data):
+                out["reason"] = ("读到文件末尾：只返回 %d 字节（文件总长 %d），请求 %d 字节"
+                                  % (len(data), len(self.data), n))
+            else:
+                out["reason"] = ("读越了所在段（0x%08X..0x%08X）的末尾：只返回段内 %d 字节，"
+                                  % (sp_start, sp_end, len(data))
+                                  + "**不把文件里紧邻的其它节当成这些地址的字节**")
+        return out
 
     def in_code(self, addr: int) -> bool:
         return any(a <= addr < b for a, b in self.code_ranges)
@@ -551,13 +598,25 @@ class Unit:
 def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
     kind = detect_container(data[:4096])
     if kind == "elf":
-        return Unit(data, name, base=base, elf=parse_elf(data))
+        unit = Unit(data, name, base=base, elf=parse_elf(data))
+        unit.base_applied = False
+        if base:
+            unit.base_note = ("ELF 自带地址映射：base=0x%08X **被忽略**（不叠加），"
+                              "地址一律取自 sh_addr/p_vaddr" % int(base))
+        return unit
     if kind in ("ihex", "srec"):
         flat = _flat_image(data, kind, base)
         if not flat.get("ok"):
             raise ValueError(flat.get("error", "HEX/S-record 解析失败"))
         unit = Unit(flat["data"], name, base=flat["base"])
         unit.container = kind
+        unit.base_applied = (kind == "srec" and bool(base))
+        if kind == "ihex":
+            unit.base_note = ("HEX 自带记录地址（min_offset=0x%08X）：base **被忽略**"
+                              "（不叠加）" % int(flat["base"] or 0))
+        elif base:
+            unit.base_note = ("S-record 记录地址整体平移 base=0x%08X（**只应用一次**）"
+                              % int(base))
         if kind == "srec":
             info = flat.get("srec") or {}
             if info.get("entry"):
@@ -580,11 +639,18 @@ def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
             raise ValueError(parsed.get("error", "%s 解析失败" % kind))
         unit = Unit(data, name, base=base, elf=parsed)
         unit.container = kind
+        unit.base_applied = False
+        if base:
+            unit.base_note = ("%s 自带地址映射：base=0x%08X **被忽略**（不叠加）"
+                              % (kind.upper(), int(base)))
         for n in parsed.get("notes") or []:
             unit.limitations.append(n)
         return unit
     unit = Unit(data, name, base=base)
     unit.container = kind
+    unit.base_applied = True
+    unit.base_note = ("raw %s 没有自带地址：base=0x%08X 作为基地址**只应用一次**"
+                      % (kind.upper(), int(base)))
     return unit
 
 
@@ -741,6 +807,58 @@ def _branch_target(mnemonic: str, op_str: str):
     return None
 
 
+def _source_of(rd: dict, unit: Unit) -> dict:
+    """把一次 :meth:`Unit.read_ex` 的出处整理成给调用方看的 ``source``。
+
+    ``file_offset`` 是文件偏移、``span`` 是这次地址落在哪个映射段；
+    ``clipped`` 为真时必须读 ``reason``——数据没读全，结论不能照用。
+    """
+    sp = rd.get("span") or {}
+    off = rd.get("file_offset")
+    return {"file_offset": off,
+            "file_offset_hex": ("0x%X" % off) if off is not None else None,
+            "span": sp, "requested": rd.get("requested"),
+            "got": rd.get("got"), "clipped": bool(rd.get("clipped")),
+            "reason": rd.get("reason") or "",
+            "container": unit.container,
+            "base_applied": bool(getattr(unit, "base_applied", False)),
+            "base_note": getattr(unit, "base_note", "")}
+
+
+def _address_map(unit: Unit) -> dict:
+    """这次反汇编用的地址映射：容器 + base 有没有生效 + 段清单。
+
+    批次94：ELF/HEX/S-record 自带地址，``base`` 对它们**不叠加**；
+    以前是静默忽略（调用方以为平移过了），现在明写 ``base_applied``。
+    """
+    return {"container": unit.container,
+            "base_hex": "0x%08X" % int(unit.base or 0),
+            "base_applied": bool(getattr(unit, "base_applied", False)),
+            "note": getattr(unit, "base_note", ""),
+            "spans": ["0x%08X..0x%08X(file 0x%X)" % (a, b, o)
+                      for a, b, o in unit.spans[:32]]}
+
+
+def readback_mismatches(unit: Unit, items) -> list:
+    """逐条核对「解码用的字节」与「按同一地址从文件重读的字节」。
+
+    ``items`` 是 ``[(addr, size, bytes_hex), ...]``；返回不一致清单（最多 8 条），
+    空清单 = 全部一致。批次94：这是「读错偏移却照常报 ok」的兜底。
+    """
+    bad = []
+    for addr, size, hexs in items:
+        chk = unit.read_ex(addr, size)
+        if chk["data"].hex() != (hexs or ""):
+            off = chk.get("file_offset")
+            bad.append({"addr_hex": "0x%08X" % addr, "decoded": hexs or "",
+                        "reread": chk["data"].hex(),
+                        "file_offset_hex": ("0x%X" % off) if off is not None else None,
+                        "reason": chk["reason"] or "重读字节与解码字节不同"})
+            if len(bad) >= 8:
+                break
+    return bad
+
+
 def disassemble(unit: Unit, start: int, end: int, *, md=None,
                 max_insns: int = MAX_INSNS, with_regs: bool = False) -> dict:
     """反汇编 ``[start, end)``。capstone 缺失/架构不支持时**明确报错**。
@@ -753,10 +871,13 @@ def disassemble(unit: Unit, start: int, end: int, *, md=None,
         md, why = _make_cs(unit.arch)
         if md is None:
             return {"ok": False, "error": why}
-    blob = unit.read(start, end - start)
+    got = unit.read_ex(start, end - start)
+    blob = got["data"]
     if not blob:
-        return {"ok": False, "error": "地址 0x%08X 不在镜像的映射范围内" % start,
-                "addr_hex": "0x%08X" % start}
+        return {"ok": False, "error": got["reason"] or
+                "地址 0x%08X 不在镜像的映射范围内" % start,
+                "addr_hex": "0x%08X" % start,
+                "source": _source_of(got, unit)}
     try:
         md.detail = True
     except Exception:  # noqa: BLE001
@@ -799,15 +920,34 @@ def disassemble(unit: Unit, start: int, end: int, *, md=None,
             pos = min(pos + unit_size, len(blob))
             addr = start + pos
             skipped += 1
+    # ---- 字节回填校验（批次94）----
+    # 解码用的字节必须能**按同一地址从文件里重新读到**、且逐字节相同。
+    # 这是「读错偏移却照常报 ok」的兜底：整体平移、跨段拼接都会在这里立刻对不上，
+    # 宁可 ok=False 也不给一份看着正常的错汇编。
+    bad = readback_mismatches(unit, [(x["addr"], x["size"], x["bytes"])
+                                     for x in insns])
+    if bad:
+        return {"ok": False,
+                "error": "字节回填校验失败：反汇编用的字节与按地址从文件重读的字节不一致"
+                         "（读错偏移或跨段拼接都会这样），指令流/分支目标/字面量池都不可信",
+                "start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end,
+                "mismatches": bad, "source": _source_of(got, unit),
+                "hint": "先用 recover_probe 核对 base 与地址映射（address_map.base_applied）："
+                        "ELF/HEX/S-record 自带地址，base 对它们不叠加"}
     out_skipped = skipped
     out = {"ok": True, "start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end,
            "count": len(insns), "truncated": truncated, "insns": insns,
-           "undefined_skips": out_skipped, "consumed": addr - start}
+           "undefined_skips": out_skipped, "consumed": addr - start,
+           "source": _source_of(got, unit)}
     if out_skipped:
         out["notes"] = ["有 %d 处无法解码的字节已跳过（指令对齐处继续），"
                         "该处指令未纳入结果" % out_skipped]
     if truncated:
         out["gaps"] = [{"reason": "指令数超过 %d 上限，反汇编在该点截断" % max_insns}]
+    if got.get("clipped"):
+        out["notes"] = (out.get("notes") or []) + [
+            "只读到 0x%X 字节（请求 0x%X）：%s"
+            % (got["got"], got["requested"], got["reason"])]
     return out
 
 
@@ -2430,6 +2570,7 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
                         "sha256": sha256_bytes(data)}
         one["arch"] = unit.arch
         one["span"] = {"start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end}
+        one["address_map"] = _address_map(unit)
         one["notes"] = note + (one.get("notes") or [])
         # 调用约定按家族写：ARM 是 AAPCS（r0..r3），RISC-V/MIPS 是各自 ABI
         from . import lift_isa as _lisa           # noqa: PLC0415
@@ -2458,6 +2599,7 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
                   "sha256": sha256_bytes(data)}
     r["arch"] = unit.arch
     r["span"] = {"start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end}
+    r["address_map"] = _address_map(unit)
     r["notes"] = note + (r.get("notes") or [])
     cps = find_code_pointers(unit)
     names = {}

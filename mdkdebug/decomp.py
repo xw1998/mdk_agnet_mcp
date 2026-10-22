@@ -223,6 +223,14 @@ def _it_conds(mn: str, op: str) -> list:
 # ----------------------------------------------------------------------
 # 取指
 # ----------------------------------------------------------------------
+def meta_src(rd: dict) -> dict:
+    """``read_ex`` 的出处（批次94）：伪 C 也要能说清「这些字节是从文件哪儿读的」。"""
+    off = rd.get("file_offset")
+    return {"file_offset_hex": ("0x%X" % off) if off is not None else None,
+            "requested": rd.get("requested"), "got": rd.get("got"),
+            "clipped": bool(rd.get("clipped")), "reason": rd.get("reason") or ""}
+
+
 def _decode(unit, start: int, end: int, *, max_insns: int = 4000):
     """反汇编 ``[start, end)``，返回 **capstone 指令对象**（要 operands 细节）。
 
@@ -233,9 +241,12 @@ def _decode(unit, start: int, end: int, *, max_insns: int = 4000):
     md, why = _make_cs(unit.arch)
     if md is None:
         return None, 0, why, {}
-    blob = unit.read(start, end - start)
+    from .recover import readback_mismatches     # 批次94：字节回填校验
+    rd = unit.read_ex(start, end - start)
+    blob = rd["data"]
     if not blob:
-        return None, 0, "地址 0x%08X 不在镜像的映射范围内" % start, {}
+        return None, 0, (rd.get("reason") or
+                         "地址 0x%08X 不在镜像的映射范围内" % start), {}
     md.detail = True
     insns, skipped = [], 0
     step = 2 if (unit.arch.get("thumb") or unit.arch.get("family") == "riscv") else 4
@@ -251,10 +262,18 @@ def _decode(unit, start: int, end: int, *, max_insns: int = 4000):
         if not got or pos < len(blob):
             pos = min(pos + step, len(blob))
             skipped += 1
+    # 批次94：解码用的字节必须能按同一地址从文件重读（读错偏移/跨段拼接的兜底）。
+    # 放在翻译之前：这里还是 capstone 对象，bytes 是原样的机器码。
+    bad = readback_mismatches(unit, [(i.address, i.size, i.bytes.hex())
+                                     for i in insns])
+    if bad:
+        return None, 0, ("字节回填校验失败：解码用的字节与按地址从文件重读的字节不一致"
+                         "（读错偏移或跨段拼接都会这样），指令流/字面量池都不可信"), \
+            {"mismatches": bad, "source": meta_src(rd)}
     # 批次93：非 ARM 家族先把指令翻成「ARM 形状的 IR」，再进同一套提升器；
     # MIPS 的分支延迟槽在这里整组提到分支之前（否则伪 C 的顺序是错的）。
     meta = {"family": (unit.arch or {}).get("family") or "arm",
-            "delay_slots_hoisted": 0}
+            "delay_slots_hoisted": 0, "source": meta_src(rd)}
     if meta["family"] in ("riscv", "mips"):
         from . import lift_isa             # noqa: PLC0415
         groups = [lift_isa.normalise(unit, i) for i in insns]
@@ -1500,7 +1519,11 @@ def decompile_function(unit, func, *, funcs=None, names=None, switches=None,
     sw_err = ""
     insns, skipped, why, meta = _decode(unit, start, end, max_insns=max_insns)
     if insns is None:
-        return {"ok": False, "error": why}
+        out = {"ok": False, "error": why}
+        if (meta or {}).get("mismatches"):
+            out["mismatches"] = meta["mismatches"]
+            out["source"] = meta.get("source")
+        return out
     if not insns:
         return {"ok": False, "error": "0x%08X 处没有指令" % start}
     names = names or {}
