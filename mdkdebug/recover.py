@@ -461,6 +461,14 @@ class Unit:
         self.container = "elf" if elf else "bin"   # elf/pe/coff/macho/ihex/srec/bin/ar
         self.entry_hint = 0     # 调用方显式指定的入口（raw bin 靠它，不靠猜）
         self.base = int(base or 0)
+        # 批次95：调用方**原样传进来**的 base（不做任何平移）——它与「实际用的 base」
+        # 是两件事（S-record 会把它加到记录地址上；ELF/HEX 则完全不用它）。
+        # 报错现场最常见的一句话是「我传了 X，它却用了 Y」，所以两个值都必须回显。
+        self.base_received = int(base or 0)
+        # 批次95：「实际用来寻址的基地址」。raw BIN 等于 base；HEX/S-record
+        # 等于展开后的记录起始地址；ELF/PE 等等于容器里的最低段地址。
+        self.base_used = int(base or 0)
+        self.base_source = "arg"      # arg / container / container+arg
         self.relocatable = bool(elf and elf.get("relocatable"))
         self.spans = []          # [(start, end, file_offset)] 覆盖的地址区间
         self.code_ranges = []    # [(start, end)] 可执行区间
@@ -599,7 +607,10 @@ def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
     kind = detect_container(data[:4096])
     if kind == "elf":
         unit = Unit(data, name, base=base, elf=parse_elf(data))
+        unit.base_received = int(base or 0)
+        unit.base_used = min((a for a, _b, _o in unit.spans), default=0)
         unit.base_applied = False
+        unit.base_source = "container"
         if base:
             unit.base_note = ("ELF 自带地址映射：base=0x%08X **被忽略**（不叠加），"
                               "地址一律取自 sh_addr/p_vaddr" % int(base))
@@ -610,7 +621,10 @@ def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
             raise ValueError(flat.get("error", "HEX/S-record 解析失败"))
         unit = Unit(flat["data"], name, base=flat["base"])
         unit.container = kind
+        unit.base_received = int(base or 0)
+        unit.base_used = int(flat["base"] or 0)
         unit.base_applied = (kind == "srec" and bool(base))
+        unit.base_source = "container+arg" if kind == "srec" else "container"
         if kind == "ihex":
             unit.base_note = ("HEX 自带记录地址（min_offset=0x%08X）：base **被忽略**"
                               "（不叠加）" % int(flat["base"] or 0))
@@ -639,7 +653,10 @@ def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
             raise ValueError(parsed.get("error", "%s 解析失败" % kind))
         unit = Unit(data, name, base=base, elf=parsed)
         unit.container = kind
+        unit.base_received = int(base or 0)
+        unit.base_used = min((a for a, _b, _o in unit.spans), default=0)
         unit.base_applied = False
+        unit.base_source = "container"
         if base:
             unit.base_note = ("%s 自带地址映射：base=0x%08X **被忽略**（不叠加）"
                               % (kind.upper(), int(base)))
@@ -825,18 +842,90 @@ def _source_of(rd: dict, unit: Unit) -> dict:
             "base_note": getattr(unit, "base_note", "")}
 
 
+def _base_check(unit: Unit) -> dict:
+    """raw BIN 的 base 自检：按这个 base 读到的前 8 字节像不像 Cortex-M 向量表？
+
+    只对「没有自带地址」的容器有意义——ELF/HEX 的地址来自容器，不靠 base 猜。
+    **只做提示，不改任何结果**：工具不会替你换 base，但要让「base 差一页」
+    在输出里看得见，而不是等调用方从一堆看着正常的指令里发现。
+    """
+    if getattr(unit, "base_source", "arg") != "arg":
+        return {"applicable": False,
+                "why": "容器自带地址（%s）：地址不靠 base 猜，本自检不适用"
+                       % unit.container}
+    fam = (unit.arch or {}).get("family")
+    if fam not in ("arm", "unknown", None):
+        return {"applicable": False,
+                "why": "架构是 %s：向量表约定是 Cortex-M 的，本自检不适用" % fam}
+    head = unit.read_ex(unit.base, 8)["data"]
+    if len(head) < 8:
+        return {"applicable": True, "verdict": "too_short",
+                "why": "镜像在该地址起不足 8 字节：连向量表都不完整"}
+    sp = int.from_bytes(head[0:4], "little")
+    reset = int.from_bytes(head[4:8], "little")
+    sp_ok = (sp & 3) == 0 and 0x10000000 <= sp <= 0x40000000
+    reset_in = unit.base <= (reset & ~1) < unit.base + len(unit.data)
+    good = sp_ok and reset_in and bool(reset & 1)
+    out = {"applicable": True,
+           "sp_hex": "0x%08X" % sp, "sp_plausible": sp_ok,
+           "reset_hex": "0x%08X" % reset, "reset_thumb_bit": bool(reset & 1),
+           "reset_in_image": reset_in,
+           "verdict": ("looks_like_cortex_m_vector_table" if good
+                       else "not_a_vector_table"),
+           "basis": "按 base 读到的前 8 字节（SP、复位地址），只做提示不参与判定"}
+    if not good:
+        out["hint"] = ("按这个 base 读到的前 8 字节不像 Cortex-M 向量表：base 差一页"
+                       "或差整段都会这样。工具**不会**自动改 base——请核对 "
+                       "address_map.base_received_hex（你传的）与 base_hex（实际用的）")
+    return out
+
+
+def _base_conflict(unit: Unit) -> dict:
+    """容器自带地址 与 调用方传的 base 不一致时，把两个值摆出来。
+
+    这种情况 base **按设计不叠加**（ELF/HEX），但「我传了 0x08005000 它却用了
+    0x08004000」读起来就像工具忽略了参数——所以必须显式报，而不是只写在 note 里。
+    """
+    got = int(getattr(unit, "base_received", 0) or 0)
+    if not got or getattr(unit, "base_source", "arg") != "container":
+        return {}
+    used = int(getattr(unit, "base_used", unit.base) or 0)
+    if got == used:
+        return {}
+    return {"argument_hex": "0x%08X" % got,
+            "container_hex": "0x%08X" % used,
+            "delta": used - got,
+            "note": "%s 自带地址（容器里写的就是 0x%08X）：你传的 base=0x%08X "
+                    "被**忽略、不叠加**。两者相差 %d 字节（0x%X）——若你预期的"
+                    "镜像起始地址是后者，说明容器记录/ELF 头写的是另一个地址，"
+                    "不是 base 没生效"
+                    % (unit.container, used, got, used - got, abs(used - got))}
+
+
 def _address_map(unit: Unit) -> dict:
     """这次反汇编用的地址映射：容器 + base 有没有生效 + 段清单。
 
     批次94：ELF/HEX/S-record 自带地址，``base`` 对它们**不叠加**；
     以前是静默忽略（调用方以为平移过了），现在明写 ``base_applied``。
+    批次95：再把「到货的 base」与「实际用的 base」分开报，并给容器冲突与向量表自检。
     """
-    return {"container": unit.container,
-            "base_hex": "0x%08X" % int(unit.base or 0),
-            "base_applied": bool(getattr(unit, "base_applied", False)),
-            "note": getattr(unit, "base_note", ""),
-            "spans": ["0x%08X..0x%08X(file 0x%X)" % (a, b, o)
-                      for a, b, o in unit.spans[:32]]}
+    out = {"container": unit.container,
+           "base_hex": "0x%08X" % int(
+               getattr(unit, "base_used", unit.base) or 0),
+           "base_received_hex": "0x%08X" % int(
+               getattr(unit, "base_received", 0) or 0),
+           "base_source": getattr(unit, "base_source", "arg"),
+           "base_applied": bool(getattr(unit, "base_applied", False)),
+           "note": getattr(unit, "base_note", ""),
+           "spans": ["0x%08X..0x%08X(file 0x%X)" % (a, b, o)
+                     for a, b, o in unit.spans[:32]]}
+    chk = _base_check(unit)
+    if chk:
+        out["base_check"] = chk
+    conf = _base_conflict(unit)
+    if conf:
+        out["base_conflict"] = conf
+    return out
 
 
 def readback_mismatches(unit: Unit, items) -> list:
@@ -2494,6 +2583,11 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
               thumb: bool | None = None) -> dict:
     """按「符号名」或「地址区间」反汇编一段。符号找不到时**列出可选名字**再报错。
 
+    输出里 ``input`` 回显**调用方原样传进来的参数**（path/size/sha256/base/start/end），
+    ``address_map`` 说**实际用了什么**（base_received_hex vs base_hex、base_source、
+    容器冲突、向量表自检）。两者分开报是刻意的：「我传了 X 它却用了 Y」这类现场，
+    没有回显就只能靠猜。
+
     ``fmt`` 给 ``c`` / ``pseudo`` 时不返回指令表，而是返回**寄存器级伪 C**
     （批次84 的 lifting）：表达式与控制流保真，类型/结构体/变量名是推断。
     """
@@ -2505,6 +2599,7 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
         return {"ok": False,
                 "error": "这是库归档（.lib/.a），成员是独立目标文件："
                          "先用 recover_project 取出成员，再对该成员反汇编"}
+    arg_start, arg_end = int(start or 0), int(end or 0)
     try:
         unit = _unit_from_data(data, path, base)
     except ValueError as e:
@@ -2567,10 +2662,17 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
             return one
         one["format"] = "pseudo_c"
         one["input"] = {"path": os.path.abspath(path), "size": len(data),
-                        "sha256": sha256_bytes(data)}
+                        "sha256": sha256_bytes(data),
+                        "base_received_hex": "0x%08X" % int(base or 0),
+                        "start_received_hex": "0x%08X" % int(arg_start or 0),
+                        "end_received_hex": "0x%08X" % int(arg_end or 0),
+                        "symbol": symbol or ""}
+        one["address_map"] = _address_map(unit)
+        if one["address_map"].get("base_conflict"):
+            one["notes"] = (one.get("notes") or []) + [
+                "base 冲突：%s" % one["address_map"]["base_conflict"]["note"]]
         one["arch"] = unit.arch
         one["span"] = {"start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end}
-        one["address_map"] = _address_map(unit)
         one["notes"] = note + (one.get("notes") or [])
         # 调用约定按家族写：ARM 是 AAPCS（r0..r3），RISC-V/MIPS 是各自 ABI
         from . import lift_isa as _lisa           # noqa: PLC0415
@@ -2595,11 +2697,21 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
     r = disassemble(unit, start, end, max_insns=max_insns)
     if not r.get("ok"):
         return r
+    r["address_map"] = _address_map(unit)
     r["input"] = {"path": os.path.abspath(path), "size": len(data),
-                  "sha256": sha256_bytes(data)}
+                  "sha256": sha256_bytes(data),
+                  "base_received_hex": "0x%08X" % int(base or 0),
+                  "start_received_hex": "0x%08X" % int(arg_start or 0),
+                  "end_received_hex": "0x%08X" % int(arg_end or 0),
+                  "symbol": symbol or ""}
+    if r["address_map"].get("base_conflict"):
+        r["notes"] = (r.get("notes") or []) + [
+            "base 冲突：%s" % r["address_map"]["base_conflict"]["note"]]
+    _bc = r["address_map"].get("base_check") or {}
+    if _bc.get("hint"):
+        r["notes"] = (r.get("notes") or []) + [_bc["hint"]]
     r["arch"] = unit.arch
     r["span"] = {"start_hex": "0x%08X" % start, "end_hex": "0x%08X" % end}
-    r["address_map"] = _address_map(unit)
     r["notes"] = note + (r.get("notes") or [])
     cps = find_code_pointers(unit)
     names = {}

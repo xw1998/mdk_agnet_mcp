@@ -18,6 +18,7 @@
   D base 只应用一次：raw BIN 生效一次、ELF/HEX 明写 base_applied=False
   E 真实 axf 上 source.file_offset 与手算一致、所有指令字节都能重读
   F 闸门：工具面仍 213、零新增依赖
+  G base 到货值/实际用值/容器冲突分开报（批次95）
 
 运行：python -m tests.test_batch94
 """
@@ -273,6 +274,109 @@ def section_e():
           rc.get("address_map") or rc.get("error"))
 
 
+
+def vector_bin(base_of_image):
+    """0x300 字节 raw BIN：SP 合法、复位地址 0x08005201（真 base 0x08005000）。"""
+    b = bytearray(0x300)
+    b[0:4] = struct.pack("<I", 0x20005000)
+    b[4:8] = struct.pack("<I", 0x08005201)
+    return bytes(b)
+
+def section_g():
+    print("G. base 到货值 / 实际用值 / 容器冲突要分开报（批次95）")
+    blob = vector_bin(None)
+    pgood = write("b95_vec.bin", blob)
+    d = RC.disasm_at(pgood, base=0x08005000, start=0x08005004, end=0x08005008,
+                     arch="arm", thumb=True)
+    am = d.get("address_map") or {}
+    check("G1 raw BIN：input.base_received_hex 就是你传的值",
+          d.get("ok") and (d.get("input") or {}).get("base_received_hex")
+          == "0x08005000", d.get("input"))
+    check("G2 raw BIN：base_received_hex / base_hex / base_source 三者一致",
+          am.get("base_received_hex") == "0x08005000"
+          and am.get("base_hex") == "0x08005000"
+          and am.get("base_source") == "arg", am)
+    check("G3 正确 base ⇒ 向量表自检 looks_like_cortex_m_vector_table",
+          (am.get("base_check") or {}).get("verdict")
+          == "looks_like_cortex_m_vector_table", am.get("base_check"))
+
+    dw = RC.disasm_at(pgood, base=0x08004000, start=0x08004004, end=0x08004008,
+                      arch="arm", thumb=True)
+    amw = dw.get("address_map") or {}
+    check("G4 差一页的 base ⇒ 自检 not_a_vector_table",
+          dw.get("ok")
+          and (amw.get("base_check") or {}).get("verdict") == "not_a_vector_table",
+          amw.get("base_check") or dw.get("error"))
+    check("G5 自检 hint 会出现在 notes 里（不是只在 address_map 深处）",
+          any("base 差一页" in n for n in (dw.get("notes") or [])),
+          dw.get("notes"))
+
+    # 用户现场：同一地址在两种 base 下的文件偏移正好差一页（0x4D118 / 0x4E118）
+    big = bytearray(0x4E400)
+    big[0:4] = struct.pack("<I", 0x20005000)
+    big[4:8] = struct.pack("<I", 0x08005101)
+    pbig = write("b95_big.bin", bytes(big))
+    o = {}
+    for bs in (0x08005000, 0x08004000):
+        rb = RC.disasm_at(pbig, base=bs, start=0x08052118, max_insns=4,
+                          arch="arm", thumb=True)
+        o[bs] = (rb.get("ok"), (rb.get("source") or {}).get("file_offset_hex"))
+    check("G6 用户现场：传 0x08005000 读 0x4D118、传 0x08004000 读 0x4E118",
+          o[0x08005000] == (True, "0x4D118")
+          and o[0x08004000] == (True, "0x4E118"), o)
+
+    hx = "\n".join([_rec(4, 0, b"\x08\x00"),
+                    _rec(0, 0x4000, bytes(range(16))),
+                    _rec(1, 0, b"")]) + "\n"
+    ph = write("b95.hex", hx.encode("ascii"))
+    dh = RC.disasm_at(ph, base=0x08005000, start=0x08004000, end=0x08004004,
+                      arch="arm", thumb=True)
+    amh = dh.get("address_map") or {}
+    check("G7 HEX：base_source=container，传入值仍被回显",
+          amh.get("base_source") == "container"
+          and amh.get("base_received_hex") == "0x08005000"
+          and amh.get("base_hex") == "0x08004000", amh)
+    check("G8 HEX：base 与容器地址不一致 ⇒ base_conflict.delta=-0x1000",
+          (amh.get("base_conflict") or {}).get("delta") == -0x1000,
+          amh.get("base_conflict"))
+    check("G9 HEX：冲突也写进 notes",
+          any("base 冲突" in n for n in (dh.get("notes") or [])), dh.get("notes"))
+
+    if os.path.isfile(EXAMPLE_AXF):
+        de = RC.disasm_at(EXAMPLE_AXF, base=0x08052118, symbol="uart_handle_line",
+                          max_insns=8)
+        ame = de.get("address_map") or {}
+        check("G10 ELF：base_source=container 且报出 base_conflict",
+              ame.get("base_source") == "container"
+              and ame.get("base_received_hex") == "0x08052118"
+              and (ame.get("base_conflict") or {}).get("argument_hex")
+              == "0x08052118", ame)
+        dc = RC.disasm_at(EXAMPLE_AXF, base=0x08052118, symbol="uart_handle_line",
+                          max_insns=8, fmt="c")
+        check("G11 伪 C 分支也回显 input.base_received_hex",
+              dc.get("ok") and (dc.get("input") or {}).get("base_received_hex")
+              == "0x08052118", dc.get("input") or dc.get("error"))
+        check("G12 伪 C 分支同样有 address_map.base_conflict",
+              (dc.get("address_map") or {}).get("base_conflict") is not None,
+              dc.get("address_map"))
+        srec = os.path.join(ROOT, "tests", "fixtures", "decomp",
+                            "decomp_fx.srec")
+        if os.path.isfile(srec):
+            us = RC._unit_from_data(open(srec, "rb").read(), srec, 0x08005000)
+            check("G13 S-record：base_source=container+arg（记录地址整体平移）",
+                  us.base_source == "container+arg"
+                  and us.base_received == 0x08005000, us.base_source)
+    else:
+        for n in ("G10 ELF 夹具存在", "G11 ELF 夹具存在2", "G12 ELF 夹具存在3"):
+            check(n, False, EXAMPLE_AXF)
+
+    pm = write("b95_small.bin", blob)
+    dmm = RC.disasm_at(pm, base=0x08005000, start=0x08005004, end=0x08005008,
+                       arch="arm", thumb=True)
+    check("G14 bin+base：address_map 的到货值与实际值相等（没有偷偷换 base）",
+          dmm["address_map"]["base_received_hex"]
+          == dmm["address_map"]["base_hex"], dmm["address_map"])
+
 def section_f():
     print("F. 闸门")
     import asyncio
@@ -299,6 +403,7 @@ def main():
         section_c()
         section_d()
         section_e()
+        section_g()
         section_f()
     finally:
         for d in TMP:

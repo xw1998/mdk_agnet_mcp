@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.18）
+│   ├── __init__.py           # 包初始化（版本号 0.2.19）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -1476,6 +1476,41 @@ dump 切出来的镜像还得调用方自己写文件。批次90 逐条补平（
 跨段读被截断且出处可查、旧写法确实会混入外来字节；再用一个复刻旧行为的 Unit 证明
 回填校验能把「读错偏移仍报 ok」拦下来（反汇编与伪 C 两条路都拦）；最后在真实 axf 上
 核对 `source.file_offset` 与手算一致、175 函数里每条指令的字节都能重读。
+
+### base 是参数不是事实：到货值 / 实际用值 / 容器冲突（批次95）
+
+用户报的现场：传 `base=0x08005000`，工具报 `base=0x08004000 作为基地址只应用一次`，
+读到的 `file_offset` 是 `0x4E118`（而 `0x08052118 - 0x08005000 = 0x4D118`），于是判定
+「工具自动识别了 base、忽略了我传的值」。**代码里没有任何自动推断 base 的逻辑**——
+`recover.py` 里 `base` 只有一个来源：`Unit.__init__` 的 `self.base = int(base or 0)`。
+所以那句话里的数字必然是**到达工具的参数**，或者容器（HEX/S-record/ELF）自带的地址。
+
+问题不在计算，在**报什么**：以前 `base_note` 只写一个数字，读者无法区分「我传的」和
+「实际用的」。批次95 把它们拆开，并给 raw BIN 一个可自证的自检：
+
+- `input{path,size,sha256,base_received_hex,start_received_hex,end_received_hex,symbol}`：
+  **调用方原样传进来的参数**（不过任何平移）。`recover_disasm` 的汇编与 `fmt="c"`
+  两条路都带。
+- `address_map.base_received_hex` / `base_hex` / `base_source`：
+  `base_received_hex` 是到货值，`base_hex` 是**实际用来寻址的基地址**（裸 bin = 传入值；
+  HEX = 记录里的最低地址；S-record = 记录地址整体平移一次后的起点；ELF/PE = 最低段地址），
+  `base_source` = `arg` / `container` / `container+arg`。
+- `base_conflict{argument_hex, container_hex, delta, note}`：容器自带地址与传入 base
+  不一致时出现（`base` 按设计不叠加，以前只写在 note 里，读起来像「被忽略了」）。
+  真实含义是「容器里写的就是另一个地址」，不是「base 没生效」。
+- `base_check{verdict, sp_hex, reset_hex, reset_in_image, hint}`：**只对 raw BIN + ARM
+  家族**做 Cortex-M 向量表自检（SP 4 字节对齐且落在 0x10000000–0x40000000、复位地址
+  bit0=1 且落在镜像内）。`verdict` 是 `looks_like_cortex_m_vector_table` /
+  `not_a_vector_table` / `too_short`；不通过时 `hint` 会进 `notes`。**只提示，绝不改 base。**
+
+现场怎么定案：把 `input.base_received_hex` 与 `address_map.base_hex`（或整块
+`address_map`）贴回来。两者相同 ⇒ base 确实是你传的值；不同 ⇒ 要么文件是 HEX/ELF
+（`base_source=container`，看 `base_conflict`），要么调用参数本身不是你以为的那个值。
+
+测试 `tests/test_batch94.py` 的 G 段（14 项）覆盖：裸 bin 回显一致、差一页时自检判
+`not_a_vector_table` 且 hint 进 notes、HEX 的 `base_source=container` 与 `delta=-0x1000`、
+ELF 的冲突、伪 C 分支回显、S-record 的 `container+arg`，以及用户现场的
+`0x4D118 / 0x4E118` 两个偏移。
 
 ### 底层库
 

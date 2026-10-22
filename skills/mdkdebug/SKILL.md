@@ -259,6 +259,15 @@ thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
     **不叠加**（以前是静默忽略，调用方以为自己平移过了）；裸 bin 才是 `true`。
   - 工具会**逐条回填校验**（解码用的字节 vs 按同一地址重读），不一致直接 `ok=false`
     + `mismatches[]`。看到它别重试同一组参数，先看 `address_map.spans` 与 `base`。
+  - **`base` 不自动识别**（批次95）：`base` 只来自你传的参数或容器自带地址。输出里
+    `input.base_received_hex` 是**你传的**，`address_map.base_hex` 是**实际用来寻址的**，
+    `base_source` 说明哪个生效（`arg` / `container` / `container+arg`）。两者不同不是 bug，
+    而是文件自带地址：看 `base_conflict{argument_hex,container_hex,delta}`。
+  - 裸 BIN 会做 Cortex-M 向量表自检：`address_map.base_check.verdict` 为
+    `not_a_vector_table` 时多半 base 差一页/差整段，`hint` 也会进 `notes`；工具**不会**
+    替你改 base。
+  - 「我传了 X 它却用了 Y」这类问题，第一件事是把 `input.base_received_hex` 与
+    `address_map.base_hex` 贴出来；不要凭 `file_offset` 反推 base（HEX/ELF 上必错）。
 
 **两版固件比对 / 库函数指纹识别**（批次86）：`recover_diff(reference, target, ...)`。
 读法只有一条：**「名字对上了」和「代码对上了」是两件事**。
