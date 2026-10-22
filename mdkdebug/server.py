@@ -4362,6 +4362,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         try:
             bps = _uvoptx.parse_uvoptx_breakpoints(path)
             return {"ok": True, "path": path, "count": len(bps), "breakpoints": bps,
+                    # 批次97：读的同时把 .uvoptx 的格式基线也带出去
+                    "file_format": _projectfile.describe(path),
                     "note": "Keil 持久化断点：BK 清不掉，Keil 下次进入调试会自动恢复"
                             "（清除用 clear_uvoptx_breakpoints）"}
         except Exception as e:  # noqa: BLE001
@@ -8813,6 +8815,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 return _js({"ok": False, "error": "未提供工程路径，且未配置默认工程"})
             cfg = _parse_uvprojx_config(p, target.strip() or None)
             cfg["project"] = p
+            # 批次97：顺带给出字节层面的基线（编码/BOM/行尾/XML/sha256），
+            # 免得「读配置」和「查文件格式」要跑两趟。文件不在时 describe 会带 error，不抛。
+            cfg["file_format"] = _projectfile.describe(p)
             return _js(cfg)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -10216,8 +10221,16 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 out["config"] = _uvprojx.read_config(p, target or "")
             if w in ("all", "groups"):
                 out["groups"] = _uvprojx.list_groups(p)
-            out["next"] = "改工程用 uvprojx_edit（会先自动备份 .uvprojx）；" \
-                          "切调试目标用 set_debug_target。"
+            # 批次97：把「这份工程文件的格式基线」一起给出去——编码/BOM/行尾/XML/sha256。
+            # 这样「读一次」就同时拿到配置与字节层面的事实：改之前不用再多跑一趟，
+            # 改之后拿 sha256 一比就知道文件到底有没有被别的工具动过。
+            out["file_format"] = _projectfile.describe(p)
+            if out["file_format"].get("level") != "ok":
+                out["file_format_warning"] = (
+                    "这份工程文件的格式有问题（见 file_format.notes）："
+                    "uVision 打开可能报错，改之前先按 notes 里的建议还原。")
+            out["next"] = ("改工程用 uvprojx_edit（会先自动备份 .uvprojx，并做往返校验/"
+                           "严格编码/XML/写后回读）；切调试目标用 set_debug_target。")
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
@@ -10242,6 +10255,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "2. **一定留着备份**：默认 backup=true，写前把原文件复制成 `<工程名>.uvprojx.mdkdebug.bak`，"
             "返回值里有 backup（备份文件的绝对路径）——改完编译通过再考虑删；\n"
             "3. **改完要重编译**：工程文件变了但 .axf 没变，调试看到的是旧固件的符号。\n"
+            "4. **Keil 开着同一工程时会被拦下**：返回 project-open-in-keil，"
+            "先 close_uvision 收窗口再改——先开 Keil 再改工程会让它弹「文件已被外部修改」模态框，"
+            "模态框会把调试通道一起堵死（真机踩过）。确实要写传 force=true。\n"
             "实现上是**文本级替换**（不是 ElementTree 序列化），保留原缩进与属性顺序，"
             "所以 diff 干净、不会把文件洗一遍；每处替换都断言锚点唯一，命中数不为 1 就放弃写入并报错。\n"
             "5. **写回时不碰编码/BOM/行尾（批次97）**：写入前做往返校验（`old_text` 编回原编码必须"
@@ -10250,9 +10266,6 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "（`verify=\"byte-identical\"`）——任一条不过都**不落盘**。新增行的行尾按原文件风格补齐"
             "（CRLF 文件里插的新行也是 CRLF）。返回值带 `encoding`/`bom`/`newline`/`newline_fixed`/"
             "`sha256_before|after`，改完能自证格式没被洗。改前改后各跑一次 `project_file_check` 核对。"
-            "4. **Keil 开着同一工程时会被拦下**：返回 project-open-in-keil，"
-            "先 close_uvision 收窗口再改——先开 Keil 再改工程会让它弹「文件已被外部修改」模态框，"
-            "模态框会把调试通道一起堵死（真机踩过）。确实要写传 force=true。\n"
             "**中风险**：会真实修改用户的工程文件（已自动备份）。"
         ),
     )

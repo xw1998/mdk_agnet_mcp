@@ -46,8 +46,11 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
    往返校验（`old_text` 编回去必须逐字节等于磁盘）→ 原编码严格编码（编不出就报
    `encode-failed`，**绝不写成 `?`**）→ XML 可解析校验 → 原子写 → 写后回读核对
    （返回 `verify="byte-identical"`）。任一条不过就**不落盘**。
-2. **改前先 `project_file_check`** 记基线（`encoding` / `bom` / `newline` / `sha256`）；
-   **改完再跑一次**：`sha256` 应该变，`encoding` / `bom` / `newline` 必须**没变**。
+2. **改前先拿到格式基线**（`encoding` / `bom` / `newline` / `sha256`）：
+   `project_file_check` 一次看整个工程（含同名 `.uvoptx`）；`uvprojx_read` /
+   `read_project_config` / `list_uvoptx_breakpoints` 的返回值里也**自带 `file_format`**，
+   读配置时顺手就有了，不用多跑一趟。**改完再核对**：`sha256` 应该变，
+   `encoding` / `bom` / `newline` 必须**没变**（格式坏了会带 `file_format_warning`）。
 3. **禁止**用 `write` / `edit` / sed / 脚本 `open(...,"w")` **整体重写**工程文件；
    也**禁止**「顺手统一行尾」「顺手加 BOM」「顺手转成 UTF-8」——同一个工程里 `.uvprojx`
    是 LF、`.uvoptx` 是 CRLF 是**正常**的，统一格式化本身就是破坏。

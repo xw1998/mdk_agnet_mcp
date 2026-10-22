@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.21）
+│   ├── __init__.py           # 包初始化（版本号 0.2.22）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -1573,6 +1573,9 @@ uVision 再打开就报错。批次97 把这条纪律做成**工具能执行的�
   5. `verify-failed`：原子写后回读，字节必须与预期逐字节相同。
 - **只归一化本次改动区间的行尾**：新增行按原文件风格补齐（CRLF 文件里插的新行也是 CRLF），
   文件其余字节不动——同一工程里 `.uvprojx` 是 LF、`.uvoptx` 是 CRLF 本来就很正常。
+- **读入口自带基线**：`uvprojx_read` / `read_project_config` / `list_uvoptx_breakpoints`
+  的返回值里都有 `file_format`（同一套字段，格式有问题时另带 `file_format_warning`），
+  所以「读一次」就同时拿到配置与字节事实，不用为了查编码多跑一趟。
 - 返回值带 `encoding` / `bom` / `newline` / `verify` / `sha256_before|after` /
   `newline_fixed`，改完能自证「格式没被洗、内容确实变了」。
 

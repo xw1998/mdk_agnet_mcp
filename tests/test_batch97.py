@@ -328,6 +328,60 @@ def section_d():
 
 
 # ----------------------------------------------------------------------
+# G. 读入口自带格式基线（一眼看清，不用跑两趟）
+# ----------------------------------------------------------------------
+def section_g():
+    print("G. 读入口自带格式基线：uvprojx_read / read_project_config / list_uvoptx_breakpoints")
+    from mdkdebug import server as SV
+
+    # 造一份「已损坏」的工程副本（截断），验证读入口会提醒
+    broken = put("broken.uvprojx", real_raw()[:5000])
+
+    async def run():
+        srv = SV.create_server()
+
+        async def _call(tool, args):
+            res = await srv.call_tool(tool, args)
+            payload = res[0][0].text if isinstance(res, tuple) else res.content[0].text
+            return json.loads(payload)
+
+        return {
+            "read": await _call("uvprojx_read", {"project": REAL_PROJ, "what": "targets"}),
+            "cfg": await _call("read_project_config", {"project": REAL_PROJ}),
+            "optx": await _call("list_uvoptx_breakpoints", {"project": REAL_PROJ}),
+            "broken": await _call("uvprojx_read", {"project": broken}),
+        }
+
+    out = asyncio.run(run())
+    ff = out["read"].get("file_format") or {}
+    ref = PF.describe(REAL_PROJ)
+    check("G1 uvprojx_read 返回 file_format，sha256/encoding/newline 与项目体检一致",
+          out["read"].get("ok") and ff.get("sha256") == ref["sha256"]
+          and ff.get("encoding") == ref["encoding"] and ff.get("newline") == ref["newline"]
+          and ff.get("level") == "ok", ff)
+    check("G2 read_project_config 也带 file_format（读配置不必再跑一趟查格式）",
+          out["cfg"].get("file_format", {}).get("sha256") == ref["sha256"],
+          out["cfg"].get("file_format"))
+    check("G3 list_uvoptx_breakpoints 带 .uvoptx 的 file_format（CRLF/非 ASCII 如实报告）",
+          (out["optx"].get("file_format") or {}).get("newline") == "CRLF"
+          and (out["optx"].get("file_format") or {}).get("non_ascii_bytes") == 9,
+          out["optx"].get("file_format"))
+    check("G4 被截断的工程：uvprojx_read 仍返回配置，但带 file_format_warning",
+          out["broken"].get("ok") and "file_format_warning" in out["broken"]
+          and out["broken"]["file_format"].get("xml_ok") is False,
+          out["broken"].get("file_format_warning"))
+
+    src = io.open(os.path.join(ROOT, "mdkdebug", "server.py"), encoding="utf-8").read()
+    seg = src[src.find('name="uvprojx_edit"'):][:6000]
+    order = [m for m in ("1. **先读后写", "2. **一定留着备份", "3. **改完要重编译",
+                         "4. **Keil 开着同一工程", "5. **写回时不碰编码")
+             if m in seg]
+    pos = [seg.find(m) for m in order]
+    check("G5 uvprojx_edit 文档里 5 条约定按序（改代码时别把编号插乱）",
+          len(order) == 5 and pos == sorted(pos), pos)
+
+
+# ----------------------------------------------------------------------
 # E. 文档纪律
 # ----------------------------------------------------------------------
 def section_e():
@@ -370,6 +424,7 @@ def main():
         section_b()
         section_c()
         section_d()
+        section_g()
         section_e()
         section_f()
     finally:
