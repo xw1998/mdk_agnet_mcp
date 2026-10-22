@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 213 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 214 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -31,6 +31,39 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
      `close_uvision` 再改，或显式 `force=true`（不推荐，Keil 里那份仍是旧内容）。
    - 收窗口用 `close_uvision(keep="oldest")`：**持 UVSOCK 4823 的是最早那个实例**，
      别按「留最新」关。
+
+### 工程管理文件编辑纪律（硬规则，批次97）
+
+`.uvprojx` / `.uvoptx` 是 uVision 的**字节契约**：编码、BOM、行尾都是内容的一部分。
+真实事故不止一起——AI 用「读文本 → 改一行 → 写回文本」改工程文件，写回时丢了 BOM、
+把 CRLF 换成 LF、把编不出的字符写成 `?`，结果 uVision 打开工程报错/分组丢失。
+这类损坏**在编辑器里看不出来**，只能在字节层面查。
+
+**必须照做：**
+
+1. **改工程只用 `uvprojx_edit`**（`add_include_path` / `del_include_path` / `add_files` /
+   `remove_files` / `add_defines` / `del_defines` / `set_debug_information`）。它内部依次做：
+   往返校验（`old_text` 编回去必须逐字节等于磁盘）→ 原编码严格编码（编不出就报
+   `encode-failed`，**绝不写成 `?`**）→ XML 可解析校验 → 原子写 → 写后回读核对
+   （返回 `verify="byte-identical"`）。任一条不过就**不落盘**。
+2. **改前先 `project_file_check`** 记基线（`encoding` / `bom` / `newline` / `sha256`）；
+   **改完再跑一次**：`sha256` 应该变，`encoding` / `bom` / `newline` 必须**没变**。
+3. **禁止**用 `write` / `edit` / sed / 脚本 `open(...,"w")` **整体重写**工程文件；
+   也**禁止**「顺手统一行尾」「顺手加 BOM」「顺手转成 UTF-8」——同一个工程里 `.uvprojx`
+   是 LF、`.uvoptx` 是 CRLF 是**正常**的，统一格式化本身就是破坏。
+4. **禁止**对这两份文件做有损中间处理：一次 `errors="replace"` 或 `latin-1` 兜底解码
+   就足以让中文路径变成 `?`，而且看不出来。需要读字节时用 `project_file_check` 的字段判断。
+5. **保持 Keil 的原文风格**：不改缩进、不改属性顺序、不重排节点、不加 XML 声明。
+   文本级替换只动目标节点，diff 才干净。
+6. **Keil 开着同一工程时不要写**：`uvprojx_edit` 会返回 `project-open-in-keil` 拦住；
+   先 `close_uvision`，改完再 `launch_uvision`。
+7. **发现损坏先还原，再重做改动**：`project_file_check` 的 `notes` 里
+   `U+FFFD`（曾被 `errors='replace'` 写过）、`xml_ok=false`（uVision 打不开）、
+   `mixed_newline`（混合行尾）都是可判定信号。修法是从版本库或
+   `<工程>.uvprojx.mdkdebug.bak` 还原，**不要在坏文件上继续改**。
+
+**一句话判断「这次改成功没有」**：`project_file_check` 里 `encoding`/`bom`/`newline`
+与改前一致、`xml_ok=true`、`sha256` 已变——三者同时成立才算改成功。
 
 ## 二、六条主线工作流
 
@@ -397,7 +430,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 169 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 170 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。

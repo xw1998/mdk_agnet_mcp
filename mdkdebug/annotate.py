@@ -43,6 +43,8 @@ READONLY = {
     "parse_build_errors", "explain_build_error", "snapshot_diff", "wait_breakpoint",
     "wait_state", "mdk_guide", "capabilities", "list_tools",
     "list_peripherals", "svd_list", "svd_decode", "uvprojx_read",
+    # 批次97：工程管理文件体检——只读文件（编码/BOM/行尾/XML/sha256），不写任何东西。
+    "project_file_check",
     # 分散加载文件：读结构与静态校验都不写文件；scatter_edit 才写。
     "scatter_read", "scatter_check",
     # 非 MDK 链路：探测与解析（不 bind 端口、不起进程）

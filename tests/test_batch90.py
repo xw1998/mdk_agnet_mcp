@@ -7,7 +7,7 @@
   C probe 的预算参数（max_functions / max_insns：触顶要如实说，不再静默截断）
   D image_split 落盘切片（切出来的字节直接能喂下一步）
   E 一条路：出件时给出可复制的台账命令（窗口按布局算好）
-  F 工具面与回归（仍 213 个、零新增依赖、注解口径）
+  F 工具面与回归（仍 214 个、零新增依赖、注解口径）
 
 运行：python -m tests.test_batch90
 """
@@ -322,7 +322,7 @@ def section_f():
     async def run():
         srv = SV.create_server(port=15991, toolsets="all")
         tools = {t.name: t for t in await srv.list_tools()}
-        check("F1 工具总数 213（本批只加参数，不新增工具）", len(tools) == 213, len(tools))
+        check("F1 工具总数 214（本批只加参数，不新增工具）", len(tools) == 214, len(tools))
         props = tools["image_split"].input_schema.get("properties") or {}
         check("F2 image_split 暴露 out_dir", "out_dir" in props, sorted(props))
         check("F3 image_split 仍标只读（写只发生在显式 out_dir，同 recover_diff 口径）",

@@ -7,7 +7,7 @@
   B 匹配口径（纯函数，手写索引）：名字≠代码、重复不展开、候选不是等价、门槛
   C 指纹库文件：不覆盖、版本对齐、写完回读
   D 端到端：真镜像自比对、改一个函数、容器不同、库文件复用
-  E 工具面：注册 213、在 build 组且不在默认面、参数与文案
+  E 工具面：注册 214、在 build 组且不在默认面、参数与文案
   F 回归：内部字段不外泄、既有输出不变、不新增依赖
 
 运行：python -m tests.test_batch86
@@ -301,7 +301,7 @@ def section_e():
     from mdkdebug import annotate as AN
     srv = SV.create_server(port=15886, toolsets="all")
     tools = {t.name: t for t in asyncio.run(srv.list_tools())}
-    check("E1 注册总数 213（批次86 +1）", len(tools) == 213, len(tools))
+    check("E1 注册总数 214（批次86 +1）", len(tools) == 214, len(tools))
     check("E2 recover_diff 已注册", "recover_diff" in tools)
     props = (tools.get("recover_diff").input_schema.get("properties") or {})
     check("E3 参数齐全（reference/target/sig/base/arch/min_insns/full）",

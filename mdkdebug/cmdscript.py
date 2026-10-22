@@ -35,6 +35,7 @@ import re
 import shutil
 import tempfile
 
+from . import projectfile
 from . import uvoptx as _uvoptx
 
 # 初始化文件里的挂载点（硬件调试用 tIfile，仿真用 sIfile）
@@ -179,11 +180,14 @@ def run_debug_script(uv4: str, project: str, commands, timeout: int = 240,
                              original, count=1)
     res["uvoptx"] = {"path": uvoptx_path, "encoding": enc, "restored": False}
 
-    try:
-        with open(uvoptx_path, "w", encoding=enc, errors="replace", newline="") as f:
-            f.write(patched)
-    except OSError as e:
-        res["error"] = "改写 .uvoptx 失败：%s" % e
+    # 批次97：挂 <tIfile> 这一步也走安全写入器（原来用 errors="replace" 裸写，
+    # 编码猜错会把中文路径写成 '?'，而且行尾/BOM 可能被改）。跑完仍按原始字节还原。
+    _w = projectfile.write_text(uvoptx_path, patched, old_text=original,
+                                        backup=False)
+    if not _w.get("ok"):
+        res["error"] = "改写 .uvoptx 失败：%s" % (_w.get("error") or "未知原因")
+        res["uvoptx"] = {"path": uvoptx_path, "encoding": enc, "restored": False,
+                         "error_code": _w.get("error_code")}
         return res
 
     # 4) 跑 UV4 -d（-o 由 builder 统一附加）

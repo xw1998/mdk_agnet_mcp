@@ -28,8 +28,10 @@ Keil uVision 在调试会话中会把断点**持久化**写入工程同目录的
 
 设计要点
 --------
-- **编码容错**：uvoptx 正常为 UTF-8（XML 声明亦为 UTF-8）；个别环境可能为 GBK/ANSI，
-  读取时依次尝试 utf-8 → gbk → latin-1，写回沿用探测到的编码，绝不擅自转码。
+- **编码容错但不擅自转码**（批次97）：uvoptx 正常为 UTF-8（XML 声明亦为 UTF-8）；个别环境
+  可能为 GBK。读取时依次尝试 utf-8 → gbk，写回**沿用探测到的编码与 BOM/行尾**，且走
+  ``projectfile.write_text`` 的五道闸门（往返校验/严格编码/XML/原子写/写后回读）——
+  编不出的字符**拒绝写**，不再 ``errors="replace"`` 写成 ``?``。
 - **文本级清理**：不用 XML 序列化器重写整个文件（会丢失缩进/节点顺序/注释），
   只在 ``<Breakpoint>…</Breakpoint>`` 区间内删除 ``<Bp>…</Bp>`` 块，其余原样保留。
 - **留备份**：清理前默认备份为 ``<name>.uvoptx.mdkdebug.bak``。
@@ -40,7 +42,7 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
+from . import projectfile
 import xml.etree.ElementTree as ET
 
 # ``<Breakpoint>…</Breakpoint>`` 块与其中的 ``<Bp>…</Bp>`` 断点条目
@@ -63,15 +65,9 @@ def uvoptx_path_for(project: str) -> str:
 
 
 def _read_text(path: str) -> tuple[str, str]:
-    """编码容错读取，返回 (文本, 实际编码)。"""
-    with open(path, "rb") as f:
-        raw = f.read()
-    for enc in ("utf-8-sig", "utf-8", "gbk", "latin-1"):
-        try:
-            return raw.decode(enc), enc
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("latin-1", errors="replace"), "latin-1"
+    """严格读取，返回 (文本, 实际编码)（批次97：交给 ``projectfile`` 判定编码）。"""
+    text, meta = projectfile.read_text(path)
+    return text, meta["encoding"]
 
 
 def _text_of(bp: ET.Element, tag: str) -> str:
@@ -152,14 +148,21 @@ def clear_uvoptx_breakpoints(path: str, backup: bool = True) -> dict:
             res["ok"] = True
             return res
 
-        if backup:
-            bak = path + ".mdkdebug.bak"
-            shutil.copy2(path, bak)
-            res["backup"] = bak
-        with open(path, "w", encoding=enc, newline="") as f:
-            f.write(new_text)
+        # 批次97：走安全写入器——往返校验/原编码严格编码/XML 可解析/原子写/写后回读。
+        # 旧实现是裸 open(...,"w",encoding=enc,newline="")，编码猜错或行尾被改写都不吭声。
+        w = projectfile.write_text(path, new_text, old_text=text, backup=backup)
+        if not w.get("ok"):
+            res.update(w)
+            res["ok"] = False
+            return res
         res["ok"] = True
         res["changed"] = True
+        res["encoding"] = w.get("encoding")
+        res["bom"] = w.get("bom")
+        res["newline"] = w.get("newline")
+        res["verify"] = w.get("verify")
+        if w.get("backup"):
+            res["backup"] = w["backup"]
         return res
     except Exception as e:  # noqa: BLE001
         res["error"] = str(e)

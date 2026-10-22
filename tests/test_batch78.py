@@ -10,7 +10,7 @@
   C 熵与签名：分块熵、高熵区间、压缩签名流校验（假头被拒）
   D inspect：ELF/HEX/bin 三格式端到端 + 大文件截断 + 上限
   E carve  ：目录必须不存在、独占写、SHA-256 回读、上限进 gaps、HEX 拒绝
-  F 工具面 ：注册 213 / build 20 / 默认面 44 / 注解归类 / 端到端
+  F 工具面 ：注册 214 / build 20 / 默认面 44 / 注解归类 / 端到端
   G 闭环   ：artifact_changed 是独立判定，不混进 flash_failed
 
 运行：python -m tests.test_batch78
@@ -324,11 +324,11 @@ def section_f():
     build = TB.tools_of("build")
     check("F1 image_inspect 在 build 组", "image_inspect" in build, len(build))
     check("F2 image_carve 在 build 组", "image_carve" in build, len(build))
-    check("F3 build 组规模 29（批次86 的 recover_diff 归在 build）", len(TB.TOOLSETS["build"]) == 29, len(TB.TOOLSETS["build"]))
+    check("F3 build 组规模 30（批次86 的 recover_diff 归在 build）", len(TB.TOOLSETS["build"]) == 30, len(TB.TOOLSETS["build"]))
 
     all_n = len(asyncio.run(SV.create_server(port=PORT, toolsets="all").list_tools()))
     core_n = len(asyncio.run(SV.create_server(port=PORT, toolsets="core").list_tools()))
-    check("F4 注册总数 213", all_n == 213, all_n)
+    check("F4 注册总数 214", all_n == 214, all_n)
     check("F5 默认面仍 44（取证工具不在默认面）", core_n == 44, core_n)
 
     a1 = AN.annotations_for("image_inspect")

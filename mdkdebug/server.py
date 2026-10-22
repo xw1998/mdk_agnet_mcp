@@ -39,6 +39,7 @@ from . import keilkb as _keilkb
 from . import cmdscript as _cmdscript
 from . import svd as _svd
 from . import uvprojx as _uvprojx
+from . import projectfile as _projectfile
 from . import precheck as _precheck
 from . import verify as _verify
 from . import image as _image
@@ -10152,6 +10153,45 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             return _js({"ok": False, "error": str(e)})
 
     @server.tool(
+        name="project_file_check",
+        title="工程管理文件体检（编码/BOM/行尾/XML 是否可解析）",
+        description=(
+            "只读体检 `.uvprojx` / `.uvoptx` / `.uvmpw`：报告**编码、有无 BOM、行尾（CRLF/LF/混合）、"
+            "非 ASCII 字节数、U+FFFD 替换字符数、XML 能否解析、sha256**，并给出 level"
+            "（ok / warn / error）与具体建议。project 可给工程文件或含工程文件的目录；"
+            "给了 .uvprojx 会连带体检同名 .uvoptx。\n"
+            "**为什么必须有这个工具**：真实事故不止一起——AI 用「读文本→改一行→写回」的方式改工程文件，"
+            "写回时丢了 BOM、把 CRLF 换成 LF、或把编不出的字符写成 `?`，结果 uVision 打开工程报错/分组丢失。"
+            "这类损坏**看不见**（工程文件在编辑器里长得一样），只能在字节层面查。\n"
+            "**纪律**：① 改工程前先跑本工具记下基线；② 只用 uvprojx_edit 改（它内部做往返校验 + "
+            "原编码严格编码 + XML 校验 + 原子写 + 写后回读，任何一条不过就不落盘）；"
+            "③ 改完再跑一次本工具，`sha256` 变了但 `encoding/bom/newline` 必须不变；"
+            "④ **绝不**用 write/edit 类文件工具整体重写工程文件，也不要「顺手统一行尾」。\n"
+            "返回里 `notes` 会直说可疑点：编码不可判定、出现 U+FFFD（曾被 `errors='replace'` 写过）、"
+            "XML 解析失败、混合行尾等。"
+        ),
+    )
+    async def project_file_check(project: str = "", files="") -> str:
+        try:
+            extra = [x.strip() for x in str(files or "").replace(";", ",").split(",")
+                     if x.strip()]
+            if not project:
+                try:
+                    project = _resolve_project("")
+                except Exception:  # noqa: BLE001
+                    project = ""
+            out = _projectfile.check_project(project, extra=extra)
+            if isinstance(out, dict) and out.get("ok"):
+                out.setdefault("next", "改工程用 uvprojx_edit；改完再跑一次本工具核对 "
+                                        "encoding/bom/newline 未变、sha256 已变。")
+                if out.get("level") == "error":
+                    out["hint"] = ("有文件已经损坏（见 files[].notes）：先从版本库或备份"
+                                   "（`*.mdkdebug.bak`）还原，再用 uvprojx_edit 重做改动。")
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
         name="uvprojx_read",
         title="只读查看 uVision 工程配置（target/包含路径/分组文件）",
         description=(
@@ -10203,7 +10243,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "返回值里有 backup（备份文件的绝对路径）——改完编译通过再考虑删；\n"
             "3. **改完要重编译**：工程文件变了但 .axf 没变，调试看到的是旧固件的符号。\n"
             "实现上是**文本级替换**（不是 ElementTree 序列化），保留原缩进与属性顺序，"
-            "所以 diff 干净、不会把文件洗一遍；每处替换都断言锚点唯一，命中数不为 1 就放弃写入并报错。"
+            "所以 diff 干净、不会把文件洗一遍；每处替换都断言锚点唯一，命中数不为 1 就放弃写入并报错。\n"
+            "5. **写回时不碰编码/BOM/行尾（批次97）**：写入前做往返校验（`old_text` 编回原编码必须"
+            "**逐字节**等于磁盘字节）、用原编码严格编码新内容（编不出就报 `encode-failed` 并指出字符，"
+            "**不再用 errors='replace' 写成 `?`**）、XML 可解析校验、原子写、写后回读核对"
+            "（`verify=\"byte-identical\"`）——任一条不过都**不落盘**。新增行的行尾按原文件风格补齐"
+            "（CRLF 文件里插的新行也是 CRLF）。返回值带 `encoding`/`bom`/`newline`/`newline_fixed`/"
+            "`sha256_before|after`，改完能自证格式没被洗。改前改后各跑一次 `project_file_check` 核对。"
             "4. **Keil 开着同一工程时会被拦下**：返回 project-open-in-keil，"
             "先 close_uvision 收窗口再改——先开 Keil 再改工程会让它弹「文件已被外部修改」模态框，"
             "模态框会把调试通道一起堵死（真机踩过）。确实要写传 force=true。\n"

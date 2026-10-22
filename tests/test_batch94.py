@@ -17,7 +17,7 @@
   C 回填校验能抓到「批量读越界/整体平移」这类伪反汇编
   D base 只应用一次：raw BIN 生效一次、ELF/HEX 明写 base_applied=False
   E 真实 axf 上 source.file_offset 与手算一致、所有指令字节都能重读
-  F 闸门：工具面仍 213、零新增依赖
+  F 闸门：工具面仍 214、零新增依赖
   G base 到货值/实际用值/容器冲突分开报（批次95）
   H 裸 BIN 不传 base 时按向量表推断并标记（批次96）
 
@@ -441,8 +441,8 @@ def section_f():
     from mdkdebug import server as SV
     names = {t.name for t in asyncio.run(
         SV.create_server(port=15995, toolsets="all").list_tools())}
-    check("F1 工具总数仍是 213（本批只改既有工具的行为）",
-          len(names) == 213, len(names))
+    check("F1 工具总数仍是 214（本批只改既有工具的行为）",
+          len(names) == 214, len(names))
     check("F2 没有引入新依赖",
           not any(m in sys.modules for m in
                   ("unicorn", "keystone", "angr", "r2pipe", "lief")),

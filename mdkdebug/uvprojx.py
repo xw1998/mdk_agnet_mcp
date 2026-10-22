@@ -12,6 +12,9 @@
 --------
 - 任何写操作前**强制备份** ``<工程>.uvprojx.mdkdebug.bak``（可用 backup=False 关掉，
   但工具层永远给 true）；
+- **写回一律走 ``projectfile.write_text``（批次97）**：往返校验 + 原编码严格编码（编不出就报错，
+  不用 ``errors="replace"`` 写成 ``?``）+ XML 校验 + 原子写 + 写后回读；任一条不过就不落盘。
+  编码/BOM/行尾都按原文件保持不变，新增行的行尾按原文件风格补齐；
 - 写入前校验锚点**唯一**，不唯一就拒绝改（宁可报错也不改坏工程）；
 - 所有返回值带 ``changes`` 明细（before/after），调用方能核对改了什么。
 """
@@ -22,22 +25,33 @@ import re
 import shutil
 import xml.etree.ElementTree as ET
 
+from . import projectfile
+
 _PATH_SEP = ";"
 
 def _read_text(path: str) -> tuple:
-    with open(path, "rb") as f:
-        raw = f.read()
-    for enc in ("utf-8-sig", "utf-8", "gbk", "latin-1"):
-        try:
-            return raw.decode(enc), enc
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("latin-1", errors="replace"), "latin-1"
+    """严格读取（批次97）：编码判定与写入校验都交给 ``projectfile``。
+
+    旧实现会走到 ``latin-1`` 兜底再 ``errors="replace"`` 写回——那正是「AI 改一次工程，
+    uVision 就打不开」的根源之一：读的时候已经不再逐字节可还原了。
+    """
+    text, meta = projectfile.read_text(path)
+    return text, meta["encoding"]
 
 def _backup(path: str) -> str:
     bak = path + ".mdkdebug.bak"
     shutil.copy2(path, bak)
     return bak
+
+
+def _write_fields(res: dict) -> dict:
+    """把写入结果里的「文件格式事实」原样透给调用方（编码/BOM/行尾/校验）。"""
+    return {"encoding": res.get("encoding"), "bom": res.get("bom"),
+            "newline": res.get("newline"),
+            "newline_fixed": res.get("newline_fixed", 0),
+            "verify": res.get("verify"), "backup": res.get("backup"),
+            "sha256_before": res.get("sha256_before"),
+            "sha256_after": res.get("sha256_after")}
 
 def _target_span(text: str, target: str) -> tuple:
     """定位指定 target 的 ``<Target>…</Target>`` 区间；target 为空时取第一个。
@@ -160,11 +174,11 @@ def add_include_path(path: str, paths, target: str = "", backup: bool = True) ->
         return {"ok": True, "changed": False, "action": "add_include_path",
                 "added": [], "skipped": items,
                 "message": "已全部存在，无需修改", "targets": list_targets(path)}
-    bak = _backup(path) if backup else None
-    with open(path, "w", encoding=enc, errors="replace", newline="") as f:
-        f.write(new_text)
+    res = _write_uvprojx(path, new_text, text, backup)
+    if not res.get("ok"):
+        return dict(res, action="add_include_path")
     return {"ok": True, "changed": True, "action": "add_include_path",
-            "target": target or "(第一个)", "backup": bak, "encoding": enc,
+            "target": target or "(第一个)", **_write_fields(res),
             "before": info["before"], "after": info["after"],
             "added": info.get("added", []), "skipped": info.get("skipped", []),
             "message": "已加入 Include Paths，重新编译即生效（Keil 若正打开该工程需先关闭再改）"}
@@ -194,11 +208,11 @@ def del_include_path(path: str, pattern: str, target: str = "",
     if not info.get("changed"):
         return {"ok": True, "changed": False, "action": "del_include_path",
                 "removed": [], "message": "没有匹配的条目"}
-    bak = _backup(path) if backup else None
-    with open(path, "w", encoding=enc, errors="replace", newline="") as f:
-        f.write(new_text)
+    res = _write_uvprojx(path, new_text, text, backup)
+    if not res.get("ok"):
+        return dict(res, action="del_include_path")
     return {"ok": True, "changed": True, "action": "del_include_path",
-            "target": target or "(第一个)", "backup": bak,
+            "target": target or "(第一个)", **_write_fields(res),
             "before": info["before"], "after": info["after"],
             "removed": info.get("removed", [])}
 
@@ -268,12 +282,12 @@ def add_files(path: str, group: str, files, backup: bool = True) -> dict:
         created_group = True
 
     new_text = text[:m.start()] + new_groups + text[m.end():]
-    bak = _backup(path) if backup else None
-    with open(path, "w", encoding=enc, errors="replace", newline="") as f:
-        f.write(new_text)
+    res = _write_uvprojx(path, new_text, text, backup)
+    if not res.get("ok"):
+        return dict(res, action="add_files")
     return {"ok": True, "changed": True, "action": "add_files", "group": group,
             "created_group": created_group, "added": todo, "skipped": skipped,
-            "backup": bak,
+            **_write_fields(res),
             "message": "已加入工程分组，重新编译即生效；FileType 按源文件(1)写入，"
                        "头文件/库文件请核对 Keil 里的类型"}
 
@@ -298,11 +312,11 @@ def remove_files(path: str, pattern: str, backup: bool = True) -> dict:
     if not removed:
         return {"ok": True, "changed": False, "action": "remove_files", "removed": [],
                 "message": "没有匹配的文件条目"}
-    bak = _backup(path) if backup else None
-    with open(path, "w", encoding=enc, errors="replace", newline="") as f:
-        f.write(new_text)
+    res = _write_uvprojx(path, new_text, text, backup)
+    if not res.get("ok"):
+        return dict(res, action="remove_files")
     return {"ok": True, "changed": True, "action": "remove_files",
-            "removed": removed, "backup": bak,
+            "removed": removed, **_write_fields(res),
             "message": "已移出工程（磁盘文件未被删除）"}
 
 # ----------------------------------------------------------------------
@@ -340,11 +354,14 @@ def _tag_span(text: str, span: tuple, tag: str) -> tuple:
         return None
     return (a + m.start(), a + m.end(), a + m.start(1), a + m.end(1))
 
-def _write_uvprojx(path: str, new_text: str, enc: str, backup: bool) -> str:
-    bak = _backup(path) if backup else None
-    with open(path, "w", encoding=enc, errors="replace", newline="") as f:
-        f.write(new_text)
-    return bak
+def _write_uvprojx(path: str, new_text: str, old_text: str, backup: bool) -> dict:
+    """写回工程文件（批次97）：走 ``projectfile.write_text``，校验不过就**不落盘**。
+
+    旧实现是 ``open(path, "w", encoding=enc, errors="replace", newline="")``：
+    ``errors="replace"`` 会把编不出来的字符静默写成 ``?``，写空了也不吭声。
+    现在：往返校验 + 原编码严格编码 + XML 可解析 + 原子写 + 写后回读核对。
+    """
+    return projectfile.write_text(path, new_text, old_text=old_text, backup=backup)
 
 def _edit_define(path: str, target: str, fn, action: str, backup: bool) -> dict:
     """<Define> 的公共骨架：范围收进 <Cads>（C 编译器那一份），只改那一处。"""
@@ -373,9 +390,11 @@ def _edit_define(path: str, target: str, fn, action: str, backup: bool) -> dict:
                 "target": target or "(第一个)", "before": old, "after": old,
                 "message": "无需修改", **(info or {})}
     new_text = text[:i0] + new + text[i1:]
-    bak = _write_uvprojx(path, new_text, enc, backup)
+    res = _write_uvprojx(path, new_text, text, backup)
+    if not res.get("ok"):
+        return dict(res, action=action)
     return {"ok": True, "changed": True, "action": action,
-            "target": target or "(第一个)", "backup": bak, "encoding": enc,
+            "target": target or "(第一个)", **_write_fields(res),
             "before": old, "after": new, **(info or {})}
 
 def add_defines(path: str, defines, target: str = "", backup: bool = True) -> dict:
@@ -450,9 +469,11 @@ def set_debug_information(path: str, enabled: bool = True, target: str = "",
                 "target": target or "(第一个)", "before": old, "after": old,
                 "message": "已经是目标状态，无需修改"}
     new_text = text[:i0] + want + text[i1:]
-    bak = _write_uvprojx(path, new_text, enc, backup)
+    res = _write_uvprojx(path, new_text, text, backup)
+    if not res.get("ok"):
+        return dict(res, action="set_debug_information")
     return {"ok": True, "changed": True, "action": "set_debug_information",
-            "target": target or "(第一个)", "backup": bak, "encoding": enc,
+            "target": target or "(第一个)", **_write_fields(res),
             "before": old, "after": want,
             "message": ("已开启调试信息（编译产出 DWARF，崩溃可定位到源码行）" if enabled
                         else "已关闭调试信息（崩溃将只剩地址，不建议）")}
