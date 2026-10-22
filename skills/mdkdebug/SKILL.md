@@ -268,6 +268,16 @@ thunk 另带 `is_thunk` + `thunk_to`。读这些字段的口径：
     替你改 base。
   - 「我传了 X 它却用了 Y」这类问题，第一件事是把 `input.base_received_hex` 与
     `address_map.base_hex` 贴出来；不要凭 `file_offset` 反推 base（HEX/ELF 上必错）。
+  - **裸 BIN 可以不传 `base`**（批次96）：前 8 字节像 Cortex-M 向量表且复位地址不在镜像内时，
+    工具按 1KB 对齐推断，并标 `address_map.base_source="inferred"` + `base_inferred{method,
+    sp_hex, reset_hex, evidence}`、`notes` 里写「base 是推断的」。显式传 `base` 永远优先；
+    数据不像向量表时**不猜、照旧报错**。
+  - 报错里的地址统一 8 位补零（`0x08005204`），`file_offset_hex` 仍是文件偏移原样。
+
+**工程优化等级**（批次96）：`read_project_config` 的 `optimization_level` 由
+`<Cads><Optim>` 决定，**1-based**（1..4 → `-O0`..`-O3`）；`-Otime` 看 `optimize_for_time`
+（来自 `<Cads><oTime>`，与 `<OptFeed>` 无关）。越界返回 `optimization_error`，不猜。
+要 100% 确认时打开工程 `CreateBatchFile`，直接读构建生成的 `.bat` / `.__i` 里的命令行。
 
 **两版固件比对 / 库函数指纹识别**（批次86）：`recover_diff(reference, target, ...)`。
 读法只有一条：**「名字对上了」和「代码对上了」是两件事**。

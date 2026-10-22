@@ -654,15 +654,21 @@ def _resolve_axf(uvprojx_path: str | None) -> str | None:
         logger.warning("解析 uvprojx 输出配置失败: %s", e)
     return None
 
-# AC5(ARMCC) Cads/Optim 数值 → 优化选项文本（Keil 下拉：-O0/-O1/-O2/-O3/-Otime）
-_OPTIM_TEXT = {"0": "-O0", "1": "-O1", "2": "-O2", "3": "-O3", "4": "-Otime"}
+# AC5(ARMCC) 的 <Cads><Optim> 是 **1-based**（1..4 → -O0..-O3），越界不猜。
+# 真值来自 CreateBatchFile 生成的 .bat / .__i：Optim=1..4 的 armcc 命令行分别是
+# -O0/-O1/-O2/-O3（2026-10-22 在 example_mdk_test 上逐档构建核对）。
+# -Otime 是**另一个开关** <Cads><oTime>（0/1），与 Optim 无关；
+# <OptFeed> 实测不产生 -Otime（只改 Optim=4 时加 OptFeed=1，命令仍是 -O3）。
+_OPTIM_LEVEL = {"1": "-O0", "2": "-O1", "3": "-O2", "4": "-O3"}
+_OPTFEED_FLAG = {"0": "-Ospace", "1": "-Otime"}
 
 
 def _parse_uvprojx_config(uvprojx_path: str | None, target_name: str | None = None) -> dict:
     """解析 .uvprojx 各 target 的编译器类型 / 优化级别 / 编译宏 / 包含路径。
 
     定位 target 用 <TargetName>；uAC6=0→ARMCC(AC5)、1→ARMCLANG(AC6)；
-    优化级别：AC5 在 <Cads><Optim>（0-4 映射 _OPTIM_TEXT），AC6 尝试同一节点文本；
+    优化级别：AC5 在 <Cads><Optim>（**1-based**：1..4 → -O0..-O3，越界给
+    optimization_error），-Otime 来自 <Cads><oTime>；AC6 尝试同一节点文本；
     编译宏：<Cads><VariousControls><Define>（逗号分隔）；包含路径同节点 <IncludePath>（分号分隔）。
     用于排查“不同 target 行为不同”——宏/优化差异一目了然。
     另解析 <Utilities><Flash1><UpdateFlashBeforeDebugging>：=1 表示 Keil 在进入调试前会自动把
@@ -685,6 +691,7 @@ def _parse_uvprojx_config(uvprojx_path: str | None, target_name: str | None = No
         uac6 = (t.findtext("uAC6") or "0").strip()
         # Cads/Optim、Cads/VariousControls/* 在 TargetOption/TargetCommonOption 之下，用任意深度路径
         optim = (t.findtext(".//Cads/Optim") or "").strip()
+        otime = (t.findtext(".//Cads/oTime") or "").strip()
         cdef_el = t.find(".//Cads/VariousControls/Define")
         cdefs = []
         if cdef_el is not None and cdef_el.text and cdef_el.text.strip():
@@ -698,11 +705,18 @@ def _parse_uvprojx_config(uvprojx_path: str | None, target_name: str | None = No
             "compiler": "ARMCLANG(AC6)" if uac6 == "1" else "ARMCC(AC5)",
             "uAC6": uac6,
             "optimization": optim,
-            "optimization_level": _OPTIM_TEXT.get(optim, f"-O{optim}" if optim.isdigit() else ""),
+            "optimization_level": _OPTIM_LEVEL.get(optim, ""),
+            "optimize_for_time": (_OPTFEED_FLAG.get(otime, "") == "-Otime"
+                                  if otime in _OPTFEED_FLAG else None),
             "defines": cdefs,
             "include_paths": inc,
             "update_flash_before_debugging": (ufbd == "1") if ufbd in ("0", "1") else None,
         }
+        if uac6 != "1" and optim and optim not in _OPTIM_LEVEL:
+            # AC5 只有 1..4；0/5/其它值说明工程文件或版本不在这套映射里
+            info["optimization_error"] = (
+                "AC5 的 <Optim> 越界：%r（合法值 1..4 → -O0..-O3）。"
+                "不猜映射；请用 CreateBatchFile 或编译器实际命令行确认。" % optim)
         targets.append(info)
         if chosen is None and (target_name is None or name == target_name):
             chosen = info

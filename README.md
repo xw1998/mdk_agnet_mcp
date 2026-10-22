@@ -75,7 +75,7 @@ PendSV/SysTick 中断活动与阻塞事件通道）：
 - **内存分析套件**：内存地图（`query_memory_map`）+ 字节搜索（`search_mem`）+ 批量填充（`fill_mem`）+ 外设写（`write_peripheral`）+ 状态 diff（`snapshot_diff`）+ 函数耗时（`profile_function`）+ 异常自动抓取（`wait_fault`），覆盖从定位地址、找魔数到观察运行变化、复现崩溃的全链路；
 - **工程产物解析**：`parse_build_errors` 把编译错误/警告解析为结构化列表（兼容 AC5/AC6 两种格式），`parse_map` 解析 .map 的 FLASH/RAM 占用、符号地址与栈使用；
 - **批量命令**：`read_mem_multi` 一次读取多个地址内存、`batch` 一次提交多条只读命令（read_mem/read_variable/calc_expression/get_status/read_registers）聚合返回，显著减少 AI 往返；
-- **多 target / 工程配置**：`project_targets` 枚举工程全部 target + 当前 target + 调试 target，`set_debug_target` 切换调试目标，`read_project_config` 解析各 target 的编译器（AC5/AC6）、优化级别（-O0~-Otime）、编译宏 Define 与包含路径——排查“不同 target 行为不同”时对比宏/优化差异；
+- **多 target / 工程配置**：`project_targets` 枚举工程全部 target + 当前 target + 调试 target，`set_debug_target` 切换调试目标，`read_project_config` 解析各 target 的编译器（AC5/AC6）、优化级别（<Optim> 1-based：1..4 → -O0..-O3，另报 -Otime）、编译宏 Define 与包含路径——排查“不同 target 行为不同”时对比宏/优化差异；
 - **采样剖析**：`profile_sampling` 基于 PC 统计采样定位热点函数（按 .axf 符号表归函数算占比），找“哪个函数占 CPU 最多”的性能瓶颈；`profile_function`/`dwt` 做函数级精确计时；
 - **目标器件信息**：`target_info` 实时读 DBGMCU->IDCODE 判芯片 DEV_ID/REV_ID + SCB->CPUID 判内核类型，返回标称 Flash/RAM 容量与内存布局，排查资源吃紧/选错型号/容量不符；
 - **环境自检 + 工作流引导**：`mdk_guide` 一键自检 Keil/UVSOCK/UV4/.axf/源码漂移/调试态/RTOS 类型，并返回推荐调试工作流与各场景应调用的工具——AI 落地的第一个工具，避免盲目试错；
@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.19）
+│   ├── __init__.py           # 包初始化（版本号 0.2.20）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -347,7 +347,7 @@ python run_server.py --transport http --http-port 8300
 | `batch` | 一次提交多条只读命令聚合返回（read_mem/read_variable/calc_expression/get_status/read_registers），减少往返 | `commands` |
 | `project_targets` | 枚举工程全部 target + 当前 target + 调试 target（UV_PRJ_ENUM_TARGETS/GET_CUR_TARGET/GET_DEBUG_TARGET） | — |
 | `set_debug_target` | 切换调试 target（UV_PRJ_SET_DEBUG_TARGET），多 target 工程切目标后重新进调试 | `target` |
-| `read_project_config` | 读取工程配置：各 target 编译器（AC5/AC6）、优化级别（-O0~-Otime）、编译宏 Define、包含路径、`update_flash_before_debugging`（调试前是否自动下载程序）（.uvprojx 解析） | `project`、`target`（可选） |
+| `read_project_config` | 读取工程配置：各 target 编译器（AC5/AC6）、优化级别（<Optim> 1-based：1..4 → -O0..-O3，另报 -Otime）、编译宏 Define、包含路径、`update_flash_before_debugging`（调试前是否自动下载程序）（.uvprojx 解析） | `project`、`target`（可选） |
 | `scatter_read` | **读分散加载文件(.sct)结构**：按行解析区域头（`RW_IRAM1 0x20000000 0x00040000 {...}`）与选择器（`.ANY`/`.ANY1`/`*`），返回 `regions`/`selectors`/`unsupported`/`errors` 与原始行号。**只读不解析语义**：不做地址推导、不替代链接器结论 | `path` |
 | `scatter_edit` | **受控编辑 .sct**：按行做文本级替换（保住缩进与注释，不整体序列化），支持 `set_region` / `add_region` / `remove_region` / `add_selector` / `remove_selector` 五种操作。**改前强制备份**（`<文件>.mdkdebug.bak`）、**改后重解析校验**，校验不过**不落盘**（宁可报错也不给你一个链接不起来的 .sct）；`dry_run=true` 只看会改成什么样 | `path`、`ops`、`dry_run?`、`backup?`、`create?`、`memmap?` |
 | `scatter_check` | **静态校验**（结论看 `clean`/`problems`，`ok` 只表示检查跑完了）：重复区域名 / 缺 size / size 为 0 / 区域重叠 / 超出内存地图（`memmap` 写法 `0x08000000:0x00100000,0x20000000:0x00030000`）。**说清楚不做什么**：不装载链接器、不校验选择器能不能匹配到段，这些只能靠链接结果验证 | `path`、`memmap?` |
@@ -1511,6 +1511,45 @@ dump 切出来的镜像还得调用方自己写文件。批次90 逐条补平（
 `not_a_vector_table` 且 hint 进 notes、HEX 的 `base_source=container` 与 `delta=-0x1000`、
 ELF 的冲突、伪 C 分支回显、S-record 的 `container+arg`，以及用户现场的
 `0x4D118 / 0x4E118` 两个偏移。
+
+### 省略 base 时按向量表推断（批次96）
+
+文档一直说 `base` 可以省略，但裸 BIN 不传 `base` 时以前只会报「地址不在镜像映射范围内」。
+批次96 补上推断，并把「推出来的」标清楚：
+
+- 触发条件（全部满足才推，否则照旧报错）：首字是合理 SP（4 字节对齐、
+  0x10000000–0x40000000）、复位地址 bit0=1、**复位地址不在 `[0, len)` 内**（在范围内说明
+  `base=0` 本来就自洽）、按 1KB 向下取整得到的候选 base 能让复位地址落在镜像内。
+- 结果标记：`address_map.base_source="inferred"`、`address_map.base_inferred{base_hex,
+  method, sp_hex, reset_hex, reset_offset, evidence}`，`notes` 里也会写「base 是推断的」。
+- **推断不是偷偷改参数**：显式传 `base` 时永远用你传的（`base_source="arg"`）；
+  数据不像向量表（乱字节）时绝不猜，仍旧报错。
+- 1KB 对齐是 Cortex-M 镜像起点常见粒度；若你的镜像不是这个粒度，推断可能偏——
+  看到 `base_source="inferred"` 就当作**待复核**，不对就显式传 `base`。
+
+另外报错里的地址统一补零到 8 位（`end(0x08005204) 必须大于 start(0x08005208)`）。
+
+### 优化等级：`<Optim>` 是 1-based，`-Otime` 另有开关（批次96）
+
+`read_project_config` / `uvprojx_read` 的 `optimization_level` 以前把 `Optim=4` 译成
+`-Otime`，是**错位**的。真值用 `CreateBatchFile` 让 uVision 自己生成命令行核对
+（2026-10-22，example_mdk_test，逐档构建读 `gpio.__i`）：
+
+| `<Optim>` | 实际命令行 | 对象代码哈希 vs 直接 armcc |
+| --- | --- | --- |
+| 1 | `-O0` | 与 `armcc -O0` 相同 |
+| 2 | `-O1` | 与 `armcc -O1` 相同 |
+| 3 | `-O2` | 与 `armcc -O2` 相同 |
+| 4 | `-O3` | 与 `armcc -O3` 相同 |
+
+- `-Otime` **不由 `<OptFeed>` 控制**：实测 `Optim=4 + oTime=1` → `-O3 -Otime`；
+  `Optim=4 + OptFeed=1` → 仍只有 `-O3`。所以映射是两张表：`<Cads><Optim>`（1..4）
+  与 `<Cads><oTime>`（0/1），互不相干。
+- 越界（0、5 或非数字）不猜：返回 `optimization_error`，`optimization_level` 留空。
+- 对象文件整文件 SHA256 会因 `File Name`、头文件 group 段哈希等 ELF 元数据而不同；
+  比较编译结果应比**指令文本**（`fromelf --text -c` 的指令行）或 `.text` 段字节。
+- 更稳妥的取证方式：工程里打开 `CreateBatchFile`，uVision 构建时生成 `.bat` 与每文件的
+  `.__i`，里面就是真实的 `armcc -O3 ...` 命令行，不需要任何翻译表。
 
 ### 底层库
 

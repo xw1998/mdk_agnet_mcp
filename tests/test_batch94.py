@@ -19,6 +19,7 @@
   E 真实 axf 上 source.file_offset 与手算一致、所有指令字节都能重读
   F 闸门：工具面仍 213、零新增依赖
   G base 到货值/实际用值/容器冲突分开报（批次95）
+  H 裸 BIN 不传 base 时按向量表推断并标记（批次96）
 
 运行：python -m tests.test_batch94
 """
@@ -377,6 +378,63 @@ def section_g():
           dmm["address_map"]["base_received_hex"]
           == dmm["address_map"]["base_hex"], dmm["address_map"])
 
+
+def section_h():
+    print("H. 裸 BIN 不传 base：按向量表推断并明确标记（批次96）")
+    blob = vector_bin(None)
+    p = write("b96_nobase.bin", blob)
+    r = RC.disasm_at(p, start=0x08005204, end=0x08005208,
+                     arch="arm", thumb=True)
+    am = r.get("address_map") or {}
+    check("H1 没传 base ⇒ base_source=inferred、base_hex=0x08005000",
+          r.get("ok") and am.get("base_source") == "inferred"
+          and am.get("base_hex") == "0x08005000", am or r.get("error"))
+    check("H2 推断后地址能正常映射（file_offset=0x204）",
+          (r.get("source") or {}).get("file_offset_hex") == "0x204",
+          r.get("source"))
+    check("H3 notes 明说 base 是推断的",
+          any("base 是**推断**的" in n for n in (r.get("notes") or [])),
+          r.get("notes"))
+    inf = am.get("base_inferred") or {}
+    check("H4 base_inferred 带方法/证据（不是只有一个数字）",
+          inf.get("method") == "cortex_m_vector_table_1k_alignment"
+          and inf.get("sp_hex") and inf.get("reset_hex")
+          and "缺 base" in (inf.get("evidence") or ""), inf)
+    check("H5 inferred 上向量表自检仍适用且通过",
+          (am.get("base_check") or {}).get("verdict")
+          == "looks_like_cortex_m_vector_table", am.get("base_check"))
+
+    r2 = RC.disasm_at(p, base=0x08005000, start=0x08005204, end=0x08005208,
+                      arch="arm", thumb=True)
+    check("H6 显式传 base 时不做推断（base_source=arg）",
+          (r2.get("address_map") or {}).get("base_source") == "arg"
+          and (r2.get("address_map") or {}).get("base_inferred") is None,
+          r2.get("address_map"))
+
+    # 复位地址本来就在 [0,len) 内 ⇒ base=0 自洽，不该被改写
+    b2 = bytearray(0x300)
+    b2[0:4] = struct.pack("<I", 0x20001000)
+    b2[4:8] = struct.pack("<I", 0x00000101)
+    p2 = write("b96_zero.bin", bytes(b2))
+    u2 = RC._unit_from_data(bytes(b2), p2, 0)
+    check("H7 复位地址在镜像内 ⇒ 不推断（base=0 自洽）",
+          u2.base == 0 and u2.base_source == "arg" and u2.base_inferred is None,
+          (u2.base, u2.base_source))
+
+    # 乱字节：没有可信向量表 ⇒ 不猜
+    junk = bytearray(0x300)
+    junk[0:8] = struct.pack("<II", 0xDEADBEEF, 0x12345678)
+    p3 = write("b96_junk.bin", bytes(junk))
+    u3 = RC._unit_from_data(bytes(junk), p3, 0)
+    check("H8 数据不像向量表 ⇒ 不推断、不猜 base",
+          u3.base == 0 and u3.base_inferred is None, (u3.base, u3.base_source))
+
+    e = RC.disasm_at(p, start=0x08005208, end=0x08005204,
+                     arch="arm", thumb=True)
+    check("H9 end<start 的报错地址补零到 8 位",
+          "end(0x08005204)" in (e.get("error") or "")
+          and "start(0x08005208)" in (e.get("error") or ""), e.get("error"))
+
 def section_f():
     print("F. 闸门")
     import asyncio
@@ -404,6 +462,7 @@ def main():
         section_d()
         section_e()
         section_g()
+        section_h()
         section_f()
     finally:
         for d in TMP:

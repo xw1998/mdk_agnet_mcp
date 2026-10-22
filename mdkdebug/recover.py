@@ -454,7 +454,8 @@ def _make_cs(arch: dict):
 class Unit:
     """一份可分析的镜像：ELF、或 HEX/BIN 展开后的扁平字节。"""
 
-    def __init__(self, data: bytes, name: str, base: int = 0, elf: dict | None = None):
+    def __init__(self, data: bytes, name: str, base: int = 0, elf: dict | None = None,
+                 infer_base: bool = True):
         self.data = data
         self.name = name
         self.elf = elf
@@ -481,6 +482,22 @@ class Unit:
         # 批次94：base 到底有没有生效必须能自证（ELF/HEX/S-record 自带地址）
         self.base_applied = (not elf)
         self.base_note = ""
+        self.base_inferred = None
+        # 批次96：裸 BIN 不给 base 时，前 8 字节若明显是 Cortex-M 向量表且复位地址
+        # 落在 [0, len) 之外，说明缺的不是推断能力而是 base——按 1KB 对齐推一个，
+        # 并在输出里标成 base_source="inferred"，让人能复核。
+        if elf is None and infer_base and not self.base:
+            inf = _infer_base_from_vectors(data)
+            if inf:
+                self.base = inf["base"]
+                self.base_used = inf["base"]
+                self.base_source = "inferred"
+                self.base_inferred = inf
+                self.base_note = ("raw BIN 没有传 base：按前 8 字节（SP=%s、"
+                                  "复位地址=%s）推断 base=%s（1KB 对齐，"
+                                  "method=%s）；若不对请显式传 base"
+                                  % (inf["sp_hex"], inf["reset_hex"],
+                                     inf["base_hex"], inf["method"]))
         self._build_spans()
         if elf is None:
             self._infer_arch_from_vectors()
@@ -606,7 +623,7 @@ class Unit:
 def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
     kind = detect_container(data[:4096])
     if kind == "elf":
-        unit = Unit(data, name, base=base, elf=parse_elf(data))
+        unit = Unit(data, name, base=base, elf=parse_elf(data), infer_base=False)
         unit.base_received = int(base or 0)
         unit.base_used = min((a for a, _b, _o in unit.spans), default=0)
         unit.base_applied = False
@@ -619,7 +636,7 @@ def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
         flat = _flat_image(data, kind, base)
         if not flat.get("ok"):
             raise ValueError(flat.get("error", "HEX/S-record 解析失败"))
-        unit = Unit(flat["data"], name, base=flat["base"])
+        unit = Unit(flat["data"], name, base=flat["base"], infer_base=False)
         unit.container = kind
         unit.base_received = int(base or 0)
         unit.base_used = int(flat["base"] or 0)
@@ -651,7 +668,7 @@ def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
                   "macho": containers.parse_macho}[kind](data)
         if not parsed.get("ok"):
             raise ValueError(parsed.get("error", "%s 解析失败" % kind))
-        unit = Unit(data, name, base=base, elf=parsed)
+        unit = Unit(data, name, base=base, elf=parsed, infer_base=False)
         unit.container = kind
         unit.base_received = int(base or 0)
         unit.base_used = min((a for a, _b, _o in unit.spans), default=0)
@@ -666,8 +683,9 @@ def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
     unit = Unit(data, name, base=base)
     unit.container = kind
     unit.base_applied = True
-    unit.base_note = ("raw %s 没有自带地址：base=0x%08X 作为基地址**只应用一次**"
-                      % (kind.upper(), int(base)))
+    if not unit.base_inferred:
+        unit.base_note = ("raw %s 没有自带地址：base=0x%08X 作为基地址**只应用一次**"
+                          % (kind.upper(), int(base or 0)))
     return unit
 
 
@@ -842,6 +860,39 @@ def _source_of(rd: dict, unit: Unit) -> dict:
             "base_note": getattr(unit, "base_note", "")}
 
 
+def _infer_base_from_vectors(data: bytes) -> dict:
+    """裸 BIN 没给 base 时，用前 8 字节推一个基地址。**不满足就返回 {}，不猜。**
+
+    判据（全部满足才推）：
+      - 首字是合理 SP（4 字节对齐、0x10000000–0x40000000）；
+      - 复位地址 bit0=1（Cortex-M Thumb 入口）；
+      - 复位地址**已经落在 [0, len) 之外**——在范围内说明 base=0 本来就对，不用推；
+      - 复位地址按 1KB 向下取整得到候选 base，且该候选让复位地址落在镜像内
+        （即复位向量距镜像起点 < min(len, 1KB)）。
+
+    1KB 对齐是 Cortex-M 镜像的常见起点粒度；推出来的值一定会被标成
+    ``base_source="inferred"`` 并进 notes，**不是**偷偷替换调用方的参数。
+    """
+    if len(data) < 8:
+        return {}
+    sp = int.from_bytes(data[0:4], "little")
+    reset = int.from_bytes(data[4:8], "little")
+    sp_ok = (sp & 3) == 0 and 0x10000000 <= sp <= 0x40000000
+    if not sp_ok or not (reset & 1):
+        return {}
+    entry = reset & ~1
+    if entry < len(data):
+        return {}                      # 本来就有一个自洽的 base=0，别动
+    cand = entry & ~0x3FF
+    if cand <= 0 or not (cand <= entry < cand + len(data)):
+        return {}
+    return {"base": cand, "base_hex": "0x%08X" % cand,
+            "method": "cortex_m_vector_table_1k_alignment",
+            "sp_hex": "0x%08X" % sp, "reset_hex": "0x%08X" % reset,
+            "reset_offset": entry - cand,
+            "evidence": "首字是合理 SP 且复位地址 bit0=1，但复位地址不在 "
+                        "[0,0x%X) 内 ⇒ 缺 base 而不是缺代码" % len(data)}
+
 def _base_check(unit: Unit) -> dict:
     """raw BIN 的 base 自检：按这个 base 读到的前 8 字节像不像 Cortex-M 向量表？
 
@@ -849,7 +900,7 @@ def _base_check(unit: Unit) -> dict:
     **只做提示，不改任何结果**：工具不会替你换 base，但要让「base 差一页」
     在输出里看得见，而不是等调用方从一堆看着正常的指令里发现。
     """
-    if getattr(unit, "base_source", "arg") != "arg":
+    if getattr(unit, "base_source", "arg") not in ("arg", "inferred"):
         return {"applicable": False,
                 "why": "容器自带地址（%s）：地址不靠 base 猜，本自检不适用"
                        % unit.container}
@@ -916,6 +967,7 @@ def _address_map(unit: Unit) -> dict:
                getattr(unit, "base_received", 0) or 0),
            "base_source": getattr(unit, "base_source", "arg"),
            "base_applied": bool(getattr(unit, "base_applied", False)),
+           "base_inferred": getattr(unit, "base_inferred", None),
            "note": getattr(unit, "base_note", ""),
            "spans": ["0x%08X..0x%08X(file 0x%X)" % (a, b, o)
                      for a, b, o in unit.spans[:32]]}
@@ -2640,11 +2692,16 @@ def disasm_at(path: str, *, base: int = 0, start: int = 0, end: int = 0,
             if not hit["size"]:
                 note.append("该符号 st_size=0（编译器没给长度），按 64 字节试读；"
                             "要完整函数请给 end")
+    if getattr(unit, "base_inferred", None):
+        note.append("base 是**推断**的：%s（%s）——不对就显式传 base"
+                    % (unit.base_inferred["base_hex"],
+                       unit.base_inferred["method"]))
     if not end:
         code_end = max((b for _, b in unit.code_ranges), default=start + 256)
         end = min(code_end, start + max_insns * 4)
     if end <= start:
-        return {"ok": False, "error": "end(0x%X) 必须大于 start(0x%X)" % (end, start)}
+        return {"ok": False,
+                "error": "end(0x%08X) 必须大于 start(0x%08X)" % (end, start)}
 
     want = (fmt or "").strip().lower()
     if want in ("c", "pseudo", "pseudo_c", "c_code"):

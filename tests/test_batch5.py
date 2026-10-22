@@ -125,8 +125,11 @@ async def main():
             cur = d.get("current", {})
             check("read_project_config 编译器=ARMCC(AC5)",
                   cur.get("compiler") == "ARMCC(AC5)", cur.get("compiler", ""))
-            check("read_project_config 优化=-Otime",
-                  cur.get("optimization_level") == "-Otime", cur.get("optimization_level", ""))
+            # Optim=4 是 1-based ⇒ -O3；-Otime 是另一个开关 <Cads><oTime>
+            check("read_project_config 优化=-O3（Optim=4，1-based）",
+                  cur.get("optimization_level") == "-O3", cur.get("optimization_level", ""))
+            check("read_project_config optimize_for_time=False（oTime=0）",
+                  cur.get("optimize_for_time") is False, cur.get("optimize_for_time"))
             defs = cur.get("defines", [])
             check("read_project_config 宏含 USE_HAL_DRIVER/STM32F401xC",
                   "USE_HAL_DRIVER" in defs and "STM32F401xC" in defs, str(defs))
@@ -134,6 +137,33 @@ async def main():
             # 指定 target
             r = await call(server, "read_project_config", {"project": _UVPX, "target": "mdk_test"})
             check("read_project_config 指定target", load(r).get("current", {}).get("name") == "mdk_test")
+
+            # ---- 批次96：Optim 是 1-based；越界要报错；-Otime 来自 oTime ----
+            import tempfile
+            mini = """<?xml version="1.0" encoding="UTF-8"?>
+<Project><Targets><Target><TargetName>T</TargetName><uAC6>0</uAC6>
+<TargetOption><TargetCommonOption><Cads>
+<Optim>%d</Optim><oTime>%d</oTime>
+<VariousControls><Define></Define><IncludePath></IncludePath></VariousControls>
+</Cads></TargetCommonOption></TargetOption></Target></Targets></Project>"""
+            d0 = tempfile.mkdtemp(prefix="mdk96_")
+            for tag, optim, otime, want_lvl, want_err, want_time in (
+                    ("bad5", 5, 0, "", True, False),
+                    ("bad0", 0, 0, "", True, False),
+                    ("o1t", 1, 1, "-O0", False, True),
+                    ("o2", 2, 0, "-O1", False, False)):
+                fp = os.path.join(d0, tag + ".uvprojx")
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write(mini % (optim, otime))
+                dd = load(await call(server, "read_project_config", {"project": fp}))
+                cur = dd.get("current") or {}
+                check("批次96 Optim=%d/oTime=%d ⇒ level=%r%s" % (
+                    optim, otime, want_lvl,
+                    "、越界报错" if want_err else ""),
+                    cur.get("optimization_level") == want_lvl
+                    and (bool(cur.get("optimization_error")) if want_err
+                         else not cur.get("optimization_error"))
+                    and cur.get("optimize_for_time") is want_time, cur)
         else:
             check("read_project_config 无真实uvprojx(跳过真值断言)", True)
 
