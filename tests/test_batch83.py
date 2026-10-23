@@ -12,7 +12,7 @@ Ghidra 的类型恢复是「从访问模式反推数据形状」：栈槽位、�
   E 真镜像交叉验证：HAL_UART_* 推出的 72 字节 == DWARF 里 __UART_HandleTypeDef 的 72；
                     HAL_DMA_Abort 推出的 96 == __DMA_HandleTypeDef 的 96
   F 工程产出：三份类型 CSV 落盘
-  G 工具面：214 个工具（+1 来自批次86）
+  G 工具面：215 个工具（+1 来自批次86）
 
 运行：python -m tests.test_batch83
 """
@@ -249,7 +249,7 @@ def section_g():
     from mdkdebug import server as SV
     names = {t.name for t in asyncio.run(
         SV.create_server(port=15883, toolsets="all").list_tools())}
-    check("G1 工具总数 214（不增依赖、本批不增工具）", len(names) == 214, len(names))
+    check("G1 工具总数 215（不增依赖、本批不增工具）", len(names) == 215, len(names))
 
 
 # ==================================================================

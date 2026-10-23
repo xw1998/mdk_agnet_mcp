@@ -285,10 +285,10 @@ def section_d():
     srv = SV.create_server(port=15983, toolsets="all")
     tools = {t.name: t for t in asyncio.run(srv.list_tools())}
     names = set(tools)
-    check("D1 注册工具数仍是 214（批次89 只给既有工具加参数，不新增工具）",
-          len(names) == 214, len(names))
-    check("D2 build 组仍是 30 个且含 recover_ledger",
-          len(TB.TOOLSETS["build"]) == 30 and "recover_ledger" in TB.TOOLSETS["build"],
+    check("D1 注册工具数仍是 215（批次89 只给既有工具加参数，不新增工具）",
+          len(names) == 215, len(names))
+    check("D2 build 组仍是 31 个且含 recover_ledger",
+          len(TB.TOOLSETS["build"]) == 31 and "recover_ledger" in TB.TOOLSETS["build"],
           len(TB.TOOLSETS["build"]))
     ann = AN.annotations_for("recover_ledger")
     props = (tools.get("recover_ledger").input_schema.get("properties") or {})

@@ -12,7 +12,7 @@
     并明说「内联体没有调用点，不能还原成 call」；反例：不含调用的重复片段不报
   E 跨函数数据流：bl 点的四个实参来源（const/copy/mem/return/calc/entry）+ 一层组合链
   F cpsid/bkpt/vmsr：只留注释并计数（不影响数据流）
-  G 工具面与回归（仍 214 个工具、零新增依赖、真镜像数字不变）
+  G 工具面与回归（仍 215 个工具、零新增依赖、真镜像数字不变）
 
 运行：python -m tests.test_batch92
 """
@@ -271,7 +271,7 @@ def section_g():
     from mdkdebug import server as SV
     names = {t.name for t in asyncio.run(
         SV.create_server(port=15993, toolsets="all").list_tools())}
-    check("G1 工具总数仍是 214（本批只改既有工具的输出）", len(names) == 214, len(names))
+    check("G1 工具总数仍是 215（本批只改既有工具的输出）", len(names) == 215, len(names))
     check("G2 没有引入新依赖（只剩 capstone / pyelftools）",
           not any(m in sys.modules for m in
                   ("unicorn", "keystone", "angr", "r2pipe", "lief")),

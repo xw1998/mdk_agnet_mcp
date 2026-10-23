@@ -193,7 +193,7 @@ DEFAULT_CLEAN_TIMEOUT = 300
 # 为什么值得单独做成表：旧实现只认识 0/1/2/3，其余一律「失败（退出码 N）」——
 # 而 11/12/13/15 是**四个各不相同的故障**，处置办法完全不一样：
 # 工程打不开要查路径与占用、器件库缺失要装 Pack、写入错误要看输出目录权限、
-# UV4 被占用要先去关实例。只说「退出码 15」等于让调用方从头排查一遍。
+# 工程读不出来要查编码/BOM。只说「退出码 15」等于让调用方从头排查一遍。
 # 负数是我们自己的合成码（进程级失败），与 UV4 无关，一并列在这里免得混淆。
 _UV4_EXIT_MEANING = {
     0: ("success", "无错误、无警告"),
@@ -202,10 +202,14 @@ _UV4_EXIT_MEANING = {
     3: ("fatal", "致命错误：许可证缺失 / 工程损坏 / 工具链不可用"),
     4: ("fatal", "致命错误（UV4 报告构建未完成）"),
     5: ("fatal", "致命错误（UV4 报告构建未完成）"),
-    11: ("project-open-failed", "无法打开工程文件（路径错误、被占用或文件损坏）"),
+    11: ("project-open-failed", "无法打开工程文件（路径错误、被占用、只读或文件损坏）"),
     12: ("device-db-missing", "设备数据库缺失（对应 Device Family Pack 未安装）"),
     13: ("write-error", "写入错误（输出目录只读 / 磁盘空间不足 / 产物文件被占用）"),
-    15: ("uv4-busy", "UV4 访问错误：已有实例占用（该工程正被另一个 Keil 实例打开着）"),
+    # 15 的官方法定含义是「读取工程文件（导入 XML）时出错」——批次99 的真机事实：
+    # 一份带 UTF-8 BOM 的 .uvprojx 就只会回 15，uVision 不给任何更具体的提示。
+    # 旧表把它写成「UV4 被占用」，会让调用方去关 Keil，方向完全错（批次100 修正）。
+    15: ("project-read-failed", "读取工程文件（XML）时出错：文件损坏/被截断/带 BOM 或编码不符，"
+                               "uVision 解析不了"),
     20: ("unknown-error", "未知错误"),
     -1: ("timeout", "超时（UV4 未在限定时间内退出，进程已被终止）"),
     -2: ("uv4-not-found", "找不到 UV4 可执行文件"),
@@ -241,12 +245,13 @@ def _exit_next_actions(exit_code: int, action: str = "") -> list:
         5: ["用 Keil 打开工程手工构建一次，看弹窗提示（多半是工具链/许可证问题）"],
         11: ["确认 project 路径拼写正确、文件确实存在（用 read_project_config 或 list_uvision_instances 核对）",
              "若工程正被 Keil 打开着导致占用，先 close_uvision 再重试"],
+        15: ["直接跑 project_file_check 看 encoding/bom/xml_ok（带 BOM 的 .uvprojx 只会回 15）",
+             "需要就地面修复时用 project_file_repair（默认 dry_run，能去 BOM 与字面量换行）",
+             "修不了再从版本库/`*.mdkdebug.bak` 还原——不要先去关 Keil，15 不是「实例被占用」"],
         12: ["安装对应器件的 Device Family Pack（Keil Pack Installer），"
              "或确认 target 名与已安装器件匹配（read_project_config 可看当前 target）"],
         13: ["检查输出目录（Objects/Listings 等）是否只读、磁盘是否已满",
              "关闭可能占用产物文件的程序（Keil 调试器、hex 查看器、烧录工具）后重试"],
-        15: ["Keil 已有实例占用该工程：先 keil_health 看清状态，再 close_uvision 关闭实例后重试",
-             "若需保留当前实例，改为在该实例里手工构建"],
         20: ["用 Keil 打开工程手工构建一次取得更明确的报错", "调 keil_health 排查调试通道与模态框"],
         -1: ["调大 timeout_s 后重试（大型工程/首次全量编译常超默认上限）"],
         -2: ["用 --uv4-path 指定 UV4.exe 路径，或确认 Keil 安装目录未被移动"],
@@ -443,7 +448,7 @@ def _result(action: str, exit_code: int, output: str, keil_before: dict | None =
     if not ok:
         d["next_actions"] = acts
         if exit_code == 15:
-            d["failure_bucket"] = "keil-busy"
+            d["failure_bucket"] = "project-unreadable"
         elif exit_code == 11:
             d["failure_bucket"] = "project-unavailable"
         elif exit_code == 12:

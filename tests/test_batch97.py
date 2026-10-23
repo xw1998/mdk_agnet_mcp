@@ -14,7 +14,7 @@
   A 体检：编码/BOM/行尾/混合行尾/非 ASCII/U+FFFD/XML 可解析/sha256
   B 安全写入：往返校验、原编码严格编码、XML 校验、原子写、写后回读
   C 三个写入接入点（uvprojx / uvoptx / cmdscript）全部改走安全写入器
-  D 工具层：project_file_check 只读体检工具（214 个工具、在 build 组、不在默认面）
+  D 工具层：project_file_check 只读体检工具（215 个工具、在 build 组、不在默认面）
   E 文档纪律：SKILL 硬规则 + PITFALLS + README
   F 闸门：零新增依赖
 
@@ -25,6 +25,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -163,16 +164,27 @@ def section_a():
 def section_b():
     print("B. 安全写入：往返校验 / 严格编码 / XML / 原子写 / 写后回读")
 
-    # B1 BOM + CRLF 文件插入新行：BOM 保住、行尾按 CRLF 补齐
+    # B1 BOM + CRLF 文件插入新行：**BOM 去掉**（批次100 纠正）、行尾按 CRLF 补齐。
+    # 批次97 时以为 BOM 必须原样保留；真机事实相反——带 BOM 的 .uvprojx uVision 打不开
+    # （命令行只回 exit 15）。所以写入时顺手去掉 BOM，并在结果里报告。
     raw = real_raw().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
     p = put("bom_crlf.uvprojx", b"\xef\xbb\xbf" + raw)
     r = UP.add_files(p, "Core", ["..\\Core\\Src\\added.c"])
     b = rbytes(p)
-    check("B1 BOM 与 CRLF 都保住：写后仍是 utf-8 BOM、裸 LF 数为 0、新增行按 CRLF 补齐",
-          r.get("ok") and r.get("changed") and b[:3] == b"\xef\xbb\xbf"
+    txt = b.decode("utf-8")
+    check("B1 带 BOM 的工程写入后 BOM 被去掉（否则 uVision 打不开）、裸 LF 数为 0、"
+          "新增行按 CRLF 补齐",
+          r.get("ok") and r.get("changed") and not b.startswith(b"\xef\xbb\xbf")
+          and r.get("bom_stripped") == "utf-8"
           and (b.count(b"\n") - b.count(b"\r\n")) == 0
-          and r.get("newline_fixed", 0) >= 4
           and r.get("verify") == "byte-identical", r)
+    # 批次99：上面那条断言**抓不住**「换行被写成字面量 LF」——字面量也不会产生裸 LF。
+    # 真正的判据是：写进去的每个结构行都单独成行，且文件里没有字面量痕迹。
+    check("B1b 新增的文件项是真换行、不是字面量（<File> / <FileName> 各自独占一行）",
+          "\r\n            <File>\r\n" in txt
+          and "<FileName>added.c</FileName>\r\n" in txt
+          and ">LF" not in txt and ">CRLF" not in txt
+          and PF.count_literal_newlines(txt) == 0, txt[txt.find("added.c") - 120:][:200])
 
     # B2 除改动区外其余字节不变
     p2 = copy_real("diff.uvprojx")
@@ -312,8 +324,8 @@ def section_d():
         return names, out
 
     names, out = asyncio.run(run())
-    check("D1 project_file_check 已注册，工具总数 214",
-          "project_file_check" in names and out["count"] == 214, out["count"])
+    check("D1 project_file_check 已注册，工具总数 215",
+          "project_file_check" in names and out["count"] == 215, out["count"])
     check("D2 在 build 组、不在默认面（会写工程的工具都不进默认面）",
           "project_file_check" in TB.TOOLSETS["build"]
           and "project_file_check" not in TB.TOOLSETS["core"], None)
@@ -382,6 +394,189 @@ def section_g():
 
 
 # ----------------------------------------------------------------------
+# H. 字面量换行：检出 + 修复（批次99 回归，防止「把行尾标签写进文件」）
+# ----------------------------------------------------------------------
+def section_h():
+    print("H. 字面量换行（>LF / >CRLF）：真正的换行 vs 写进文件的标签")
+    raw = real_raw()
+    txt0 = raw.decode("utf-8")
+
+    # H1 LF 文件：add_files 插入的多行必须各自成行
+    p = put("lf.uvprojx", raw)
+    r = UP.add_files(p, "Core", ["..\\Core\\Src\\h1.c"])
+    txt = rbytes(p).decode("utf-8")
+    check("H1 LF 文件里 add_files：<File>/<FileName>/<FileType> 各自独占一行、无字面量",
+          r.get("ok") and r.get("changed")
+          and "\n            <File>\n" in txt
+          and "<FileName>h1.c</FileName>\n" in txt
+          and PF.count_literal_newlines(txt) == 0, txt[txt.find("h1.c") - 100:][:180])
+
+    # H2 CRLF 文件：同样，且不能混进裸 LF
+    p2 = put("crlf.uvprojx", raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    r2 = UP.add_files(p2, "Core", ["..\\Core\\Src\\h2.c"])
+    b2 = rbytes(p2)
+    check("H2 CRLF 文件里 add_files：行尾仍是 CRLF（裸 LF=0）、无字面量",
+          r2.get("ok") and (b2.count(b"\n") - b2.count(b"\r\n")) == 0
+          and PF.count_literal_newlines(b2.decode("utf-8")) == 0, r2)
+
+    # H3 把标签当分隔符传进去，必须当场报错（而不是写出字面量）
+    threw = None
+    try:
+        PF.normalize_inserted_newlines("a\nb", "a\nX\nb", "LF")
+    except ValueError as e:
+        threw = str(e)
+    check("H3 normalize 收到标签（'LF'）而不是换行符时抛 ValueError，不再静默写坏",
+          threw is not None and "newline_seq" in threw, threw)
+
+    # H4 体检能认出这种损坏（XML 仍是合法的，只能靠签名）
+    broken = txt0.replace("</Group>\n", "</Group>LF")
+    p4 = put("broken.uvprojx", broken.encode("utf-8"))
+    r4 = PF.inspect(p4)
+    check("H4 体检检出字面量换行：literal_newline_suspects>0、level=error，但 xml_ok 仍为 true",
+          r4["literal_newline_suspects"] > 0 and r4["level"] == "error"
+          and r4["xml_ok"] is True
+          and any("字面量" in n for n in r4["notes"]), r4)
+
+    # H5 dry_run 默认不写
+    snap = rbytes(p4)
+    r5 = PF.repair_literal_newlines(p4)
+    check("H5 修复默认 dry_run：报处数与前几处上下文，但文件一字不动",
+          r5.get("ok") and (r5.get("found") or {}).get("literal_newlines", 0) > 0
+          and r5.get("changed") is False
+          and r5.get("samples") and rbytes(p4) == snap, r5)
+
+    # H6 真修：换行回来、XML 仍合法、有备份
+    r6 = PF.repair_literal_newlines(p4, dry_run=False)
+    fixed_txt = rbytes(p4).decode("utf-8")
+    check("H6 真修：字面量清零、换行恢复、XML 仍可解析、备份存在",
+          r6.get("ok") and r6.get("changed") and r6.get("verify") == "byte-identical"
+          and PF.count_literal_newlines(fixed_txt) == 0
+          and PF.inspect(p4)["xml_ok"] and os.path.isfile(r6.get("backup") or "")
+          and r6.get("message", "").startswith("已修复"), r6)
+
+    # H7 文件名里的 LF 不能被误伤
+    p7 = put("path.uvprojx", txt0.replace("../Core/Src/main.c", "../Core/LF/main.c")
+             .encode("utf-8"))
+    r7 = PF.repair_literal_newlines(p7, dry_run=False)
+    check("H7 只动「标签之间」的位置：<FilePath> 里的 LF 不被误改",
+          r7.get("ok") and "../Core/LF/main.c" in rbytes(p7).decode("utf-8"), r7)
+
+    # H8 工具层：注册 + 默认试跑
+    from mdkdebug import server as SV
+
+    async def run():
+        srv = SV.create_server()
+        tools = await srv.list_tools()
+        names = sorted(t.name for t in tools)
+
+        async def _call(tool, args):
+            res = await srv.call_tool(tool, args)
+            payload = res[0][0].text if isinstance(res, tuple) else res.content[0].text
+            return json.loads(payload)
+
+        snap_before = rbytes(p4)
+        out = await _call("project_file_repair", {"project": p4})
+        return names, out, rbytes(p4) == snap_before
+
+    names, out, untouched = asyncio.run(run())
+    check("H8 project_file_repair 已注册（工具总数 215），默认 dry_run 且不写文件",
+          "project_file_repair" in names and len(names) == 215
+          and out.get("dry_run") is True
+          and all(f.get("changed") is False for f in out.get("files") or [])
+          and untouched, out)
+
+
+# ----------------------------------------------------------------------
+# I. 批次100：BOM（uVision 打不开的真因）+ 逐行拼装 + 退出码 15
+# ----------------------------------------------------------------------
+def section_i():
+    print("I. BOM / 逐行拼装 / 退出码 15")
+    raw = real_raw()
+    txt0 = raw.decode("utf-8")
+    bom_raw = b"\xef\xbb\xbf" + raw
+
+    # I1 体检：BOM 必须判 error（旧实现只报 bom: utf-8 并说 ok）
+    p1 = put("bom.uvprojx", bom_raw)
+    r1 = PF.inspect(p1)
+    check("I1 体检把 BOM 判为 error（旧实现 level=ok，漏检了真正让 uVision 打不开的原因）",
+          r1["bom"] == "utf-8" and r1["level"] == "error"
+          and any("BOM" in n and "exit 15" in n for n in r1["notes"]), r1["notes"])
+
+    # I2 任何写入口写一次就去掉 BOM（不留「打不开的工程」）
+    r2 = PF.write_text(p1, txt0)
+    after2 = rbytes(p1)
+    check("I2 write_text 顺手去掉 UTF-8 BOM：报告 bom_stripped，磁盘上确实没有 BOM 了",
+          r2.get("ok") and r2.get("bom_stripped") == "utf-8"
+          and not after2.startswith(b"\xef\xbb\xbf")
+          and r2.get("verify") == "byte-identical", r2)
+
+    # I3 修复工具默认试跑：报 BOM，不写
+    p3 = put("bom2.uvprojx", bom_raw)
+    snap3 = rbytes(p3)
+    r3 = PF.repair_project_file(p3)
+    check("I3 repair_project_file 默认 dry_run：found.bom 报出来但不写文件",
+          r3.get("ok") and (r3.get("found") or {}).get("bom") == "utf-8"
+          and r3.get("changed") is False and rbytes(p3) == snap3, r3)
+
+    # I4 真修：BOM 去掉、XML 仍合法、有备份
+    r4 = PF.repair_project_file(p3, dry_run=False)
+    check("I4 真修 BOM：去掉、XML 仍可解析、备份存在、message 说明修了什么",
+          r4.get("ok") and r4.get("changed") and (r4.get("repaired") or {}).get("bom") == "utf-8"
+          and not rbytes(p3).startswith(b"\xef\xbb\xbf")
+          and PF.inspect(p3)["xml_ok"] and os.path.isfile(r4.get("backup") or "")
+          and "BOM" in (r4.get("message") or ""), r4)
+
+    # I5 两类缺陷一次修完
+    p5 = put("both.uvprojx", ("\ufeff" + txt0.replace("</Group>\n", "</Group>LF"))
+             .encode("utf-8"))
+    r5 = PF.repair_project_file(p5)
+    r5b = PF.repair_project_file(p5, dry_run=False)
+    check("I5 BOM + 字面量换行同时存在时，一次修复两类并各自报数",
+          (r5.get("found") or {}).get("bom") == "utf-8"
+          and (r5.get("found") or {}).get("literal_newlines", 0) > 0
+          and (r5b.get("repaired") or {}).get("bom") == "utf-8"
+          and (r5b.get("repaired") or {}).get("literal_newlines", 0) > 0
+          and PF.count_literal_newlines(rbytes(p5).decode("utf-8")) == 0, r5b)
+
+    # I6 缩进跟着工程走：4 空格的工程不会被塞进 8 空格
+    # 只缩进 XML 结构行（`<File>` 的替换会顺带命中 `<FilePath>`，必须显式列全标签）
+    txt4 = re.sub(r"\n( +)(</?File>|<FileName>|<FileType>|<FilePath>|<Groups>|</Groups>"
+                  r"|<Group>|</Group>|<GroupName>|<Files>|</Files>)",
+                  lambda m: "\n" + m.group(1)[:-4] + m.group(2), txt0)
+    p6 = put("indent4.uvprojx", txt4.encode("utf-8"))
+    r6 = UP.add_files(p6, "Core", ["..\\Core\\Src\\i6.c"])
+    t6 = rbytes(p6).decode("utf-8")
+    seg6 = t6[t6.find("<FileName>i6.c</FileName>") - 60:t6.find("<FilePath>..\\Core\\Src\\i6.c") + 40]
+    check("I6 add_files 的缩进取自工程本身（缩进 4 格后的工程写 8/10 空格，"
+          "不再写死旧的 12/14）",
+          r6.get("ok") and "\n        <File>\n          <FileName>i6.c</FileName>\n" in t6
+          and "\n            <File>" not in t6, seg6)
+
+    # I7 结构行各自独占一行（LF 与 CRLF 两种文件都成立）
+    p7 = put("lines.uvprojx", raw)
+    UP.add_files(p7, "Core", ["..\\Core\\Src\\i7.c"])
+    t7 = rbytes(p7).decode("utf-8")
+    i7 = t7.find("<FileName>i7.c</FileName>")
+    blk7 = t7[i7 - 40:i7 + 160]
+    check("I7 逐行拼装：<File>/<FileName>/<FileType>/<FilePath>/</File> 各占一行、无标签残渣",
+          blk7.count("\n") >= 4 and "LF <" not in blk7 and ">LF" not in blk7
+          and PF.count_literal_newlines(t7) == 0, blk7)
+
+    # I8 退出码 15 的官方含义（读工程失败），不能再报成「被占用」
+    from mdkdebug import builder as BD
+    acts = BD._exit_next_actions(15)
+    check("I8 退出码 15 = project-read-failed，next_actions 指向 project_file_check/repair",
+          BD._exit_meaning(15) == "project-read-failed"
+          and any("project_file_check" in a for a in acts)
+          and any("project_file_repair" in a for a in acts), acts)
+
+    # I9 错误归桶也认得这条
+    from mdkdebug import errors as ER
+    code = ER.classify_error("*** Error: error reading the project file")
+    check("I9 报错文本「error reading the project file」归到 project-unreadable 桶",
+          code == "project-unreadable", code)
+
+# ----------------------------------------------------------------------
 # E. 文档纪律
 # ----------------------------------------------------------------------
 def section_e():
@@ -399,6 +594,9 @@ def section_e():
           "五十九" in pitfalls and "BOM" in pitfalls and "行尾" in pitfalls)
     check("E5 README 记录 project_file_check 与本批的写入校验",
           "project_file_check" in readme)
+    check("E6 SKILL 讲明「BOM = 打不开」与 exit 15，README/PITFALLS 记录批次100",
+          "BOM" in skill and "exit 15" in skill and "bom_stripped" in skill
+          and "六十一" in pitfalls and "bom_stripped" in readme)
 
 
 # ----------------------------------------------------------------------
@@ -425,6 +623,8 @@ def main():
         section_c()
         section_d()
         section_g()
+        section_h()
+        section_i()
         section_e()
         section_f()
     finally:

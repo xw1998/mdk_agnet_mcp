@@ -374,7 +374,8 @@ def group_d_builder():
     check("D1 UV4 退出码表覆盖关键码并给出机器可读名（不再是笼统的「失败」）",
           em(0) == "success" and em(1) == "warning" and em(2) == "build-error"
           and em(11) == "project-open-failed" and em(12) == "device-db-missing"
-          and em(13) == "write-error" and em(15) == "uv4-busy"
+          # 批次100：15 的法定含义是「读取工程文件出错」，旧表误写成 uv4-busy
+          and em(13) == "write-error" and em(15) == "project-read-failed"
           and em(99) == "unmapped-exit-code",
           [em(c) for c in (0, 1, 2, 11, 12, 13, 15, 99)])
     check("D2 人读文本也齐全（3/4/5 与 -1/-2/-3 都不再是裸数字）",
@@ -453,8 +454,8 @@ def group_d_builder():
         state["code"] = 15
         r = builder.rebuild_project("C:/fake/UV4.exe", REAL_PROJ,
                                     ensure_debug_channel=False)
-        check("D17 退出码 15 → failure_bucket=keil-busy（可机读的失败分类）",
-              r.get("ok") is False and r.get("failure_bucket") == "keil-busy"
+        check("D17 退出码 15 → failure_bucket=project-unreadable（可机读的失败分类）",
+              r.get("ok") is False and r.get("failure_bucket") == "project-unreadable"
               and r.get("next_actions"), r.get("failure_bucket"))
         for code, bucket in ((11, "project-unavailable"), (12, "toolchain-not-ready"),
                              (13, "output-write-failed"), (2, "build-failed"),
@@ -601,7 +602,7 @@ async def group_f_surface(server):
         check("F1 工具已注册：%s" % nm, nm in tools)
 
     n = len(tools)
-    check("F2 工具总数 214（批次35 +10 + 批次34 +1 + 批次36 +46 + 批次40 +3 + 批次42 +1）", n == 214, n)
+    check("F2 工具总数 215（批次35 +10 + 批次34 +1 + 批次36 +46 + 批次40 +3 + 批次42 +1）", n == 215, n)
 
     d = tools["flash_download"].description or ""
     check("F3 高风险工具描述带【风险】高并点明不可逆",

@@ -128,6 +128,9 @@ DESTRUCTIVE = {
     "batch_debug_script",
     # 非 MDK 侧：写目标 Flash/RAM、覆盖用户工程里的插桩文件
     "ocd_flash", "ocd_write_mem", "ocd_load", "trace_instrument",
+    # 批次99：把工程文件里被写坏的字面量换行改回真换行。默认 dry_run 只读；
+    # 但一旦 dry_run=false 就改用户的工程文件，与 uvprojx_edit 同档。
+    "project_file_repair",
 }
 
 # ----------------------------------------------------------------------
@@ -198,7 +201,7 @@ MUTATING = {
     "trace_swo_start", "trace_swo_stop", "trace_scope_start",
     "trace_scope_stop", "trace_pcsample",
     "coverage_start", "coverage_stop", "coverage_clear",
-    "uvprojx_edit", "wait_fault",
+    "uvprojx_edit", "project_file_repair", "wait_fault",
     "scatter_edit", "core_select",
     "watchdog_freeze", "write_mem", "write_peripheral",
     # 批次49：函数运行时线录制会下/撤硬件断点并 halt/resume 目标；

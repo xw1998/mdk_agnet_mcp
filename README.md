@@ -217,7 +217,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.22）
+│   ├── __init__.py           # 包初始化（版本号 0.2.23）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -234,7 +234,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 214 个工具定义
+│   └── server.py             # MCP Server 与 215 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -283,7 +283,7 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **214** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **215** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
 - **MDK 族（121 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
 - **非 MDK 族（86 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**·**任务表取名**，34 个）/ **其余非 MDK 能力**（RTOS 分析、复位循环观测、分散加载文件、C 代码索引、可视化出图与 trace 统计，18 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
@@ -621,13 +621,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-214 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 170 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+215 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 171 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 214 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 215 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -659,8 +659,8 @@ toolset(action="load",   toolsets="all")        # 一次全装 214 个（=full/*
 |---|---|---|---|---|
 | 默认（`core` 组 + 元工具，描述 `lean`） | 44 | 约 2.2 万 | **约 3.9 万**（−56%） | 不设环境变量 |
 | **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 6 千** | **约 1.5 万** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
-| `all`（全装，描述默认 `lean`） | 214 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
-| `all` + `MDKDEBUG_DESC=min` | 214 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
+| `all`（全装，描述默认 `lean`） | 215 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=min` | 215 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
 | 上述任一档 + `MDKDEBUG_DESC=full` | — | 逐字节还原全文 | — | 要逐字完整说明时 |
 
 - **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。
@@ -1125,7 +1125,7 @@ Ghidra 最有名的那个功能——把机器码变成类 C——批次84 吸�
 `adcs/sbc.w` 需要 C 位表达式，链断时猜一个进位就是静默错答案；宁可留一行
 `/* 未支持: sbc.w ... */` 并计数。
 
-接线方式（**批次84 不新增 MCP 工具**；总数在批次86/87/88 变成 214，那是函数匹配的 `recover_diff`、镜像切分的 `image_split` 与闭环台账的 `recover_ledger`）：
+接线方式（**批次84 不新增 MCP 工具**；总数在批次86/87/88 变成 215，那是函数匹配的 `recover_diff`、镜像切分的 `image_split` 与闭环台账的 `recover_ledger`）：
 
 - `recover_disasm(symbol="HAL_RCC_OscConfig", fmt="c")` —— 单个函数出伪 C；
 - `recover_project` 默认写一份 `src/pseudo_c.c`（`include_pseudo_c=False` 可关，
@@ -1352,7 +1352,7 @@ Flash 窗口 `0x08000000 + 2 MiB`、RAM 窗口 `0x20000000 + 128 KiB`）：扫�
 
 批次79~89 把能力补齐了，但把「AI 拿着一份固件走一遍」实测下来，路上有四处会卡：
 异构镜像要等 `armlink` 才失败、`recover_probe` 一次吐 45 KB JSON、深度扫描截断是静默的、
-dump 切出来的镜像还得调用方自己写文件。批次90 逐条补平（**不新增工具，仍是 214 个**）：
+dump 切出来的镜像还得调用方自己写文件。批次90 逐条补平（**不新增工具，仍是 215 个**）：
 
 | 卡点 | 以前 | 现在 |
 |---|---|---|
@@ -1446,7 +1446,7 @@ dump 切出来的镜像还得调用方自己写文件。批次90 逐条补平（
 
 测试 `tests/test_batch93.py` 用手写字节夹具（不依赖工具链）覆盖三个家族的
 算术/访存/分支/调用、零点丢弃、RVC、MIPS 延迟槽顺序、ARM 模式的 `push/pop` 与
-`movw/movt`，以及家族拒绝与「工具面仍 214 / 零新增依赖」。
+`movw/movt`，以及家族拒绝与「工具面仍 215 / 零新增依赖」。
 
 ### 读字节的出处与回填校验（批次94）
 
@@ -1578,9 +1578,25 @@ uVision 再打开就报错。批次97 把这条纪律做成**工具能执行的�
   所以「读一次」就同时拿到配置与字节事实，不用为了查编码多跑一趟。
 - 返回值带 `encoding` / `bom` / `newline` / `verify` / `sha256_before|after` /
   `newline_fixed`，改完能自证「格式没被洗、内容确实变了」。
+- **BOM 判 error、写入时去 BOM**（批次100）：带 `UTF-8 BOM` 的 `.uvprojx` uVision **读不进去**——
+  命令行构建只回 `exit 15`（`error reading the project file`），GUI 里就是打不开，且没有更具体的
+  提示。所以 `project_file_check` 把 BOM 判成 `error`（XML 仍然合法，别用 `xml_ok` 判健康），
+  任何写入口（`uvprojx_edit` / `project_file_repair`）写回时都会去掉 UTF-8 BOM 并报 `bom_stripped`。
+- **`exit 15` 的含义订正**（批次100）：官方文档是「读取工程文件（导入 XML）出错」，
+  旧退出码表把它写成「UV4 被占用」，会把人指去关 Keil。现在归 `project-read-failed` /
+  `failure_bucket=project-unreadable`，`next_actions` 直接指向 `project_file_check` /
+  `project_file_repair`。`errors.py` 也新增同名错误桶。
+- **`add_files` 改为逐行拼装**（批次100）：行尾与缩进都从工程里量出来（不再写死 `\n` 与
+  8/10 空格），`<File>`/`<FileName>`/`<FileType>`/`<FilePath>` 各占一行；4 空格缩进的工程
+  不会被塞进 12 空格。
+- **字面量换行**（批次99 修）：`inspect` / `project_file_check` 会报
+  `literal_newline_suspects`——文件里出现 `>LF` / `>CRLF` 紧跟空白再跟 `<`
+  （`</Group>LF        <Group>` 这种）。它**不会让 XML 失效**，所以 `xml_ok` 仍是 true，
+  只能在字节/结构层查。修复工具 `project_file_repair`（默认 `dry_run=true` 只报数，
+  确认后传 false 才写，写前备份、走五道闸门，只动「标签之间」的位置）。
 
 纪律写成了可直接照做的清单：见 `skills/mdkdebug/SKILL.md` 的
-「工程管理文件编辑纪律（硬规则）」与 `docs/PITFALLS.md` 第五十九。
+「工程管理文件编辑纪律（硬规则）」与 `docs/PITFALLS.md` 第五十九～六十一。
 
 ### 底层库
 

@@ -5,7 +5,7 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 
 # mdkdebug —— Keil 在线调试的组合拳
 
-mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 214 个工具。
+mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 215 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
 ## 一、动手前的四条纪律
@@ -35,9 +35,15 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
 ### 工程管理文件编辑纪律（硬规则，批次97）
 
 `.uvprojx` / `.uvoptx` 是 uVision 的**字节契约**：编码、BOM、行尾都是内容的一部分。
-真实事故不止一起——AI 用「读文本 → 改一行 → 写回文本」改工程文件，写回时丢了 BOM、
-把 CRLF 换成 LF、把编不出的字符写成 `?`，结果 uVision 打开工程报错/分组丢失。
-这类损坏**在编辑器里看不出来**，只能在字节层面查。
+真实事故不止一起——AI 用「读文本 → 改一行 → 写回文本」改工程文件，写回时把 CRLF 换成 LF、
+或把编不出的字符写成 `?`，结果 uVision 打开工程报错/分组丢失。这类损坏**在编辑器里看不出来**，
+只能在字节层面查。
+
+**BOM 是「打不开」而不是「无害差异」**（批次100 真机事实）：带 `UTF-8 BOM` 的 `.uvprojx`
+uVision **读不进去**，命令行构建只回 `exit 15`（`error reading the project file`），
+GUI 里就是打不开，且不给更具体的提示。所以 `project_file_check` 把 BOM 判成 `error`，
+`uvprojx_edit` 写回时会**顺手去掉 UTF-8 BOM**（结果里报 `bom_stripped`）——
+这不是格式漂移，是修复。UTF-16 的工程文件本服务拒绝写（去 BOM 等于改编码，需先转码）。
 
 **必须照做：**
 
@@ -50,14 +56,20 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
    `project_file_check` 一次看整个工程（含同名 `.uvoptx`）；`uvprojx_read` /
    `read_project_config` / `list_uvoptx_breakpoints` 的返回值里也**自带 `file_format`**，
    读配置时顺手就有了，不用多跑一趟。**改完再核对**：`sha256` 应该变，
-   `encoding` / `bom` / `newline` 必须**没变**（格式坏了会带 `file_format_warning`）。
+   `encoding` / `newline` 必须**没变**（格式坏了会带 `file_format_warning`）；
+   `bom` 是唯一例外：带 BOM 的文件写完 BOM 会消失，那是修复。
 3. **禁止**用 `write` / `edit` / sed / 脚本 `open(...,"w")` **整体重写**工程文件；
    也**禁止**「顺手统一行尾」「顺手加 BOM」「顺手转成 UTF-8」——同一个工程里 `.uvprojx`
    是 LF、`.uvoptx` 是 CRLF 是**正常**的，统一格式化本身就是破坏。
 4. **禁止**对这两份文件做有损中间处理：一次 `errors="replace"` 或 `latin-1` 兜底解码
    就足以让中文路径变成 `?`，而且看不出来。需要读字节时用 `project_file_check` 的字段判断。
 5. **保持 Keil 的原文风格**：不改缩进、不改属性顺序、不重排节点、不加 XML 声明。
-   文本级替换只动目标节点，diff 才干净。
+   文本级替换只动目标节点，diff 才干净。新增行的**行尾与缩进都取自工程本身**
+   （`add_files` 已按原文件量出来再逐行拼装，不再写死 `8`/`10` 空格）。
+6. **工程打不开时先体检、再修复，别猜**：`build` 回 `exit 15` 时先 `project_file_check`
+   （看 `bom` / `xml_ok` / `literal_newline_suspects`），再 `project_file_repair`
+   （默认 `dry_run`；BOM 与字面量换行都能修）。`exit 15` **不是**「Keil 被占用」，
+   不要去关 Keil 实例。
 6. **Keil 开着同一工程时不要写**：`uvprojx_edit` 会返回 `project-open-in-keil` 拦住；
    先 `close_uvision`，改完再 `launch_uvision`。
 7. **发现损坏先还原，再重做改动**：`project_file_check` 的 `notes` 里
@@ -67,6 +79,13 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
 
 **一句话判断「这次改成功没有」**：`project_file_check` 里 `encoding`/`bom`/`newline`
 与改前一致、`xml_ok=true`、`sha256` 已变——三者同时成立才算改成功。
+
+**别漏了「字面量换行」这一类**：如果工程里出现 `>LF` / `>CRLF` 紧跟空白再跟 `<`
+（例如 `</Group>LF        <Group>`），说明某个写入器把**行尾标签**当成了分隔符写进文件。
+这种损坏**XML 仍然合法**（`xml_ok` 是 true），uVision 里表现为内容挤在同一行、分组看着乱，
+靠解析校验查不出来。`project_file_check` 会给出 `literal_newline_suspects`，
+修法是 `project_file_repair`（**默认 dry_run 只报数**，确认后传 `dry_run=false`）。
+**验收不能只看「没有裸 LF」**：必须确认结构行各自独占一行（`<File>` / `<FileName>` 等）。
 
 ## 二、六条主线工作流
 
@@ -433,7 +452,7 @@ RTT、变量 scope、halt 采样、DWT 计数、PC 采样这些**观测**工具�
 
 - **参数别名**：`query`/`name`/`expression`、`addr`/`address`、`timeout_ms`/`timeout_s`
   这类直觉写法都能落地；但**未列出的参数名会被拒绝**（不会静默用默认值），报错里会列出可用参数。
-- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 170 个按需装载——
+- **工具面默认精简**：默认只暴露 44 个（`core` 38 个 + 6 个元工具），其余 171 个按需装载——
   `toolset(action="load", toolsets="mem,trace")` 装回来、`toolset(action="status")` 看现状；
   启动时也可用 `MDKDEBUG_TOOLSETS=serial` 指定（参数优先），`=all` 全开。可用组名见 `capabilities`；
   `tools_groups()` 列组/档总览、`tools_load(group="mem")` 等价装卸（新入口，参数更少）。

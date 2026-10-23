@@ -10,7 +10,7 @@
   D **下界语义**（关键防假绿）：推出来的窗口只把判据从 unverified 抬到 plausible，
     落在外面记未核、不判 invalid；硬错误（SP=0、Thumb 位为 0）不被豁免
   E 出件时给出「省掉窗口」的那一行
-  F 工具面与回归（仍 214 个、零新增依赖）
+  F 工具面与回归（仍 215 个、零新增依赖）
 
 运行：python -m tests.test_batch91
 """
@@ -209,7 +209,7 @@ def section_f():
     async def run():
         srv = SV.create_server(port=15992, toolsets="all")
         tools = {t.name: t for t in await srv.list_tools()}
-        check("F1 工具总数 214（本批只加行为，不新增工具）", len(tools) == 214, len(tools))
+        check("F1 工具总数 215（本批只加行为，不新增工具）", len(tools) == 215, len(tools))
         props = tools["recover_ledger"].input_schema.get("properties") or {}
         check("F2 recover_ledger 的参数面没变（窗口仍是可选参数）",
               {"flash_start", "flash_size", "ram_start", "ram_size"} <= set(props),

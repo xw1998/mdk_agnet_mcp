@@ -2536,3 +2536,61 @@ Flash 没被读出来。**「落在我没 dump 到的那一段」和「向量表
 
 判断「这次改成功没有」的一句话：`project_file_check` 里 `encoding`/`bom`/`newline` 与改前
 一致、`xml_ok=true`、`sha256` 已变——三者同时成立才算改成功。
+
+---
+
+## 六十、把行尾的「标签」当成分隔符写进文件：XML 合法、体检也查不出来
+
+批次97 引入的「按原文件风格补齐新增行行尾」有一个致命写法：`detect()` 把行尾**标签**
+（`"CRLF"` / `"LF"`）和真正的**字符序列**（`"\r\n"` / `"\n"`）混成了一个字段，
+写回时 `want = meta["newline"]` 拿到的是标签，于是每插入一个换行就往工程里塞进两个
+可见字符：
+
+```xml
+</Group>LF        <Group>LF        <GroupName>Core</GroupName>LF        <Files>LF
+```
+
+三个反直觉的地方，值得记牢：
+
+1. **XML 仍然合法**。这些 `LF` 只是文字节点里多出来的字符，`ET.fromstring` 照过，
+   `xml_ok=true`、写入闸门全绿、`verify=byte-identical` 也成立——五道闸门一个都没拦住。
+2. **测试也绿**。当时的断言是「CRLF 文件写完后裸 LF 数为 0、BOM 还在、`newline_fixed>=4`」，
+   字面量 `LF` 同样满足这三条。**「没有裸 LF」不等于「换行是对的」**。
+3. **uVision 里表现为「内容挤在一行/分组看着乱」**，不是报错，很容易被当成 UI 问题去查。
+
+正确做法（批次99）：
+
+- **标签与序列分开两个字段**：`newline` 给人看（`"CRLF"`/`"LF"`），`newline_seq` 给代码用
+  （`"\r\n"`/`"\n"`）；
+- **在归一化函数入口硬校验**：只接受 `"\n"` / `"\r\n"`，来别的当场 `ValueError`；
+- **断言要落在结构上**：不只是「没有裸 LF」，而是「`<File>`、`<FileName>` 各自独占一行」；
+- **给已损坏的文件留修复路径**：签名是 `>LF` / `>CRLF` 紧跟空白再跟 `<`，
+  `project_file_repair` 只替换这些位置（`<FilePath>../Core/LF/main.c` 这种文件名不会被误伤），
+  默认 `dry_run` 只报数，写前备份并走五道闸门。
+
+## 六十一、带 BOM 的 .uvprojx：uVision 只回 exit 15，而且退出码表本身写错了
+
+真机事故（2026-10）：一份 `.uvprojx` 被写成 **UTF-8 with BOM**。uVision 打不开，
+命令行 `UV4 -b` 只回 `exit 15`，日志只有一句 `error reading the project file`。
+文件本身完全合法：XML 能解析、编码自洽、往返校验通过、五道写入闸门全绿。
+
+三个反直觉点：
+
+- **BOM 不是「无害差异」**：对 uVision 的工程文件它就是致命错误，而我们的体检当时把
+  `bom: utf-8` 报成 `level=ok`——「XML 能解析」被当成了「健康」。
+- **退出码 15 的含义被记错了**：官方文档是「读取工程文件（导入 XML）时出错」，
+  旧表写成「UV4 被占用」，于是 next_actions 让人去 `close_uvision`——方向完全错，
+  而且找不到原因时只能靠二分（换文件、去 BOM、换 target）一个个试。
+- **写死的换行与缩进是同一类病**：`add_files` 用 `"\n"` 拼模板、写死 8/10 空格，
+  在一个 12/14 空格缩进的工程里既错位、又要靠写入器事后补行尾；补丁漏一层就留下
+  字面量 `LF`。行尾与缩进都该**从文件里量**，而不是从代码里假设。
+
+正确做法：
+
+- 体检把 BOM 判 `error`，并在提示里直接给出「`exit 15` / uVision 打不开」的因果；
+- 写入口写回时顺手去掉 UTF-8 BOM（`bom_stripped`），UTF-16 拒绝并说明要转码；
+- 退出码表按官方文档对齐，`exit 15` → `project-read-failed` / `project-unreadable`，
+  `next_actions` 指向 `project_file_check` → `project_file_repair`；
+- 新增行**逐行拼装**：行尾取 `newline_seq`、缩进取文件里第一个同类标签的缩进；
+- 修复工具做成「一类缺陷一个开关、默认 dry_run」：BOM 与字面量换行可分别开关，
+  一次调用能把两类一起修完并各自报数。

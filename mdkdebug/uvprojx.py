@@ -29,6 +29,15 @@ from . import projectfile
 
 _PATH_SEP = ";"
 
+def _first_indent(text: str, tag: str) -> str:
+    """取某个标签**首次出现所在行的缩进**（用于按原文件的风格拼新行）。"""
+    m = re.search(r"\n([ \t]*)" + tag, text)
+    return m.group(1) if m else ""
+
+def _line_start(text: str, idx: int) -> int:
+    """``idx`` 所在行的行首下标（没有换行就是 0）。"""
+    return text.rfind("\n", 0, idx) + 1
+
 def _read_text(path: str) -> tuple:
     """严格读取（批次97）：编码判定与写入校验都交给 ``projectfile``。
 
@@ -47,6 +56,8 @@ def _backup(path: str) -> str:
 def _write_fields(res: dict) -> dict:
     """把写入结果里的「文件格式事实」原样透给调用方（编码/BOM/行尾/校验）。"""
     return {"encoding": res.get("encoding"), "bom": res.get("bom"),
+            # 批次100：带 BOM 的工程写入时会去掉 BOM（uVision 读不了），必须透出去
+            "bom_stripped": res.get("bom_stripped"), "bom_note": res.get("bom_note"),
             "newline": res.get("newline"),
             "newline_fixed": res.get("newline_fixed", 0),
             "verify": res.get("verify"), "backup": res.get("backup"),
@@ -221,7 +232,7 @@ def add_files(path: str, group: str, files, backup: bool = True) -> dict:
 
     files 为相对工程目录的路径（如 ``..\\Core\\Src\\usart.c``）；重复路径会跳过。
     """
-    text, enc = _read_text(path)
+    text, meta = projectfile.read_text(path)
     fl = [str(f) for f in (files if isinstance(files, (list, tuple)) else [files])
           if str(f).strip()]
     if not fl:
@@ -240,18 +251,29 @@ def add_files(path: str, group: str, files, backup: bool = True) -> dict:
         return {"ok": True, "changed": False, "action": "add_files", "added": [],
                 "skipped": skipped, "message": "这些文件已在工程里，无需修改"}
 
-    def _mk_file(p, ftype="1"):
-        name = os.path.basename(_norm_inc(p))
-        return ("        <File>\n"
-                "          <FileName>%s</FileName>\n"
-                "          <FileType>%s</FileType>\n"
-                "          <FilePath>%s</FilePath>\n"
-                "        </File>\n" % (name, ftype, _norm_inc(p)))
-
     m = re.search(r"<Groups>.*?</Groups>", text, re.S)
     if not m:
         return {"ok": False, "error": "工程里没有 <Groups> 节点，拒绝改写"}
     groups_seg = m.group(0)
+
+    # 行尾与缩进**都取自原文件**，逐行拼装（批次100）。
+    # 旧实现把 "\n" 写死在模板里，靠写入器事后补行尾——一旦哪个入口没走那层归一化，
+    # 工程里就会留下字面量 "LF"（XML 仍合法，uVision 里内容挤成一行）；缩进也写死成
+    # 8/10 空格，遇到 4 空格的工程整块错位。改成「先量出本工程的行尾与缩进，再逐行
+    # join」，两件事同时解决。
+    nl = meta["newline_seq"]
+    file_ind = _first_indent(groups_seg, r"<File>") or "        "
+    child_ind = file_ind + "  "
+    group_ind = _first_indent(groups_seg, r"<Group>") or "      "
+    group_child_ind = group_ind + "  "
+
+    def _file_lines(p, ftype="1"):
+        name = os.path.basename(_norm_inc(p))
+        return [file_ind + "<File>",
+                child_ind + "<FileName>%s</FileName>" % name,
+                child_ind + "<FileType>%s</FileType>" % ftype,
+                child_ind + "<FilePath>%s</FilePath>" % _norm_inc(p),
+                file_ind + "</File>"]
 
     gm = None
     for g in re.finditer(r"[ \t]*<Group>.*?</Group>", groups_seg, re.S):
@@ -264,21 +286,26 @@ def add_files(path: str, group: str, files, backup: bool = True) -> dict:
     if gm is not None:
         seg = gm.group(0)
         fm = re.search(r"</Files>", seg)
-        ins_at = gm.start() + fm.start() if fm else None
-        if ins_at is None:
+        if not fm:
             return {"ok": False, "error": "分组 %s 里没有 <Files> 节点" % group}
-        add = "".join(_mk_file(p) for p in todo)
-        new_seg = seg[:fm.start()] + add + seg[fm.start():]
+        # 整行插入：落在 ``</Files>`` 所在行的行首，不碰它前面的缩进
+        at = _line_start(seg, fm.start())
+        lines = []
+        for p in todo:
+            lines.extend(_file_lines(p))
+        new_seg = seg[:at] + nl.join(lines) + nl + seg[at:]
         new_groups = groups_seg[:gm.start()] + new_seg + groups_seg[gm.end():]
         created_group = False
     else:
-        block = ("      <Group>\n"
-                 "        <GroupName>%s</GroupName>\n"
-                 "        <Files>\n%s"
-                 "        </Files>\n"
-                 "      </Group>\n" % (group, "".join(_mk_file(p) for p in todo)))
-        ins = re.search(r"</Groups>", groups_seg).start()
-        new_groups = groups_seg[:ins] + block + groups_seg[ins:]
+        lines = [group_ind + "<Group>",
+                 group_child_ind + "<GroupName>%s</GroupName>" % group,
+                 group_child_ind + "<Files>"]
+        for p in todo:
+            lines.extend(_file_lines(p))
+        lines += [group_child_ind + "</Files>", group_ind + "</Group>"]
+        cm = re.search(r"</Groups>", groups_seg)
+        at = _line_start(groups_seg, cm.start())
+        new_groups = groups_seg[:at] + nl.join(lines) + nl + groups_seg[at:]
         created_group = True
 
     new_text = text[:m.start()] + new_groups + text[m.end():]

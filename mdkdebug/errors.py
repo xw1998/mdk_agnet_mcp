@@ -65,6 +65,15 @@ ERROR_CODES = {
             "调 close_uvision 关闭占用实例后重试；需要保留则改在该实例里手工操作",
         ],
     },
+    "project-unreadable": {
+        "text": "工程文件读不出来（XML 损坏 / 被截断 / 带 BOM / 编码不符）——uVision 只会回 exit 15",
+        "next_actions": [
+            "调 project_file_check 看 encoding / bom / xml_ok / literal_newline_suspects",
+            "带 BOM 或缺换行时调 project_file_repair（默认 dry_run，确认后 dry_run=false）",
+            "修不了再从版本库或 `*.mkddebug.bak` 还原，用 uvprojx_edit 重做改动",
+            "不要先去关 Keil：exit 15 不是「实例被占用」，那个是 uvsock-unavailable/keil-busy",
+        ],
+    },
     "keil-launch-failed": {
         "text": "以可见方式启动 Keil uVision 失败",
         "next_actions": [
@@ -808,6 +817,10 @@ _RULES = (
     # 下面这两条已经能盖住。
     (r"写入错误|磁盘空间|输出目录.*只读|只读.*(目录|文件系统|属性)", "output-write-failed"),
     (r"UV4 访问错误|已有实例占用", "keil-busy"),
+    # 批次100：exit 15 的真实含义是「读取工程文件出错」，不是「实例被占用」。
+    # 放在 keil-busy 之后、uvsock 之前：文案里带「读取工程文件」「BOM」都归这里。
+    (r"读取工程文件|error reading (the )?project file|导入\s*XML|工程文件带\S*\s*BOM|带\s*BOM\s*的工程",
+     "project-unreadable"),
     (r"已处于调试|已在调试态|调试会话已存在", "already-debugging"),
     (r"未进入调试|不在调试|需要调试态|not in debug", "not-debugging"),
     (r"超时|timeout", "timeout"),

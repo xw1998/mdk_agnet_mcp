@@ -114,7 +114,11 @@ def detect(raw: bytes) -> dict:
         "encoding": enc,
         "encoding_confident": confident,
         "bom": bom,
+        # ``newline`` 是**给人看的标签**（"CRLF"/"LF"）；``newline_seq`` 才是真正写回时用的
+        # 字符序列。两者必须分开——批次97 曾把标签直接当分隔符写进文件，于是工程里多出
+        # 一堆字面量 ``LF``（XML 仍然合法，所以体检也看不出来）。
         "newline": "CRLF" if newline == "\r\n" else "LF",
+        "newline_seq": newline,
         "crlf": crlf,
         "lf_only": bare_lf,
         "cr_only": bare_cr,
@@ -127,6 +131,17 @@ def detect(raw: bytes) -> dict:
 
 
 _EXPAT_ENC = {"utf-8-sig": "utf-8", "utf-16": "utf-16", "latin-1": "iso-8859-1"}
+
+# 「字面量换行」的签名：``>LF`` 或 ``>CRLF`` 紧跟空白再跟 ``<``。
+# 来历：把行尾**标签**（"LF"/"CRLF"）当成分隔符写进文件，换行就变成了 1~2 个可见字符。
+# 这类损坏**不会让 XML 失效**（它们只是文字节点里多出来的字符），所以解析校验拦不住，
+# 只能靠这个签名 + 结构合理性去查。
+_LITERAL_NL_RE = re.compile(r">(?:CRLF|LF)(?=[ \t]*<)")
+
+
+def count_literal_newlines(text: str) -> int:
+    """数一数文件里有多少处「本该是换行、实际是字面量 LF/CRLF」的痕迹。"""
+    return len(_LITERAL_NL_RE.findall(text))
 
 
 def _xml_probe(data: bytes, encoding: str = "") -> tuple:
@@ -181,6 +196,15 @@ def inspect(path: str) -> dict:
         notes.append("编码无法判定（UTF-8/GBK 都解不开），写入时不会做任何替换，"
                      "只会拒绝。这份文件多半已经被别的工具写坏过。")
         level = "error"
+    if meta["bom"]:
+        # 真机事实（批次100）：带 BOM 的 .uvprojx，uVision **读不进去**，且不给任何可读
+        # 提示——命令行构建只回 exit 15（error reading the project file），GUI 里则是
+        # 打开失败。这类文件 XML 完全合法、编码也自洽，所以「XML 能解析」不能当健康。
+        notes.append("工程文件带 %s BOM（文件头有 BOM 字节）——uVision 读工程文件时会失败，"
+                     "命令行构建只回 exit 15（error reading the project file），没有更具体的"
+                     "提示。去掉 BOM 即可恢复：用 project_file_repair（默认先试跑），或让本服务"
+                     "任意写入口写一次（写入时会自动去掉 UTF-8 BOM）。" % meta["bom"])
+        level = "error"
     if meta["replacement_chars"]:
         notes.append("文本里有 %d 个 U+FFFD 替换字符——这是「用 errors='replace' 写回过」"
                      "的典型痕迹，原文的字符已经不可恢复，建议从版本库/备份找回。"
@@ -195,6 +219,14 @@ def inspect(path: str) -> dict:
                      "不会顺手统一全文件；但 uVision 对此容错差，建议用 git 还原成统一行尾。"
                      % (meta["crlf"], meta["lf_only"]))
         level = "warn"
+    literal_nl = count_literal_newlines(text)
+    out["literal_newline_suspects"] = literal_nl
+    if literal_nl:
+        notes.append("发现 %d 处「本该是换行、实际是字面量 LF/CRLF」的痕迹"
+                     "（典型是写入器把行尾标签当成了分隔符）——XML 仍然合法，但 uVision 里"
+                     "这些内容会挤在同一行。用 project_file_repair 修（默认先试跑），"
+                     "或从 `*.mdkdebug.bak` / 版本库还原。" % literal_nl)
+        level = "error"
     if not meta["roundtrip_ok"] and level == "ok":
         notes.append("用检测到的编码「解→编」不能还原原始字节，说明这份文件的编码判断不可靠。")
         level = "warn"
@@ -210,7 +242,8 @@ def describe(path: str) -> dict:
         return r
     keys = ("path", "size", "sha256", "encoding", "encoding_confident", "bom", "newline",
             "crlf", "lf_only", "cr_only", "mixed_newline", "non_ascii_bytes",
-            "replacement_chars", "roundtrip_ok", "xml_ok", "xml_error", "root_tag",
+            "replacement_chars", "literal_newline_suspects", "roundtrip_ok",
+            "xml_ok", "xml_error", "root_tag",
             "level", "notes")
     return {k: r[k] for k in keys if k in r}
 
@@ -263,6 +296,10 @@ def normalize_inserted_newlines(old_text: str, new_text: str, newline: str) -> t
     uVision 的原文比对。返回 (新文本, 被改写的行数)。
     """
     want = newline or "\n"
+    if want not in ("\n", "\r\n"):
+        # 防御：这里一旦收到 "LF"/"CRLF" 这类**标签**而不是换行符，就会把字面量写进工程文件，
+        # 而 XML 仍然合法（只是文字节点里多几个字符），体检也查不出来。宁可当场报错。
+        raise ValueError("newline_seq must be \"\\n\" or \"\\r\\n\", got %r" % (want,))
     i = _common_prefix_len(old_text, new_text)
     j = _common_suffix_len(old_text, new_text, i)
     mid = new_text[i:len(new_text) - j if j else len(new_text)]
@@ -355,10 +392,13 @@ def write_text(path: str, new_text: str, old_text: str = None,
                     error="原文件行尾是混合的（CRLF %d / 裸 LF %d），已按 allow_mixed=false "
                           "拒绝写入。先用 git 还原成统一行尾。" % (meta["crlf"], meta["lf_only"]))
 
-    if new_text == cur_text:
+    if new_text == cur_text and not meta["bom"]:
+        # 注意 ``and not meta["bom"]``：只有 BOM 要修时文本本身没变化，但文件仍需重写一次
+        # 才能把 BOM 去掉（否则 repair 会「报告成功、BOM 还在」）。
         return dict(base, ok=True, changed=False, message="内容无变化，未写文件")
 
-    fixed_text, nl_fixed = normalize_inserted_newlines(cur_text, new_text, meta["newline"])
+    fixed_text, nl_fixed = normalize_inserted_newlines(cur_text, new_text,
+                                                       meta["newline_seq"])
     try:
         data = fixed_text.encode(meta["encoding"])
     except UnicodeEncodeError as e:
@@ -373,6 +413,19 @@ def write_text(path: str, new_text: str, old_text: str = None,
                           "若确实要写这些字符，请先把整份文件转成 UTF-8（会改变文件编码，需用户同意）。"
                           % (meta["encoding"], e, bad),
                     offending_text=bad)
+
+    # 批次100：uVision 读不了带 BOM 的工程文件（exit 15）。既然这次写入已经要动这个文件，
+    # 就顺手把 BOM 去掉——留着等于交付一份「打不开的工程」。UTF-16 不能这么处理：去掉 BOM
+    # 会得到一段无法按 UTF-8 读的字节，必须整份转码，那是另一件事，直接拒绝并说清楚。
+    bom_stripped = ""
+    if meta["bom"] == "utf-8":
+        data = data[len(codecs.BOM_UTF8):] if data.startswith(codecs.BOM_UTF8) else data
+        bom_stripped = "utf-8"
+    elif meta["bom"]:
+        return dict(base, ok=False, error_code="bom-utf16",
+                    error="工程文件是 %s 编码（带 BOM），uVision 只认 ANSI/UTF-8 的 "
+                          ".uvprojx；本服务不会在写入时顺带整份转码（那会改掉文件编码本身）。"
+                          "请先用编辑器/iconv 把它转成 UTF-8（无 BOM），再编辑。" % meta["bom"])
 
     old_xml_ok = None
     if validate_xml and os.path.splitext(path)[1].lower() in XML_SUFFIXES:
@@ -417,6 +470,14 @@ def write_text(path: str, new_text: str, old_text: str = None,
                size_after=len(after), newline_fixed=nl_fixed,
                encoding_preserved=True, roundtrip_ok=meta["roundtrip_ok"],
                verify="byte-identical")
+    if bom_stripped:
+        out["bom_before"] = bom_stripped
+        out["bom_stripped"] = bom_stripped
+        out["bom_note"] = ("原文件带 %s BOM，本次写入已去掉——uVision 读带 BOM 的工程文件"
+                           "会失败（exit 15），去掉后才会正常打开。" % bom_stripped)
+        # 去掉 BOM 之后文件实际是纯 UTF-8：`encoding` 报的是**读取时**的判定（utf-8-sig），
+        # 别让调用方以为写回去还是 sig。
+        out["encoding_after"] = "utf-8"
     if old_xml_ok is not None:
         out["xml_ok"] = bool(old_xml_ok)
     if old_xml_ok is False:
@@ -427,6 +488,77 @@ def write_text(path: str, new_text: str, old_text: str = None,
                                "旧实现会把 LF 混进 CRLF 文件里。" % (nl_fixed, meta["newline"]))
     return out
 
+
+def repair_literal_newlines(path: str, dry_run: bool = True, backup: bool = True) -> dict:
+    """（兼容保留）只修「字面量换行」，不碰 BOM。
+
+    等价于 ``repair_project_file(..., fix_bom=False)``；新代码请直接用后者。
+    """
+    return repair_project_file(path, dry_run=dry_run, backup=backup, fix_bom=False)
+
+def repair_project_file(path: str, dry_run: bool = True, backup: bool = True,
+                        fix_bom: bool = True, fix_literal_newlines: bool = True) -> dict:
+    """修工程文件里两类「uVision 打不开 / 看着坏」的格式缺陷（默认只试跑）。
+
+    1. **BOM**：uVision 读带 BOM 的 XML 工程文件会失败，命令行构建只回 exit 15
+       （error reading the project file），没有任何可读提示。UTF-8 BOM 可以就地去掉；
+       UTF-16 去掉 BOM 等于改编码，本函数拒绝，让调用方先转码。
+    2. **字面量 LF/CRLF**：写入器把行尾**标签**当成了分隔符，XML 依然合法（所以 XML
+       校验、编码往返校验全都绿），但 uVision 里内容挤成一行。只修「标签之间」的位置，
+       ``FilePath`` 里出现的 ``LF``（前面不是 ``>``）一律不动。
+
+    返回 ``{ok, dry_run, found:{bom, literal_newlines}, repaired:{...}, changed, ...}``。
+    """
+    text, meta = read_text(path)
+    bom = meta["bom"]
+    n = count_literal_newlines(text) if fix_literal_newlines else 0
+    out = {"ok": True, "path": os.path.abspath(path), "encoding": meta["encoding"],
+           "newline": meta["newline"], "dry_run": bool(dry_run),
+           "found": {"bom": bom if fix_bom else "",
+                     "literal_newlines": n},
+           "repaired": {"bom": "", "literal_newlines": 0}}
+    if not out["found"]["bom"] and not n:
+        out.update(changed=False,
+                   message="没有发现 BOM 或字面量换行，工程文件格式正常。")
+        return out
+    if bom and bom != "utf-8":
+        return dict(out, ok=False, error_code="bom-utf16",
+                    error="工程文件是 %s 编码（带 BOM）。uVision 只认 ANSI/UTF-8 的工程文件，"
+                          "且本服务不做整份转码（会改变文件编码本身）。请先用编辑器/iconv "
+                          "把它转成 UTF-8（无 BOM）再编辑。" % bom)
+
+    new_text = _LITERAL_NL_RE.sub(">" + meta["newline_seq"], text) if n else text
+    left = count_literal_newlines(new_text)
+    out["repaired"]["literal_newlines"] = n - left
+    out["literal_newlines_left"] = left
+    out["samples"] = []
+    if n:
+        for m in list(_LITERAL_NL_RE.finditer(text))[:3]:
+            a = max(0, m.start() - 40)
+            out["samples"].append(text[a:m.end() + 40].replace("\r", "\\r")
+                                  .replace("\n", "\\n"))
+    if dry_run:
+        out["changed"] = False
+        out["next"] = ("确认无误后传 dry_run=false 真正修复（会先备份 "
+                       "`<工程>.mdkdebug.bak`，再走五道写入闸门）。")
+        return out
+    if new_text == text and not bom:
+        out["changed"] = False
+        return out
+    res = write_text(path, new_text, old_text=text, backup=backup)
+    if not res.get("ok"):
+        return dict(out, ok=False, changed=False, error=res.get("error"),
+                    error_code=res.get("error_code"))
+    out["repaired"]["bom"] = res.get("bom_stripped") or ""
+    out.update(changed=True, backup=res.get("backup"), verify=res.get("verify"),
+               sha256_before=res.get("sha256_before"), sha256_after=res.get("sha256_after"))
+    parts = []
+    if out["repaired"]["bom"]:
+        parts.append("去掉 %s BOM" % out["repaired"]["bom"])
+    if out["repaired"]["literal_newlines"]:
+        parts.append("修复 %d 处字面量换行" % out["repaired"]["literal_newlines"])
+    out["message"] = "已" + "、".join(parts) + "。" if parts else "内容无变化。"
+    return out
 
 def check_project(project: str, extra=()) -> dict:
     """体检一个工程：``.uvprojx`` 与同名 ``.uvoptx``（以及 ``extra`` 里的路径）。"""
@@ -454,6 +586,7 @@ def check_project(project: str, extra=()) -> dict:
         return {"ok": False, "error": "没找到工程文件（给 .uvprojx/.uvoptx 或含它们的目录）",
                 "project": project}
     files = [describe(x) for x in paths]
+    # 体检结果里的 level 已包含「字面量换行」缺陷；这里再汇总一次供调用方直接看
     bad = [f for f in files if f.get("level") == "error"]
     warn = [f for f in files if f.get("level") == "warn"]
     out = {"ok": True, "project": p or project, "count": len(files), "files": files,

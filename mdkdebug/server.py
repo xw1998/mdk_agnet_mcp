@@ -10168,9 +10168,13 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "**为什么必须有这个工具**：真实事故不止一起——AI 用「读文本→改一行→写回」的方式改工程文件，"
             "写回时丢了 BOM、把 CRLF 换成 LF、或把编不出的字符写成 `?`，结果 uVision 打开工程报错/分组丢失。"
             "这类损坏**看不见**（工程文件在编辑器里长得一样），只能在字节层面查。\n"
+            "**BOM 判 error**：uVision 读带 BOM 的 .uvprojx 会失败，命令行构建只回 "
+            "exit 15（error reading the project file），GUI 里就是打不开——"
+            "所以 BOM 不算「无害差异」。\n"
             "**纪律**：① 改工程前先跑本工具记下基线；② 只用 uvprojx_edit 改（它内部做往返校验 + "
             "原编码严格编码 + XML 校验 + 原子写 + 写后回读，任何一条不过就不落盘）；"
-            "③ 改完再跑一次本工具，`sha256` 变了但 `encoding/bom/newline` 必须不变；"
+            "③ 改完再跑一次本工具，`sha256` 变了但 `encoding/newline` 必须不变"
+            "（BOM 是唯一例外：带 BOM 的文件在写入时会被去掉，那是修复）；"
             "④ **绝不**用 write/edit 类文件工具整体重写工程文件，也不要「顺手统一行尾」。\n"
             "返回里 `notes` 会直说可疑点：编码不可判定、出现 U+FFFD（曾被 `errors='replace'` 写过）、"
             "XML 解析失败、混合行尾等。"
@@ -10190,9 +10194,76 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 out.setdefault("next", "改工程用 uvprojx_edit；改完再跑一次本工具核对 "
                                         "encoding/bom/newline 未变、sha256 已变。")
                 if out.get("level") == "error":
-                    out["hint"] = ("有文件已经损坏（见 files[].notes）：先从版本库或备份"
-                                   "（`*.mdkdebug.bak`）还原，再用 uvprojx_edit 重做改动。")
+                    out["hint"] = ("有文件已经损坏（见 files[].notes）：先跑 project_file_repair（默认 dry_run）"
+                                   "看能否就地面修复——BOM 与字面量换行都能修；"
+                                   "修不了（编码不可判定 / U+FFFD / XML 坏）再从版本库或 `*.mkddebug.bak` 还原，"
+                                   "再用 uvprojx_edit 重做改动。")
             return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="project_file_repair",
+        title="修复工程文件里的 BOM / 字面量换行（默认只试跑）",
+        description=(
+            "修 `.uvprojx` / `.uvoptx` 的两类**格式故障**（都不影响 XML 合法性，所以必须专门查）："
+            "① **BOM**——uVision 读带 BOM 的工程文件会失败，命令行构建只回 exit 15"
+            "（error reading the project file），GUI 里就是打不开；UTF-8 BOM 可就地去，"
+            "UTF-16 会拒绝（去 BOM 等于改编码，请先转码）。"
+            "② **字面量换行**——文件里出现 "
+            "`>LF` / `>CRLF` 紧跟空白再跟 `<` 的地方（例如 `</Group>LF        <Group>`）。\n"
+            "**来历**：某个写入器把行尾的**标签**（`LF`/`CRLF`）当成分隔符写进了文件——"
+            "换行变成了 1~2 个可见字符。这类损坏**不会让 XML 失效**（只是文字节点多了字符），"
+            "所以 `xml_ok` 仍是 true、uVision 里表现为内容挤在同一行、分组/列表看起来乱。\n"
+            "**默认 `dry_run=true`：只报数量与前几处上下文，不写文件。** 确认后传 false 才真修；"
+            "修复前自动备份 `<工程>.mdkdebug.bak`，并走五道写入闸门（往返校验/严格编码/"
+            "XML/原子写/写后回读）。\n"
+            "只动「标签之间」的位置，`<FilePath>..\\LF\\x.c` 这类文件名里的 LF 不会被误改。\n"
+            "修复完请再跑一次 `project_file_check` 或直接打开 Keil 核对；如果文件已经被后续"
+            "编辑改过、`dry_run` 报的处数对不上你记得的，优先从备份/版本库还原。"
+        ),
+    )
+    async def project_file_repair(project: str = "", files="", dry_run: bool = True) -> str:
+        try:
+            extra = [x.strip() for x in str(files or "").replace(";", ",").split(",")
+                     if x.strip()]
+            targets = []
+            if project:
+                targets.append(project)
+            targets.extend(extra)
+            if not targets:
+                try:
+                    targets.append(_resolve_project(""))
+                except Exception:  # noqa: BLE001
+                    return _js({"ok": False, "error": "没给工程文件，也找不到当前工程"})
+            out = []
+            for t in targets:
+                p = os.path.abspath(t)
+                if os.path.isdir(p):
+                    cand = [os.path.join(p, n) for n in sorted(os.listdir(p))
+                            if n.lower().endswith((".uvprojx", ".uvoptx"))]
+                else:
+                    cand = [p]
+                for c in cand:
+                    if not os.path.isfile(c):
+                        out.append({"ok": False, "path": c, "error": "文件不存在"})
+                        continue
+                    out.append(_projectfile.repair_project_file(c, dry_run=dry_run))
+            total = sum((x.get("found") or {}).get("literal_newlines", 0)
+                        for x in out if x.get("ok"))
+            bom_files = [x for x in out if x.get("ok") and (x.get("found") or {}).get("bom")]
+            res = {"ok": all(x.get("ok") for x in out), "dry_run": bool(dry_run),
+                   "found": total, "files": out}
+            res["bom_files"] = len(bom_files)
+            if not total and not bom_files:
+                res["message"] = ("没有发现 BOM，也没有字面量换行痕迹（`>LF`/`>CRLF` 紧跟 `<`）。")
+            elif dry_run:
+                res["message"] = ("发现 %d 个文件带 BOM、%d 处字面量换行，尚未修改。"
+                                  "确认后传 dry_run=false。" % (len(bom_files), total))
+            else:
+                res["message"] = ("已修 %d 个文件的 BOM、%d 处字面量换行，并已备份。"
+                                  % (len(bom_files), total))
+            return _js(res)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})
 

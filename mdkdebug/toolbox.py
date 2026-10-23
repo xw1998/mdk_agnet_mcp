@@ -82,6 +82,7 @@ TOOLSETS = {
         # 批次97：工程管理文件编码体检（只读）。与 uvprojx_edit 同组——「改之前先看基线、
         # 改之后核对没被洗坏」，两者是一条纪律的两端。
         "project_file_check",
+        "project_file_repair",
         "scatter_read", "scatter_edit", "scatter_check", "project_targets", "set_debug_target",
         "read_project_config",
         # 批次77：固件契约预检（只读）与「编译→烧录→串口等令牌」闭环入口。
