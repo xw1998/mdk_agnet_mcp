@@ -11,7 +11,7 @@ Ghidra 最贵的一层是反编译器：把指令提升成带表达式、结构�
   D 跳转表：按守卫条件定项数 + 表数据剔除（不把表字节当指令）
   E 真镜像端到端（175 函数，未支持如实标注）
   F 批量/写文件/错误路径
-  G 工具面：215 个工具、不增依赖（+1 来自批次86）
+  G 工具面：220 个工具、不增依赖（+1 来自批次86）
   H 接入面：recover_disasm(fmt="c") / recover_project 的 src/pseudo_c.c
 
 运行：python -m tests.test_batch84
@@ -314,7 +314,7 @@ def section_g():
     from mdkdebug import server as SV
     names = {t.name for t in asyncio.run(
         SV.create_server(port=15884, toolsets="all").list_tools())}
-    check("G1 工具总数 215（本批不新增）", len(names) == 215, len(names))
+    check("G1 工具总数 220（本批不新增）", len(names) == 220, len(names))
     check("G2 反编译没有新造工具（能力做进既有 recover_*）",
           not any(k in n for n in names
                   for k in ("decomp", "pseudo", "lift")),

@@ -12,7 +12,7 @@ xref（谁碰过这个地址）、call graph（谁调谁）、jump table / switc
   D 调用图：入度出度、根（=有出边无入边）、环（Tarjan）、深度
   E 跳转表：tbb / tbh / ldr pc 表 / add pc 相对表 / 比较链
   F 真镜像端到端：关系层进 report.json、三份 CSV 落盘、老文件不变
-  G 工具面：215 个工具（本批不新增；+1 来自批次86）
+  G 工具面：220 个工具（本批不新增；+1 来自批次86）
 
 运行：python -m tests.test_batch82
 """
@@ -373,7 +373,7 @@ def section_g():
     from mdkdebug import server as SV
     names = {t.name for t in asyncio.run(
         SV.create_server(port=15882, toolsets="all").list_tools())}
-    check("G1 工具总数 215（本批不新增）", len(names) == 215, len(names))
+    check("G1 工具总数 220（本批不新增）", len(names) == 220, len(names))
     check("G2 关系层没有新造工具（能力做进既有 recover_*）",
           not any(k in n for n in names for k in ("xref", "callgraph", "switch")),
           [n for n in names if "xref" in n or "graph" in n])

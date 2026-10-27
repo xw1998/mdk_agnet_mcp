@@ -10,7 +10,7 @@
   C RISC-V：结构体候选 / 符号性 / 跨函数调用实参
   D MIPS：分支延迟槽提到分支之前（语义）、jr $ra、lui、slt（绝对值目标）
   E ARM 模式（ARMv5/ARM9）：push/pop、ldm、bx lr、movw/movt、bl
-  F 闸门：不可翻译的家族要明确拒绝并给理由；工具面仍 215；零新增依赖
+  F 闸门：不可翻译的家族要明确拒绝并给理由；工具面仍 220；零新增依赖
 
 夹具全是手写字节，**不依赖工具链**；编码在写之前用 capstone 逐条核对过。
 运行：python -m tests.test_batch93
@@ -281,8 +281,8 @@ def section_f():
     from mdkdebug import server as SV
     names = {t.name for t in asyncio.run(
         SV.create_server(port=15994, toolsets="all").list_tools())}
-    check("F6 工具总数仍是 215（本批只改既有工具的行为）",
-          len(names) == 215, len(names))
+    check("F6 工具总数仍是 220（本批只改既有工具的行为）",
+          len(names) == 220, len(names))
     check("F7 没有引入新依赖（反汇编/翻译只用 capstone + struct）",
           not any(m in sys.modules for m in
                   ("unicorn", "keystone", "angr", "r2pipe", "lief")),

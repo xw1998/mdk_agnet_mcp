@@ -109,18 +109,26 @@ def violation(target: str, *, depth: int = 3) -> dict | None:
     - 目标目录自身或近 3 级父目录里存在 `.uvprojx` / `.uvoptx` / `.ioc` 等工程文件，
       且目标目录本身不是本服务的证据目录（没有 `report.json` / `manifest.json`）；
     - 目标目录名属于 ``BLOCK_DIRS``（`App` / `Core` / `Src` / `Drivers` …），
-      且不是证据目录。
+      且不是证据目录；
+    - 目标目录**在**这样一个源码目录之内（如 `Core/Src/rep`）：新起的子目录名不会
+      命中 BLOCK_DIRS，但产物照样落在源码树里，一样会被顺手挂进工程。
     """
     d = os.path.abspath(target or ".")
     if is_evidence_dir(d):
         return None
     shared = _shared_roots()
-    cur, hops, proj = d, 0, ""
+    cur, hops, proj, srcdir = d, 0, "", ""
     while cur and hops <= depth:
         if os.path.normcase(cur) in shared:
             break                     # 到共享根就停：这里不是工程边界
         proj = _has_project_file(cur)
         if proj:
+            break
+        # 只看**目录自己的名字**是否像构建目录：`C:\Users\...` 里那个 `Users`
+        # 不是构建目录，按祖先判会把整块磁盘都判成禁区（批次101 自测踩到的假阳性）。
+        leaf = os.path.basename(os.path.normpath(cur))
+        if leaf.lower() in BLOCK_DIRS and _looks_like_source_dir(cur):
+            srcdir = cur
             break
         parent = os.path.dirname(cur)
         if parent == cur:
@@ -130,13 +138,16 @@ def violation(target: str, *, depth: int = 3) -> dict | None:
         return {"code": "evidence-in-build-dir", "target": d,
                 "project_file": proj,
                 "reason": "目标目录位于 Keil 工程内（找到 %s）" % os.path.basename(proj)}
-    # 只看**目标目录自己**的名字，不看路径上的祖先目录：`C:\Users\...` 里那个 `Users`
-    # 不是构建目录，按祖先判会把整块磁盘都判成禁区（批次101 自测踩到的假阳性）。
-    leaf = os.path.basename(os.path.normpath(d))
-    if leaf.lower() in BLOCK_DIRS and _looks_like_source_dir(d):
+    if srcdir:
+        leaf = os.path.basename(os.path.normpath(srcdir))
+        if os.path.normcase(srcdir) == os.path.normcase(d):
+            reason = "目标目录名 `%s` 且里面确实有源码" % leaf
+        else:
+            reason = ("目标目录位于源码目录 `%s` 之内（该目录里确实有源码）"
+                      % srcdir)
         return {"code": "evidence-in-build-dir", "target": d,
                 "blocked_component": leaf,
-                "reason": "目标目录名 `%s` 且里面确实有源码" % leaf}
+                "reason": reason}
     return None
 
 

@@ -14,7 +14,7 @@
   A 体检：编码/BOM/行尾/混合行尾/非 ASCII/U+FFFD/XML 可解析/sha256
   B 安全写入：往返校验、原编码严格编码、XML 校验、原子写、写后回读
   C 三个写入接入点（uvprojx / uvoptx / cmdscript）全部改走安全写入器
-  D 工具层：project_file_check 只读体检工具（215 个工具、在 build 组、不在默认面）
+  D 工具层：project_file_check 只读体检工具（220 个工具、在 build 组、不在默认面）
   E 文档纪律：SKILL 硬规则 + PITFALLS + README
   F 闸门：零新增依赖
 
@@ -324,8 +324,8 @@ def section_d():
         return names, out
 
     names, out = asyncio.run(run())
-    check("D1 project_file_check 已注册，工具总数 215",
-          "project_file_check" in names and out["count"] == 215, out["count"])
+    check("D1 project_file_check 已注册，工具总数 220",
+          "project_file_check" in names and out["count"] == 220, out["count"])
     check("D2 在 build 组、不在默认面（会写工程的工具都不进默认面）",
           "project_file_check" in TB.TOOLSETS["build"]
           and "project_file_check" not in TB.TOOLSETS["core"], None)
@@ -479,8 +479,8 @@ def section_h():
         return names, out, rbytes(p4) == snap_before
 
     names, out, untouched = asyncio.run(run())
-    check("H8 project_file_repair 已注册（工具总数 215），默认 dry_run 且不写文件",
-          "project_file_repair" in names and len(names) == 215
+    check("H8 project_file_repair 已注册（工具总数 220），默认 dry_run 且不写文件",
+          "project_file_repair" in names and len(names) == 220
           and out.get("dry_run") is True
           and all(f.get("changed") is False for f in out.get("files") or [])
           and untouched, out)

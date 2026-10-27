@@ -303,7 +303,7 @@ def use_attr(obj, name, val):
 def section_a():
     print("A. 工具面与注解")
     total = sum(len(v) for v in TB.TOOLSETS.values()) + len(TB.ALWAYS)
-    check("A1 注册总数 215（分组表 198 + 常驻 6）", total == 215, total)
+    check("A1 注册总数 220（分组表 198 + 常驻 6）", total == 220, total)
     check("A2 trace_record 归 trace 组（批次55 加 3 个 buff 到 30，批次56 再加 3 个 swd 到 33，批次64 再加 1 个任务表到 34，批次72 再加 2 个分析层到 37，批次75 再加 trace_watch 到 38）",
           "trace_record" in (TB.TOOLSETS.get("trace") or []) and gsize("trace") == 38,
           gsize("trace"))
@@ -326,12 +326,12 @@ def section_a():
     for v in TB.TOOLSETS.values():
         allnames |= set(v)
     bad = A.check_surface(sorted(allnames))
-    check("A8 check_surface 在 215 个工具上无问题", not bad, bad)
+    check("A8 check_surface 在 220 个工具上无问题", not bad, bad)
     # 默认面：core + ALWAYS，其余收起
     exposed = gsize("core") + len(TB.ALWAYS)
     check("A9 默认暴露 core 38 + 常驻 6 = 44（新增工具进 core 后自动生效）",
           exposed == 44, exposed)
-    check("A10 默认收起 171（215-44）", 215 - exposed == 171, 215 - exposed)
+    check("A10 默认收起 176（220-44）", 220 - exposed == 176, 220 - exposed)
 
 
 def section_b():

@@ -106,6 +106,12 @@ TOOLSETS = {
         # 批次88：闭环台账。默认会跑 recover_verify（写 build/、调 armasm/armlink/UV4），
         # 不进默认面，也不进只读白名单。
         "recover_ledger",
+        # 批次102：镜像语义层（字符串池/可达性与死代码/数据表导出/冻结调用图栈深）
+        # 与两镜像逐函数差分。全部只读、只解析字节；recover_bindiff 与
+        # recover_datatable 只有在显式给 out_dir / out（或 evidence_only=false）时
+        # 才落盘，其余路径一个字节都不碰。属逆向场景，不进默认面。
+        "recover_strings", "recover_deadcode", "recover_bindiff",
+        "recover_datatable", "recover_stack",
     },
     "serial": {
         "serial_list_ports", "serial_monitor_start", "serial_monitor_status",

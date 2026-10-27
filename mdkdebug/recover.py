@@ -696,7 +696,7 @@ def _unit_from_data(data: bytes, name: str, base: int = 0) -> Unit:
 # 向量表
 # ----------------------------------------------------------------------
 def vector_table(unit: Unit, base: int | None = None, max_entries: int = 128,
-                 endian: str | None = None) -> dict:
+                 endian: str | None = None, skip_empty: bool = False) -> dict:
     """按 Cortex-M 约定读前 N 个字：初值 SP + 异常/中断入口。
 
     每一栏都是**观察到的事实**（地址、Thumb 位），但「这个入口属于哪个中断」只在
@@ -707,7 +707,8 @@ def vector_table(unit: Unit, base: int | None = None, max_entries: int = 128,
     if base is None:
         base = unit.base if not unit.elf else (unit.code_ranges[0][0] if unit.code_ranges else 0)
     out = {"base_hex": "0x%08X" % int(base), "entries": [], "sp": None,
-           "reset": None, "count": 0, "semantics": "unverified", "gaps": []}
+           "reset": None, "count": 0, "semantics": "unverified", "gaps": [],
+           "empty": []}
     first = unit.read(base, 4 * max_entries)
     if len(first) < 8:
         out["gaps"].append({"reason": "镜像在向量表地址处不足 8 字节，读不到 SP/复位地址"})
@@ -723,9 +724,20 @@ def vector_table(unit: Unit, base: int | None = None, max_entries: int = 128,
                                       "该地址可能不是向量表，或镜像是压缩/加密的"})
     for i, w in enumerate(words):
         if i > 0 and (w == 0 or w == 0xFFFFFFFF):
+            if skip_empty:
+                # Cortex-M 的保留槽位（7..10）本来就常常是 0：当空槽跳过而**不**终止，
+                # 否则 SysTick/外设中断入口整片丢在表外（会连带把它们调用的函数
+                # 误判成不可达）。
+                out["empty"].append(i)
+                continue
             break
         if i == 0:
             continue
+        if skip_empty and not unit.is_exec_address(w):
+            # 向量表里出现「不是代码地址」的非零字 ⇒ 表到此结束（后面已是别的数据）
+            out["gaps"].append({"reason": "第 %d 个槽位是非代码地址 0x%08X："
+                                          "按会话约定这里视为向量表结束" % (i, w)})
+            break
         name = _EXC[i] if i < len(_EXC) else ("IRQ%d" % (i - 16) if i >= 16 else "")
         entry = {
             "index": i,

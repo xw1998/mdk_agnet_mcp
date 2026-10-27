@@ -74,6 +74,9 @@ from .codeindex import tools as _codetools
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
 from .numparse import parse_int as _parse_int
+from . import semantics as _sem
+from . import bindiff as _bindiff
+from . import callgraph as _callgraph
 
 logger = logging.getLogger("mdkdebug.server")
 
@@ -7932,6 +7935,168 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 ram_size=_pi(ram_size, "ram_size", 0),
                 claim=str(claim or "").strip(),
                 timeout_s=float(timeout_s or 240.0))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_strings",
+        title="固件逆向：字符串 / 数据池语义（三重过滤 + 引用证据）",
+        description=(
+            "从镜像里提取可打印串，并回答「这条**真的**是文案吗、谁在引用它」。\n"
+            "每条给 addr / text / encoding(ascii 或 gbk) / kinds / ref_strength / verdict / refs。\n"
+            "三重过滤（每一重都记判据，被丢弃的计数并给原因，不静默减少）：\n"
+            "① 字符集：ASCII 可打印（含 \\t）或合法 GBK 双字节；高字节串必须能按 GBK 严格解出；\n"
+            "② 边界：NUL 终止 / 落在段首尾 / 前一字节是 0x00 三者取一才算硬边界，"
+            "代码区里没有硬边界的串默认丢弃（最像指令字节凑巧可打印）；\n"
+            "③ 引用：指令直接算出地址（adr / add pc）、字面量池里被 ldr 取出的值、被指令引用的"
+            "指针字（table）——任一命中才算被引用；孤立指针字（pointer）只算弱证据。\n"
+            "kinds 分类：format / at_command / path / url / version / mac_addr / diagnostic / cjk / plain。\n"
+            "referenced_only=true 只留被引用的（假阳性最少的口径）；allow_gbk=false 只认 ASCII；\n"
+            "code_strings=true 连「落在可执行区、又没有引用」的候选一起列出（默认只计数，因为那 99% 是指令字节）；\n"
+            "include_dropped=true 把被丢弃的条目也放进 strings（默认只给 dropped_sample 抽样）。\n"
+            "限制：「无引用」不证明没用（间接寻址的字符串会落成 no_reference）。"
+        ),
+    )
+    async def recover_strings(path: str, base: str | int = 0, min_len: int = 4,
+                              max_strings: int = 2000, allow_gbk: bool = True,
+                              referenced_only: bool = False, kinds: str = "",
+                              code_strings: bool = False,
+                              include_dropped: bool = False) -> str:
+        try:
+            out = _sem.strings(str(path or "").strip(), base=_pi(base, "base", 0),
+                               min_len=int(min_len or 4),
+                               max_strings=int(max_strings or 2000),
+                               allow_gbk=bool(allow_gbk),
+                               referenced_only=bool(referenced_only),
+                               kinds=str(kinds or ""),
+                               code_strings=bool(code_strings),
+                               include_dropped=bool(include_dropped))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_deadcode",
+        title="固件逆向：未引用函数与未引用区间（静态可达性）",
+        description=(
+            "从根（向量表 / 入口 / 命名根 main,Reset_Handler）做可达性传播，列出**静态无引用**的"
+            "函数与数据区间。\n"
+            "函数判词：unreferenced（不在可达集、也没有调用指向）/ unreachable_but_called"
+            "（有调用方，但调用方自己也不可达）/ unreachable_but_pointed（有字面量池或数据字指向它，"
+            "回调表的可能）。\n"
+            "区间：把「被指令读写过的字节 + 被指令取过的指针字 + 向量表」涂掉，剩下的空洞按大小排序，"
+            "带 looks_like(zeros/text/words/bytes) 与被符号表覆盖的情况（in_symbols）。\n"
+            "how_to_confirm 给出「删掉重建、bin 逐字节相同」的确证路径（recover_project_exact + "
+            "recover_verify）。\n"
+            "限制：判词是 unreferenced，**不是**「死代码」——间接调用、函数指针表、外部中断向量、"
+            "自修改代码都可能让它在运行期被用到。有间接调用未解析时该结论只能当线索。"
+        ),
+    )
+    async def recover_deadcode(path: str, base: str | int = 0, min_gap: int = 64,
+                               symbols: str = "") -> str:
+        try:
+            out = _sem.deadcode(str(path or "").strip(), base=_pi(base, "base", 0),
+                                min_gap=int(min_gap or 64),
+                                symbols=str(symbols or ""))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_bindiff",
+        title="固件逆向：两镜像逐函数差分（PASS / RESIDUE / FAIL + 外设窗口）",
+        description=(
+            "逐函数比两张镜像，出三态报告，不是逐字节 diff。\n"
+            "PASS：规范化指令序列相同（可执行区间里的地址已归一成 <CODE>）或函数体字节相同；\n"
+            "RESIDUE：把所有立即数都抹平后序列相同（差异只在地址/常量），或相似度 ≥ threshold，"
+            "逐条列出差异指令，必须人工看一眼是哪一类常量；\n"
+            "FAIL：配上了但序列有实质差异，或一侧没有对应函数（basis=missing_in_target / "
+            "missing_in_reference）。\n"
+            "windows 逐窗对比外设访问，写法 GPIOA@0x40020000+0x400,USART1@0x40011000+0x400"
+            "（或 0x40020000-0x40020400）：窗口判词 PASS/RESIDUE/FAIL，带只在一侧的偏移与读写次数差。\n"
+            "给 out_dir 就落报告（report.json / report.md / windows.csv，utf-8 无 BOM + "
+            "evidence_only 标记 + 构建目录拒写）。\n"
+            "限制：函数清单完整度未知，missing_in_* 不单独证明源码有增删；PASS 只说明机器码没变，"
+            "不证明运行行为相同。"
+        ),
+    )
+    async def recover_bindiff(reference: str, target: str,
+                              base: str | int = 0, base_target: str | int = 0,
+                              windows: str = "", out_dir: str = "",
+                              name: str = "bindiff", threshold: float = 0.9,
+                              min_insns: int = 4) -> str:
+        try:
+            out = _bindiff.compare(str(reference or "").strip(),
+                                   str(target or "").strip(),
+                                   base=_pi(base, "base", 0),
+                                   base_target=_pi(base_target, "base_target", 0),
+                                   windows=str(windows or ""),
+                                   out_dir=str(out_dir or "").strip(),
+                                   name=str(name or "bindiff"),
+                                   threshold=float(threshold or 0.9),
+                                   min_insns=int(min_insns or 4))
+            return _js(out)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_datatable",
+        title="固件逆向：数据表结构化导出为 C（回读自证）",
+        description=(
+            "把一段定长结构导成带字段名的 C 数组，并**逐元素回读校验**（verified/mismatches）。\n"
+            "fmt=auto 会先试着认：256 项完全等于 CRC32(poly 0xEDB88320) / CRC16-ARC(0xA001) / "
+            "CRC16-CCITT(0x8408) 现算表 → 认出来就按表导；再试指针数组（每个字都指向可打印串）"
+            "→ 导成 const char *const[]；都不像就看 fields 决定 array 还是 records。\n"
+            "显式用法：fmt=array（count + elem 1/2/4 + signed）、fmt=records（fields 如 "
+            "id:u16,flags:u16,value:s32 + count，可选 record_size 留填充）、fmt=at_table、"
+            "fmt=crc32 / crc16_arc / crc16_ccitt。\n"
+            "给 out 就写盘（utf-8 无 BOM）；默认 evidence_only=true 会加 EVIDENCE ONLY 文件头 + "
+            "#error 闸门并拒绝写进构建目录——真要当源码用请显式 evidence_only=false。\n"
+            "限制：作用域(static)/类型/表名都是工具起的；CRC 认表靠全表比对（认得就是认得，不是凭形状猜）。"
+        ),
+    )
+    async def recover_datatable(path: str, addr: str | int = 0, base: str | int = 0,
+                                count: int = 0, elem: int = 4, signed: bool = False,
+                                fmt: str = "auto", record_size: int = 0,
+                                fields: str = "", name: str = "",
+                                out: str = "", evidence_only: bool = True) -> str:
+        try:
+            out_d = _sem.datatable(str(path or "").strip(), base=_pi(base, "base", 0),
+                                   addr=_pi(addr, "addr", 0), count=int(count or 0),
+                                   elem=int(elem or 4), signed=bool(signed),
+                                   fmt=str(fmt or "auto"), record_size=int(record_size or 0),
+                                   fields=str(fields or ""), name=str(name or ""),
+                                   out=str(out or "").strip(),
+                                   evidence_only=bool(evidence_only))
+            return _js(out_d)
+        except Exception as e:  # noqa: BLE001
+            return _js({"ok": False, "error": str(e)})
+
+    @server.tool(
+        name="recover_stack",
+        title="固件逆向：调用图与栈深度（静态最坏链）",
+        description=(
+            "算每个函数的栈帧与从根出发的**最坏调用链**（对标 AC5 armlink --callgraph，但只看镜像、"
+            "不要求能链接的工程）。\n"
+            "帧 = prologue 里 push {} 的寄存器数×4 与 sub sp,#imm 的峰值（中途 pop/add 会退回）；"
+            "mov sp,rX 判 dynamic，不给数。\n"
+            "最坏链从向量表 / 入口 / roots（逗号分隔函数名，如 main,app_entry）出发 DFS 累加，"
+            "每个根给 worst_depth_bytes / chain / verdict：static_bound（全是直接调用）、"
+            "lower_bound（链上有间接调用，静态解析不了，给出的是下界）、unbounded（链上有环，"
+            "递归没有静态上界，不硬凑数字）。\n"
+            "给 stack_size 会算 fits/margin（已预留异常入栈的 32 字节）；只有 verdict=static_bound 的根才给这两个数——链上有间接调用/环时「够不够」算不出来，不猜。\n"
+            "限制：静态上界 ≠ 实测，尾调用优化/内联/合并帧都会让实际更小；只覆盖主栈 MSP，"
+            "RTOS 任务栈要按各自根单独算；浮点 lazy stacking 不在模型里。"
+        ),
+    )
+    async def recover_stack(path: str, base: str | int = 0,
+                            stack_size: str | int = 0, roots: str = "") -> str:
+        try:
+            out = _callgraph.analyze_stack(str(path or "").strip(),
+                                           base=_pi(base, "base", 0),
+                                           stack_size=_pi(stack_size, "stack_size", 0),
+                                           roots=str(roots or ""))
             return _js(out)
         except Exception as e:  # noqa: BLE001
             return _js({"ok": False, "error": str(e)})

@@ -112,6 +112,12 @@ READONLY = {
     # 批次86：函数匹配/版本比对——只读两侧镜像并算指纹；只有显式给
     # save_reference_sig 时才写一个 .sig.json（那一步由参数控制，不在默认路径上）。
     "recover_diff",
+    # 批次102：语义层与差分——只读镜像、只解析字节。两个会落盘的工具
+    # （recover_bindiff / recover_datatable）写不写完全由参数决定：
+    # recover_bindiff 只在显式给 out_dir 时写三份报告，recover_datatable
+    # 只在显式给 out 时写 —— 默认路径不碰文件系统（同 image_split 的口径）。
+    "recover_strings", "recover_deadcode", "recover_bindiff",
+    "recover_datatable", "recover_stack",
 }
 
 # ----------------------------------------------------------------------
@@ -154,6 +160,9 @@ NON_IDEMPOTENT = {
     # 批次88：recover_ledger 默认也走 verify（写 build/）；即使 verify_json 复评不落盘，
     # 它同样「重跑一次 ≠ 只跑一次」。
     "recover_project_exact", "recover_verify", "recover_ledger",
+    # 批次102：给 out_dir 时要求该目录为空（同 image_carve 的「不复用目录」），
+    # 第二次调用必然失败，效果不等价于一次；不给 out_dir 时它不写盘。
+    "recover_bindiff",
     # 渲染默认每次生成一个带时间戳的新文件（重复调用会攒出多个页面），
     # 因此不是幂等——与 session_state 同口径。
     "view_render",
@@ -236,7 +245,10 @@ def annotations_for(name: str) -> dict:
     return {
         "readOnlyHint": read_only,
         "destructiveHint": (n in DESTRUCTIVE) if not read_only else False,
-        "idempotentHint": True if read_only else (n not in NON_IDEMPOTENT),
+        # 幂等与只读是两件事：只读工具也可能不幂等（例如 recover_bindiff 必须往
+        # 空目录落报告，同参数再来一次必失败）。此前写成「只读 ⇒ 幂等」，会把这种
+        # 工具谎报成可重放，调用方据此重试就会拿到「目录非空」的错误。
+        "idempotentHint": n not in NON_IDEMPOTENT,
         "openWorldHint": n in OPEN_WORLD,
     }
 

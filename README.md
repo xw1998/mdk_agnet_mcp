@@ -229,7 +229,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.25）
+│   ├── __init__.py           # 包初始化（版本号 0.2.26）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -246,7 +246,7 @@ mdk_agent/
 │   ├── linkio.py             # 链路原语层：把「读/写内存、读核寄存器、停/走」从 Keil(UVSOCK) 与 OpenOCD 里抽出来
 │   ├── traceproto.py         # trace 协议：ITM 解码、MTF 帧格式与 CRC8
 │   ├── trace.py              # trace：SWO / RTT（主机侧自研）/ SWD 采样 / DWT / 插桩组件部署（观测类工具两条链路通用）
-│   └── server.py             # MCP Server 与 215 个工具定义
+│   └── server.py             # MCP Server 与 220 个工具定义
 ├── components/
 │   └── trace/                # 目标侧插桩组件（ITM / RTT / UART / BUFF 四后端，只依赖 CMSIS）
 │                             #   mdk_trace.[ch] / mdk_trace_rtt.[ch] / config 默认头 / CMakeLists / README
@@ -314,12 +314,12 @@ python run_server.py --transport http --http-port 8300
 
 ## 暴露的 MCP 工具
 
-共 **215** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
+共 **220** 个（**默认只暴露 44 个**，其余按需装载，见[工具面](#工具面默认精简--按需装载)），分两大块：
 
-- **MDK 族（121 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
-- **非 MDK 族（86 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**·**任务表取名**，34 个）/ **其余非 MDK 能力**（RTOS 分析、复位循环观测、分散加载文件、C 代码索引、可视化出图与 trace 统计，18 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
+- **MDK 族（132 个）**——调试读写 / 断点与命中等待 / 外设与内存 / 符号定位 / 工程分析 / **编译·清理·烧录** / **UV4 命令行批处理调试** / **CMSIS-SVD 解码** / **工程文件与分散加载文件(.sct)受控编辑** / **复位循环识别** / Keil 生命周期管理 / **宿主机串口日志与命令应答 · Modbus 主站（RTU/ASCII + 裸帧）** / **看门狗冻结与 Cache 感知** / 环境自检引导（下表）。
+- **非 MDK 族（82 个）**——**工具链**（gcc/make/cmake 探测与调用、构建、ELF/size/objcopy、编译错误解析，10 个）/ **目标档案与多核**（接口·速度·SWO·RTT 参数档案与自动识别、工程现场配置发现、多核目标的核列举与切换，7 个）/ **OpenOCD**（会话·内存·寄存器·断点·烧录，17 个）/ **trace 与覆盖率**（SWO·RTT·采样剖析·DWT·非侵入式 scope·插桩组件部署·**代码覆盖率**·**ETM 能力探测**·**函数运行时线录制**·**目标侧缓冲后端**·**SWD 无缝流后端**·**任务表取名**，38 个）/ **RTOS 任务感知**（任务列表·栈水位·队列信号量，3 个）/ **C 代码索引**（建/同步索引·符号检索·单符号源码体·文件清单·调用关系与影响面，7 个）——不依赖 Keil，同样能在 RISC-V / ESP32 等非 MDK 芯片上工作（见[非 MDK 芯片与 trace](#非-mdk-芯片与-trace不依赖-keil)）。
 - **常驻元工具（6 个）**——`toolset`（工具面按需装载）/ `list_tools` / `capabilities` / `get_version` / `tools_groups` / `tools_load`：**永不被裁**，否则 AI 连工具清单都问不出来、也装不回来。
-- **RTOS 任务感知（3 个）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
+- **RTOS 任务感知（3 个，已计在上面非 MDK 族里，单列只为讲清它跨两条链路）**——`rtos_info` / `rtos_tasks` / `rtos_objects`：FreeRTOS 的任务列表、状态、**栈水位**与队列/信号量。**跨两条链路**（有 Keil 会话走 UVSOCK，否则走 OpenOCD），因为「多任务卡死」既发生在 MDK 工程里也发生在 gcc 工程里（见 [RTOS 任务感知](#rtos-任务感知rtos_3-个)）。
 
 下表为 MDK 族工具：
 
@@ -652,13 +652,13 @@ target_guess(elf) → ocd_start(profile=...) → ocd_flash(file=...) → trace_i
 
 ### 工具面（默认精简 + 按需装载）
 
-215 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 171 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
+220 个工具全量塞进上下文会稀释注意力、也吃掉上下文预算。所以**默认只暴露 44 个**（`core` 组 38 个 + 6 个元工具），其余 176 个**没被删掉、也没失效**，用 `toolset` 工具随时装回来：
 
 ```text
 toolset(action="status")                        # 装了哪些组、收起多少个、怎么装回来
 toolset(action="load",   toolsets="mem,rtos")   # 追加装载（幂等，可反复调）
 toolset(action="unload", toolsets="trace")      # 收起
-toolset(action="load",   toolsets="all")        # 一次全装 215 个（=full/*）
+toolset(action="load",   toolsets="all")        # 一次全装 220 个（=full/*）
 ```
 
 装载也可以放在启动时：`MDKDEBUG_TOOLSETS=serial` 只留串口 14 个、`core,build`、`toolchain,target,ocd,trace` 把上百个 Keil 工具全收起来调非 MDK 芯片；`=all` 回到全开。**启动参数优先于环境变量**。
@@ -670,7 +670,7 @@ toolset(action="load",   toolsets="all")        # 一次全装 215 个（=full/*
 | `core` | 进出调试 / 运行控制 / 状态 / 跨会话状态 / 环境一致性体检、符号工程绑定、断点硬件残留校验、复位循环识别、可视化出图（38 个） |
 | `mem` | 内存与外设读写 / D-Cache 一致性维护（11 个） |
 | `symbol` | 符号与源码定位（7 个；`set_symbol_file`/`list_symbol_projects` 已上移 `core`） |
-| `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑 / 固件契约预检、闭环验证 / 镜像取证 / 固件逆向（骨架/字节精确复刻/镜像切分/闭环台账）（29 个） |
+| `build` | 编译 / 清理 / 烧录 / 工程配置 / 分散加载文件(.sct)受控编辑 / 固件契约预检、闭环验证 / 镜像取证 / 固件逆向（骨架/字节精确复刻/镜像切分/闭环台账/字符串池与死代码/两镜像逐函数差分/数据表导出/调用图栈深）（36 个） |
 | `serial` | 宿主机串口监听与命令应答 + Modbus 主站（14 个） |
 | `advanced` | 诊断 / 剖析 / SVD / 工程编辑 / 复位循环识别等进阶能力（26 个） |
 | `toolchain` | 非 MDK：工具链探测 / 构建 / 编译 / ELF·size·objcopy / 编译错误解析（10 个） |
@@ -690,8 +690,8 @@ toolset(action="load",   toolsets="all")        # 一次全装 215 个（=full/*
 |---|---|---|---|---|
 | 默认（`core` 组 + 元工具，描述 `lean`） | 44 | 约 2.2 万 | **约 3.9 万**（−56%） | 不设环境变量 |
 | **`nano` 极简档**（自动用 `min` 描述档） | **19** | **约 6 千** | **约 1.5 万** | `MDKDEBUG_TOOLSETS=nano` 或 `toolset(toolsets="nano")` |
-| `all`（全装，描述默认 `lean`） | 215 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
-| `all` + `MDKDEBUG_DESC=min` | 215 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
+| `all`（全装，描述默认 `lean`） | 220 | 约 10 万 | 约 20.2 万（−51%） | `toolset(toolsets="all")` |
+| `all` + `MDKDEBUG_DESC=min` | 220 | 约 6.6 万 | 约 16.7 万 | 工具全要，但描述只留一句摘要 |
 | 上述任一档 + `MDKDEBUG_DESC=full` | — | 逐字节还原全文 | — | 要逐字完整说明时 |
 
 - **`nano` 档**不是「组」而是**档位**：它横跨 `core` / `build` / `trace` 三组，挑出 15 个最短入口（健康检查 / 编译烧录 / 进出调试 / 跑停 / 读写内存与变量 / 断点 / 读 trace / **取回完整说明的 `mdk_guide`**）**＋ 6 个元工具**，小上下文模型也能一次装全，之后再按需加装。
@@ -1675,6 +1675,64 @@ uVision 再打开就报错。批次97 把这条纪律做成**工具能执行的�
 > 晚于崩溃。现在示例的 `command` 直接指向 `run_server.cmd`（Linux 用 `run_server.sh`），
 > 并给出「宿主只放可执行文件时把 `-E -s -u` 写进 `args`」的后路；`test_batch101` 增加
 > `F10`/`F11` 两条断言盯着示例块，防止下次又漂回去。
+
+### 逆向语义层：字符串 / 死代码 / 两镜像差分 / 栈深 / 数据表（批次102）
+
+前几批解决的是「这段字节是什么指令、属于哪个函数、像什么类型」。批次102 往上一层：
+**这段字节想说什么、哪些没人用、两个版本差在哪、最深能压多少栈**。五个工具，
+一律「只给静态证据 + 明说判不出来」，不给看起来权威的结论。
+
+- **`recover_strings`（字符串与数据池语义）**：可打印串清单，三重过滤缺一不可——
+  ① 字符集（ASCII 或中文双字节；只在 GBK 扩展区成立、又没有强引用的标 `loose_gbk` 丢掉，
+  随机指令字节很常凑出这种组合）② 边界（NUL 终止 / 落段首尾 / 前一字节是 `0x00` 才算硬边界）
+  ③ 引用（指令直接算出地址 `adr`/`add pc`、字面量池里被 `ldr` 取出的值、被引用的指针字算 table；
+  孤立的指针字只算弱证据）。**被丢弃的每一条都按原因计数**（`counts.dropped`），
+  落在可执行区又没有引用的候选默认不进列表——要看它得显式 `code_strings=true`
+  （rodata 与 `.text` 混装时那里 99% 是指令字节）。
+- **`recover_deadcode`（静态可达性）**：从向量表 / 入口 / `main`、`Reset_Handler` 出发做传播，
+  列出**静态无引用**的函数（判词 `unreferenced` / `unreachable_but_called` /
+  `unreachable_but_pointed`）与未被任何指令或指针字覆盖的区间。判词用的是
+  「unreferenced」而不是「死代码」：间接调用、回调表、外部中断向量、自修改代码都能在运行期
+  用到它；要变成确定结论就走 `how_to_confirm` 那条路（复刻工程 → 删掉这些区间 → 重建，
+  bin 仍逐字节相同）。区间数为 0 时会写 `ranges_note` 说明**这条判据在本镜像上不适用**
+  （可执行段覆盖全部存储 / 数据区全被引用），而不是「没有死代码」。
+- **`recover_bindiff`（两镜像逐函数差分）**：三态而不是逐字节 diff——
+  `PASS`（规范化指令序列相同，可执行区里的地址已归一成 `<CODE>`，或函数体字节相同；
+  **字节不同不扣分**，重定位就会改地址常量）、`RESIDUE`（抹平所有立即数后序列相同，
+  或相似度 ≥ `threshold`，附 `residue_kind=immediates_only/structural_shift` 与逐条差异）、
+  `FAIL`（配上了但序列有实质差异，或一侧没有对应函数：`missing_in_target` /
+  `missing_in_reference`）。配对按「唯一非自动名 → 字节相同 → 指令序列相同 → 相似度贪心」
+  四阶段，且都要求 `n_insns >= min_insns`（默认 4）——**太小的函数不硬配**，宁可落进
+  `missing_in_*`。`windows=GPIOA@0x40020000+0x400` 还能逐外设窗口比访问偏移与读写次数。
+- **`recover_stack`（调用图与栈深）**：帧 = prologue 里 `push {}` 的寄存器数 × 4 与
+  `sub sp,#imm` 的**峰值**（中途 `pop`/`add sp` 会退回），`mov sp,rX` 判动态不给数。
+  每个根给 `worst_depth_bytes` + `chain` + `verdict`：`static_bound`（全直接调用）/
+  `lower_bound`（链上有间接调用解析不了，给的是下界）/ `unbounded`（链上有环，递归没有静态上界）。
+  **`fits`/`margin_bytes` 只在 `static_bound` 时出现**——链上有间接调用或环时「够不够」算不出来，
+  不猜；给 `stack_size` 时先把异常的 32 字节硬件入栈预留掉再比。
+- **`recover_datatable`（数据表导成 C，并逐元素回读自证）**：`fmt=auto` 先试着认现算的
+  CRC32 / CRC16-ARC / CRC16-CCITT 表（256 项逐项比对，认出来才导），再试指针数组
+  （每个字都指向可打印串 ⇒ `const char *const[]`），都不像才按 `fields` 落到 `array` 或
+  `records`。导出的 C 会被**重新解析回数值/字节**，与从镜像读的原值逐个比，任何一项不同就
+  `verified=false` 并列出下标——`mismatches=[]` 才是真的自证通过。
+
+三处**只有做的时候才会踩到**的口径与缺陷，一并记在这里：
+
+1. **回读自证以前是假绿**（本批修）：旧实现用 `re.findall(r"0x([0-9A-F]+)", 整段生成文本)`
+   取「生成的值」，于是文件头注释里的 `0x08000000` / `0xEDB88320` 被当成第 0/1 个元素，
+   `verified` 恒为 False；`records` 路用 `-?\d+|0x…` 先吃到 typedef 行里 `uint16_t` 的 `16`，
+   又恒为假红。现在只解析 `= {` 之后、`};` 之前的**数组体**（先抹掉 C 字符串字面量，
+   正则里 hex 排在十进制前面，否则 `0x00000000` 会被拆成两个 `0`），并且**打印与回读用同一套
+   有符号口径**（s32 的 `0xFFFFFFFF` 写成 `-1`，回读也按 `-1` 比）。
+2. **向量表保留槽位不能当终止符**：Cortex-M 的 7..10 号槽常常是 0，旧逻辑读到 0 就停，
+   于是 SysTick/外设中断入口整片丢在表外，还会**连带把它们调用的函数误判成不可达**。
+   `vector_table(skip_empty=True)` 把空槽记进 `empty` 并继续，只有遇到「非代码地址」才
+   认定表结束；`skip_empty=False` 行为不变（向后兼容）。
+3. **只读 ≠ 幂等**：`recover_bindiff` 往 `out_dir` 落报告（`report.json`/`report.md`/
+   `windows.csv`，utf-8 无 BOM + `evidence_only` 标记），且**要求目录为空**——同参数再来一次
+   必然失败。所以注解层把幂等单独判（`idempotentHint = not in NON_IDEMPOTENT`），
+   不再写成「只读 ⇒ 幂等」；证据落盘护栏也从「目标目录名像构建目录」扩到
+   「目标目录**在**某个装着源码的构建目录之内」（`Core/Src/rep` 这种新起子目录以前能漏过去）。
 
 ### 底层库
 
