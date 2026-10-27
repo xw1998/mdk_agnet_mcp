@@ -8,6 +8,17 @@ description: 用 mdkdebug MCP 驱动 Keil uVision 做在线调试——读变量
 mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，共 215 个工具。
 本技能告诉你**先调什么、按什么顺序调、遇到问题找谁**，避免在近百个工具里瞎试。
 
+## 零、怎么把它起来（含宿主环境隔离）
+
+**优先用随附启动脚本**：`run_server.cmd`（Windows）/ `run_server.sh`（其余）。
+它会先清掉 `PYTHONPATH` / `PYTHONHOME` 等变量，再 `python -E -s` 起服务。
+
+为什么不能只靠 `python run_server.py`：宿主（编辑器、Agent 框架）常把自己的 `PYTHONPATH`
+传给子进程，指到另一套标准库时，python 会在**解释器初始化阶段**就崩
+（`Fatal Python error: init_import_site ... SRE module mismatch`），此时项目代码一行都没执行，
+**进程内无法自愈**。进程内的 `bootstrap` 只兜第二档（起来了但 import 到别人的模块 → 清变量重启）。
+排错时想禁止自愈（要看到真实崩溃栈）就设 `MDKDEBUG_NO_REEXEC=1`。
+
 ## 一、动手前的四条纪律
 
 1. **冷启动先对齐环境**，不要凭印象直接下命令：
@@ -31,6 +42,24 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
      `close_uvision` 再改，或显式 `force=true`（不推荐，Keil 里那份仍是旧内容）。
    - 收窗口用 `close_uvision(keep="oldest")`：**持 UVSOCK 4823 的是最早那个实例**，
      别按「留最新」关。
+
+### 逆向产物是**证据**，不是源码（硬规则，批次101）
+
+- `recover_project` / `recover_project_exact` 出的 `src/pseudo_c.c` 带着 `EVIDENCE ONLY` 头注释和
+  `#error` 编译期闸门（不定义 `MDKDEBUG_ALLOW_EVIDENCE_ONLY` 就编不过），`report.json` /
+  `manifest.json` 里是 `evidence_only: true`。
+- **不要**把它挂进工程、也不要挪进 `App/` `Core/` `Src/` `Drivers/` 这类目录：出件入口会直接拒
+  （`error_code=evidence-in-build-dir`）。真源码要人按证据重写，混合工程会变成谁也分不清的 `Ported/`。
+- 证据产物放独立目录（`<工程>/recovered/` 或源码树之外）。
+
+### 地址类参数怎么传（批次101）
+
+`base` / `flash_start` / `flash_size` / `ram_start` / `ram_size` **十进制和 `0x…` 都收**
+（`0b…`/`0o…` 也收；`08000000` 按十进制解释，要十六进制请写 `0x`）。
+`image_inspect` 的返回把两个基址分开：`file_offset_base(_hex)` 是**文件里的偏移**，
+`load_base(_hex)` 是**加载/烧录地址**（`address_basis` 说明取自 `flash_start` / `param_base` /
+`hex_record` / `elf_paddr`），`base_hex` 是 `load_base_hex` 的别名。
+导出物一律**无 BOM 的 UTF-8**（CSV 首列就是 `addr`），别再用 `utf-8-sig` 去读。
 
 ### 工程管理文件编辑纪律（硬规则，批次97）
 

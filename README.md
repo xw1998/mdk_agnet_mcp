@@ -117,6 +117,18 @@ PendSV/SysTick 中断活动与阻塞事件通道）：
   字段提到 `output.shared` + 把说明类长文本截断到 200 字符、`full=true` 取全量（覆盖环境变量默认与 `max_lines`）。
   **不传参数时行为与以前一字不差**；**裁了就报**（`output.truncated` / `dropped` / `hint`），
   **不碰真值**（数值与 line/text/value/data 这类内容字段绝不截断，列表元素不改写）；
+- **逆向产物带「这是证据不是代码」的硬标记**（批次101）：`recover_project` / `recover_project_exact`
+  出的 `src/pseudo_c.c` 头注释写明 `EVIDENCE ONLY`，并带 `#error` **编译期闸门**
+  （不显式 `#define MDKDEBUG_ALLOW_EVIDENCE_ONLY` 就编不过）；`report.json` / `manifest.json`
+  顶层与逐文件都有 `evidence_only: true`。目标目录名是 `App/`、`Core/`、`Src/`、`Drivers/`
+  这类源码目录、或位于某个 Keil 工程内时**直接拒绝**（`error_code=evidence-in-build-dir`）——
+  「长得像源码」是这类产物唯一真实的危害：挂进工程，你的工程就变成一半真源码、一半寄存器级
+  提升的 `Ported/`，之后没人分得清哪行是证据；
+- **地址口径统一**（批次101）：地址类入参（`base` / `flash_start` / `flash_size` / `ram_start` /
+  `ram_size`）既收十进制也收 `0x…` / `0b…` / `0o…`；`image_inspect` 把**文件偏移**与**加载基址**
+  分成两组字段报（`file_offset_base(_hex)` / `load_base(_hex)` + `address_basis` 说明来源），
+  `base_hex` 保留为 `load_base_hex` 的别名。**导出物一律无 BOM 的 UTF-8**（CSV 首列键就是
+  `addr`，不是 `\ufeffaddr`），行尾固定 `\n`——证据是给程序读的，BOM 只会让下游取不到列；
 - **随附 companion 技能 `skills/mdkdebug/SKILL.md`**：把「怎么用这套工具」写成 AI 可直接读的技能文件
   （先自检再动手、四条主线工作流、`session_state` 接续、三个输出控制旋钮、参数与工具面约定、出错先看谁），
   避免每次冷启动都从 `list_tools` 摸索；
@@ -217,7 +229,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.23）
+│   ├── __init__.py           # 包初始化（版本号 0.2.24）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -256,6 +268,23 @@ mdk_agent/
 ## 快速开始
 
 ### 启动 MCP Server
+
+**方式零：用随附启动脚本（推荐——自带环境隔离）**
+
+```bat
+run_server.cmd                    :: Windows
+```
+
+```bash
+./run_server.sh                   # Linux / macOS / Git-Bash
+```
+
+为什么要多这一层：MCP 宿主常把自己的 `PYTHONPATH` / `PYTHONHOME` 传给子进程。一旦它
+指到另一套标准库，`python run_server.py` 会在**解释器初始化阶段**就死（`import re` 拿到别人的
+`re.py` → `SRE module mismatch`），连主程序都执行不到——**进程内没有任何代码能救**。
+所以启动脚本先 `set "PYTHONPATH="` 再 `python -E -s`，进程内的 `mdkdebug/bootstrap.py` 只兜第二档
+（python 起来了、但 import 到别人的模块时自动清变量重启自己）。解释器选择顺序：
+`MDKDEBUG_PYTHON` → `.venv` → `python` → `py -3`。
 
 **方式一：stdio（MCP 客户端标准方式）**
 
@@ -1597,6 +1626,33 @@ uVision 再打开就报错。批次97 把这条纪律做成**工具能执行的�
 
 纪律写成了可直接照做的清单：见 `skills/mdkdebug/SKILL.md` 的
 「工程管理文件编辑纪律（硬规则）」与 `docs/PITFALLS.md` 第五十九～六十一。
+
+### 启动自带环境隔离 / 证据标记 / 地址口径 / 无 BOM（批次101）
+
+四条**只在真实使用中才现形**的缺陷，一次修齐（不只是写进文档）：
+
+1. **启动自带隔离**。宿主把 `PYTHONPATH` 指到别的标准库时，`python run_server.py` 会死在
+   `site` 初始化（`Fatal Python error: init_import_site ... SRE module mismatch`）——
+   实测的触发者是 `.pth` 里的 editable finder（`pathlib → fnmatch → re`）。使用者的绕法是
+   `env -u PYTHONPATH -u PYTHONHOME`，这不该由使用者承担。现在两档：
+   **进程外** `run_server.cmd` / `run_server.sh` 先清变量再 `-E -s` 起 python；
+   **进程内** `mdkdebug/bootstrap.py` 在 `-E` 生效前先查环境，脏了就带着 argv 与 stdio 重启自己
+   （Windows 走 `subprocess`——`os.execv*` 会把带空格的解释器路径重新拆开）。用 `-E -s` 而不用
+   `-I`：3.11 起 `-I` 隐含 `-P`，会把脚本目录从 `sys.path` 去掉，源码树反而找不到自己。
+   `-E` 会连带忽略 `PYTHONIOENCODING`/`PYTHONUTF8`，所以 stdio 显式 `reconfigure` 成 UTF-8
+   （否则 Windows 回落到 cp936，中文 JSON 变问号）。
+2. **证据产物不许伪装成源码**（`mdkdebug/evidence.py`）：伪 C 文件头 + `#error` 闸门 +
+   `report.json`/`manifest.json` 的 `evidence_only` + 落盘位置护栏（见功能特性）。
+   护栏判据是「目标目录自身名字属于源码/构建目录」或「近 3 级父目录里有 `.uvprojx`/`.ioc`」
+   且自身不是证据目录；**共享根（`%TEMP%`、`~`）不当工程边界**——自测时就因为 `%TEMP%` 里躺着
+   一个 `mix.uvprojx`，把整块临时目录判成了禁区。
+3. **地址口径**：入参统一走 `numparse.parse_int`（`0x`/`0b`/`0o`/`_` 分隔/首尾空白；
+   **不猜**——`08000000` 是十进制 8000000）；返回把两个基址拆开报，`base_hex` 变成
+   `load_base_hex` 的别名（以前它恒等于入参 `base`，传了 `flash_start` 也不反映）。
+   注意 MCP 框架会先用**函数注解**做类型校验，所以这些参数必须声明成 `str | int`，
+   否则 `"0x08000000"` 在进函数之前就被判成类型错误。
+4. **导出无 BOM**：`mdkdebug/textio.py` 是唯一写入口径（`utf-8` + `newline="\n"` + 无 BOM），
+   `_csv` 改走它；闸门里用 AST 扫包内「以 `utf-8-sig` 写文件」的写法，防止回潮。
 
 ### 底层库
 

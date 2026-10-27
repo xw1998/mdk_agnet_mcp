@@ -38,6 +38,9 @@ import os
 import re
 import struct
 
+from . import evidence as _evidence
+from . import textio as _textio
+
 from . import closure, containers, fid, reveng, rtypes
 import subprocess
 
@@ -2347,13 +2350,12 @@ target_include_directories(%s PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 
 def _csv(header: list, rows: list) -> str:
-    import csv
-    import io
-    buf = io.StringIO()
-    w = csv.writer(buf, lineterminator="\n")
-    w.writerow(header)
-    w.writerows(rows)
-    return buf.getvalue()
+    """CSV 文本：**无 BOM**、`\n` 行尾（统一走 mdkdebug.textio）。
+
+    真机反馈：带 BOM 的 CSV 首列键是 ``'\ufeffaddr'``，下游按 ``addr`` 取列取不到，
+    必须先按 utf-8-sig 读。本服务的产物是给程序读的证据，不该有 BOM。
+    """
+    return _textio.csv_text(header, rows)
 
 
 def _jsonable(an: dict) -> dict:
@@ -2370,6 +2372,10 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
     if not out_dir:
         return {"ok": False, "error": "缺少 out_dir"}
     dest = os.path.abspath(out_dir)
+    # 位置非法优先于"目录已存在"：落在构建目录里，说"位置非法"比说"已存在"有用得多
+    bad = _evidence.violation(dest)
+    if bad:
+        return {**_evidence.refusal(dest, bad), "output_directory": dest}
     if os.path.exists(dest):
         return {"ok": False, "output_directory": dest,
                 "error": "输出目录已存在：%s —— 本工具不覆盖任何既有内容，"
@@ -2452,8 +2458,10 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
                 names={f["addr"]: f["name"] for f in funcs if f.get("name")},
                 switches=(sw0 or {}).get("switches") if isinstance(sw0, dict) else None)
             if pcr.get("ok") and pcr.get("functions"):
-                _emit(dest, "src/pseudo_c.c",
-                      _decomp.pseudo_c_file(pcr, title=name), files)
+                _rec = _emit(dest, "src/pseudo_c.c",
+                             _decomp.pseudo_c_file(pcr, title=name), files)
+                # 机读标志：这份产物是**证据**，不是可编译源码（文件里还有 #error 闸门）
+                _rec["evidence_only"] = True
                 pseudo_ok = True
                 if pcr.get("n_failed"):
                     notes.append("%d 个函数没能提升成伪 C" % pcr["n_failed"])
@@ -2548,8 +2556,12 @@ def build_project(path: str, out_dir: str, *, name: str = "recovered",
     _emit(dest, "Makefile", _makefile(name), files)
     _emit(dest, "CMakeLists.txt", _cmake_text(name), files)
     # 7. 机器可读报告
+    report = _jsonable(an)
+    report["evidence_only"] = True
+    report["artifact_kind"] = "evidence"       # 提醒：这是取证产物，不是源码工程
+    report["evidence_only_files"] = [f["rel"] for f in files if f.get("evidence_only")]
     _emit(dest, "report.json",
-          json.dumps(_jsonable(an), ensure_ascii=False, indent=1), files)
+          json.dumps(report, ensure_ascii=False, indent=1), files)
     # 8. 人读说明（最后写，好把文件清单列全）
     rels = [f["rel"] for f in files] + ["README.md"]
     _emit(dest, "README.md", _readme(an, regions, sorted(rels)), files)
@@ -3279,6 +3291,10 @@ def project_exact(path: str, out_dir: str, *, name: str = "recovered",
     if not chunks:
         return {"ok": False, "error": "没有可加载字节：这份输入里找不到能复刻的区间"}
     dest = os.path.abspath(out_dir)
+    # 同上：位置非法优先于"目录已存在"
+    bad = _evidence.violation(dest)
+    if bad:
+        return {**_evidence.refusal(dest, bad), "out_dir": dest}
     if os.path.exists(dest):
         return {"ok": False,
                 "error": "输出目录已存在：%s" % dest,
@@ -3385,6 +3401,9 @@ def project_exact(path: str, out_dir: str, *, name: str = "recovered",
             "判据是 recover_verify 的 byte_identical，不是「看起来像」",
         ],
     }
+    manifest["evidence_only"] = True
+    manifest["artifact_kind"] = "evidence"
+    manifest["evidence_only_files"] = [f["rel"] for f in files]
     _emit(dest, "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
           files)
 

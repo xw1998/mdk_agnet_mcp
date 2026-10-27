@@ -2003,16 +2003,27 @@ def decompile(unit, funcs, *, max_funcs: int = 60, max_insns: int = 4000,
 
 
 def pseudo_c_file(results: dict, *, title: str = "recovered") -> str:
-    """把批量结果拼成一个 .c 文件（带文件头与限制声明）。"""
+    """把批量结果拼成一个 .c 文件（带 evidence_only 硬标记与编译期闸门）。"""
     head = [
-        "/* %s —— 由 mdkdebug 从固件镜像提升出的**寄存器级伪 C**" % title,
+        "/* ==========================================================================",
+        " * EVIDENCE ONLY —— 这不是源码（evidence_only = true）",
         " *",
-        " * 这不是原始源码。证据链：指令 -> 表达式/控制流（保真）；",
-        " * 类型名、结构体划分、变量名、注释（推断/缺失）。",
+        " * %s —— 由 mdkdebug 从固件镜像提升出的**寄存器级伪 C**。" % title,
+        " * 证据链：指令 -> 表达式/控制流（保真）；类型名、结构体划分、变量名（推断）。",
         " * 变量名按参数/计数器/基址/临时量推断，注释里保留原始寄存器号；",
         " * int vs unsigned 只在有消费指令作证时才区分，冲突处写 unknown。",
         " * 未提升的指令在源码里逐条留下「未支持」注释。",
-        " */",
+        " *",
+        " * **不要把它挂进工程**。器件的正确做法是：这份文件只作为对照证据留在",
+        " * 恢复目录里（报告里带 evidence_only=true）；真源码要人按证据重写。",
+        " * 下面这道 #error 就是「证明它是证据」的硬闸门：它编不过，除非你显式定义",
+        " * MDKDEBUG_ALLOW_EVIDENCE_ONLY——那一步必须由人做，不能由脚本顺手带过。",
+        " * 元数据：report.json / manifest.json 的 evidence_only=true，逐文件同名字段。",
+        " * ========================================================================== */",
+        "#ifndef MDKDEBUG_ALLOW_EVIDENCE_ONLY",
+        '#error "pseudo_c.c is a mdkdebug evidence artifact (evidence_only=true), NOT source code. Define MDKDEBUG_ALLOW_EVIDENCE_ONLY only if you really mean to compile evidence."',
+        "#endif",
+        "// evidence_only: true",
         "#include <stdint.h>",
         "",
     ]
@@ -2021,8 +2032,15 @@ def pseudo_c_file(results: dict, *, title: str = "recovered") -> str:
 
 
 def write_pseudo_c(results: dict, dest: str, *, title: str = "recovered") -> str:
-    os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
+    """单独落一份伪 C。目标在源码/工程目录里时**直接拒绝**（evidence_only 护栏）。"""
+    from . import evidence as _evidence          # noqa: PLC0415
+    full = os.path.abspath(dest)
+    bad = _evidence.violation(os.path.dirname(full))
+    if bad:
+        raise ValueError("%s\n%s" % (_evidence.refusal(full, bad)["error"],
+                                     _evidence.refusal(full, bad)["hint"]))
     text = pseudo_c_file(results, title=title)
-    with open(dest, "w", encoding="utf-8", newline="\n") as fh:
+    os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+    with open(full, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
     return text

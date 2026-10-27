@@ -2594,3 +2594,47 @@ Flash 没被读出来。**「落在我没 dump 到的那一段」和「向量表
 - 新增行**逐行拼装**：行尾取 `newline_seq`、缩进取文件里第一个同类标签的缩进；
 - 修复工具做成「一类缺陷一个开关、默认 dry_run」：BOM 与字面量换行可分别开关，
   一次调用能把两类一起修完并各自报数。
+
+## 六十二、宿主 PYTHONPATH 让 python 死在 site 初始化，程序自己救不了
+
+真机现象（2026-10）：MCP 宿主把自己的 `PYTHONPATH` 传给子进程后，`python run_server.py` 直接退出，
+stderr 是：
+
+```
+Fatal Python error: init_import_site: Failed to import the site module
+  ... __editable___xxx_finder.py ... pathlib ... fnmatch ... import re
+  File "<毒化目录>/re.py", line 1: ImportError: SRE module mismatch
+```
+
+四个反直觉点：
+
+- **崩在 `site` 初始化**，连 `run_server.py` 的第一行都没执行——所以「在程序里 try/except」
+  或「在 bootstrap 里清理环境」**全都来不及**。唯一的解是**进程外**先清变量：
+  `run_server.cmd` / `run_server.sh` 里 `set "PYTHONPATH="` 再 `python -E -s`。
+- **触发者是 `.pth` 里的 editable finder**：`addpackage` 会 `import` 那些 finder，
+  于是 `pathlib → fnmatch → re`——这就是「明明没 import re 却崩在 re」的来历。
+- **不能用 `-I`**：CPython 3.11 起 `-I` 隐含 `-P`，会把**脚本所在目录**从 `sys.path` 去掉，
+  源码树 `python run_server.py` 反而 `ModuleNotFoundError: mdkdebug`。用 `-E -s`。
+- **`-E` 会连带忽略 `PYTHONIOENCODING`/`PYTHONUTF8`**：Windows 回落到 cp936，
+  MCP 的 UTF-8 JSON 里中文就变问号。所以清环境要**白名单**（只剥影响 import 的
+  `PYTHONPATH`/`PYTHONHOME`/… ，保留 IO 类），并且 stdio 显式 `reconfigure(encoding="utf-8")`。
+- Windows 上 `os.execve` 会把 argv 用空格简单拼接，解释器路径带空格（`...\WPS 灵犀\python-env\...`）
+  就被重新拆开，报 `can't open file ...\灵犀\python-env\python.exe`。改用 `subprocess.call(cmd, env=...)`
+  + `SystemExit(rc)`（stdio 管道继承，MCP 不受影响）。
+
+## 六十三、证据产物长得像源码，就会被编进工程
+
+真机现象：`recover_project` 出的 `src/pseudo_c.c` 被顺手挂进工程，编译居然过了一部分，
+于是整个工程变成「一半真源码、一半寄存器级提升」，后续谁也分不清哪行是证据（用户原话：变成 `Ported/`）。
+
+要点：
+
+- **注释拦不住**：长得像源码就是会被人和 AI 当源码用。要**编译期闸门**——
+  文件里 `#ifndef MDKDEBUG_ALLOW_EVIDENCE_ONLY / #error ...`，不显式定义就编不过，
+  「悄悄编进去」这件事物理失败。
+- **元数据也要有**：`report.json` / `manifest.json` 顶层 `evidence_only: true` + 逐文件同名标志，
+  下游（脚本 / AI）不用读注释就能判。
+- **落盘位置要拦**：目标目录名属于 `App`/`Core`/`Src`/`Drivers`… 或位于某个 Keil 工程内 →
+  直接拒绝并给下一步。但**判据只看目标目录自身名字 + 有限的祖先层级，且共享根（`%TEMP%`、`~`）
+  不当工程边界**——自测时 `%TEMP%` 里躺着一个别人的 `mix.uvprojx`，按祖先判会把整块临时目录
+  全判成禁区（假阳性比漏判更难查）。

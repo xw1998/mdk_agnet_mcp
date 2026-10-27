@@ -500,7 +500,14 @@ def inspect_image(path: str, *, base: int = 0, flash_start: int | None = None,
     out = {"ok": True}
     out.update(_identity(path))
     out["format"] = fmt
-    out["base_hex"] = "0x%X" % int(base)
+    # 地址口径（批次101）：把「文件偏移」与「加载基址」分成两组字段报。
+    # 旧字段 base_hex 保留为 load_base_hex 的别名——批次101 之前它恒等于入参 base，
+    # 传了 flash_start 也不反映，是被调用方投诉过的缺陷。
+    out["file_offset_base"] = 0
+    out["file_offset_base_hex"] = "0x0"
+    out["load_base"] = None
+    out["load_base_hex"] = None
+    out["address_basis"] = None
     warnings, limitations = [], []
 
     if fmt == "ihex":
@@ -514,8 +521,9 @@ def inspect_image(path: str, *, base: int = 0, flash_start: int | None = None,
             warnings.append("HEX 有无法解析的行（只列前 5 条）")
         if hexinfo["overlaps"]:
             warnings.append("HEX 有数据记录地址重叠：后写覆盖前写，镜像内容取决于记录顺序")
-        if hexinfo["min_offset"]:
-            out["base_hex"] = "0x%X" % hexinfo["min_offset"]
+        # HEX 记录里写的是**绝对地址**，文件本身没有「偏移」这回事：file_offset_base 恒 0。
+        out["load_base"] = hexinfo["min_offset"]
+        out["address_basis"] = "hex_record"
         payload = _hex_bytes_to_sparse(text)
         limitations.append("HEX 检出的是**记录覆盖范围**；空隙（gaps）表示该区间没有数据，"
                            "不等于该地址上的 Flash 是擦除态")
@@ -523,6 +531,29 @@ def inspect_image(path: str, *, base: int = 0, flash_start: int | None = None,
         payload = data
         if fmt == "elf":
             out["elf"] = elf_layout(path)
+            _segs = [g for g in (out["elf"].get("load_segments") or [])
+                     if g.get("filesz")]
+            # load_segments 只给 *_hex（文本口径），这里按十六进制读回来
+            out["load_base"] = int(_segs[0]["paddr_hex"], 16) if _segs else None
+            out["address_basis"] = "elf_paddr"
+        else:
+            # bin 没有自带地址：调用方给的 flash_start 才是它被烧到哪儿；
+            # 没给就退回 base（=「文件第 0 字节对应的地址」，默认 0）。
+            if flash_start is not None:
+                out["load_base"] = int(flash_start)
+                out["address_basis"] = "flash_start"
+            else:
+                out["load_base"] = int(base)
+                out["address_basis"] = "param_base"
+
+    if out["load_base"] is not None:
+        out["load_base_hex"] = "0x%X" % int(out["load_base"])
+        out["base_hex"] = out["load_base_hex"]
+    else:
+        out["base_hex"] = "0x%X" % int(base)
+    if fmt == "ihex":
+        limitations.append("HEX 的 file_offset_base 恒 0：记录里写的是绝对地址，"
+                           "文件只有记录顺序、没有偏移；绝对地址看 load_base")
 
     # 向量表：ELF 取第一个 PT_LOAD 的 paddr/offset；HEX/BIN 取 base
     vt_off = None

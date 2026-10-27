@@ -73,8 +73,28 @@ from . import trstats as _trstats
 from .codeindex import tools as _codetools
 from .periph import (list_peripherals as _periph_list, get_peripheral as _periph_get,
                      query_memory_map as _query_memory_map)
+from .numparse import parse_int as _parse_int
 
 logger = logging.getLogger("mdkdebug.server")
+
+
+def _pi(value, name, default=None):
+    """工具入参的整数口径（批次101）：接受 ``0x…``/``0b…``/``0o…`` 与纯十进制。
+
+    以前这些参数是 ``int(base or 0)``，于是调用方照文档传 ``"0x08000000"`` 直接
+    ValueError（看着像参数错，其实是口径没统一）。解析失败照样报错、不猜。
+
+    **注意签名**：只把这里改成 _pi 是不够的——MCP 框架会先用函数注解做类型校验，
+    ``base: int`` 会在进函数之前就把 ``"0x..."`` 判成类型错误。所以这些参数一律声明成
+    ``str | int``（与 read_mem 的 ``_addr_arg`` 同一套口径），真正的解析在这里做。
+    """
+    return _parse_int(value, name=name, default=default)
+
+
+def _pi_opt(value, name):
+    """可选窗口参数（flash_start/ram_start/…）：None、空串、负数都算「没给」。"""
+    n = _parse_int(value, name=name, default=None)
+    return None if n is None or n < 0 else n
 
 # itm_trace 的增量解码状态（Keil 的 Debug(printf) Viewer 缓冲是「拉一次给一坨」，
 # 分片拉取时半包必须留到下次，否则 ITM 解码会整段错位）。
@@ -7450,22 +7470,26 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "口径：签名命中是**观察**；区间长度是「到下一个签名」的**推导上界**"
             "（size_basis=next_signature_upper_bound）；两者都不证明后面是合法分区或可运行代码。"
             "只读工具。大文件只扫前 32 MiB 并明说。"
+            "地址口径（批次101）：地址类入参既收十进制也收 0x… 写法；输出 load_base(_hex) 是"
+            "加载/烧录地址、file_offset_base(_hex) 是文件内偏移、address_basis 说明来源，"
+            "base_hex 是 load_base_hex 的别名。"
         ),
     )
-    async def image_inspect(path: str, base: int = 0, flash_start: int = -1,
-                            flash_size: int = 0, ram_start: int = -1,
-                            ram_size: int = 0, block: int = 1024,
+    async def image_inspect(path: str, base: str | int = 0,
+                            flash_start: str | int = -1,
+                            flash_size: str | int = 0, ram_start: str | int = -1,
+                            ram_size: str | int = 0, block: int = 1024,
                             max_regions: int = 64) -> str:
         try:
             out = _image.inspect_image(
                 str(path or "").strip(),
-                base=int(base or 0),
-                flash_start=None if int(flash_start) < 0 else int(flash_start),
-                flash_size=int(flash_size or 0) or None,
-                ram_start=None if int(ram_start) < 0 else int(ram_start),
-                ram_size=int(ram_size or 0) or None,
-                block=int(block or 1024),
-                max_regions=int(max_regions or 64),
+                base=_pi(base, "base", 0),
+                flash_start=_pi_opt(flash_start, "flash_start"),
+                flash_size=(_pi_opt(flash_size, "flash_size") or None),
+                ram_start=_pi_opt(ram_start, "ram_start"),
+                ram_size=(_pi_opt(ram_size, "ram_size") or None),
+                block=_pi(block, "block", 1024),
+                max_regions=_pi(max_regions, "max_regions", 64),
             )
             return _js(out)
         except Exception as e:  # noqa: BLE001
@@ -7530,25 +7554,25 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "目录必须不存在（不覆盖既有证据）；不给 out_dir 就只报边界、不写任何东西。"
         ),
     )
-    async def image_split(path: str, base: int = 0,
-                          flash_start: int = -1, flash_size: int = 0,
-                          ram_start: int = -1, ram_size: int = 0,
-                          erase: int = 255, erase_min: int = 256,
+    async def image_split(path: str, base: str | int = 0,
+                          flash_start: str | int = -1, flash_size: str | int = 0,
+                          ram_start: str | int = -1, ram_size: str | int = 0,
+                          erase: str | int = 255, erase_min: str | int = 256,
                           max_tables: int = 32, handler_ratio: float = 0.75,
-                          min_image: int = 256, out_dir: str = "") -> str:
+                          min_image: str | int = 256, out_dir: str = "") -> str:
         try:
             out = _imagesplit.split_image(
                 str(path or "").strip(),
-                base=int(base or 0),
-                flash_start=None if int(flash_start) < 0 else int(flash_start),
-                flash_size=int(flash_size or 0) or None,
-                ram_start=None if int(ram_start) < 0 else int(ram_start),
-                ram_size=int(ram_size or 0) or None,
-                erase=int(erase if erase is not None else 255),
-                erase_min=int(erase_min or 256),
-                max_tables=int(max_tables or 32),
+                base=_pi(base, "base", 0),
+                flash_start=_pi_opt(flash_start, "flash_start"),
+                flash_size=(_pi_opt(flash_size, "flash_size") or None),
+                ram_start=_pi_opt(ram_start, "ram_start"),
+                ram_size=(_pi_opt(ram_size, "ram_size") or None),
+                erase=_pi(erase, "erase", 255),
+                erase_min=_pi(erase_min, "erase_min", 256),
+                max_tables=_pi(max_tables, "max_tables", 32),
                 handler_ratio=float(handler_ratio if handler_ratio is not None else 0.75),
-                min_image=int(min_image or 256),
+                min_image=_pi(min_image, "min_image", 256),
                 out_dir=str(out_dir or "").strip(),
             )
             return _js(out)
@@ -7587,9 +7611,9 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "deep=True 用 117 s 只多认出 5 个函数）：只想看布局就 deep=false，要读代码用 recover_disasm。"
         ),
     )
-    async def recover_probe(path: str, base: int = 0, deep: bool = True,
-                            arch: str = "", endian: str = "", bits: int = 0,
-                            thumb: bool = False, entry: int = 0,
+    async def recover_probe(path: str, base: str | int = 0, deep: bool = True,
+                            arch: str = "", endian: str = "", bits: str | int = 0,
+                            thumb: bool = False, entry: str | int = 0,
                             detail: str = "full", max_functions: int = 0,
                             max_insns: int = 0) -> str:
         try:
@@ -7604,11 +7628,11 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
                 kw["max_functions"] = int(max_functions)
             if int(max_insns or 0) > 0:
                 kw["max_insns"] = int(max_insns)
-            out = _recover.analyze(str(path or "").strip(), base=int(base or 0),
+            out = _recover.analyze(str(path or "").strip(), base=_pi(base, "base", 0),
                                    deep=bool(deep), arch=str(arch or ""),
-                                   endian=str(endian or ""), bits=int(bits or 0),
+                                   endian=str(endian or ""), bits=_pi(bits, "bits", 0),
                                    thumb=(None if not thumb else True),
-                                   entry=int(entry or 0), **kw)
+                                   entry=_pi(entry, "entry", 0), **kw)
             if out.get("ok") and _detail == "compact":
                 out = _recover.compact_view(
                     out, max_functions=(int(max_functions) if int(max_functions or 0) > 0 else 40))
@@ -7680,14 +7704,15 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "类型名与变量名是推断值；未提升的指令在源码里逐条标注，不静默丢。"
         ),
     )
-    async def recover_disasm(path: str, start: int = 0, end: int = 0,
-                             symbol: str = "", base: int = 0,
+    async def recover_disasm(path: str, start: str | int = 0,
+                             end: str | int = 0,
+                             symbol: str = "", base: str | int = 0,
                              max_insns: int = 5000, fmt: str = "",
-                             arch: str = "", endian: str = "", bits: int = 0,
+                             arch: str = "", endian: str = "", bits: str | int = 0,
                              thumb: bool = False) -> str:
         try:
-            out = _recover.disasm_at(str(path or "").strip(), base=int(base or 0),
-                                     start=int(start or 0), end=int(end or 0),
+            out = _recover.disasm_at(str(path or "").strip(), base=_pi(base, "base", 0),
+                                     start=_pi(start, "start", 0), end=_pi(end, "end", 0),
                                      symbol=str(symbol or "").strip(),
                                      max_insns=int(max_insns or 5000),
                                      fmt=str(fmt or "").strip(),
@@ -7772,7 +7797,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def recover_project(path: str, out_dir: str, name: str = "recovered",
-                             base: int = 0, deep: bool = True,
+                             base: str | int = 0, deep: bool = True,
                              max_stub_functions: int = 300,
                              max_asm_functions: int = 200,
                              include_asm: bool = True,
@@ -7782,8 +7807,8 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             out = _recover.build_project(
                 str(path or "").strip(), str(out_dir or "").strip(),
                 name=str(name or "recovered") or "recovered",
-                base=int(base or 0), deep=bool(deep),
-                max_stub_functions=int(max_stub_functions or 300),
+                base=_pi(base, "base", 0), deep=bool(deep),
+                max_stub_functions=_pi(max_stub_functions, "max_stub_functions", 300),
                 max_asm_functions=int(max_asm_functions or 200),
                 include_asm=bool(include_asm),
                 include_pseudo_c=bool(include_pseudo_c),
@@ -7813,7 +7838,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
         ),
     )
     async def recover_project_exact(path: str, out_dir: str, name: str = "recovered",
-                                    base: int = 0, device: str = "", vendor: str = "",
+                                    base: str | int = 0, device: str = "", vendor: str = "",
                                     pack_id: str = "", emit_uvprojx: bool = True,
                                     include_asm: bool = True,
                                     max_asm_functions: int = 400,
@@ -7822,7 +7847,7 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             out = _recover.project_exact(
                 str(path or "").strip(), str(out_dir or "").strip(),
                 name=str(name or "recovered") or "recovered",
-                base=int(base or 0), device=str(device or ""),
+                base=_pi(base, "base", 0), device=str(device or ""),
                 vendor=str(vendor or ""), pack_id=str(pack_id or ""),
                 emit_uvprojx=bool(emit_uvprojx), include_asm=bool(include_asm),
                 max_asm_functions=int(max_asm_functions or 400),
@@ -7889,20 +7914,22 @@ def create_server(host: str = "127.0.0.1", port: int = 4823,
             "默认会往 <project_dir>/build/ 写中间产物（不是只读工具）。"
         ),
     )
-    async def recover_ledger(project_dir: str, image: str = "", base: int = 0,
+    async def recover_ledger(project_dir: str, image: str = "", base: str | int = 0,
                              verify_json: str = "", arm_bin: str = "",
                              skip_build: bool = False, via_uvprojx: bool = False,
-                             flash_start: int = 0, flash_size: int = 0,
-                             ram_start: int = 0, ram_size: int = 0,
+                             flash_start: str | int = 0, flash_size: str | int = 0,
+                             ram_start: str | int = 0, ram_size: str | int = 0,
                              claim: str = "", timeout_s: float = 240.0) -> str:
         try:
             out = _recover.build_closure_ledger(
                 str(project_dir or "").strip(), str(image or "").strip(),
-                base=int(base or 0), verify_json=str(verify_json or "").strip(),
+                base=_pi(base, "base", 0), verify_json=str(verify_json or "").strip(),
                 arm_bin=str(arm_bin or ""), skip_build=bool(skip_build),
                 via_uvprojx=bool(via_uvprojx),
-                flash_start=int(flash_start or 0), flash_size=int(flash_size or 0),
-                ram_start=int(ram_start or 0), ram_size=int(ram_size or 0),
+                flash_start=_pi(flash_start, "flash_start", 0),
+                flash_size=_pi(flash_size, "flash_size", 0),
+                ram_start=_pi(ram_start, "ram_start", 0),
+                ram_size=_pi(ram_size, "ram_size", 0),
                 claim=str(claim or "").strip(),
                 timeout_s=float(timeout_s or 240.0))
             return _js(out)

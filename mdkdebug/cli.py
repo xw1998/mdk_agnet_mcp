@@ -13,12 +13,20 @@ mdkdebug MCP Server 命令行入口。
 
 from __future__ import annotations
 
-import argparse
-import asyncio
-import logging
 import sys
 
-from . import __version__
+# 环境自愈必须发生在**任何会 import re 的模块之前**（argparse 就会 import re）。
+# 宿主污染 PYTHONPATH/PYTHONHOME 时，这里会死于 "SRE module mismatch"。
+from .bootstrap import configure_stdio, ensure_isolated
+
+configure_stdio()
+ensure_isolated()
+
+import argparse  # noqa: E402
+import asyncio  # noqa: E402
+import logging  # noqa: E402
+
+from . import __version__  # noqa: E402
 
 
 def main() -> int:
