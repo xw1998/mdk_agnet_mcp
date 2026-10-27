@@ -507,6 +507,19 @@ def section_f():
     check("F4 README 写了导出无 BOM", "BOM" in readme and "csv" in readme.lower())
     check("F5 SKILL 写了启动方式与隔离", "run_server" in skill and "PYTHONPATH" in skill)
     check("F6 SKILL 写了 evidence_only 纪律", "evidence_only" in skill)
+    # F8：MCP 客户端配置示例必须指向启动脚本。文档里写 `"command": "python"` +
+    # `run_server.py` 正是「要使用者自己加 env -u」的坑源：清理时机晚于崩溃。
+    i = readme.find("mcpServers")
+    if i >= 0:
+        a = readme.rfind("```json", 0, i)
+        b = readme.find("```", i)
+        cfg = readme[a:b] if a >= 0 and b >= 0 else readme[i:i + 400]
+    else:
+        cfg = ""
+    check("F10 MCP 配置示例的 command 是启动脚本（不是 python + run_server.py）",
+          "run_server.cmd" in cfg and '"command": "python"' not in cfg, cfg[:200])
+    check("F11 README/SKILL 讲清「直起必须带 -E -s」",
+          '"-E", "-s"' in readme and "-E -s" in skill)
     check("F7 PITFALLS 记录了 BOM 与启动污染两条",
           "\\ufeff" in pit or "BOM" in pit, "")
     import ast

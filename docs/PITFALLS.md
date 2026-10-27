@@ -2621,6 +2621,11 @@ Fatal Python error: init_import_site: Failed to import the site module
 - Windows 上 `os.execve` 会把 argv 用空格简单拼接，解释器路径带空格（`...\WPS 灵犀\python-env\...`）
   就被重新拆开，报 `can't open file ...\灵犀\python-env\python.exe`。改用 `subprocess.call(cmd, env=...)`
   + `SystemExit(rc)`（stdio 管道继承，MCP 不受影响）。
+- **包装脚本再好，文档里的配置示例写错也等于没有**：仓库早就有 `run_server.cmd/.sh`，但
+  README 的 MCP 配置示例仍是 `"command": "python"` + `"args": ["...run_server.py"]`——
+  照着抄就必然踩坑（清理时机在崩溃之后）。修法是**把示例本身改成 `"command": ".../run_server.cmd"`**，
+  并留一条「宿主只允许可执行文件时把 `-E -s -u` 写进 args」的后路，再加测试断言盯着示例块
+  （`F10`），否则下次改文档又漂回去。
 
 ## 六十三、证据产物长得像源码，就会被编进工程
 

@@ -229,7 +229,7 @@ mdk_agent/
 ├── requirements.txt          # Python 依赖
 ├── README.md
 ├── mdkdebug/
-│   ├── __init__.py           # 包初始化（版本号 0.2.24）
+│   ├── __init__.py           # 包初始化（版本号 0.2.25）
 │   ├── cli.py                # 命令行入口（main，mdkdebug 命令）
 │   ├── uvsock.py             # UVSOCK 协议：命令码、VSET/AMEM/EXECCMD 打包与解析
 │   ├── interface.py          # TCP 物理接口层（含异步消息残留清理）
@@ -287,6 +287,8 @@ run_server.cmd                    :: Windows
 `MDKDEBUG_PYTHON` → `.venv` → `python` → `py -3`。
 
 **方式一：stdio（MCP 客户端标准方式）**
+
+> 只在**环境干净**的终端里直接 `python run_server.py`；宿主拉起的场景一律用方式零或 `-E -s`。
 
 ```bash
 python run_server.py                              # 默认连 127.0.0.1:4823
@@ -748,17 +750,32 @@ toolset(action="load",   toolsets="all")        # 一次全装 215 个（=full/*
 
 ## 接入 AI 工具客户端
 
-以支持 MCP 的客户端为例，在 MCP 配置中加入该服务：
+以支持 MCP 的客户端为例，在 MCP 配置中加入该服务——**`command` 直接指向启动脚本**，
+不要把 `python` + `run_server.py` 拆成两段（见下）：
 
 ```json
 {
   "mcpServers": {
     "mdkdebug": {
-      "command": "python",
-      "args": ["D:/工作/git_project/mdk_agent/run_server.py", "--idle-timeout", "30"]
+      "command": "D:/工作/git_project/mdk_agent/run_server.cmd",
+      "args": ["--idle-timeout", "30"]
     }
   }
 }
+```
+
+> Linux / macOS 把 `command` 换成 `/path/to/mdk_agent/run_server.sh`。
+> 解释器不在宿主 PATH 上时，加 `"env": {"MDKDEBUG_PYTHON": "C:/.../python.exe"}`。
+
+**为什么不能写成 `"command": "python"` + `args: ["...run_server.py"]`**：宿主会把**它自己的**
+`PYTHONPATH`/`PYTHONHOME` 传给子进程，指到另一套标准库时 python 在 `site` 初始化阶段就崩
+（`Fatal Python error: init_import_site ... SRE module mismatch`），`run_server.py` 一行都没执行，
+进程内的 `bootstrap` 也来不及救。启动脚本里的清理发生在 **python 之前**，这才是唯一可靠的时机。
+
+若必须用解释器直起（例如宿主只允许 `command` = 可执行文件），把隔离开关写进 `args`：
+
+```json
+{ "command": "python", "args": ["-E", "-s", "-u", "D:/工作/git_project/mdk_agent/run_server.py"] }
 ```
 
 > 请将示例中的绝对路径替换为你的工程实际路径。
@@ -1653,6 +1670,11 @@ uVision 再打开就报错。批次97 把这条纪律做成**工具能执行的�
    否则 `"0x08000000"` 在进函数之前就被判成类型错误。
 4. **导出无 BOM**：`mdkdebug/textio.py` 是唯一写入口径（`utf-8` + `newline="\n"` + 无 BOM），
    `_csv` 改走它；闸门里用 AST 扫包内「以 `utf-8-sig` 写文件」的写法，防止回潮。
+> **批次101 补丁（0.2.25）**：启动包装脚本早就有了，但 README 的 MCP 配置示例仍写
+> `"command": "python"` + `"args": [".../run_server.py"]`——照着抄必然踩坑，因为清理时机
+> 晚于崩溃。现在示例的 `command` 直接指向 `run_server.cmd`（Linux 用 `run_server.sh`），
+> 并给出「宿主只放可执行文件时把 `-E -s -u` 写进 `args`」的后路；`test_batch101` 增加
+> `F10`/`F11` 两条断言盯着示例块，防止下次又漂回去。
 
 ### 底层库
 

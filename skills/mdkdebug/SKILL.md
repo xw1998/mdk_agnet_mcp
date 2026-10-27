@@ -13,6 +13,10 @@ mdkdebug 是一个把 Keil uVision 变成「可被 AI 调用」的 MCP 服务，
 **优先用随附启动脚本**：`run_server.cmd`（Windows）/ `run_server.sh`（其余）。
 它会先清掉 `PYTHONPATH` / `PYTHONHOME` 等变量，再 `python -E -s` 起服务。
 
+配置 MCP 客户端时，`command` **直接指向启动脚本**（`"command": ".../run_server.cmd"`），
+不要写成 `"command": "python"` + `"args": [".../run_server.py"]`——后者的清理时机在 python
+起来之后，而崩溃发生在之前。宿主只接受可执行文件时，把 `-E -s -u` 写进 `args`。
+
 为什么不能只靠 `python run_server.py`：宿主（编辑器、Agent 框架）常把自己的 `PYTHONPATH`
 传给子进程，指到另一套标准库时，python 会在**解释器初始化阶段**就崩
 （`Fatal Python error: init_import_site ... SRE module mismatch`），此时项目代码一行都没执行，
